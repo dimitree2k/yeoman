@@ -8,7 +8,7 @@ from pathlib import Path
 
 import pytest
 from yeoman_shared.raw_archive.purge import PurgeSelector, plan_purge, purge
-from yeoman_shared.raw_archive.records import archive_files, iter_records, line_sha256
+from yeoman_shared.raw_archive.records import TOMBSTONE, archive_files, iter_records, line_sha256
 from yeoman_shared.raw_archive.verify import AUDIT, latest_manifest, verify_archive
 from yeoman_shared.raw_archive.writer import RawArchive, RawEvent
 
@@ -55,12 +55,12 @@ def _ids(root: Path) -> list[str]:
         r["native"]["payload"]["messageId"]
         for p in archive_files(root)
         for _, r, _ in iter_records(p)
-        if r
+        if r and r != TOMBSTONE
     ]
 
 
 def _records(root: Path) -> list[dict]:
-    return [record for path in archive_files(root) for _, record, _ in iter_records(path) if record]
+    return [record for path in archive_files(root) for _, record, _ in iter_records(path) if record and record != TOMBSTONE]
 
 
 def _media_description(message_id: str = "m1", *, generated_ms: int = OCT) -> dict:
@@ -123,7 +123,7 @@ def test_raw_purge_includes_matching_media_description(tmp_path: Path) -> None:
     )
     assert result.removed_lines == 1
     assert result.removed_sha256 == (line_sha256(line),)
-    assert target.read_text(encoding="utf-8") == ""
+    assert json.loads(target.read_text(encoding="utf-8")) == TOMBSTONE
     [audit] = [record for _, record, _ in iter_records(root / AUDIT) if record]
     assert audit["files"] == ["derived/media-descriptions.jsonl"]
     assert audit["removed_sha256"] == [line_sha256(line)]
@@ -317,7 +317,7 @@ def test_purge_of_a_sealed_month_updates_the_manifest_and_verify_stays_green(
     )
     sealed = root / "whatsapp" / "2026-09.jsonl"
     assert stat.S_IMODE(sealed.stat().st_mode) == 0o444
-    assert latest_manifest(root)["whatsapp/2026-09.jsonl"]["lines"] == 1
+    assert latest_manifest(root)["whatsapp/2026-09.jsonl"]["lines"] == 2
     assert verify_archive(root, run_dir=run, now_ms=OCT + 2).ok
 
 
@@ -936,7 +936,7 @@ def test_purge_retains_media_during_cross_process_store_to_append_lease(
         record
         for archive_path in archive_files(root)
         for _, record, _ in iter_records(archive_path)
-        if record is not None
+        if record is not None and record != TOMBSTONE
     ]
     assert [record["native_id"] for record in records] == ["late"]
     assert (root / meta["path"]).exists()
@@ -967,7 +967,7 @@ def test_append_of_stale_media_metadata_is_marked_unstored(tmp_path: Path) -> No
         record
         for path in archive_files(root)
         for _, record, _ in iter_records(path)
-        if record and record["native_id"] == "stale"
+        if record and record != TOMBSTONE and record["native_id"] == "stale"
     ]
     assert record["native"] == {"file_id": "stale"}
     assert record["media"]["stored"] is False
@@ -1275,7 +1275,285 @@ def test_purge_scans_legacy_default_spool_when_registry_has_only_custom_spool(
         record
         for path in archive_files(root)
         for _, record, _ in iter_records(path)
-        if record and record["native_id"] == "legacy-pending"
+        if record and record != TOMBSTONE and record["native_id"] == "legacy-pending"
     ]
     assert kept["media"]["stored"] is True
     assert (root / kept["media"]["path"]).is_file()
+
+
+def test_purge_preserves_physical_and_segment_refs(tmp_path: Path) -> None:
+    from yeoman_gateway.history.attestations import make, parse, resolve_author_targets
+    from yeoman_gateway.history.extract import extract
+    from yeoman_gateway.history.layer1 import Layer1Line, iter_layer1
+    from yeoman_shared.raw_archive.records import dumps
+    from yeoman_shared.raw_archive.verify import record_closed
+
+    root, archive = _setup(tmp_path)
+    _message(archive, "erase", "c1", SEPT)
+    _message(archive, "keep", "c1", SEPT)
+    native = root / "whatsapp" / "2026-09.jsonl"
+    before = native.read_bytes().splitlines(keepends=True)
+    native.write_bytes(before[0] + b"\n{broken\r\n" + before[1] + b"no-newline")
+    original_bytes = native.read_bytes().splitlines(keepends=True)
+    record_closed(root, native, now_ms=OCT)
+    native.chmod(0o444)
+    batch = {
+        "backfill_version": 1, "channel": "whatsapp", "kind": "message", "chat_id": "c1",
+        "occurred_ms": SEPT, "time_certainty": "capture_time_approx",
+        "payload": {"messageId": "keep", "text": "secret-erase", "segments": [
+            {"senderId": "111", "text": "left", "messageId": "left"},
+            {"senderId": "222", "text": "secret-erase", "messageId": "erase"},
+            {"senderId": "333", "text": "right", "messageId": "keep"},
+        ]}, "original": {"content": "left secret-erase right"},
+        "native": {"payload": {"text": "secret-erase"}},
+    }
+    backfill = root / "backfill" / "memory.jsonl"
+    backfill.parent.mkdir()
+    backfill.write_text(dumps(batch) + "\n" + dumps({
+        "backfill_version": 1, "channel": "whatsapp", "kind": "message", "chat_id": "c1",
+        "original": {"source_message_id": "erase", "content": "secret-erase"},
+    }) + "\n")
+    for name, kind in [("media-descriptions", "media_description"), ("media-transcripts", "media_transcript")]:
+        path = root / "derived" / f"{name}.jsonl"
+        path.parent.mkdir(exist_ok=True)
+        path.write_text(dumps({**_media_description("erase"), "kind": kind}) + "\n")
+        record_closed(root, path, now_ms=OCT)
+    base = "backfill/memory.jsonl#1"
+    targets = [base, f"{base}/0", f"{base}/1", f"{base}/2"]
+
+    def author_targets(extracted):
+        decisions = [parse(Layer1Line(f"owner/attestations.jsonl#{i + 1}", make(
+            "author", 10 + i, "synthetic", source_ref=target, anchor="490001@s.whatsapp.net")))
+            for i, target in enumerate(targets)]
+        return [resolve_author_targets([decision], extracted.messages, extracted.events)
+                for decision in decisions]
+
+    initial = extract(iter_layer1([root]))
+    initial_targets = author_targets(initial)
+    assert [list(winners) for winners, _ in initial_targets] == [
+        [f"{base}/2"], [f"{base}/0"], [f"{base}/1"], [f"{base}/2"]]
+    assert all(not review for _, review in initial_targets)
+    selector = PurgeSelector(channel="whatsapp", chat_id="c1", native_id="erase", before_ms=OCT)
+    assert plan_purge(root, selector).removed_lines == 5
+    result = purge(root, selector, operator="owner", now_ms=OCT)
+    assert result.removed_lines == 5
+    marker = {"purged_version": 1}
+    after = native.read_bytes().splitlines(keepends=True)
+    assert json.loads(after[0]) == marker
+    assert after[1:] == original_bytes[1:]
+    rows = [json.loads(line) for line in backfill.read_text().splitlines()]
+    assert rows[0]["payload"]["segments"] == [batch["payload"]["segments"][0], marker, batch["payload"]["segments"][2]]
+    assert rows[1] == marker
+    assert "secret-erase" not in backfill.read_text()
+    assert "original" not in rows[0] and "native" not in rows[0]
+    lines = list(iter_layer1([root]))
+    assert next(line for line in lines if line.ref == "whatsapp/2026-09.jsonl#4").record["native"]["payload"]["messageId"] == "keep"
+    extracted = extract(lines)
+    assert [m.ref for m in extracted.messages if m.segmented] == ["backfill/memory.jsonl#1/0", "backfill/memory.jsonl#1/2"]
+    post_targets = author_targets(extracted)
+    assert [list(winners) for winners, _ in post_targets] == [
+        [f"{base}/2"], [f"{base}/0"], [], [f"{base}/2"]]
+    assert post_targets[2][1][0]["reason"] == "missing_or_non_content_target"
+    initial_speakers = {m.ref: (m.sender_raw, m.text) for m in initial.messages if m.segmented}
+    assert {m.ref: (m.sender_raw, m.text) for m in extracted.messages if m.segmented} == {
+        ref: initial_speakers[ref] for ref in (f"{base}/0", f"{base}/2")}
+    assert extracted.outcomes[("backfill/memory.jsonl", "skipped:purged")] == 1
+    assert sum(extracted.outcomes.values()) == len(lines)
+    assert latest_manifest(root)["whatsapp/2026-09.jsonl"]["lines"] == 4
+    assert verify_archive(root, run_dir=tmp_path / "run", now_ms=OCT).ok
+    for name in ("media-descriptions", "media-transcripts"):
+        assert json.loads((root / "derived" / f"{name}.jsonl").read_text()) == marker
+    purge(root, PurgeSelector(channel="whatsapp", chat_id="c1", native_id="keep"), operator="owner", now_ms=OCT + 1)
+    final = extract(iter_layer1([root]))
+    final_targets = author_targets(final)
+    assert [list(winners) for winners, _ in final_targets] == [[], [f"{base}/0"], [], []]
+    assert final_targets[0][1][0]["reason"] == "missing_or_non_content_target"
+    assert final_targets[3][1][0]["reason"] == "missing_or_non_content_target"
+    survivor = next(m for m in final.messages if m.ref == f"{base}/0")
+    assert (survivor.sender_raw, survivor.text) == initial_speakers[f"{base}/0"]
+    assert sum(final.outcomes.values()) == len(list(iter_layer1([root])))
+
+
+def test_disposed_content_cannot_return_via_drain(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    import yeoman_shared.raw_archive.writer as writer_module
+    from yeoman_shared.raw_archive.records import append_is_disposed, dumps
+
+    root, archive = _setup(tmp_path)
+    archive.append(RawEvent(channel="whatsapp", kind="outbound_result", direction="out",
+                            native={"message_id": "erase"}, chat_id="c1", correlation_id="corr",
+                            received_ms=SEPT))
+    purge(root, PurgeSelector(channel="whatsapp", chat_id="c1", native_id="erase", before_ms=OCT), operator="owner")
+    backfill = {"backfill_version": 1, "channel": "whatsapp", "kind": "message", "chat_id": "c1",
+                "occurred_ms": OCT + 100, "time_certainty": "provider_timestamp",
+                "original": {"source_message_id": "erase", "created_ms": SEPT}}
+    assert append_is_disposed(root / AUDIT, backfill, dumps(backfill))
+    backfill["original"]["created_ms"] = OCT
+    backfill["occurred_ms"] = SEPT
+    assert not append_is_disposed(root / AUDIT, backfill, dumps(backfill))
+    segmented = {**backfill, "received_ms": SEPT, "original": {},
+                 "payload": {"segments": [{"messageId": "safe"}, {"messageId": "erase"}]}}
+    assert append_is_disposed(root / AUDIT, segmented, dumps(segmented))
+    real_append = writer_module.append_line
+    for mode in ("direct", "spool", "memory"):
+        event = RawEvent(channel="whatsapp", kind="outbound_request", direction="out", native={"text": "secret"},
+                         chat_id="c1", correlation_id="corr", received_ms=SEPT)
+        if mode != "direct":
+            with monkeypatch.context() as patch:
+                patch.setattr(writer_module, "append_line", lambda *args, **kwargs: (_ for _ in ()).throw(OSError("storage")))
+                if mode == "memory":
+                    patch.setattr(archive, "_spool_line_locked", lambda *args: False)
+                assert archive.append(event) is False
+            assert archive.drain_spool() == 1
+        else:
+            assert archive.append(event) is True  # existing bool means consumed, including suppression
+        assert archive.status().pending_in_memory == 0
+        assert not list(archive.spool.glob("*.json"))
+    assert real_append is writer_module.append_line
+    assert _records(root) == []
+    for kind in ("media_description", "media_transcript"):
+        derived = {**_media_description("erase", generated_ms=OCT + 100), "kind": kind}
+        assert append_is_disposed(root / AUDIT, derived, dumps(derived))
+    captured_late = {"channel": "whatsapp", "chat_id": "c1", "native_id": "erase",
+                     "received_ms": OCT, "native": {"payload": {"timestamp": SEPT // 1000}}}
+    assert not append_is_disposed(root / AUDIT, captured_late, dumps(captured_late))
+    captured_early = {**captured_late, "received_ms": SEPT,
+                      "native": {"payload": {"timestamp": (OCT + 100) // 1000}}}
+    assert append_is_disposed(root / AUDIT, captured_early, dumps(captured_early))
+    (root / AUDIT).chmod(0o600)
+    with (root / AUDIT).open("a") as handle:
+        handle.write('{"disposition":{"scope":"message"}}\n')
+    with pytest.raises(OSError, match="dispositions"):
+        append_is_disposed(root / AUDIT, backfill, dumps(backfill))
+    assert archive.append(_pending_message("blocked")) is False
+    assert len(list(archive.spool.glob("*.json"))) == 1
+
+
+@pytest.mark.parametrize("capture", ["original", "received_ms", "generated_ms", "unknown"])
+def test_partial_purge_preserves_capture_time_across_sequential_selectors(tmp_path: Path, capture: str) -> None:
+    from yeoman_gateway.history.extract import extract
+    from yeoman_gateway.history.layer1 import iter_layer1
+    from yeoman_shared.raw_archive.records import dumps, record_capture_ms, record_parts
+
+    root, _ = _setup(tmp_path)
+    row = {"backfill_version": 1, "channel": "whatsapp", "kind": "message", "chat_id": "c1",
+           "occurred_ms": 50, "time_certainty": "provider_timestamp",
+           "payload": {"messageId": "keep", "segments": [
+               {"messageId": "erase", "text": "secret"}, {"messageId": "keep", "text": "survivor"}]}}
+    if capture == "original":
+        row["original"] = {"created_ms": 200, "content": "secret survivor"}
+    elif capture != "unknown":
+        row[capture] = 200
+    expected_capture = 0 if capture == "unknown" else 200
+    path = root / "backfill" / "memory.jsonl"
+    path.parent.mkdir()
+    path.write_text(dumps(row) + "\n")
+    later_selector = PurgeSelector(channel="whatsapp", chat_id="c1", native_id="keep", before_ms=100)
+    expected_count = 1 if capture == "unknown" else 0
+    assert plan_purge(root, later_selector).removed_lines == expected_count
+    purge(root, PurgeSelector(channel="whatsapp", chat_id="c1", native_id="erase", before_ms=300), operator="owner")
+    saved = json.loads(path.read_text())
+    assert record_capture_ms(saved) == expected_capture
+    assert [record_capture_ms(part) for part in record_parts(saved)] == [expected_capture]
+    assert saved["occurred_ms"] == 50 and saved["time_certainty"] == "provider_timestamp"
+    assert "original" not in saved and "secret" not in path.read_text()
+    assert plan_purge(root, later_selector).removed_lines == expected_count
+    assert purge(root, later_selector, operator="owner").removed_lines == expected_count
+    if capture != "unknown":
+        [copy] = extract(iter_layer1([root])).messages
+        assert copy.ref == "backfill/memory.jsonl#1/1" and copy.text == "survivor"
+
+
+@pytest.mark.parametrize("boundary", ["manifest", "directory", "before_replace"])
+@pytest.mark.parametrize("keep_neighbor", [False, True])
+def test_purge_retry_recovers_only_authorized_sealed_publication(tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
+                                                               boundary: str, keep_neighbor: bool) -> None:
+    import yeoman_shared.raw_archive.purge as purge_module
+    from yeoman_gateway.history.layer1 import iter_layer1
+    from yeoman_shared.raw_archive.records import file_digest
+    from yeoman_shared.raw_archive.verify import record_closed
+
+    root, archive = _setup(tmp_path)
+    _message(archive, "erase", "c1", SEPT)
+    if keep_neighbor:
+        _message(archive, "keep", "c1", SEPT)
+    path = root / "whatsapp" / "2026-09.jsonl"
+    before = path.read_bytes().splitlines(keepends=True)
+    record_closed(root, path, now_ms=OCT)
+    path.chmod(0o444)
+    selector = PurgeSelector(channel="whatsapp", chat_id="c1", native_id="erase")
+    real_replace, real_sync = purge_module.os.replace, purge_module._fsync_directory
+    replaced = False
+
+    def replace(source, destination):
+        nonlocal replaced
+        if Path(destination) == path and boundary == "before_replace":
+            raise OSError("injected before replacement")
+        real_replace(source, destination)
+        if Path(destination) == path:
+            replaced = True
+
+    def sync(directory):
+        if replaced and boundary == "directory":
+            raise OSError("injected after replacement")
+        real_sync(directory)
+
+    with monkeypatch.context() as patch:
+        patch.setattr(purge_module.os, "replace", replace)
+        patch.setattr(purge_module, "_fsync_directory", sync)
+        if boundary == "manifest":
+            patch.setattr(purge_module, "record_closed", lambda *args, **kwargs: (_ for _ in ()).throw(OSError("injected manifest")))
+        with pytest.raises(OSError, match="injected"):
+            purge(root, selector, operator="owner", now_ms=OCT + 1)
+    if boundary == "before_replace":
+        assert path.read_bytes().splitlines(keepends=True) == before
+    else:
+        assert "checksum_mismatch:whatsapp/2026-09.jsonl" in verify_archive(root, run_dir=tmp_path / "run", now_ms=OCT + 2).problems
+        assert json.loads(path.read_bytes().splitlines()[0]) == TOMBSTONE
+    purge(root, selector, operator="owner", now_ms=OCT + 3)
+    assert verify_archive(root, run_dir=tmp_path / "run", now_ms=OCT + 4).ok
+    after = path.read_bytes().splitlines(keepends=True)
+    assert json.loads(after[0]) == TOMBSTONE and after[1:] == before[1:]
+    assert "secret-erase" not in path.read_text()
+    assert [line.ref for line in iter_layer1([root])] == [f"whatsapp/2026-09.jsonl#{i + 1}" for i in range(len(before))]
+    entry = latest_manifest(root)["whatsapp/2026-09.jsonl"]
+    assert (entry["sha256"], entry["lines"], entry["bytes"]) == file_digest(path)
+    assert path.stat().st_mode & 0o777 == 0o444
+
+
+def test_purge_pending_recovery_refuses_unexpected_bytes(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    import yeoman_shared.raw_archive.purge as purge_module
+    from yeoman_shared.raw_archive.verify import record_closed
+
+    root, archive = _setup(tmp_path)
+    _message(archive, "erase", "c1", SEPT)
+    path = root / "whatsapp" / "2026-09.jsonl"
+    record_closed(root, path, now_ms=OCT)
+    path.chmod(0o444)
+    original_manifest = latest_manifest(root)
+    selector = PurgeSelector(channel="whatsapp", chat_id="c1", native_id="erase")
+    with monkeypatch.context() as patch:
+        patch.setattr(purge_module, "record_closed", lambda *args, **kwargs: (_ for _ in ()).throw(OSError("injected manifest")))
+        with pytest.raises(OSError):
+            purge(root, selector, operator="owner")
+    path.chmod(0o600)
+    path.write_text('{"unrelated":"unexpected bytes"}\n')
+    path.chmod(0o444)
+    with pytest.raises(OSError, match="pending"):
+        purge(root, selector, operator="owner")
+    assert latest_manifest(root) == original_manifest
+    assert "checksum_mismatch:whatsapp/2026-09.jsonl" in verify_archive(root, run_dir=tmp_path / "run", now_ms=OCT).problems
+
+
+def test_purge_without_pending_evidence_never_blesses_checksum_mismatch(tmp_path: Path) -> None:
+    from yeoman_shared.raw_archive.verify import record_closed
+
+    root, archive = _setup(tmp_path)
+    _message(archive, "erase", "c1", SEPT)
+    path = root / "whatsapp" / "2026-09.jsonl"
+    record_closed(root, path, now_ms=OCT)
+    original_manifest = latest_manifest(root)
+    path.write_text('{"purged_version":1}\n')
+    path.chmod(0o444)
+    purge(root, PurgeSelector(channel="whatsapp", chat_id="c1", native_id="erase"), operator="owner")
+    assert latest_manifest(root) == original_manifest
+    assert "checksum_mismatch:whatsapp/2026-09.jsonl" in verify_archive(root, run_dir=tmp_path / "run", now_ms=OCT).problems

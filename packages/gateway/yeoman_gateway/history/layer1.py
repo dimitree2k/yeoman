@@ -5,17 +5,22 @@ from __future__ import annotations
 import hashlib
 import json
 import os
-from collections.abc import Iterable, Iterator, Sequence
+from collections.abc import Iterable, Iterator, Mapping, Sequence
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Any
 
 from yeoman_shared.raw_archive.paths import ProtectedPathError, is_protected
+from yeoman_shared.raw_archive.records import TOMBSTONE
 
 BACKFILL_VERSION = 1
 PROVENANCE = frozenset({"native", "recovered_text", "verbatim_unverified", "derived_only"})
 TIME_CERTAINTY = frozenset({"native", "provider_timestamp", "capture_time_approx", "unknown"})
 SUBDIRS = ("whatsapp", "backfill", "derived", "owner")
+
+
+def is_tombstone(record: Mapping[str, Any]) -> bool:
+    return dict(record) == TOMBSTONE
 
 
 def canonical_json(value: Any) -> str:

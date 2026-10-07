@@ -85,3 +85,18 @@ def test_layer1_files_across_roots_sorted_and_unique(tmp_path):
     (dev / "whatsapp" / "2026-10.jsonl").write_text("", encoding="utf-8")
     with pytest.raises(ValueError):
         layer1_files([live, dev])
+
+
+def test_tombstones_are_content_free_accounted_and_not_messages(tmp_path):
+    from yeoman_gateway.history.extract import extract
+    from yeoman_gateway.history.layer1 import is_tombstone
+
+    marker = {"purged_version": 1}
+    write_jsonl_once(tmp_path / "whatsapp" / "2026-10.jsonl", [marker])
+    lines = list(iter_layer1([tmp_path]))
+    assert lines[0].ref == "whatsapp/2026-10.jsonl#1"
+    assert is_tombstone(lines[0].record)
+    assert not is_tombstone({**marker, "text": "content"})
+    result = extract(lines)
+    assert result.outcomes[("whatsapp/2026-10.jsonl", "skipped:purged")] == 1
+    assert not result.messages and not result.events

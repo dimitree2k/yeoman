@@ -527,3 +527,78 @@ def test_invalid_audit_blocks_archive_append_and_preserves_spool(tmp_path: Path)
     assert archive.drain_spool() == 0
     assert spooled.is_file()
     assert _lines(month_file) == []
+
+
+def test_owner_append_receipt_is_after_fsync_and_inode_recheck(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    from yeoman_gateway.history.layer1 import write_jsonl_once
+    from yeoman_shared.raw_archive import records
+    from yeoman_shared.raw_archive.paths import ProtectedPathError
+    from yeoman_shared.raw_archive.purge import PurgeSelector, purge
+
+    assert hasattr(records, "append_owner_record") and hasattr(records, "CommittedLine")
+    root = tmp_path / "home" / "data" / "raw"
+    monkeypatch.setenv("YEOMAN_HOME", str(tmp_path / "home"))
+    record = {"attestation_version": 2, "type": "author", "at_ms": NOW, "note": "synthetic", "by": "owner",
+              "source_ref": "whatsapp/2026-09.jsonl#1", "anchor": "111",
+              "channel": "whatsapp", "chat_id": "chat@g.us", "native_message_id": "erase"}
+    target = root / "owner" / "attestations.jsonl"
+    target.parent.mkdir(parents=True)
+    target.write_bytes(b'{"partial":')
+    real_fsync, real_flock = os.fsync, records.fcntl.flock
+    locks, synced = [], []
+    replaced = False
+
+    def flock(fd, op):
+        nonlocal replaced
+        path = Path(os.readlink(f"/proc/self/fd/{fd}"))
+        locks.append(path.name)
+        real_flock(fd, op)
+        if path == target and not replaced:
+            replacement = target.with_suffix(".new")
+            replacement.write_bytes(b'{}\n{"partial":')
+            os.replace(replacement, target)
+            replaced = True
+
+    def fsync(fd):
+        real_fsync(fd)
+        synced.append(Path(os.readlink(f"/proc/self/fd/{fd}")))
+
+    monkeypatch.setattr(records.fcntl, "flock", flock)
+    monkeypatch.setattr(os, "fsync", fsync)
+    receipt = records.append_owner_record(root, record)
+    assert receipt == records.CommittedLine("owner/attestations.jsonl", 3, target.stat().st_size)
+    assert locks[:3] == [records.PURGE_DISPOSITION_LOCK, target.name, target.name]
+    assert target in synced and target.parent in synced
+    assert json.loads(target.read_bytes().splitlines()[-1]) == record
+    inode = target.stat().st_ino
+    result = purge(root, PurgeSelector(channel="whatsapp", chat_id="chat@g.us", native_id="erase"), operator="owner")
+    assert result.removed_lines == 1 and target.stat().st_ino != inode
+    assert json.loads(target.read_bytes().splitlines()[-1]) == records.TOMBSTONE
+    record = {**record, "native_message_id": "keep"}
+    receipt = records.append_owner_record(root, record)
+    assert receipt == records.CommittedLine("owner/attestations.jsonl", 4, target.stat().st_size)
+    disposed = {**record, "channel": "whatsapp", "chat_id": "chat@g.us", "native_message_id": "erase"}
+    before = target.read_bytes()
+    assert records.append_owner_record(root, disposed) is None
+    assert target.read_bytes() == before
+    with pytest.raises(ProtectedPathError):
+        write_jsonl_once(target, [record])
+    monkeypatch.setattr(os, "fsync", lambda fd: (_ for _ in ()).throw(OSError("fsync failed")))
+    with pytest.raises(OSError, match="fsync failed"):
+        records.append_owner_record(root, record)
+    monkeypatch.setattr(os, "fsync", real_fsync)
+    real_stat = records.os.stat
+
+    def stale_after_sync(path, *args, **kwargs):
+        if Path(path) == target and target in synced:
+            replacement = target.with_suffix(".new")
+            replacement.write_bytes(before)
+            os.replace(replacement, target)
+            synced.clear()
+        return real_stat(path, *args, **kwargs)
+
+    synced.clear()
+    monkeypatch.setattr(os, "fsync", fsync)
+    monkeypatch.setattr(records.os, "stat", stale_after_sync)
+    with pytest.raises(OSError, match="replaced"):
+        records.append_owner_record(root, record)

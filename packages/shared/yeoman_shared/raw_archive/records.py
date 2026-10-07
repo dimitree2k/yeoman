@@ -14,6 +14,7 @@ import json
 import os
 import re
 from collections.abc import Callable, Iterator, Mapping
+from dataclasses import dataclass
 from datetime import date, datetime
 from pathlib import Path
 from typing import Any
@@ -23,6 +24,14 @@ OPEN_FILE_MODE = 0o600
 CLOSED_FILE_MODE = 0o444
 PURGE_DISPOSITION_LOCK = ".purge-disposition.lock"
 _MONTH_STEM = re.compile(r"^\d{4}-\d{2}$")
+TOMBSTONE = {"purged_version": 1}
+
+
+@dataclass(frozen=True, slots=True)
+class CommittedLine:
+    relative_path: str
+    line_number: int
+    end_offset: int
 
 
 def _fsync_directory(path: Path) -> None:
@@ -77,6 +86,7 @@ def append_line(
     mode: int = OPEN_FILE_MODE,
     coordination_lock: Path | None = None,
     should_append: Callable[[], bool] | None = None,
+    on_committed: Callable[[int, int], None] | None = None,
 ) -> bool:
     """Append one line and fsync; return false when the locked owner check disposes it."""
     if "\n" in line or "\r" in line:
@@ -113,12 +123,78 @@ def append_line(
                     view = view[written:]
                 os.fsync(fd)
                 _fsync_directory(path.parent)
+                if os.fstat(fd).st_ino != os.stat(path).st_ino:
+                    raise OSError("raw archive path replaced after publication")
+                if on_committed is not None:
+                    end = os.fstat(fd).st_size
+                    # ponytail: owner receipt scans file bytes; index counts if owner append frequency warrants it.
+                    lines = 0
+                    for offset in range(0, end, 1024 * 1024):
+                        lines += os.pread(fd, min(1024 * 1024, end - offset), offset).count(b"\n")
+                    on_committed(lines, end)
                 return True
             finally:
                 os.close(fd)
     finally:
         if coordinator_fd is not None:
             os.close(coordinator_fd)
+
+
+def append_owner_record(raw_root: Path, record: Mapping[str, Any]) -> CommittedLine | None:
+    """Publish a gateway-validated owner envelope to its fixed destination, without a queue."""
+    version = record.get("attestation_version")
+    if (not isinstance(version, int) or isinstance(version, bool) or version not in (1, 2)
+            or not isinstance(record.get("type"), str) or not record["type"]):
+        raise ValueError("invalid owner attestation envelope")
+    relative = "owner/attestations.jsonl"
+    path = raw_root / relative
+    if any(parent.is_symlink() for parent in (path, *path.parents)):
+        raise ValueError("owner destination must not traverse a symlink")
+    line = dumps(record)
+    receipt = None
+
+    def committed(number: int, end: int) -> None:
+        nonlocal receipt
+        receipt = CommittedLine(relative, number, end)
+
+    append_line(path, line, coordination_lock=raw_root / PURGE_DISPOSITION_LOCK,
+                should_append=lambda: not append_is_disposed(raw_root / "AUDIT", dict(record), line),
+                on_committed=committed)
+    return receipt
+
+
+def record_capture_ms(record: dict[str, Any]) -> int:
+    """Source capture time, never a provider occurrence time or import execution time."""
+    for key in ("received_ms", "generated_ms"):
+        if record.get(key) is not None:
+            return int(record[key])
+    original = record.get("original")
+    if isinstance(original, dict):
+        for key in ("received_ms", "created_ms", "updated_ms"):
+            if original.get(key) is not None:
+                return int(original[key])
+        value = original.get("created_at")
+        if isinstance(value, str):
+            parsed = datetime.fromisoformat(value.replace("Z", "+00:00"))
+            if parsed.tzinfo is None:
+                from datetime import UTC
+
+                parsed = parsed.replace(tzinfo=UTC)
+            return int(parsed.timestamp() * 1000)
+    if record.get("time_certainty") == "capture_time_approx":
+        return int(record.get("occurred_ms") or 0)
+    return 0  # Unknown capture time cannot prove that content postdates a disposition.
+
+
+def record_parts(record: dict[str, Any]) -> list[dict[str, Any]]:
+    """Independent segment identities; the parent native ID never selects other speakers."""
+    payload = record.get("payload")
+    segments = payload.get("segments") if isinstance(payload, dict) else None
+    if not isinstance(segments, list):
+        return [record]
+    return [{"channel": record.get("channel"), "chat_id": record.get("chat_id"),
+             "received_ms": record_capture_ms(record), "payload": segment}
+            for segment in segments if isinstance(segment, dict) and segment != TOMBSTONE]
 
 
 def record_identities(record: dict[str, Any]) -> set[str]:
@@ -159,20 +235,55 @@ def record_identities(record: dict[str, Any]) -> set[str]:
     else:
         ids = {str(record.get("native_id") or "")}
     ids.add(str(record.get("native_message_id") or ""))
+    payload = record.get("payload")
+    if isinstance(payload, dict):
+        ids.add(str(payload.get("messageId") or ""))
+        for segment in payload.get("segments", []) if isinstance(payload.get("segments"), list) else []:
+            if isinstance(segment, dict):
+                ids.add(str(segment.get("messageId") or ""))
+    original = record.get("original")
+    if isinstance(original, dict):
+        for key in ("message_id", "source_message_id", "provider_message_id", "r_provider_message_id"):
+            ids.add(str(original.get(key) or ""))
+        payload_json = original.get("payload_json")
+        if isinstance(payload_json, str):
+            try:
+                original_payload = json.loads(payload_json)
+            except ValueError:
+                original_payload = None
+            if isinstance(original_payload, dict):
+                for key in ("message_id", "source_message_id", "provider_message_id"):
+                    ids.add(str(original_payload.get(key) or ""))
     if (channel == "telegram" and kind == "media") or record.get("provenance") == "journal":
         ids.add(str(record.get("correlation_id") or ""))
     ids.discard("")
     return ids
 
 
+def record_correlations(record: dict[str, Any]) -> set[str]:
+    values = {str(record.get("correlation_id") or "")}
+    original = record.get("original")
+    if isinstance(original, dict):
+        values.add(str(original.get("correlation_id") or ""))
+    values.discard("")
+    return values
+
+
+def derived_from_disposed(record: dict[str, Any], identities: set[str] | frozenset[str]) -> bool:
+    """Generation time cannot make a purged source message new again."""
+    return (record.get("kind") in {"media_description", "media_transcript"}
+            and bool(record_identities(record).intersection(identities)))
+
+
 def append_is_disposed(audit_path: Path, record: dict[str, Any], line: str) -> bool:
     """Match a locked month append against durable owner purge dispositions."""
     channel = str(record.get("channel") or "")
     chat_id = str(record.get("chat_id") or "")
-    received_ms = int(record.get("received_ms") or record.get("generated_ms") or 0)
+    received_ms = record_capture_ms(record)
     identities = record_identities(record)
-    correlation_id = str(record.get("correlation_id") or "")
+    correlations = record_correlations(record)
     digest = line_sha256(line)
+    disposed = False
     try:
         for _, audit, _ in iter_records(audit_path):
             if audit is None:
@@ -212,25 +323,26 @@ def append_is_disposed(audit_path: Path, record: dict[str, Any], line: str) -> b
                 continue
             if scope == "message" and scoped_chat is None and chat_id:
                 continue  # Do not let an unscoped numeric ID collide across chats.
-            if before_ms is not None and received_ms >= before_ms:
+            if (before_ms is not None and received_ms >= before_ms
+                    and not derived_from_disposed(record, set(message_ids))):
                 continue
             if scope == "chat":
                 if before_ms is None:
                     raise OSError("raw archive chat disposition has no cutoff")
-                return received_ms < before_ms
+                disposed = True
             if digest in removed_hashes:
-                return True
+                disposed = True
             if identities.intersection(message_ids):
-                return True
-            if correlation_id and correlation_id in correlation_ids:
-                return True
+                disposed = True
+            if correlations.intersection(correlation_ids):
+                disposed = True
     except FileNotFoundError:
         if audit_path.is_symlink():
             raise OSError("raw archive AUDIT symlink is broken")
         return False
     except (OSError, UnicodeError, ValueError, TypeError) as exc:
         raise OSError("could not read raw archive purge dispositions") from exc
-    return False
+    return disposed
 
 
 def append_protected(path: Path, line: str) -> None:

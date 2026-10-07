@@ -1,4 +1,4 @@
-"""Owner-only physical deletion from the raw archive, with an audit record (D11).
+"""Owner-only content erasure from the raw archive, with stable slots and an audit (D11).
 
 This is the only code allowed to delete inside ``data/raw/``. It is reachable from the
 owner's CLI (``yeoman raw purge``) and never from chat commands, models or agent tools.
@@ -12,6 +12,7 @@ from __future__ import annotations
 import json
 import os
 import time
+import uuid
 from dataclasses import asdict, dataclass
 from pathlib import Path
 from typing import Any
@@ -19,29 +20,35 @@ from typing import Any
 from yeoman_shared.raw_archive.records import (
     OPEN_FILE_MODE,
     PURGE_DISPOSITION_LOCK,
+    TOMBSTONE,
+    _fsync_directory,
     append_protected,
     archive_files,
+    derived_from_disposed,
     dumps,
+    file_digest,
     iter_records,
     line_sha256,
     lock_file,
+    record_capture_ms,
+    record_correlations,
     record_identities,
+    record_parts,
 )
 from yeoman_shared.raw_archive.verify import AUDIT, latest_manifest, record_closed
 from yeoman_shared.raw_archive.writer import (
-    MEDIA_DESCRIPTION_DESTINATION,
     SPOOL_REGISTRY_FILE,
     safe_channel,
     stored_media_relative,
     try_lock_media_purge,
 )
 
+PURGE_PUBLICATIONS = ".purge-publications.jsonl"
 
 def _channel_files(root: Path, channel: str) -> list[Path]:
     files = archive_files(root, channel)
-    derived = root / MEDIA_DESCRIPTION_DESTINATION
-    if derived.is_file():
-        files.append(derived)
+    for sub in ("backfill", "derived", "owner"):
+        files.extend(archive_files(root, sub))
     return sorted(files)
 
 
@@ -59,15 +66,15 @@ class PurgeSelector:
             raise ValueError("purge needs a chat or a message id; whole-channel purge is refused")
 
     def matches(self, record: dict[str, Any]) -> bool:
+        if record == TOMBSTONE:
+            return False
         if record.get("channel") != safe_channel(self.channel):
             return False
         if self.chat_id and record.get("chat_id") != self.chat_id:
             return False
         if self.native_id and self.native_id not in record_identities(record):
             return False
-        if self.before_ms is not None and int(
-            record.get("received_ms") or record.get("generated_ms") or 0
-        ) >= self.before_ms:
+        if self.before_ms is not None and record_capture_ms(record) >= self.before_ms:
             return False
         return True
 
@@ -93,14 +100,19 @@ class _PurgePredicate:
     correlations: frozenset[str]
 
     def matches(self, record: dict[str, Any]) -> bool:
+        if record == TOMBSTONE:
+            return False
+        parts = record_parts(record)
+        if parts != [record]:
+            return any(self.matches(part) for part in parts)
         if record.get("channel") != safe_channel(self.selector.channel):
             return False
         if self.chat_id is not None and str(record.get("chat_id") or "") != self.chat_id:
             return False
         if (
             self.selector.before_ms is not None
-            and int(record.get("received_ms") or record.get("generated_ms") or 0)
-            >= self.selector.before_ms
+            and record_capture_ms(record) >= self.selector.before_ms
+            and not derived_from_disposed(record, self.identities)
         ):
             return False
         if self.selector.native_id is None:
@@ -108,16 +120,15 @@ class _PurgePredicate:
         ids = record_identities(record)
         if ids.intersection(self.identities):
             return True
-        correlation = str(record.get("correlation_id") or "")
-        return bool(correlation and correlation in self.correlations)
+        return bool(record_correlations(record).intersection(self.correlations))
 
 
 def _build_predicate(root: Path, selector: PurgeSelector) -> _PurgePredicate:
     matched: list[dict[str, Any]] = []
     for path in _channel_files(root, safe_channel(selector.channel)):
         for _, record, _ in iter_records(path):
-            if record is not None and selector.matches(record):
-                matched.append(record)
+            if record is not None:
+                matched.extend(part for part in record_parts(record) if selector.matches(part))
     chats = {str(record.get("chat_id") or "") for record in matched}
     if selector.native_id is not None and selector.chat_id is None:
         if len(chats) > 1:
@@ -129,9 +140,7 @@ def _build_predicate(root: Path, selector: PurgeSelector) -> _PurgePredicate:
     correlations: set[str] = set()
     for record in matched:
         identities.update(record_identities(record))
-        correlation = str(record.get("correlation_id") or "")
-        if correlation:
-            correlations.add(correlation)
+        correlations.update(record_correlations(record))
     return _PurgePredicate(selector, chat_id, frozenset(identities), frozenset(correlations))
 
 
@@ -311,24 +320,143 @@ def _unreferenced_media_locked(
     return tuple(sorted(candidates - spool_references))
 
 
-def _rewrite_without(path: Path, predicate: _PurgePredicate, lock_fd: int) -> None:
+def _stage_rewrite(path: Path, predicate: _PurgePredicate, lock_fd: int) -> Path:
     mode = os.fstat(lock_fd).st_mode & 0o777
     temporary = path.with_name(f".{path.name}.purge-tmp")
-    with temporary.open("w", encoding="utf-8") as handle:
-        for _, record, line in iter_records(path):
-            if record is not None and predicate.matches(record):
-                continue
-            handle.write(line + "\n")
+    temporary.unlink(missing_ok=True)  # Only called after any authorized pending stage was recovered.
+    with path.open("rb") as source, temporary.open("wb") as handle:
+        for raw in source:
+            try:
+                record = json.loads(raw)
+            except (ValueError, UnicodeError):
+                record = None
+            if isinstance(record, dict) and predicate.matches(record):
+                replacement: dict[str, Any] = TOMBSTONE
+                payload = record.get("payload")
+                segments = payload.get("segments") if isinstance(payload, dict) else None
+                if isinstance(segments, list):
+                    parts = iter(record_parts(record))
+                    kept = []
+                    for segment in segments:
+                        if isinstance(segment, dict) and segment != TOMBSTONE:
+                            kept.append(TOMBSTONE if predicate.matches(next(parts)) else segment)
+                        else:
+                            kept.append(segment)
+                    if any(isinstance(segment, dict) and segment != TOMBSTONE and segment for segment in kept):
+                        # The original/raw batch duplicates removed content. Retain only the envelope
+                        # and independent surviving segments, without inherited text/media/hash.
+                        replacement = {key: record[key] for key in (
+                            "backfill_version", "channel", "kind", "chat_id", "occurred_ms",
+                            "time_certainty", "direction", "provenance", "skip_reason") if key in record}
+                        replacement["received_ms"] = record_capture_ms(record)
+                        clean_payload = {"segments": kept}
+                        for key in ("chatJid", "fromAssistant", "messageId"):
+                            if key in payload and (key != "messageId" or any(
+                                    isinstance(segment, dict) and segment.get("messageId") == payload[key]
+                                    for segment in kept)):
+                                clean_payload[key] = payload[key]
+                        replacement["payload"] = clean_payload
+                ending = b"\r\n" if raw.endswith(b"\r\n") else b"\n" if raw.endswith(b"\n") else b""
+                handle.write(dumps(replacement).encode("utf-8") + ending)
+            else:
+                handle.write(raw)
+        os.fchmod(handle.fileno(), mode or OPEN_FILE_MODE)
         handle.flush()
         os.fsync(handle.fileno())
-    os.chmod(temporary, mode or OPEN_FILE_MODE)
-    os.replace(temporary, path)
+    _fsync_directory(path.parent)
+    return temporary
+
+
+def _manifest_digest(entry: dict[str, Any]) -> tuple[Any, Any, Any]:
+    return entry.get("sha256"), entry.get("lines"), entry.get("bytes")
+
+
+def _pending_publications(root: Path) -> list[dict[str, Any]]:
+    """Read only owner-created, content-free publication evidence; corruption fails closed."""
+    journal = root / PURGE_PUBLICATIONS
+    if journal.is_symlink():
+        raise OSError("invalid pending purge journal path")
+    pending: dict[str, dict[str, Any]] = {}
+    try:
+        # ponytail: scan owner purge history; compact completed entries if it becomes large.
+        for _, entry, _ in iter_records(journal):
+            if (entry is None or entry.get("version") != 1
+                    or not isinstance(entry.get("operation_id"), str)):
+                raise OSError("invalid pending purge journal")
+            operation = entry["operation_id"]
+            if entry.get("state") == "pending":
+                if operation in pending or not isinstance(entry.get("files"), list) or not entry["files"]:
+                    raise OSError("invalid pending purge operation")
+                seen: set[str] = set()
+                for item in entry["files"]:
+                    if not isinstance(item, dict) or not isinstance(item.get("file"), str):
+                        raise OSError("invalid pending purge file")
+                    relative = Path(item["file"])
+                    if (relative.is_absolute() or len(relative.parts) != 2
+                            or item["file"] != relative.as_posix() or item["file"] in seen
+                            or any(part in {".", "..", "media"} for part in relative.parts)
+                            or relative.suffix != ".jsonl"
+                            or (root / relative).is_symlink() or (root / relative.parent).is_symlink()
+                            or not isinstance(item.get("sealed"), bool)):
+                        raise OSError("invalid pending purge destination")
+                    seen.add(item["file"])
+                    for key in ("before", "after"):
+                        digest = item.get(key)
+                        if (not isinstance(digest, list) or len(digest) != 3
+                                or not isinstance(digest[0], str) or len(digest[0]) != 64
+                                or any(c not in "0123456789abcdef" for c in digest[0])
+                                or any(type(value) is not int or value < 0 for value in digest[1:])):
+                            raise OSError("invalid pending purge digest")
+                pending[operation] = entry
+            elif entry.get("state") == "complete" and operation in pending:
+                del pending[operation]
+            else:
+                raise OSError("invalid pending purge completion")
+    except FileNotFoundError:
+        return []
+    except (UnicodeError, ValueError, TypeError) as exc:
+        raise OSError("invalid pending purge journal") from exc
+    return list(pending.values())
+
+
+def _publish_pending(root: Path, operation: dict[str, Any], *, now_ms: int) -> None:
+    """Caller holds the root and destination locks; never bless a digest outside this operation."""
+    manifest = latest_manifest(root)
+    for item in operation["files"]:
+        path = root / item["file"]
+        before, after = tuple(item["before"]), tuple(item["after"])
+        current = file_digest(path)
+        if current not in (before, after):
+            raise OSError(f"pending purge bytes changed: {item['file']}")
+        if item["sealed"] and _manifest_digest(manifest.get(item["file"], {})) not in (before, after):
+            raise OSError(f"pending purge manifest changed: {item['file']}")
+        if current == before:
+            temporary = path.with_name(f".{path.name}.purge-tmp")
+            if temporary.is_symlink() or file_digest(temporary) != after:
+                raise OSError(f"pending purge stage changed: {item['file']}")
+            os.replace(temporary, path)
+        _fsync_directory(path.parent)
+        if item["sealed"] and _manifest_digest(manifest[item["file"]]) != after:
+            record_closed(root, path, now_ms=now_ms, note="purged")
+    append_protected(root / PURGE_PUBLICATIONS, dumps({
+        "version": 1, "operation_id": operation["operation_id"], "state": "complete",
+    }))
+
+
+def _recover_pending(root: Path, *, now_ms: int) -> None:
+    for operation in _pending_publications(root):
+        locked = _lock_files(root, tuple(item["file"] for item in operation["files"]))
+        try:
+            _publish_pending(root, operation, now_ms=now_ms)
+        finally:
+            for _, _, fd in reversed(locked):
+                os.close(fd)
 
 
 def purge(
     root: Path, selector: PurgeSelector, *, operator: str, now_ms: int | None = None
 ) -> PurgeResult:
-    """Remove selected lines and record a durable owner disposition, including zero matches."""
+    """Tombstone selected content and record a durable owner disposition, including zero matches."""
     selector.validate()
     now = int(now_ms if now_ms is not None else time.time() * 1000)
     effective = selector
@@ -343,6 +471,7 @@ def purge(
     locked: list[tuple[str, Path, int]] = []
     try:
         media_guard_fd = try_lock_media_purge(root)
+        _recover_pending(root, now_ms=now)
         files = tuple(
             path.relative_to(root).as_posix()
             for path in _channel_files(root, safe_channel(effective.channel))
@@ -371,10 +500,11 @@ def purge(
         identities = set(predicate.identities)
         correlations = set(predicate.correlations)
         for record in selected_records:
-            identities.update(record_identities(record))
-            correlation = str(record.get("correlation_id") or "")
-            if correlation:
-                correlations.add(correlation)
+            for part in record_parts(record):
+                if not predicate.matches(part):
+                    continue
+                identities.update(record_identities(part))
+                correlations.update(record_correlations(part))
         audit_record = {
             "ts_ms": now,
             "operator": operator,
@@ -394,12 +524,21 @@ def purge(
         }
         append_protected(root / AUDIT, dumps(audit_record))
         sealed = latest_manifest(root)
+        publication_files = []
         for relative, path, lock_fd in locked:
             if relative not in plan.files:
                 continue
-            _rewrite_without(path, predicate, lock_fd)
-            if relative in sealed:
-                record_closed(root, path, now_ms=now, note="purged")
+            before = file_digest(path)
+            if relative in sealed and _manifest_digest(sealed[relative]) != before:
+                raise OSError(f"sealed purge checksum mismatch: {relative}")
+            temporary = _stage_rewrite(path, predicate, lock_fd)
+            publication_files.append({"file": relative, "before": list(before),
+                                      "after": list(file_digest(temporary)), "sealed": relative in sealed})
+        if publication_files:
+            operation = {"version": 1, "operation_id": uuid.uuid4().hex,
+                         "state": "pending", "files": publication_files}
+            append_protected(root / PURGE_PUBLICATIONS, dumps(operation))
+            _publish_pending(root, operation, now_ms=now)
         for relative in plan.media_removed:
             (root / relative).unlink(missing_ok=True)
         return plan

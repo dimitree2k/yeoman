@@ -11,7 +11,7 @@ from typing import Any
 from .attestations import Attestation, parse
 from .convert.common import clean_text, media_kind
 from .ids import Ident, classify
-from .layer1 import Layer1Line
+from .layer1 import Layer1Line, is_tombstone
 from .resolve import REF, ContactRecord, IdentityInput
 
 SOURCE_RANKS = {"journal": 1, "bridge_refs": 2, "reply_context": 3, "inbound_archive": 3,
@@ -122,6 +122,9 @@ def extract(lines: Iterable[Layer1Line]) -> Extracted:
     for line in lines:
         if line.record is None:
             out.count(line.ref, "invalid_json")
+            continue
+        if is_tombstone(line.record):
+            out.count(line.ref, "skipped:purged")
             continue
         sub = line.ref.split("/", 1)[0]
         if sub == "owner":
@@ -395,7 +398,7 @@ def _backfill(line: Layer1Line, out: Extracted) -> None:
             parent_media = p.get("media") if isinstance(p.get("media"), dict) else (
                 {"kind": p["mediaKind"]} if p.get("mediaKind") else None)
             for index, segment in enumerate(segments):
-                if not isinstance(segment, dict) or not any(
+                if not isinstance(segment, dict) or is_tombstone(segment) or not any(
                         key in segment for key in ("text", "messageId", "senderId", "media", "mediaKind")):
                     continue
                 segment_payload = {**p, **segment}
