@@ -76,3 +76,66 @@ def test_contacts_db_and_chat_registry(tmp_path):
     assert field["skip_reason"] == "not_projected:contact_fields"
     (chat,) = list(convert_chat_registry(tmp_path))
     assert (chat["kind"], chat["skip_reason"]) == ("chat_record", "chat_metadata")
+
+
+def test_identity_evidence_times_survive_conversion(tmp_path):
+    from yeoman_gateway.history.extract import extract
+    from yeoman_gateway.history.layer1 import Layer1Line
+    make_db(tmp_path / 'data/knowledge/knowledge.db', KNOWLEDGE, {
+        'knowledge_identifier_bindings': [{'binding_id': 'b', 'channel': 'whatsapp', 'kind': 'pn_jid',
+            'namespace': 'default', 'value': '491100000003@s.whatsapp.net', 'person_id': 'K',
+            'status': 'active', 'valid_from_ms': 0, 'valid_until_ms': 200, 'mapping_verified': 1}],
+        'knowledge_provider_pair_evidence': [{'channel': 'whatsapp', 'namespace': 'default',
+            'phone_value': '491100000003@s.whatsapp.net', 'lid_value': '777000000001@lid',
+            'first_observed_at_ms': 100, 'last_observed_at_ms': 199}],
+    })
+    records = list(convert_knowledge(tmp_path))
+    binding = next(r for r in records if r['kind'] == 'identifier_record')
+    assert binding['payload']['validFromMs'] == 0
+    ex = extract(Layer1Line(f'backfill/knowledge.jsonl#{n}', r) for n, r in enumerate(records, 1))
+    pair = next(item for item in ex.identity.timed_links if item.evidence == 'native_pair')
+    assert (pair.occurred_ms, pair.last_ms, pair.time_basis) == (100, 199, 'provider_timestamp')
+    link = next(item for item in ex.identity.timed_links if item.evidence == 'knowledge_binding')
+    assert (link.valid_from_ms, link.valid_until_ms) == (0, 200)
+
+
+def test_converter_zero_start_preserves_prior_contact_window_uuid(tmp_path):
+    import sqlite3
+    import uuid
+    from contextlib import closing
+
+    from hist_fixtures import write_jsonl
+    from yeoman_gateway.history.attestations import make
+    from yeoman_gateway.history.project import project
+    from yeoman_gateway.history.resolve import NAMESPACE
+
+    p = '491100000003@s.whatsapp.net'
+    root = tmp_path / 'layer1'
+    write_jsonl(root / 'owner/attestations.jsonl', [
+        make('contact', 1, 'original', identifiers=[p]),
+        make('identifier_ended', 2, 'end', identifier=p, ended_ms=200),
+    ])
+    source = tmp_path / 'source'
+    binding = {'binding_id': 'b', 'channel': 'whatsapp', 'kind': 'pn_jid', 'namespace': 'default',
+               'value': p, 'person_id': 'K', 'status': 'active', 'valid_from_ms': 0,
+               'valid_until_ms': 0, 'mapping_verified': 1}
+    make_db(source / 'data/knowledge/knowledge.db', KNOWLEDGE, {
+        'contacts': [{'id': 'K', 'display_name': 'known', 'created_at': '2026-01-01T00:00:00'}],
+        'knowledge_identifier_bindings': [binding],
+    })
+    write_jsonl(root / 'backfill/knowledge.jsonl', list(convert_knowledge(source)))
+    exposed = str(uuid.uuid5(NAMESPACE, f'window:{p}:None:200:'))
+    before_db = tmp_path / 'before.db'
+    project([root], before_db)
+    with closing(sqlite3.connect(before_db)) as conn:
+        assert conn.execute('SELECT merged_into FROM contacts WHERE contact_id = ?', (exposed,)).fetchone() == ('K',)
+    with closing(sqlite3.connect(source / 'data/knowledge/knowledge.db')) as conn:
+        conn.execute('UPDATE knowledge_identifier_bindings SET valid_until_ms = 200')
+        conn.commit()
+    write_jsonl(root / 'backfill/knowledge.jsonl', list(convert_knowledge(source)))
+    after_db = tmp_path / 'after.db'
+    project([root], after_db)
+    with closing(sqlite3.connect(after_db)) as conn:
+        assert conn.execute('SELECT merged_into FROM contacts WHERE contact_id = ?', (exposed,)).fetchone() == ('K',)
+        assert conn.execute('SELECT contact_id, valid_from_ms, valid_until_ms FROM identifier_history WHERE value = ?',
+                            (p,)).fetchall() == [('K', 0, 200)]

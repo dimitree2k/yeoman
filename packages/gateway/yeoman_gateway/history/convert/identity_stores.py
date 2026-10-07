@@ -34,7 +34,9 @@ def _binding(row: dict[str, Any]) -> tuple[str, str, dict[str, Any]]:
         "contactRef": row.get("person_id"), "identifier": row.get("value"),
         "identifierKind": row.get("kind"), "status": row.get("status"),
         "mappingVerified": row.get("mapping_verified"),
-        "validFromMs": row.get("valid_from_ms") or None, "validUntilMs": row.get("valid_until_ms") or None,
+        # Legacy (0, 0) means unbounded; a real [0, end) keeps its zero start.
+        "validFromMs": row.get("valid_from_ms") if row.get("valid_until_ms") or row.get("valid_from_ms") else None,
+        "validUntilMs": row.get("valid_until_ms") or None,
         "source": "binding"})
 
 

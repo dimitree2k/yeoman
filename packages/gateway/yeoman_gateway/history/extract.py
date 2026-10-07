@@ -150,7 +150,7 @@ def _sender(payload: dict[str, Any], *, allow_group: bool = True) -> tuple[Ident
 
 
 def _observe(out: Extracted, idents: list[Ident], sender: Ident | None, name: Any, ms: int | None,
-             ref: str, link: bool, chat: str) -> None:
+             ref: str, link: bool, chat: str, certainty: str) -> None:
     inp = out.identity
     inp.see(classify(chat), None, ref)
     for ident in idents:
@@ -158,7 +158,7 @@ def _observe(out: Extracted, idents: list[Ident], sender: Ident | None, name: An
     if link:
         for lid in (i for i in idents if i.kind == "lid"):
             for pn in (i for i in idents if i.kind == "pn_jid"):
-                inp.link(lid, pn, "native_pair", ref)
+                inp.link(lid, pn, "native_pair", ref, occurred_ms=ms, time_basis=certainty)
     if name and sender is not None and sender.kind in ("lid", "pn_jid", "newsletter", "numeric"):
         inp.name(sender.value, name, ms, ref)
 
@@ -186,7 +186,7 @@ def _message(out: Extracted, ref: str, p: dict[str, Any], *, channel: str, chat:
     ))
     if not assistant:
         _observe(out, idents, sender, name, ms, ref,
-                 provenance == "native" and not p.get("lidConflict"), chat)
+                 provenance == "native" and not p.get("lidConflict"), chat, certainty)
 
 
 def _event(out: Extracted, ref: str, kind: str, p: dict[str, Any], *, channel: str, chat: str,
@@ -205,7 +205,7 @@ def _event(out: Extracted, ref: str, kind: str, p: dict[str, Any], *, channel: s
                                 assistant, ms, certainty, payload, provenance,
                                 str(native_event_id) if native_event_id else None))
     if not assistant:
-        _observe(out, idents, actor, None, ms, ref, False, chat)
+        _observe(out, idents, actor, None, ms, ref, False, chat, certainty)
 
 
 def _membership(out: Extracted, ref: str, type_: str, p: dict[str, Any], *, channel: str, chat: str,
@@ -227,7 +227,7 @@ def _membership(out: Extracted, ref: str, type_: str, p: dict[str, Any], *, chan
         for ident in (lid, pn):
             out.identity.see(ident, ms, ref)
         if provenance == "native" and lid is not None and pn is not None:
-            out.identity.link(lid, pn, "native_pair", ref)
+            out.identity.link(lid, pn, "native_pair", ref, occurred_ms=ms, time_basis=certainty)
         members.add(tuple(sorted(i.value for i in (lid, pn) if i is not None)))
     payload: dict[str, Any] = {"participants": [list(member) for member in sorted(members)]}
     if kind == "member_snapshot":
@@ -244,7 +244,7 @@ def _membership(out: Extracted, ref: str, type_: str, p: dict[str, Any], *, chan
         for ident in (actor_lid, actor_phone):
             out.identity.see(ident, ms, ref)
         if provenance == "native" and actor_lid is not None and actor_phone is not None:
-            out.identity.link(actor_lid, actor_phone, "native_pair", ref)
+            out.identity.link(actor_lid, actor_phone, "native_pair", ref, occurred_ms=ms, time_basis=certainty)
     else:
         actor = classify(raw_actor)
         actor_raw = str(raw_actor) if raw_actor else None
@@ -354,7 +354,8 @@ def _identity(ref: str, kind: str, record: dict[str, Any], p: dict[str, Any], ou
         lid, pn = classify(p.get("lid")), classify(p.get("pnJid"))
         if lid is None or pn is None or lid.kind != "lid" or pn.kind != "pn_jid":
             return "skipped:pair_incomplete"
-        inp.link(lid, pn, "native_pair", ref)
+        inp.link(lid, pn, "native_pair", ref, occurred_ms=p.get("firstMs"),
+                 last_ms=p.get("lastMs"), time_basis="provider_timestamp")
         return "identity"
     status = str(p.get("status") or "").lower()
     if status not in _USABLE_STATUS:
@@ -362,7 +363,8 @@ def _identity(ref: str, kind: str, record: dict[str, Any], p: dict[str, Any], ou
     ident = classify(p.get("identifier"))
     if ident is None or not ident.strong or not p.get("contactRef"):
         return "skipped:identifier_not_full"
-    inp.bind(str(p["contactRef"]), ident, ref)
+    inp.bind(str(p["contactRef"]), ident, ref, valid_from_ms=p.get("validFromMs"),
+             valid_until_ms=p.get("validUntilMs"))
     return "identity"
 
 

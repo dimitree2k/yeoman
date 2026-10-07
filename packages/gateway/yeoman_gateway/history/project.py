@@ -18,7 +18,7 @@ from .extract import EventCopy, Extracted, MessageCopy, extract
 from .ids import Ident
 from .layer1 import canonical_json, iter_layer1, layer1_files
 from .resolve import Resolution, resolve
-from .schema import create
+from .schema import PROJECTOR_VERSION, create
 
 WINDOW_MS = 120_000
 _CERTAINTY = {"native": 0, "provider_timestamp": 0, "capture_time_approx": 1, "unknown": 2}
@@ -133,8 +133,8 @@ def _join_target(copy: MessageCopy, index: dict[tuple[str, str, str], tuple[list
 
 
 def _basis(res: Resolution, ident: Ident | None, provenance: str,
-           inferred: bool) -> tuple[str | None, str]:
-    contact, match = res.resolve(ident)
+           inferred: bool, occurred_ms: int | None, time_basis: str) -> tuple[str | None, str]:
+    contact, match = res.resolve(ident, occurred_ms=occurred_ms, time_basis=time_basis)
     if contact is None:
         return None, "unknown"
     if provenance != "native" or inferred:
@@ -169,6 +169,7 @@ def _message_row(channel: str, chat: str, native_id: str | None, copies: list[Me
     from_assistant = any(c.from_assistant for c in copies)
     sender_copy = next((c for c in copies if c.sender is not None), None)
     sender_identifier = sender_copy.sender_raw if sender_copy is not None and not from_assistant else None
+    sent_ms, certainty = _best_time(copies)
     contact: str | None
     if authors.get(message_id):
         contact, basis = authors[message_id], "owner_attested"
@@ -176,12 +177,12 @@ def _message_row(channel: str, chat: str, native_id: str | None, copies: list[Me
         native = any(c.from_assistant and c.provenance == "native" for c in copies)
         contact, basis = arvid, "native_identifier" if native else "derived_claim"
     elif sender_copy is not None:
-        contact, basis = _basis(res, sender_copy.sender, sender_copy.provenance, sender_copy.inferred_sender)
+        contact, basis = _basis(res, sender_copy.sender, sender_copy.provenance, sender_copy.inferred_sender,
+                                sent_ms, certainty)
     else:
         contact, basis = None, "unknown"
     if contact is None:
         basis = "unknown"
-    sent_ms, certainty = _best_time(copies)
     text, provenance = _text_and_provenance(copies)
     media = dict(next((c.media for c in copies if c.media), None) or {})
     description = next((c.description for c in copies if c.description), None)
@@ -241,7 +242,7 @@ def _actor(copy: EventCopy, res: Resolution, arvid: str | None) -> tuple[str | N
     elif copy.actor is None:
         return None, "unknown"
     else:
-        contact, match = res.resolve(copy.actor)
+        contact, match = res.resolve(copy.actor, occurred_ms=copy.occurred_ms, time_basis=copy.time_certainty)
         if match == "group":
             contact, basis = (arvid, "reaction_echo") if copy.kind == "reaction" else (None, "unknown")
         elif copy.provenance != "native":
@@ -387,9 +388,10 @@ def _write(db_path: Path, res: Resolution, messages: list[dict[str, Any]], event
                  json.dumps(list(c.source_refs))) for c in contacts])
             conn.executemany(
                 "INSERT INTO identifier_history (contact_id, channel, kind, value, strength, evidence,"
-                " first_seen_ms, last_seen_ms, ended_ms, source_refs) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)", [
+                " first_seen_ms, last_seen_ms, ended_ms, source_refs, valid_from_ms, valid_until_ms)"
+                " VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)", [
                     (i.contact_id, i.channel, i.kind, i.value, i.strength, i.evidence, i.first_seen_ms,
-                     i.last_seen_ms, i.ended_ms, json.dumps(list(i.source_refs)))
+                     i.last_seen_ms, i.ended_ms, json.dumps(list(i.source_refs)), i.valid_from_ms, i.valid_until_ms)
                     for i in sorted(res.identifiers, key=lambda i: (i.contact_id, i.kind, i.value))])
             conn.executemany("INSERT INTO messages (message_id, channel, chat_id, native_message_id, sender_contact_id, "
                               "sender_identifier, sender_basis, direction, sent_ms, time_certainty, text, media_json, "
@@ -411,8 +413,8 @@ def _write(db_path: Path, res: Resolution, messages: list[dict[str, Any]], event
             for rel, path in files:
                 data = path.read_bytes()
                 counts[rel] = sum(1 for line in data.decode("utf-8", errors="replace").splitlines() if line.strip())
-                conn.execute("INSERT INTO projector_state (file, lines, sha256) VALUES (?, ?, ?)",
-                             (rel, counts[rel], hashlib.sha256(data).hexdigest()))
+                conn.execute("INSERT INTO projector_state (file, lines, sha256, projector_version) VALUES (?, ?, ?, ?)",
+                             (rel, counts[rel], hashlib.sha256(data).hexdigest(), PROJECTOR_VERSION))
             conn.commit()
         finally:
             conn.close()

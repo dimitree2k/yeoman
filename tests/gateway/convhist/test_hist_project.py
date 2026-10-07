@@ -6,6 +6,7 @@ import pytest
 from hist_fixtures import FRANK_LID, FRANK_PN, T0, _bf, _raw, sample_layer1, write_jsonl
 from hist_fixtures import SAMPLE_GROUP as G
 from yeoman_gateway.history.attestations import make
+from yeoman_gateway.history.ids import classify
 from yeoman_gateway.history.project import project
 
 
@@ -153,7 +154,9 @@ def _dump(path):
         tables = {t: conn.execute(f"SELECT * FROM {t} ORDER BY 1").fetchall()
                   for t in ("contacts", "messages", "message_events")}
         tables["identifier_history"] = conn.execute(
-            "SELECT contact_id, kind, value, evidence, source_refs FROM identifier_history ORDER BY 1, 2, 3").fetchall()
+            "SELECT contact_id, channel, kind, value, strength, evidence, source_refs,"
+            " valid_from_ms, valid_until_ms, ended_ms, first_seen_ms, last_seen_ms"
+            " FROM identifier_history ORDER BY 1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12").fetchall()
         return tables
 
 
@@ -161,6 +164,30 @@ def test_rebuild_identical_and_protected_refused(built, monkeypatch):
     _, _, _, (live, dev, tmp_path) = built
     project([live, dev], tmp_path / "again.db")
     assert _dump(tmp_path / "out" / "history.db") == _dump(tmp_path / "again.db")
+    # Persistent determinism also covers temporal validity, ends and observations.
+    temporal = tmp_path / "temporal"
+    phone = "491100000003@s.whatsapp.net"
+    write_jsonl(temporal / "owner/attestations.jsonl", [
+        make("identifier", 1, "window", anchor=FRANK_PN, identifier=phone,
+             valid_from_ms=100, valid_until_ms=300),
+        make("identifier_ended", 2, "end", identifier=phone, ended_ms=200),
+    ])
+    write_jsonl(temporal / "backfill/journal.jsonl", [
+        _bf("journal", "message", {"messageId": "T", "senderId": phone, "text": "temporal"},
+            ms=150, certainty="provider_timestamp")])
+    temporal_db = tmp_path / "temporal.db"
+    project([temporal], temporal_db)
+    project([temporal], tmp_path / "temporal-again.db")
+    expected = _dump(temporal_db)
+    assert expected == _dump(tmp_path / "temporal-again.db")
+    # Each temporal field must participate in the comparison.
+    with closing(sqlite3.connect(temporal_db)) as conn:
+        for field in ("valid_from_ms", "valid_until_ms", "ended_ms", "first_seen_ms", "last_seen_ms"):
+            conn.execute(f"UPDATE identifier_history SET {field} = {field} + 1 WHERE value = ?", (phone,))
+            conn.commit()
+            assert _dump(temporal_db) != expected, field
+            conn.execute(f"UPDATE identifier_history SET {field} = {field} - 1 WHERE value = ?", (phone,))
+            conn.commit()
     monkeypatch.setenv("YEOMAN_HOME", str(tmp_path / "home"))
     with pytest.raises(PermissionError):
         project([live, dev], tmp_path / "home" / "data" / "raw" / "history.db")
@@ -425,3 +452,129 @@ def test_events_without_times_do_not_merge_by_payload_alone(tmp_path):
         assert report["events"] == 2
         assert {tuple(json.loads(row[0])) for row in rows} == {
             ("whatsapp/events.jsonl#1",), ("whatsapp/events.jsonl#2",)}
+
+
+def test_telegram_attestations_stay_provenance_only(tmp_path):
+    from yeoman_gateway.history.extract import extract
+    from yeoman_gateway.history.layer1 import iter_layer1
+    from yeoman_gateway.history.resolve import resolve
+    from yeoman_gateway.history.schema import PROJECTOR_VERSION
+    root = tmp_path / 'layer1'
+    records = [
+        make('identifier', 1, 'stored', anchor=FRANK_PN, identifier='telegram:123'),
+        make('contact', 2, 'mixed', identifiers=[FRANK_PN, 'telegram:124'], name='Frank'),
+        make('contact', 3, 'telegram only', identifiers=['telegram:125']),
+        make('identifier_ended', 4, 'stored end', identifier='telegram:123', ended_ms=3),
+    ]
+    write_jsonl(root / 'owner/attestations.jsonl', records)
+    write_jsonl(root / 'backfill/telegram.jsonl', [
+        {**_bf('journal', 'message', {'senderId': 'telegram:125', 'messageId': 'T1'}, ms=T0),
+         'channel': 'telegram'},
+        {**_bf('journal', 'reaction', {'senderId': 'telegram:125', 'emoji': 'x'}, ms=T0),
+         'channel': 'telegram'},
+    ])
+    ex = extract(iter_layer1([root]))
+    assert len(ex.attestations) == len(ex.identity.attestations) == 4
+    res = resolve(ex.identity)
+    assert res.resolve(classify('telegram:125')) == (None, 'unknown')
+    assert all(i.channel == 'whatsapp' for i in res.identifiers)
+    db = tmp_path / 'history.db'
+    project([root], db)
+    with closing(sqlite3.connect(db)) as conn:
+        assert conn.execute('SELECT count(*) FROM contacts WHERE merged_into IS NULL').fetchone()[0] == 1
+        assert conn.execute("SELECT count(*) FROM identifier_history WHERE channel != 'whatsapp' OR value LIKE 'telegram:%'").fetchone()[0] == 0
+        assert conn.execute('SELECT count(*) FROM messages').fetchone()[0] == 0
+        assert conn.execute('SELECT count(*) FROM message_events').fetchone()[0] == 0
+        assert conn.execute('PRAGMA user_version').fetchone()[0] == 2
+        assert {r[0] for r in conn.execute('SELECT projector_version FROM projector_state')} == {PROJECTOR_VERSION}
+
+
+def test_project_temporal_message_and_event_time_selection(tmp_path):
+    a, b, phone = ('491100000001@s.whatsapp.net', '491100000002@s.whatsapp.net',
+                   '491100000003@s.whatsapp.net')
+    root = tmp_path / 'layer1'
+    boundary = T0 + 2000
+    write_jsonl(root / 'owner/attestations.jsonl', [
+        make('identifier', 1, 'old owner', anchor=a, identifier=phone,
+             valid_from_ms=T0, valid_until_ms=boundary),
+        make('identifier', 2, 'new owner', anchor=b, identifier=phone, valid_from_ms=boundary),
+    ])
+    write_jsonl(root / 'whatsapp/events.jsonl', [
+        _raw('message', 'message', {'chatJid': G, 'messageId': 'OLD', 'senderId': phone,
+                                   'text': 'old', 'timestamp': T0 // 1000 + 1}),
+        _raw('message', 'message', {'chatJid': G, 'messageId': 'NEW', 'senderId': phone,
+                                   'text': 'new', 'timestamp': boundary // 1000}),
+        _raw('reaction', 'reaction', {'chatJid': G, 'targetMessageId': 'OLD', 'senderId': phone,
+                                      'emoji': 'x', 'timestamp': T0 // 1000 + 1}),
+        _raw('reaction', 'reaction', {'chatJid': G, 'targetMessageId': 'OLD', 'senderId': phone,
+                                      'emoji': 'x', 'timestamp': boundary // 1000}),
+        _raw('message', 'message', {'chatJid': G, 'messageId': 'APPROX', 'senderId': phone,
+                                   'text': 'approx'}, received=boundary + 1000),
+    ])
+    # Selected native time governs even when a higher-ranked sender copy has only capture time.
+    write_jsonl(root / 'backfill/journal.jsonl', [
+        {**_bf('journal', 'message', {'messageId': 'APPROX', 'senderId': phone, 'text': 'approx'}, ms=T0+1000),
+         'time_certainty': 'provider_timestamp'},
+    ])
+    db = tmp_path / 'history.db'
+    project([root], db)
+    with closing(sqlite3.connect(db)) as conn:
+        ids = dict(conn.execute('SELECT value, contact_id FROM identifier_history WHERE value IN (?, ?)', (a,b)))
+        messages = dict(conn.execute('SELECT native_message_id, sender_contact_id FROM messages'))
+        assert messages == {'OLD': ids[a], 'NEW': ids[b], 'APPROX': ids[a]}
+        events = conn.execute('SELECT actor_contact_id, actor_identifier FROM message_events').fetchall()
+        assert set(events) == {(ids[a], phone), (ids[b], phone)} and len(events) == 2
+        assert set(conn.execute('SELECT valid_from_ms, valid_until_ms FROM identifier_history WHERE value = ?',
+                                (phone,))) == {(T0, boundary), (boundary, None)}
+
+
+@pytest.mark.parametrize('order', [(0, 1, 2), (2, 1, 0), (1, 2, 0)])
+def test_project_multi_window_anchor_agrees_across_assertion_order(tmp_path, order):
+    a, p, q = ('491100000001@s.whatsapp.net', '491100000003@s.whatsapp.net',
+               '491100000004@s.whatsapp.net')
+    fields = [dict(anchor=a, identifier=p, valid_from_ms=100, valid_until_ms=300),
+              dict(anchor=a, identifier=p, valid_from_ms=200), dict(anchor=p, identifier=q)]
+    root = tmp_path / 'layer1'
+    write_jsonl(root / 'owner/attestations.jsonl', [
+        make('identifier', n, 'ownership', **fields[index]) for n, index in enumerate(order, 1)])
+    write_jsonl(root / 'backfill/journal.jsonl', [
+        _bf('journal', 'message', {'messageId': 'Q', 'senderId': q, 'text': 'Q'}, ms=250,
+            certainty='provider_timestamp')])
+    db = tmp_path / 'history.db'
+    report = project([root], db)
+    with closing(sqlite3.connect(db)) as conn:
+        owners = {r[0] for r in conn.execute('SELECT contact_id FROM identifier_history WHERE value IN (?, ?, ?)',
+                                            (a, p, q))}
+        assert len(owners) == 1
+        assert conn.execute('SELECT sender_contact_id FROM messages').fetchone()[0] in owners
+    assert not report['review']['temporal_links_ambiguous']
+
+
+@pytest.mark.parametrize('case', ['unique', 'absent', 'multiple'])
+def test_project_identifier_ended_applicability_and_provenance(tmp_path, case):
+    a, b, p = ('491100000001@s.whatsapp.net', '491100000002@s.whatsapp.net',
+               '491100000003@s.whatsapp.net')
+    root = tmp_path / 'layer1'
+    records = []
+    if case != 'absent':
+        records.append(make('identifier', 1, 'first owner', anchor=a, identifier=p))
+    if case == 'multiple':
+        records.append(make('identifier', 2, 'second owner', anchor=b, identifier=p, valid_from_ms=100))
+    records.append(make('identifier_ended', 3, 'end', identifier=p, ended_ms=200))
+    write_jsonl(root / 'owner/attestations.jsonl', records)
+    write_jsonl(root / 'backfill/journal.jsonl', [
+        _bf('journal', 'message', {'messageId': str(ms), 'senderId': p, 'text': 'source'},
+            ms=ms, certainty='provider_timestamp') for ms in (199, 200)])
+    db = tmp_path / 'history.db'
+    report = project([root], db)
+    with closing(sqlite3.connect(db)) as conn:
+        rows = conn.execute('SELECT valid_until_ms, ended_ms, source_refs FROM identifier_history WHERE value = ?', (p,)).fetchall()
+        authors = dict(conn.execute('SELECT native_message_id, sender_contact_id FROM messages'))
+    if case == 'unique':
+        assert rows[0][:2] == (200, 200) and len(rows) == 1
+        assert set(json.loads(rows[0][2])) >= {'owner/attestations.jsonl#1', 'owner/attestations.jsonl#2'}
+        assert authors['199'] is not None and authors['200'] is None
+        assert not report['review']['identifier_ended_not_applied']
+    else:
+        assert all(row[:2] == (None, None) for row in rows)
+        assert report['review']['identifier_ended_not_applied'][0]['resolution'] == case
