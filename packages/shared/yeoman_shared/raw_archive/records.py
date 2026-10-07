@@ -140,16 +140,26 @@ def append_line(
             os.close(coordinator_fd)
 
 
-def append_owner_record(raw_root: Path, record: Mapping[str, Any]) -> CommittedLine | None:
+def validate_owner_envelope(record: Mapping[str, Any]) -> None:
+    """Publisher envelope contract, shared by whole-package validation and publication."""
+    version = record.get('attestation_version')
+    if (type(version) is not int or version not in (1, 2)
+            or not isinstance(record.get('type'), str) or not record['type']):
+        raise ValueError('invalid owner attestation envelope')
+
+
+def preflight_owner_paths(raw_root: Path) -> None:
+    """Read-only protected owner path checks before any lock/destination creation."""
+    for relative in (PURGE_DISPOSITION_LOCK, 'AUDIT', 'owner/attestations.jsonl'):
+        _no_symlinks(raw_root / relative)
+
+
+def append_owner_record_locked(raw_root: Path, record: Mapping[str, Any]) -> CommittedLine | None:
     """Publish a gateway-validated owner envelope to its fixed destination, without a queue."""
-    version = record.get("attestation_version")
-    if (not isinstance(version, int) or isinstance(version, bool) or version not in (1, 2)
-            or not isinstance(record.get("type"), str) or not record["type"]):
-        raise ValueError("invalid owner attestation envelope")
+    validate_owner_envelope(record)
+    preflight_owner_paths(raw_root)
     relative = "owner/attestations.jsonl"
     path = raw_root / relative
-    if any(parent.is_symlink() for parent in (path, *path.parents)):
-        raise ValueError("owner destination must not traverse a symlink")
     line = dumps(record)
     receipt = None
 
@@ -157,10 +167,90 @@ def append_owner_record(raw_root: Path, record: Mapping[str, Any]) -> CommittedL
         nonlocal receipt
         receipt = CommittedLine(relative, number, end)
 
-    append_line(path, line, coordination_lock=raw_root / PURGE_DISPOSITION_LOCK,
-                should_append=lambda: not append_is_disposed(raw_root / "AUDIT", dict(record), line),
+    append_line(path, line,
+                should_append=lambda: not _owner_is_disposed(raw_root, record, line),
                 on_committed=committed)
     return receipt
+
+
+def append_owner_record(raw_root: Path, record: Mapping[str, Any]) -> CommittedLine | None:
+    """Publish one owner record while sharing the purge/import root lock."""
+    validate_owner_envelope(record)
+    preflight_owner_paths(raw_root)
+    fd = lock_file(raw_root / PURGE_DISPOSITION_LOCK, create=True)
+    try:
+        return append_owner_record_locked(raw_root, record)
+    finally:
+        os.close(fd)
+
+
+def _owner_is_disposed(raw_root: Path, record: Mapping[str, Any], line: str) -> bool:
+    if append_is_disposed(raw_root / "AUDIT", dict(record), line):
+        return True
+    legacy = record.get('message_id')
+    if record.get('type') == 'message_author' and isinstance(legacy, str):
+        keys = legacy.split(':', 2)
+        if len(keys) == 3 and append_is_disposed(raw_root / 'AUDIT', {
+                'channel': keys[0], 'chat_id': keys[1], 'native_id': keys[2]}, line):
+            return True
+    ref = record.get('source_ref')
+    if isinstance(ref, str):
+        match = re.fullmatch(r'(whatsapp|backfill|derived)/([^/\\#]+\.jsonl)#([1-9][0-9]*)(?:/([0-9]+))?', ref)
+        if match is None:
+            raise ValueError('invalid owner source ref')
+        sub, name, number, segment = match.groups()
+        path = raw_root / sub / name
+        _no_symlinks(path)
+        try:
+            selected = next((item for item in iter_records(path) if item[0] == int(number)), None)
+        except FileNotFoundError:
+            selected = None
+        if selected is None:
+            # Compatibility for the existing gateway-validated, explicitly identity-bound envelope.
+            # A canonical source-ref-only author has no such binding and must refuse.
+            if (isinstance(record.get('channel'), str) and record['channel']
+                    and isinstance(record.get('chat_id'), str) and record['chat_id']
+                    and any(isinstance(record.get(key), str) and record[key]
+                            for key in ('native_message_id', 'native_id'))):
+                return append_is_disposed(raw_root / 'AUDIT', dict(record), line)
+            raise ValueError('owner source evidence unavailable')
+        _, source, source_line = selected
+        if source == TOMBSTONE:
+            return True
+        if not isinstance(source, dict):
+            raise ValueError('owner source evidence invalid')
+        payload = source.get('payload')
+        parts = payload.get('segments') if isinstance(payload, dict) else None
+        if isinstance(parts, list):
+            if segment is None:
+                native_id = payload.get('messageId')
+                indexes = [index for index, part in enumerate(parts)
+                           if native_id and isinstance(part, dict) and part.get('messageId') == native_id]
+                if len(indexes) != 1:
+                    raise ValueError('ambiguous owner base source ref')
+                index = indexes[0]
+            else:
+                index = int(segment)
+            if index >= len(parts) or not isinstance(parts[index], dict):
+                raise ValueError('owner segment evidence unavailable')
+            if parts[index] == TOMBSTONE:
+                return True
+            source = {'channel': source.get('channel'), 'chat_id': source.get('chat_id'),
+                      'received_ms': record_capture_ms(source), 'payload': parts[index],
+                      'origin': source.get('origin')}
+            source_line = dumps(source)
+        elif segment is not None:
+            raise ValueError('owner source is not segmented')
+        origin = source.get('origin')
+        row_bound = isinstance(origin, dict) and isinstance(origin.get('row_sha256'), str)
+        if (not isinstance(source.get('channel'), str) or not source['channel']
+                or not isinstance(source.get('chat_id'), str) or not source['chat_id']
+                or not (record_identities(source) or record_correlations(source)
+                        or source.get('native_id') or row_bound)):
+            raise ValueError('owner source identity unavailable')
+        return append_is_disposed(raw_root / 'AUDIT', source, source_line)
+
+    return False
 
 
 def record_capture_ms(record: dict[str, Any]) -> int:
@@ -424,3 +514,310 @@ def archive_files(root: Path, channel: str | None = None) -> list[Path]:
         if directory.is_dir():
             files.extend(sorted(directory.glob("*.jsonl")))
     return files
+
+
+IMPORT_RECEIPTS = '.import-receipts.jsonl'
+_IMPORT_PATH = re.compile(r'backfill/[A-Za-z0-9_-]+\.jsonl|derived/media-descriptions\.jsonl')
+
+
+def _no_symlinks(path: Path) -> None:
+    if any(p.is_symlink() for p in (path, *path.parents)):
+        raise ValueError('import path must not traverse a symlink')
+    if path.exists() and (not path.is_file() and not path.is_dir()):
+        raise ValueError('import path must be a regular file or directory')
+
+
+def import_manifest_digest(manifest: Mapping[str, Any]) -> str:
+    return line_sha256(dumps({k: v for k, v in manifest.items() if k != 'package_digest'}))
+
+
+def import_source_locator(origin: Mapping[str, Any]) -> tuple[str | None, dict[str, Any], dict[str, Any]]:
+    """Relative locator in a digest-bound logical source inventory; never read origin paths."""
+    if not origin:
+        return None, {}, {}
+    path = origin.get('path')
+    if not isinstance(path, str) or not path:
+        raise ValueError('invalid source origin path')
+    identity = line_sha256(dumps({'store': origin.get('store'), 'path': path}))
+    entry = {'path': f'sources/{identity}/source', 'origin_path_sha256': line_sha256(path)}
+    locator = {**origin, 'path': entry['path'], 'inventory_id': identity}
+    return identity, entry, locator
+
+
+def validate_import_manifest(staged_root: Path, manifest: Mapping[str, Any]) -> dict[str, bytes]:
+    """Read and validate the entire fixed-destination envelope; never create files."""
+    from .paths import is_protected
+
+    _no_symlinks(staged_root)
+    if is_protected(staged_root):
+        raise ValueError('staging must be outside protected archives')
+    if (manifest.get('version') != 1 or not isinstance(manifest.get('snapshot_identity'), str)
+            or not manifest['snapshot_identity'] or not isinstance(manifest.get('files'), dict)
+            or not manifest['files'] or manifest.get('package_digest') != import_manifest_digest(manifest)):
+        raise ValueError('invalid import manifest')
+    boundary = {'basis': 'staged-byte-prefixes', 'files': {
+        name: {key: info.get(key) for key in ('sha256', 'bytes', 'lines')}
+        for name, info in manifest['files'].items() if isinstance(info, dict)}}
+    if manifest.get('snapshot_boundary') != boundary:
+        raise ValueError('invalid snapshot boundary')
+    paths = {p.relative_to(staged_root).as_posix() for p in staged_root.rglob('*.jsonl')}
+    if paths != set(manifest['files']):
+        raise ValueError('manifest must cover exactly the staged line files')
+    result = {}
+    ref_map = {}
+    inventory = {}
+    for relative, info in sorted(manifest['files'].items()):
+        if not isinstance(relative, str) or _IMPORT_PATH.fullmatch(relative) is None:
+            raise ValueError('unsupported import destination')
+        path = staged_root / relative
+        _no_symlinks(path)
+        blob = path.read_bytes()
+        lines = blob.splitlines(keepends=True)
+        if (not isinstance(info, dict) or info.get('sha256') != hashlib.sha256(blob).hexdigest()
+                or info.get('bytes') != len(blob) or info.get('lines') != len(lines)
+                or (blob and not blob.endswith(b'\n')) or not isinstance(info.get('rows'), list)
+                or len(info['rows']) != len(lines)):
+            raise ValueError('staged file differs from manifest')
+        for number, (line, row) in enumerate(zip(lines, info['rows'], strict=True), 1):
+            record = json.loads(line)
+            ref = f'{relative}#{number}'
+            if (not isinstance(record, dict) or not isinstance(row, dict)
+                    or row.get('source_ref') != ref or row.get('sha256') != hashlib.sha256(line).hexdigest()):
+                raise ValueError('invalid staged row envelope')
+            if relative.startswith('backfill/'):
+                if record.get('backfill_version') != 1 or not isinstance(record.get('origin'), dict):
+                    raise ValueError('invalid backfill envelope')
+            elif record.get('kind') != 'media_description':
+                raise ValueError('invalid derived envelope')
+            origin = record.get('origin', {})
+            inventory_id, entry, locator = import_source_locator(origin)
+            if inventory_id is not None:
+                inventory[inventory_id] = entry
+            original = record.get('original')
+            uuid = original.get('uuid', original.get('id')) if isinstance(original, dict) else None
+            if (row.get('original_row_sha256') != origin.get('row_sha256') or row.get('uuid') != uuid
+                    or row.get('origin') != locator):
+                raise ValueError('manifest original locator differs from staged row')
+            ref_map[ref] = ref
+            payload = record.get('payload')
+            if isinstance(payload, dict) and isinstance(payload.get('segments'), list):
+                for index in range(len(payload['segments'])):
+                    ref_map[f'{ref}/{index}'] = f'{ref}/{index}'
+        result[relative] = blob
+    if manifest.get('source_inventory') != inventory:
+        raise ValueError('manifest source inventory differs from staged evidence')
+    if manifest.get('ref_map') != ref_map:
+        raise ValueError('manifest ref map differs from staged physical rows')
+    return result
+
+
+def _import_receipt(raw_root: Path, digest: str) -> dict[str, Any] | None:
+    path = raw_root / IMPORT_RECEIPTS
+    _no_symlinks(path)
+    if not path.exists():
+        return None
+    latest = {}
+    for _, row, _ in iter_records(path):
+        if row is None or row.get('version') != 1 or row.get('status') not in ('partial', 'complete'):
+            raise ValueError('invalid import receipt journal')
+        latest[row['package_digest']] = row
+    if any(key != digest and row['status'] == 'partial' for key, row in latest.items()):
+        raise ValueError('another partial import must be completed first')
+    return latest.get(digest)
+
+
+def _import_render(raw_root: Path, record: dict[str, Any], line: bytes) -> tuple[bytes, bool]:
+    payload = record.get('payload')
+    segments = payload.get('segments') if isinstance(payload, dict) else None
+    if isinstance(segments, list):
+        parts = iter(record_parts(record))
+        kept, changed = [], False
+        for segment in segments:
+            if isinstance(segment, dict) and segment != TOMBSTONE:
+                part = next(parts)
+                disposed = append_is_disposed(raw_root / 'AUDIT', part, dumps(part))
+                kept.append(TOMBSTONE if disposed else segment)
+                changed |= disposed
+            else:
+                kept.append(segment)
+        if changed:
+            replacement = TOMBSTONE
+            if any(isinstance(part, dict) and part != TOMBSTONE and part for part in kept):
+                replacement = {key: record[key] for key in (
+                    'backfill_version', 'channel', 'kind', 'chat_id', 'occurred_ms', 'time_certainty',
+                    'direction', 'provenance', 'skip_reason') if key in record}
+                replacement['received_ms'] = record_capture_ms(record)
+                replacement['payload'] = {'segments': kept}
+                for key in ('chatJid', 'fromAssistant', 'messageId'):
+                    if key in payload and (key != 'messageId' or any(
+                            isinstance(part, dict) and part.get('messageId') == payload[key] for part in kept)):
+                        replacement['payload'][key] = payload[key]
+            return (dumps(replacement) + '\n').encode(), True
+    disposed = append_is_disposed(raw_root / 'AUDIT', record, line[:-1].decode('utf-8'))
+    return ((dumps(TOMBSTONE) + '\n').encode() if disposed else line), disposed
+
+
+def _import_plan(raw_root: Path, blobs: Mapping[str, bytes], manifest: Mapping[str, Any],
+                 receipt: dict[str, Any] | None) -> tuple[dict[str, Any], dict[str, bytes]]:
+    """Pin all prefixes and exact append bytes before any protected mutation."""
+    files, ref_map, additions = {}, {}, {}
+    for relative, blob in sorted(blobs.items()):
+        path = raw_root / relative
+        _no_symlinks(path)
+        pending = path.with_name(path.name + '.import-partial')
+        _no_symlinks(pending)
+        current = path.read_bytes() if path.exists() else b''
+        previous = receipt['files'].get(relative) if receipt else None
+        if previous is not None:
+            base_size = previous['base_bytes']
+            base = current[:base_size]
+            if len(base) != base_size or hashlib.sha256(base).hexdigest() != previous['base_sha256']:
+                raise ValueError('import destination prefix changed')
+        else:
+            if relative.startswith('backfill/') and path.exists():
+                raise FileExistsError('backfill destination already exists without import receipt')
+            base = current
+        if base and not base.endswith(b'\n'):
+            raise ValueError('import destination has an incomplete physical line')
+        base_lines = base.count(b'\n')
+        # Exact bytes, not semantic JSON/text matching: different evidence stays distinct.
+        existing = {}
+        if relative.startswith('derived/'):
+            for number, line in enumerate(base.splitlines(keepends=True), 1):
+                existing.setdefault(line, number)
+        added = []
+        row_hashes = []
+        suppressed = 0
+        for number, line in enumerate(blob.splitlines(keepends=True), 1):
+            record = json.loads(line)
+            rendered, disposed = _import_render(raw_root, record, line)
+            suppressed += int(disposed)
+            # Each suppressed source retains a distinct tombstone slot, never compact refs.
+            final_number = existing.get(rendered) if not disposed else None
+            if final_number is None:
+                added.append(rendered)
+                final_number = base_lines + len(added)
+                if not disposed and relative.startswith('derived/'):
+                    existing.setdefault(rendered, final_number)
+            source_ref = f'{relative}#{number}'
+            final_ref = f'{relative}#{final_number}'
+            ref_map[source_ref] = final_ref
+            payload = record.get('payload')
+            if isinstance(payload, dict) and isinstance(payload.get('segments'), list):
+                for index in range(len(payload['segments'])):
+                    ref_map[f'{source_ref}/{index}'] = f'{final_ref}/{index}'
+            row_hashes.append(hashlib.sha256(rendered).hexdigest())
+        addition = b''.join(added)
+        info = {'base_bytes': len(base), 'base_sha256': hashlib.sha256(base).hexdigest(),
+                'bytes': len(base) + len(addition), 'sha256': hashlib.sha256(base + addition).hexdigest(),
+                'lines': base_lines + len(added), 'row_hashes': row_hashes, 'suppressed': suppressed}
+        if previous is not None and info != previous:
+            raise ValueError('import disposition or plan changed')
+        tail = current[len(base):]
+        boundaries = {0}
+        offset = 0
+        for line in added:
+            offset += len(line)
+            boundaries.add(offset)
+        if (not addition.startswith(tail) or len(tail) not in boundaries
+                or (receipt and receipt['status'] == 'complete' and current != base + addition)):
+            raise ValueError('import destination bytes changed')
+        if pending.exists() and (receipt is None or not addition.startswith(pending.read_bytes())):
+            raise ValueError('unbound or changed incomplete publication')
+        files[relative] = info
+        additions[relative] = addition[len(tail):]
+    result = {'version': 1, 'package_digest': manifest['package_digest'],
+              'snapshot_identity': manifest['snapshot_identity'], 'status': 'partial',
+              'files': files, 'ref_map': ref_map}
+    if receipt and (receipt['ref_map'] != ref_map or set(receipt['files']) != set(files)):
+        raise ValueError('import receipt differs from package')
+    return result, additions
+
+
+def preview_import(raw_root: Path, staged_root: Path, manifest: Mapping[str, Any]) -> dict[str, Any]:
+    """Read-only preview. Confirm repeats these checks under the existing root lock."""
+    blobs = validate_import_manifest(staged_root, manifest)
+    _no_symlinks(raw_root)
+    _no_symlinks(raw_root / PURGE_DISPOSITION_LOCK)
+    _no_symlinks(raw_root / 'AUDIT')
+    receipt = _import_receipt(raw_root, manifest['package_digest'])
+    result, _ = _import_plan(raw_root, blobs, manifest, receipt)
+    if receipt and receipt['status'] == 'complete':
+        return receipt
+    return result
+
+
+def _publish_import_file(path: Path, addition: bytes, *, write_once: bool) -> None:
+    """Durable write-once link for backfill; derived lines reuse locked append_line."""
+    if not write_once:
+        if not path.exists() and not addition:
+            ensure_private_dir(path.parent)
+            fd = os.open(path, os.O_WRONLY | os.O_CREAT | os.O_EXCL, OPEN_FILE_MODE)
+            os.fsync(fd)
+            os.close(fd)
+            _fsync_directory(path.parent)
+        for line in addition.splitlines(keepends=True):
+            append_line(path, line[:-1].decode('utf-8'))
+        return
+    ensure_private_dir(path.parent)
+    if path.exists():
+        if addition:
+            raise ValueError('backfill publication already exists')
+        fd = os.open(path, os.O_RDONLY)
+        try:
+            os.fsync(fd)
+            _fsync_directory(path.parent)
+        finally:
+            os.close(fd)
+        return
+    pending = path.with_name(path.name + '.import-partial')
+    _no_symlinks(pending)
+    if pending.exists():
+        prefix = pending.read_bytes()
+        if not addition.startswith(prefix):
+            raise ValueError('incomplete backfill publication differs')
+        fd = lock_file(pending, create=True)
+        try:
+            os.lseek(fd, 0, os.SEEK_END)
+            view = memoryview(addition[len(prefix):])
+            while view:
+                written = os.write(fd, view)
+                if written <= 0:
+                    raise OSError('backfill staging made no progress')
+                view = view[written:]
+            os.fsync(fd)
+        finally:
+            os.close(fd)
+    else:
+        fd = os.open(pending, os.O_WRONLY | os.O_CREAT | os.O_EXCL, OPEN_FILE_MODE)
+        with os.fdopen(fd, 'wb') as handle:
+            handle.write(addition)
+            handle.flush()
+            os.fsync(handle.fileno())
+    os.link(pending, path)
+    _fsync_directory(path.parent)
+    pending.unlink()
+    _fsync_directory(path.parent)
+
+
+def import_backfill(raw_root: Path, staged_root: Path, manifest: Mapping[str, Any]) -> dict[str, Any]:
+    """Prevalidate, pin a durable partial receipt, and resume exact publications; not atomic."""
+    # ponytail: holds one staged package in memory; stream pinned descriptors if package size warrants it.
+    blobs = validate_import_manifest(staged_root, manifest)
+    preview_import(raw_root, staged_root, manifest)  # Invalid packages/destinations create nothing.
+    coordinator = lock_file(raw_root / PURGE_DISPOSITION_LOCK, create=True)
+    try:
+        receipt = _import_receipt(raw_root, manifest['package_digest'])
+        result, additions = _import_plan(raw_root, blobs, manifest, receipt)
+        if receipt and receipt['status'] == 'complete':
+            return receipt
+        if receipt is None:
+            append_line(raw_root / IMPORT_RECEIPTS, dumps(result))
+        for relative, addition in additions.items():
+            path = raw_root / relative
+            _publish_import_file(path, addition, write_once=relative.startswith('backfill/'))
+        result['status'] = 'complete'
+        append_line(raw_root / IMPORT_RECEIPTS, dumps(result))
+        return result
+    finally:
+        os.close(coordinator)

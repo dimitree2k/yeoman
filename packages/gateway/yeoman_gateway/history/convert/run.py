@@ -96,3 +96,76 @@ def run_conversion(source_home: Path, raw_out: Path, *, decode: Decoder | None,
             "lines": count, "kinds": dict(sorted(kinds.items())), "skipped": dict(sorted(skipped.items())),
         }
     return report
+
+
+def prepare_import_manifest(staged_root: Path) -> dict[str, Any]:
+    """Bind staged physical rows and exact original locators to a deterministic snapshot."""
+    import hashlib
+    import json
+
+    from yeoman_shared.raw_archive.records import (
+        import_manifest_digest,
+        import_source_locator,
+        validate_import_manifest,
+    )
+
+    from ..layer1 import PROVENANCE, TIME_CERTAINTY, row_sha256
+
+    if is_protected(staged_root):
+        raise PermissionError('staging must be outside protected archives')
+    if any(p.is_symlink() for p in (staged_root, *staged_root.parents)):
+        raise ValueError('staging must not traverse symlinks')
+    files, ref_map, inventory = {}, {}, {}
+    for path in sorted(staged_root.rglob('*.jsonl')):
+        relative = path.relative_to(staged_root).as_posix()
+        if any(p.is_symlink() for p in (path, *path.parents)):
+            raise ValueError('staged file must not traverse symlinks')
+        blob = path.read_bytes()
+        rows = []
+        for number, line in enumerate(blob.splitlines(keepends=True), 1):
+            record = json.loads(line)
+            if not isinstance(record, dict):
+                raise ValueError('staged row must be an object')
+            origin = record.get('origin', {})
+            if not isinstance(origin, dict):
+                raise ValueError('invalid origin')
+            if relative.startswith('backfill/'):
+                if (record.get('backfill_version') != 1 or record.get('provenance') not in PROVENANCE
+                        or record.get('time_certainty') not in TIME_CERTAINTY
+                        or not isinstance(record.get('payload'), dict)
+                        or not isinstance(record.get('channel'), str) or not isinstance(record.get('kind'), str)
+                        or not all(isinstance(origin.get(k), str) for k in ('store', 'path', 'table', 'row_key'))
+                        or 'original' not in record):
+                    raise ValueError('invalid backfill record')
+            elif (record.get('kind') != 'media_description'
+                    or not isinstance(record.get('channel'), str)
+                    or not isinstance(record.get('chat_id'), str)
+                    or not isinstance(record.get('native_message_id'), str)
+                    or record.get('text') is not None and not isinstance(record['text'], str)):
+                raise ValueError('invalid derived record')
+            if 'original' in record and origin.get('row_sha256') != row_sha256(record['original']):
+                raise ValueError('original row digest mismatch')
+            ref = f'{relative}#{number}'
+            original = record.get('original')
+            uuid = original.get('uuid', original.get('id')) if isinstance(original, dict) else None
+            inventory_id, entry, locator = import_source_locator(origin)
+            if inventory_id is not None:
+                inventory[inventory_id] = entry
+            rows.append({'source_ref': ref, 'sha256': hashlib.sha256(line).hexdigest(),
+                         'original_row_sha256': origin.get('row_sha256'), 'uuid': uuid,
+                         'origin': locator})
+            ref_map[ref] = ref
+            payload = record.get('payload')
+            if isinstance(payload, dict) and isinstance(payload.get('segments'), list):
+                for index in range(len(payload['segments'])):
+                    ref_map[f'{ref}/{index}'] = f'{ref}/{index}'
+        files[relative] = {'sha256': hashlib.sha256(blob).hexdigest(), 'bytes': len(blob),
+                           'lines': len(rows), 'rows': rows}
+    manifest = {'version': 1, 'snapshot_identity': row_sha256({'files': files, 'source_inventory': inventory}),
+                'source_inventory': inventory, 'files': files,
+                'snapshot_boundary': {'basis': 'staged-byte-prefixes', 'files': {
+                    name: {key: info[key] for key in ('sha256', 'bytes', 'lines')}
+                    for name, info in files.items()}}, 'ref_map': ref_map}
+    manifest['package_digest'] = import_manifest_digest(manifest)
+    validate_import_manifest(staged_root, manifest)
+    return manifest

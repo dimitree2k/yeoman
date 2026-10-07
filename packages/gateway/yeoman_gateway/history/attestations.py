@@ -253,3 +253,64 @@ def resolve_author_targets(
                            "claims": [{**_claim(a, ref), **event_evidence.get(ref, {})}
                                       for ref, a in corrected]})
     return winners, review
+
+
+def validate_owner_package(raw_root: Path, records: Sequence[dict[str, Any]]) -> None:
+    """Validate the whole local package against current native/identity evidence, read-only."""
+    from yeoman_shared.raw_archive.records import (
+        _owner_is_disposed,
+        dumps,
+        preflight_owner_paths,
+        validate_owner_envelope,
+    )
+
+    from .extract import extract
+    from .layer1 import iter_layer1, layer1_files
+    from .resolve import resolve
+
+    preflight_owner_paths(raw_root)
+    for record in records:
+        _check(record)
+        validate_owner_envelope(record)
+    paths = [raw_root, *(path for _, path in layer1_files([raw_root]))]
+    if any(parent.is_symlink() for path in paths for parent in (path, *path.parents)):
+        raise ValueError('owner evidence must not traverse symlinks')
+    existing = list(iter_layer1([raw_root]))
+    owner_path = raw_root / 'owner/attestations.jsonl'
+    owner_bytes = owner_path.read_bytes() if owner_path.exists() else b''
+    count = owner_bytes.count(b'\n') + int(bool(owner_bytes) and not owner_bytes.endswith(b'\n'))
+    proposed = [parse(Layer1Line(f'owner/attestations.jsonl#{count + index}', record))
+                for index, record in enumerate(records, 1)]
+    evidence = extract(existing)
+    # Author/name/merge fields cannot invent an otherwise unknown anchor.
+    initial = list(evidence.identity.attestations)
+    evidence.identity.attestations = initial + [a for a in proposed if a.type == 'contact']
+    anchors = resolve(evidence.identity)
+    for att in proposed:
+        if att.type == 'identifier' and anchors.contact_for_anchor(att.fields['anchor']) is None:
+            raise ValueError('unknown or ambiguous identifier anchor')
+    evidence.identity.attestations += [a for a in proposed if a.type in ('identifier', 'identifier_ended')]
+    resolved = resolve(evidence.identity)
+    for att in proposed:
+        fields = ('a', 'b') if att.type in ('merge', 'unmerge') else ('anchor',)
+        for field in fields:
+            if field in att.fields and resolved.contact_for_anchor(att.fields[field]) is None:
+                raise ValueError('unknown or ambiguous owner anchor')
+    refs = {a.ref for a in proposed}
+    for entries in resolved.review.values():
+        for entry in entries:
+            if any(ref in canonical_json(entry) for ref in refs):
+                raise ValueError('ambiguous owner identifier decision')
+    _, review = resolve_author_targets(proposed, evidence.messages, evidence.events)
+    if review:
+        raise ValueError('invalid, ambiguous or conflicting author targets')
+    # A legacy native-ID locator cannot silently select colliding original rows.
+    for att in proposed:
+        if att.type == 'message_author':
+            selected = [c for c in evidence.messages if message_copy_id(c) == att.fields['message_id']]
+            if len({(c.text, c.batch_key) for c in selected}) > 1:
+                raise ValueError('legacy author locator selects colliding content')
+
+    # Prove every publisher source binding before the first package write; confirm repeats under lock.
+    for record in records:
+        _owner_is_disposed(raw_root, record, dumps(record))
