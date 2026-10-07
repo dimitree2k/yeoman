@@ -154,9 +154,21 @@ do not apply automatically.
 
 - Before recovery/refactoring, record branch, HEAD and worktree status. Preserve
   uncommitted work; never reset, clean or discard it without approval.
-- Use at most one implementer and one reviewer per task. Allow one fix round;
-  a second needs the owner's decision. Only in-scope P0/P1 findings block
+- Use one implementer and one fresh reviewer per task. The coordinator decides
+  further fix rounds and scope rulings without stopping for the owner (owner
+  instruction 2026-10-07) and records each ruling in the task's evidence folder.
+  After a fix round the coordinator verifies that every finding became a passing
+  test; a fresh re-review is needed only when a fix adds a new mechanism or
+  touches deletion, durability or security. Only in-scope P0/P1 findings block
   completion; log P2/P3 and do not broaden the task.
+- Before handing off, run every test file that imports a changed module (find
+  them with grep), not only the plan's named selectors. Asyncio tests need local
+  sockets: run Codex with `sandbox_workspace_write.network_access=true`, and keep
+  socket-test basetemps short (`~/.cache/yt7/...`; AF_UNIX paths over ~108
+  characters fail). `tests/conftest.py` isolates `HOME`/`YEOMAN_HOME` and fails
+  any test that touches the live runtime; do not work around it with env overrides.
+- New files under `tests/gateway/` and `tests/shared/` are matched by
+  `.gitignore`; stage them with `git add -f`.
 - Work budgets are 60 minutes per task and 4 hours per phase, not process
   timeouts. Follow the approved plan and `~/.codex/AGENTS.md` for check scope,
   preflight, monitoring and retries.
