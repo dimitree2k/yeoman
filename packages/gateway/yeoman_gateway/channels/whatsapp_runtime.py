@@ -214,19 +214,14 @@ class WhatsAppRuntimeManager:
         hasher.update(f"protocolVersion={manifest.protocol_version}\n".encode())
         hasher.update(f"buildId={manifest.build_id}\n".encode())
 
-        files = [
-            root / "bridge.manifest.json",
-            root / "package.json",
-            root / "dist" / "index.js",
-            root / "dist" / "server.js",
-            root / "dist" / "protocol.js",
-            root / "dist" / "whatsapp.js",
-        ]
-        for file_path in files:
-            if not file_path.exists():
-                hasher.update(f"missing:{file_path.name}\n".encode())
-                continue
-            hasher.update(f"name:{file_path.name}\n".encode())
+        files = [(name, root / name) for name in (MANIFEST_FILENAME, "package.json")]
+        files.extend(
+            (f"dist/{path.relative_to(root / 'dist').as_posix()}", path)
+            for path in sorted((root / "dist").rglob("*"))
+            if path.is_file()
+        )
+        for name, file_path in files:
+            hasher.update(f"name:{name}\n".encode())
             hasher.update(file_path.read_bytes())
             hasher.update(b"\n")
         return hasher.hexdigest()

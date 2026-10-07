@@ -6,6 +6,7 @@ import pytest
 from yeoman_gateway.app.bootstrap import GatewayRuntime
 from yeoman_gateway.channels.whatsapp_runtime import BridgeStatus, WhatsAppRuntimeManager
 from yeoman_shared.utils.helpers import get_operational_store_path
+from yeoman_shared.whatsapp_protocol import PROTOCOL_VERSION
 
 
 def test_status_removes_pid_file_for_non_bridge_process(tmp_path, monkeypatch) -> None:
@@ -242,3 +243,33 @@ def test_gateway_cleanup_closes_processing_when_retention_stop_fails(monkeypatch
 
     assert "processing" in closed
     assert "channels" in closed
+
+
+def test_runtime_refreshes_when_non_entry_dist_module_changes(tmp_path, monkeypatch) -> None:
+    source = tmp_path / "source"
+    target = tmp_path / "runtime"
+    manifest = (
+        f'{{"bridgeVersion":"1.0.0","protocolVersion":{PROTOCOL_VERSION},"buildId":"test"}}'
+    )
+    for root in (source, target):
+        (root / "dist").mkdir(parents=True)
+        (root / "bridge.manifest.json").write_text(manifest)
+        (root / "package.json").write_text('{"name":"test-bridge"}')
+        for name in ("index.js", "server.js", "protocol.js", "whatsapp.js"):
+            (root / "dist" / name).write_text(name)
+        (root / "dist" / "message_reference_store.js").write_text("old")
+
+    manager = WhatsAppRuntimeManager(
+        source_bridge_dir=source,
+        user_bridge_dir=target,
+    )
+    monkeypatch.setattr(manager, "_ensure_runtime_dependencies", lambda root: None)
+
+    assert manager.ensure_runtime() == target
+    assert manager._runtime_refreshed is False
+
+    (source / "dist" / "message_reference_store.js").write_text("new")
+
+    assert manager.ensure_runtime() == target
+    assert manager._runtime_refreshed is True
+    assert (target / "dist" / "message_reference_store.js").read_text() == "new"
