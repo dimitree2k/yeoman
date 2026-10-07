@@ -103,10 +103,17 @@ def test_verify_determinism_requires_pinned_inputs(tmp_path, monkeypatch):
     write_jsonl(dev / 'backfill/tombstone.jsonl', [{'purged_version': 1}])
     with (dev / 'backfill/tombstone.jsonl').open('a') as out:
         out.write('\n')
-    project([live, dev], db)
+    projected = project([live, dev], db)
     original = db.read_bytes()
     checked = verify([live, dev], db, scratch=None, frozen=True)
     assert checked['accounting']['backfill/tombstone.jsonl'] == {'lines': 2, 'accounted': 2}
+    import sqlite3
+    with sqlite3.connect(db) as conn:
+        assert conn.execute("SELECT lines FROM projector_state WHERE file='backfill/tombstone.jsonl'").fetchone() == (1,)
+    assert projected['projector_state_line_basis'] == 'nonblank'
+    assert projected['accounting'] == checked['accounting']
+    assert projected['blank_lines_skipped'] == checked['blank_lines_skipped']
+    assert projected['outcomes']['backfill/tombstone.jsonl'] == {'skipped:purged': 1, 'skipped:blank': 1}
     assert checked['blank_lines_skipped']['backfill/tombstone.jsonl'] == 1
     assert checked['accounting_ok'] is True
     with pytest.raises(ValueError, match='frozen'):

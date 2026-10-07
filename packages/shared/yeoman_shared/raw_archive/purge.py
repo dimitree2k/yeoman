@@ -443,8 +443,10 @@ def _publish_pending(root: Path, operation: dict[str, Any], *, now_ms: int) -> N
     }))
 
 
-def _recover_pending(root: Path, *, now_ms: int) -> None:
+def _recover_pending(root: Path, *, now_ms: int, destination: str | None = None) -> None:
     for operation in _pending_publications(root):
+        if destination is not None and not any(item["file"] == destination for item in operation["files"]):
+            continue
         locked = _lock_files(root, tuple(item["file"] for item in operation["files"]))
         try:
             _publish_pending(root, operation, now_ms=now_ms)

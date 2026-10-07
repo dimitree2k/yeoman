@@ -48,6 +48,12 @@ CHAT = "pilot@g.us"
 NOW_MS = int(time.time() * 1000)
 
 
+@pytest.fixture(autouse=True)
+def _fresh_pilot_time(monkeypatch: pytest.MonkeyPatch) -> None:
+    # Collection can precede execution by more than the scheduler's ten-minute TTL.
+    monkeypatch.setitem(globals(), "NOW_MS", int(time.time() * 1000))
+
+
 class _ScriptedClient:
     """Speaks the existing async ``chat(messages, max_tokens=...)`` interface."""
 
@@ -323,7 +329,8 @@ async def test_shadow_pilot_admits_and_decides_without_any_effect(tmp_path: Path
     await rt["scheduler"].start()
     try:
         assert rt["ingress"].handle_event(_event()) is True
-        for _ in range(100):
+        deadline = time.monotonic() + 10
+        while time.monotonic() < deadline:
             disposition = await rt["log"].disposition_by_chat(CHANNEL, CHAT)
             if disposition:
                 break
@@ -367,7 +374,8 @@ async def test_live_pilot_path_produces_one_comment_and_one_reservation(tmp_path
     await rt["scheduler"].start()
     try:
         assert rt["ingress"].handle_event(_event()) is True
-        for _ in range(100):
+        deadline = time.monotonic() + 10
+        while time.monotonic() < deadline:
             if rt["submission"].submissions:
                 break
             await asyncio.sleep(0.02)
@@ -399,7 +407,8 @@ async def test_silence_pilot_records_silence_and_spends_nothing(tmp_path: Path) 
     await rt["scheduler"].start()
     try:
         assert rt["ingress"].handle_event(_event()) is True
-        for _ in range(100):
+        deadline = time.monotonic() + 10
+        while time.monotonic() < deadline:
             disposition = await rt["log"].disposition_by_chat(CHANNEL, CHAT)
             if disposition:
                 break

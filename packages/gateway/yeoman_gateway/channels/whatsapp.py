@@ -1123,6 +1123,8 @@ class WhatsAppChannel(BaseChannel):
             kind=kind,
             direction="in",
             native={key: value for key, value in frame.items() if key != "token"},
+            # Persisted Bridge observation time is stable across redelivery and cutoff purges.
+            received_ms=int(frame["observedAt"]),
             native_id=str(frame.get("eventId") or ""),
             chat_id=str(payload.get("chatJid") or ""),
             account=str(frame.get("accountId") or ""),

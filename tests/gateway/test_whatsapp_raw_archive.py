@@ -1373,7 +1373,8 @@ async def test_saturation_reads_delayed_ack_and_replays_shed_after_recovery(tmp_
 
 
 @pytest.mark.asyncio
-async def test_stop_settles_raw_thread_and_journals_without_ack(tmp_path, monkeypatch):
+@pytest.mark.parametrize("purge_mode", [None, "chat", "message"])
+async def test_stop_settles_raw_thread_and_journals_without_ack(tmp_path, monkeypatch, purge_mode):
     import threading
     channel, archive, store = _setup(tmp_path)
     channel._raw_retry_initial_seconds = 0.01
@@ -1415,13 +1416,49 @@ async def test_stop_settles_raw_thread_and_journals_without_ack(tmp_path, monkey
         before = _records(archive.root)
         await asyncio.sleep(0.05)
         assert _records(archive.root) == before  # no archive mutation after normal stop
+        if purge_mode:
+            from yeoman_shared.raw_archive.purge import PurgeSelector, purge
+            selector = PurgeSelector(channel="whatsapp", chat_id=CHAT,
+                                     native_id="m-1" if purge_mode == "message" else None,
+                                     before_ms=NOW + 100 if purge_mode == "message" else None)
+            purge(archive.root, selector, operator="synthetic", now_ms=NOW + 100)
+            assert _records(archive.root) == [{"purged_version": 1}]
+            archive._clock = lambda: NOW + 200
         mode = "success"
         channel._stopping = False
         channel._bridge_intake_closed = False
         await channel._handle_bridge_message(_frame(_message()))
         await channel._drain_bridge_worker()
         assert store.count_events() == 1 and acked == ["evt-1"] and projected == ["evt-1"]
-        assert len(_records(archive.root)) == 2  # accepted append-only copy across stop/replay
+        if purge_mode:
+            from yeoman_gateway.history.project import project as project_history
+            assert _records(archive.root) == [{"purged_version": 1}]  # durable suppression permits ACK
+            # Another restart/replay must still suppress the observation.
+            await channel.stop()
+            channel._stopping = False
+            channel._bridge_intake_closed = False
+            await channel._handle_bridge_message(_frame(_message()))
+            await channel._drain_bridge_worker()
+            assert _records(archive.root) == [{"purged_version": 1}]
+            fresh = json.loads(_frame(_message("new content", messageId="new"), event_id="evt-new"))
+            fresh["observedAt"] = NOW + 300
+            fresh["payload"]["timestamp"] = 1  # provider occurrence is not capture time
+            await channel._handle_bridge_message(json.dumps(fresh))
+            await channel._drain_bridge_worker()
+            rows = _records(archive.root)
+            assert rows[0] == {"purged_version": 1} and len(rows) == 2
+            assert rows[1]["received_ms"] == NOW + 300
+            assert "hello" not in next((archive.root / "whatsapp").glob("*.jsonl")).read_text()
+            db = tmp_path / "history.db"
+            assert project_history([archive.root], db)["messages"] == 1
+            import sqlite3
+            with sqlite3.connect(db) as conn:
+                assert conn.execute("SELECT native_message_id, text FROM messages").fetchall() == [("new", "new content")]
+            assert store.count_events() == 2
+            # This mock counts dispatch attempts; canonical journal/history assertions above prove uniqueness.
+            assert projected == acked == ["evt-1", "evt-1", "evt-new"]
+        else:
+            assert len(_records(archive.root)) == 2  # accepted append-only copy across stop/replay
     finally:
         release.set()
         if stop is not None:

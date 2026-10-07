@@ -44,8 +44,8 @@ def project(roots: Sequence[Path], db_path: Path) -> dict[str, Any]:
     authors = _authors(ex, res)
     messages, unattached = _messages(ex, res, arvid, authors)
     events = _events(ex, res, arvid, {m["message_id"] for m in messages}, res.review, authors)
-    line_counts = _write(db_path, res, messages, events, files)
-    return _report(ex, res, messages, events, line_counts, unattached)
+    line_counts, blanks = _write(db_path, res, messages, events, files)
+    return _report(ex, res, messages, events, line_counts, blanks, unattached)
 
 
 def _authors(ex: Extracted, res: Resolution) -> dict[str, AuthorCorrection]:
@@ -439,7 +439,7 @@ def _mark_current_reactions(rows: list[dict[str, Any]]) -> None:
 
 
 def _write(db_path: Path, res: Resolution, messages: list[dict[str, Any]], events: list[dict[str, Any]],
-           files: list[tuple[str, Path]]) -> dict[str, int]:
+           files: list[tuple[str, Path]]) -> tuple[dict[str, int], dict[str, int]]:
     building = db_path.with_name(db_path.name + ".building")
     if is_protected(building):
         raise PermissionError(f"refusing to write history.db staging file into the raw archive: {building}")
@@ -448,6 +448,7 @@ def _write(db_path: Path, res: Resolution, messages: list[dict[str, Any]], event
     owned = os.fstat(fd)
     os.close(fd)
     counts: dict[str, int] = {}
+    blanks: dict[str, int] = {}
     try:
         conn = sqlite3.connect(building)
         try:
@@ -484,15 +485,17 @@ def _write(db_path: Path, res: Resolution, messages: list[dict[str, Any]], event
                  json.dumps(e["source_refs"]), e["native_event_id"]) for e in events])
             for rel, path in files:
                 data = path.read_bytes()
-                counts[rel] = sum(1 for line in data.decode("utf-8", errors="replace").splitlines() if line.strip())
+                physical = data.splitlines()
+                counts[rel] = len(physical)
+                blanks[rel] = sum(not line.strip() for line in physical)
                 conn.execute("INSERT INTO projector_state (file, lines, sha256, projector_version) VALUES (?, ?, ?, ?)",
-                             (rel, counts[rel], hashlib.sha256(data).hexdigest(), PROJECTOR_VERSION))
+                             (rel, counts[rel] - blanks[rel], hashlib.sha256(data).hexdigest(), PROJECTOR_VERSION))
             conn.commit()
         finally:
             conn.close()
         os.chmod(building, 0o600)
         os.replace(building, db_path)
-        return counts
+        return counts, blanks
     finally:
         try:
             current = building.lstat()
@@ -504,15 +507,19 @@ def _write(db_path: Path, res: Resolution, messages: list[dict[str, Any]], event
 
 
 def _report(ex: Extracted, res: Resolution, messages: list[dict[str, Any]], events: list[dict[str, Any]],
-            line_counts: dict[str, int], unattached: int) -> dict[str, Any]:
+            line_counts: dict[str, int], blanks: dict[str, int], unattached: int) -> dict[str, Any]:
     outcomes: dict[str, dict[str, int]] = defaultdict(dict)
     for (file, outcome), n in sorted(ex.outcomes.items()):
         outcomes[file][outcome] = n
+    for file, count in blanks.items():
+        if count:
+            outcomes[file]["skipped:blank"] = count
     accounting = {f: {"lines": n, "accounted": sum(outcomes.get(f, {}).values())}
                   for f, n in line_counts.items()}
     live = [c for c in res.contacts if c.merged_into is None]
     return {
         "files": len(line_counts), "outcomes": dict(outcomes), "accounting": accounting,
+        "blank_lines_skipped": blanks, "projector_state_line_basis": "nonblank",
         "accounting_ok": all(v["lines"] == v["accounted"] for v in accounting.values()),
         "contacts": len(live), "provisional_contacts": sum(c.status == "provisional" for c in live),
         "merged_contacts": len(res.contacts) - len(live), "messages": len(messages),

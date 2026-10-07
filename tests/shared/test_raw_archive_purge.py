@@ -1557,3 +1557,81 @@ def test_purge_without_pending_evidence_never_blesses_checksum_mismatch(tmp_path
     purge(root, PurgeSelector(channel="whatsapp", chat_id="c1", native_id="erase"), operator="owner")
     assert latest_manifest(root) == original_manifest
     assert "checksum_mismatch:whatsapp/2026-09.jsonl" in verify_archive(root, run_dir=tmp_path / "run", now_ms=OCT).problems
+
+
+@pytest.mark.parametrize("blocked", [False, True])
+@pytest.mark.parametrize("route", ["raw", "description", "transcript", "owner", "import"])
+def test_append_completes_pending_purge_before_new_evidence(tmp_path, monkeypatch, route, blocked):
+    import yeoman_shared.raw_archive.purge as purge_module
+    from yeoman_gateway.history.convert.run import prepare_import_manifest
+    from yeoman_shared.raw_archive.records import append_owner_record, dumps, import_backfill
+
+    root, archive = _setup(tmp_path)
+    if route == "raw":
+        _message(archive, "erase", "c1", OCT)
+        path = root / "whatsapp/2026-10.jsonl"
+    elif route == "owner":
+        path = root / "owner/attestations.jsonl"
+        append_owner_record(root, {"attestation_version": 1, "type": "contact", "channel": "whatsapp",
+                                   "chat_id": "c1", "native_id": "erase", "text": "secret-erase"})
+    else:
+        kind = "media_transcript" if route == "transcript" else "media_description"
+        path = root / "derived" / ("media-transcripts.jsonl" if route == "transcript" else "media-descriptions.jsonl")
+        append = archive.append_media_transcript if route == "transcript" else archive.append_media_description
+        assert append({**_media_description("erase"), "kind": kind})
+    before = path.read_bytes()
+    real_replace = purge_module.os.replace
+    def interrupted(source, target):
+        if Path(target) == path:
+            raise OSError("injected pending publication")
+        return real_replace(source, target)
+    with monkeypatch.context() as patch:
+        patch.setattr(purge_module.os, "replace", interrupted)
+        with pytest.raises(OSError, match="injected"):
+            purge(root, PurgeSelector(channel="whatsapp", chat_id="c1", native_id="erase"), operator="owner")
+    assert path.read_bytes() == before
+    assert len(purge_module._pending_publications(root)) == 1
+    if route == "import":
+        staged = tmp_path / "staged"
+        staged_path = staged / "derived/media-descriptions.jsonl"
+        staged_path.parent.mkdir(parents=True)
+        staged_path.write_text(dumps(_media_description("new")) + "\n")
+        manifest = prepare_import_manifest(staged)
+
+    def publish():
+        if route == "raw":
+            return archive.append(_pending_message("new", received_ms=OCT + 1))
+        if route == "owner":
+            return append_owner_record(root, {"attestation_version": 1, "type": "contact", "channel": "whatsapp",
+                                              "chat_id": "c1", "native_id": "new", "text": "new"})
+        if route == "import":
+            return import_backfill(root, staged, manifest)
+        return append({**_media_description("new"), "kind": kind})
+
+    if blocked:
+        stage = path.with_name(f".{path.name}.purge-tmp")
+        held = stage.with_suffix(".held")
+        stage.rename(held)
+        if route in {"owner", "import"}:
+            with pytest.raises(OSError):
+                publish()
+        else:
+            assert publish() is (route == "transcript")  # transcript reports durable spool acceptance
+            assert len(list(archive.spool.glob("*.json"))) == 1
+            assert archive.drain_spool() == 0  # drain has the same fence
+            assert len(list(archive.spool.glob("*.json"))) == 1
+        assert path.read_bytes() == before
+        assert len(purge_module._pending_publications(root)) == 1
+        held.rename(stage)
+        if route not in {"owner", "import"}:
+            assert archive.drain_spool() == 1
+        else:
+            assert publish()
+    else:
+        assert publish()
+    rows = [row for _, row, _ in iter_records(path)]
+    assert rows[0] == TOMBSTONE and len(rows) == 2
+    assert "erase" not in path.read_text() and "new" in path.read_text()
+    assert not purge_module._pending_publications(root)
+    assert purge(root, PurgeSelector(channel="whatsapp", native_id="new", chat_id="c1"), operator="owner").removed_lines == 1
+    assert [row for _, row, _ in iter_records(path)] == [TOMBSTONE, TOMBSTONE]

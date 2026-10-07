@@ -13,6 +13,7 @@ import hashlib
 import json
 import os
 import re
+import time
 from collections.abc import Callable, Iterator, Mapping
 from dataclasses import dataclass
 from datetime import date, datetime
@@ -97,6 +98,8 @@ def append_line(
         lock_file(coordination_lock, create=True) if coordination_lock is not None else None
     )
     try:
+        if coordination_lock is not None and coordination_lock.name == PURGE_DISPOSITION_LOCK:
+            recover_pending_append(coordination_lock.parent, path)
         while True:
             try:
                 fd = os.open(path, os.O_RDWR | os.O_APPEND | os.O_CREAT | os.O_EXCL, mode)
@@ -140,6 +143,15 @@ def append_line(
             os.close(coordinator_fd)
 
 
+def recover_pending_append(raw_root: Path, path: Path) -> None:
+    """Caller holds the root lock; settle authorized purge bytes before taking the append lock."""
+    # Local import: purge uses these I/O primitives and the writer that calls append_line.
+    from .purge import _recover_pending
+
+    _recover_pending(raw_root, now_ms=int(time.time() * 1000),
+                     destination=path.relative_to(raw_root).as_posix())
+
+
 def validate_owner_envelope(record: Mapping[str, Any]) -> None:
     """Publisher envelope contract, shared by whole-package validation and publication."""
     version = record.get('attestation_version')
@@ -167,6 +179,7 @@ def append_owner_record_locked(raw_root: Path, record: Mapping[str, Any]) -> Com
         nonlocal receipt
         receipt = CommittedLine(relative, number, end)
 
+    recover_pending_append(raw_root, path)
     append_line(path, line,
                 should_append=lambda: not _owner_is_disposed(raw_root, record, line),
                 on_committed=committed)
@@ -807,6 +820,8 @@ def import_backfill(raw_root: Path, staged_root: Path, manifest: Mapping[str, An
     preview_import(raw_root, staged_root, manifest)  # Invalid packages/destinations create nothing.
     coordinator = lock_file(raw_root / PURGE_DISPOSITION_LOCK, create=True)
     try:
+        for relative in blobs:
+            recover_pending_append(raw_root, raw_root / relative)
         receipt = _import_receipt(raw_root, manifest['package_digest'])
         result, additions = _import_plan(raw_root, blobs, manifest, receipt)
         if receipt and receipt['status'] == 'complete':

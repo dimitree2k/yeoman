@@ -122,12 +122,13 @@ class TestFindSourceRepo:
 
 def test_deploy_dry_run_exits_zero() -> None:
     """Integration test: yeoman deploy --dry-run should succeed."""
+    repo = Path(__file__).resolve().parents[2]
     result = subprocess.run(
         ["yeoman", "deploy", "--dry-run"],
         capture_output=True,
         text=True,
-        cwd=str(Path.home() / "Documents" / "yeoman"),
-        env={**os.environ, "YEOMAN_SOURCE_DIR": str(Path.home() / "Documents" / "yeoman")},
+        cwd=repo,
+        env={**os.environ, "YEOMAN_SOURCE_DIR": str(repo)},
     )
     assert result.returncode == 0, f"deploy --dry-run failed:\n{result.stderr}"
 
