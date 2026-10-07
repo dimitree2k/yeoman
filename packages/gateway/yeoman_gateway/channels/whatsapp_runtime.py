@@ -32,6 +32,7 @@ MANIFEST_FILENAME = "bridge.manifest.json"
 DEFAULT_BUILD_ID = "dev"
 STARTUP_HEALTH_RETRIES = 2
 STARTUP_HEALTH_RETRY_BASE_DELAY_S = 1.0
+BRIDGE_RUNTIME_IGNORE_PATTERNS = ("node_modules", "src", "*.ts", "*.d.ts")
 
 
 @dataclass(slots=True)
@@ -215,11 +216,18 @@ class WhatsAppRuntimeManager:
         hasher.update(f"buildId={manifest.build_id}\n".encode())
 
         files = [(name, root / name) for name in (MANIFEST_FILENAME, "package.json")]
-        files.extend(
-            (f"dist/{path.relative_to(root / 'dist').as_posix()}", path)
-            for path in sorted((root / "dist").rglob("*"))
-            if path.is_file()
-        )
+        ignore = shutil.ignore_patterns(*BRIDGE_RUNTIME_IGNORE_PATTERNS)
+        dist = root / "dist"
+        for directory, dirnames, filenames in os.walk(dist, followlinks=True):
+            ignored = ignore(directory, dirnames + filenames)
+            dirnames[:] = sorted(name for name in dirnames if name not in ignored)
+            files.extend(
+                (path.relative_to(root).as_posix(), path)
+                for name in sorted(filenames)
+                if name not in ignored
+                for path in (Path(directory) / name,)
+            )
+        files.sort(key=lambda item: item[0])
         for name, file_path in files:
             hasher.update(f"name:{name}\n".encode())
             hasher.update(file_path.read_bytes())
@@ -279,7 +287,7 @@ class WhatsAppRuntimeManager:
         shutil.copytree(
             source,
             tmp_dir,
-            ignore=shutil.ignore_patterns("node_modules", "src", "*.ts", "*.d.ts"),
+            ignore=shutil.ignore_patterns(*BRIDGE_RUNTIME_IGNORE_PATTERNS),
         )
 
         self._validate_bridge_artifacts(tmp_dir)

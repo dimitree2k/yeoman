@@ -258,6 +258,13 @@ def test_runtime_refreshes_when_non_entry_dist_module_changes(tmp_path, monkeypa
         for name in ("index.js", "server.js", "protocol.js", "whatsapp.js"):
             (root / "dist" / name).write_text(name)
         (root / "dist" / "message_reference_store.js").write_text("old")
+    linked_artifacts = tmp_path / "linked-artifacts"
+    linked_artifacts.mkdir()
+    (linked_artifacts / "nested.js").write_text("old linked artifact")
+    (source / "dist" / "linked").symlink_to(linked_artifacts, target_is_directory=True)
+    (target / "dist" / "linked").mkdir()
+    (target / "dist" / "linked" / "nested.js").write_text("old linked artifact")
+    (source / "dist" / "message_reference_store.d.ts").write_text("source types")
 
     manager = WhatsAppRuntimeManager(
         source_bridge_dir=source,
@@ -267,9 +274,27 @@ def test_runtime_refreshes_when_non_entry_dist_module_changes(tmp_path, monkeypa
 
     assert manager.ensure_runtime() == target
     assert manager._runtime_refreshed is False
+    assert not (target / "dist" / "message_reference_store.d.ts").exists()
 
     (source / "dist" / "message_reference_store.js").write_text("new")
 
     assert manager.ensure_runtime() == target
     assert manager._runtime_refreshed is True
     assert (target / "dist" / "message_reference_store.js").read_text() == "new"
+    assert not (target / "dist" / "message_reference_store.d.ts").exists()
+
+    backups = set(target.parent.glob("runtime.bak-*"))
+    assert manager.ensure_runtime() == target
+    assert manager._runtime_refreshed is False
+    assert set(target.parent.glob("runtime.bak-*")) == backups
+
+    (source / "dist" / "message_reference_store.d.ts").write_text("updated source types")
+    assert manager.ensure_runtime() == target
+    assert manager._runtime_refreshed is False
+    assert set(target.parent.glob("runtime.bak-*")) == backups
+    assert not (target / "dist" / "message_reference_store.d.ts").exists()
+
+    (linked_artifacts / "nested.js").write_text("updated linked artifact")
+    assert manager.ensure_runtime() == target
+    assert manager._runtime_refreshed is True
+    assert (target / "dist" / "linked" / "nested.js").read_text() == "updated linked artifact"
