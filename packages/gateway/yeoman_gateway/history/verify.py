@@ -14,7 +14,7 @@ from typing import Any
 from .convert.common import open_ro
 from .extract import extract
 from .layer1 import canonical_json, iter_layer1, layer1_files
-from .project import _events, project
+from .project import _authors, _events, project
 from .resolve import resolve
 
 TABLES = ("contacts", "identifier_history", "messages", "message_events")
@@ -70,9 +70,10 @@ def verify(roots: Sequence[Path], db_path: Path, *, scratch: Path | None) -> dic
     report: dict[str, Any] = {"coverage": coverage(db_path)}
     ex = extract(iter_layer1(roots))
     resolution = resolve(ex.identity)
+    authors = _authors(ex, resolution)
     with closing(_open(db_path)) as conn:
         message_ids = {row[0] for row in conn.execute("SELECT message_id FROM messages")}
-    _events(ex, resolution, resolution.role_contact.get("assistant"), message_ids, resolution.review)
+    _events(ex, resolution, resolution.role_contact.get("assistant"), message_ids, resolution.review, authors)
     report["review"] = resolution.review
     accounted: Counter[str] = Counter()
     for (file, _), count in ex.outcomes.items():

@@ -578,3 +578,285 @@ def test_project_identifier_ended_applicability_and_provenance(tmp_path, case):
     else:
         assert all(row[:2] == (None, None) for row in rows)
         assert report['review']['identifier_ended_not_applied'][0]['resolution'] == case
+
+
+# Task 3 fixtures deliberately use synthetic people, chats and content.
+_T3_OWNER, _T3_OTHER, _T3_CHAT = '91001@lid', '91002@lid', '91000@g.us'
+
+
+def _t3_message(native_id, text, sender=_T3_OTHER):
+    return _bf('memory', 'message', {'messageId': native_id, 'senderId': sender, 'text': text},
+               chat=_T3_CHAT, provenance='verbatim_unverified')
+
+
+def _t3_contacts():
+    return [make('contact', 1, 'synthetic owner', identifiers=[_T3_OWNER], role='owner'),
+            make('contact', 1, 'synthetic other', identifiers=[_T3_OTHER])]
+
+
+def test_author_base_ref_selects_only_native_id_segment(tmp_path):
+    from yeoman_gateway.history import attestations
+
+    assert callable(getattr(attestations, "resolve_author_targets", None)), "Task 3 target resolver missing"
+    resolve_author_targets = attestations.resolve_author_targets
+    from yeoman_gateway.history.extract import extract
+    from yeoman_gateway.history.layer1 import iter_layer1
+    from yeoman_gateway.history.verify import verify
+
+    root = tmp_path / 'layer1'
+    segments = [{'senderId': f'{92000+i}@lid', 'text': f'synthetic speaker {i}',
+                 'messageId': 'LAST' if i == 6 else None} for i in range(7)]
+    row = _t3_message('LAST', None)
+    row['payload']['segments'] = segments
+    multiple = _t3_message('REPEATED', None)
+    multiple['payload']['segments'] = [{'messageId': 'REPEATED', 'text': 'one'},
+                                       {'messageId': 'REPEATED', 'text': 'two'}]
+    no_match = _t3_message('ABSENT', None)
+    no_match['payload']['segments'] = [{'text': 'no native id'}]
+    write_jsonl(root / 'backfill/memory.jsonl', [row, multiple, no_match])
+    # Content-free purged slot; Task 4 owns the concrete tombstone writer/grammar.
+    write_jsonl(root / 'whatsapp/slots.jsonl', [{}, _raw('receipt', 'receipt', {})])
+    targets = ['backfill/memory.jsonl#1', 'backfill/memory.jsonl#1/0',
+               'backfill/memory.jsonl#2', 'backfill/memory.jsonl#3',
+               'whatsapp/slots.jsonl#1', 'whatsapp/slots.jsonl#2', 'whatsapp/slots.jsonl#99']
+    records = _t3_contacts() + [make('author', 10+i, 'synthetic correction', source_ref=ref,
+                                    anchor=_T3_OWNER) for i, ref in enumerate(targets)]
+    write_jsonl(root / 'owner/attestations.jsonl', records)
+    ex = extract(iter_layer1([root]))
+    winners, review = resolve_author_targets(ex.attestations, ex.messages, ex.events)
+    assert set(winners) == {'backfill/memory.jsonl#1/6', 'backfill/memory.jsonl#1/0'}
+    assert len(review) == 5
+    assert {r['attestation_ref'] for r in review} == {
+        f'owner/attestations.jsonl#{n}' for n in range(5, 10)}
+    db = tmp_path / 'history.db'
+    report = project([root], db)
+    with closing(sqlite3.connect(db)) as conn:
+        owner = conn.execute("SELECT contact_id FROM contacts WHERE role='owner'").fetchone()[0]
+        rows = conn.execute('SELECT text, sender_contact_id, sender_identifier, sender_basis, source_refs FROM messages').fetchall()
+        for i in range(7):
+            (message,) = [r for r in rows if r[0] == f'synthetic speaker {i}']
+            assert message[2] == f'{92000+i}@lid'
+            if i in (0, 6):
+                assert message[1] == owner and message[3] == 'owner_attested'
+                assert f'owner/attestations.jsonl#{3 if i == 6 else 4}' in json.loads(message[4])
+            else:
+                assert message[1] != owner and message[3] == 'derived_claim'
+                assert json.loads(message[4]) == [f'backfill/memory.jsonl#1/{i}']
+    assert report['accounting_ok'] and len(report['review']['author_targets']) == 5
+    verified = verify([root], db, scratch=None)
+    assert verified['accounting_ok'] and verified['review']['author_targets'] == report['review']['author_targets']
+
+
+def test_event_author_applied_before_clustering(tmp_path):
+    from yeoman_gateway.history.verify import verify
+
+    root = tmp_path / 'layer1'
+    edits = [_raw('edit', 'edit', {'chatJid': _T3_CHAT, 'messageId': 'TARGET',
+                                  'nativeEventId': 'EDIT', 'text': 'synthetic revision',
+                                  'timestamp': T0 // 1000 + i}) for i in (0, 1)]
+    edits += [_raw('edit', 'edit', {'chatJid': _T3_CHAT, 'messageId': 'TARGET',
+                                   'nativeEventId': 'EDIT', 'senderId': _T3_OTHER,
+                                   'text': 'synthetic revision', 'timestamp': T0 // 1000})]
+    edits.append(_raw('reaction', 'reaction', {'chatJid': _T3_CHAT, 'senderId': _T3_CHAT,
+                                              'targetMessageId': 'TARGET', 'emoji': 'x'}))
+    edits.append(_raw('membership_change', 'membership_change',
+                      {'chatJid': _T3_CHAT, 'actor': _T3_CHAT, 'action': 'add', 'participants': []}))
+    write_jsonl(root / 'whatsapp/events.jsonl', edits)
+    write_jsonl(root / 'owner/attestations.jsonl', _t3_contacts())
+    db = tmp_path / 'history.db'
+    project([root], db)
+    with closing(sqlite3.connect(db)) as conn:
+        before = {r[0] for r in conn.execute("SELECT event_id FROM message_events WHERE kind='edit'")}
+    corrections = [make('author', 10, 'synthetic event correction',
+                        source_ref=f'whatsapp/events.jsonl#{i}', anchor=_T3_OWNER if i < 3 else _T3_OTHER)
+                   for i in (1, 2, 3)]
+    write_jsonl(root / 'owner/attestations.jsonl', _t3_contacts() + corrections)
+    report = project([root], db)
+    with closing(sqlite3.connect(db)) as conn:
+        owner = conn.execute("SELECT contact_id FROM contacts WHERE role='owner'").fetchone()[0]
+        rows = conn.execute("SELECT event_id, actor_contact_id, actor_identifier, actor_basis, source_refs FROM message_events WHERE kind='edit'").fetchall()
+        assert len(rows) == 2
+        (corrected,) = [r for r in rows if r[1] == owner]
+        assert corrected[0] not in before
+        assert corrected[2:4] == (None, 'owner_attested')
+        assert set(json.loads(corrected[4])) == {'whatsapp/events.jsonl#1', 'whatsapp/events.jsonl#2',
+                                                'owner/attestations.jsonl#3', 'owner/attestations.jsonl#4'}
+        (other,) = [r for r in rows if r[1] != owner]
+        assert other[2:4] == (_T3_OTHER, 'owner_attested')
+        assert conn.execute("SELECT actor_contact_id FROM message_events WHERE kind='reaction'").fetchone()[0] is None
+        assert conn.execute("SELECT actor_contact_id, actor_identifier, actor_basis FROM message_events WHERE kind='member_add'").fetchone() == (None, _T3_CHAT, 'native_identifier')
+    conflicts = report['review']['author_targets']
+    assert any(r['reason'] == 'conflicting_entity_authors' and len(r['claims']) == 3 for r in conflicts)
+    assert report['accounting_ok']
+    assert verify([root], db, scratch=None)['review']['author_targets'] == conflicts
+    project([root], tmp_path / 'again.db')
+    with closing(sqlite3.connect(tmp_path / 'again.db')) as conn:
+        assert {r[0] for r in conn.execute("SELECT event_id FROM message_events WHERE kind='edit'")} == {r[0] for r in rows}
+
+
+def test_distinct_owner_rows_with_repeated_native_id_are_reviewed(tmp_path):
+    root = tmp_path / 'layer1'
+    records = []
+    for text in ('synthetic request', 'synthetic follow-up'):
+        row = _t3_message('COLLISION', None)
+        row['payload']['segments'] = [{'senderId': _T3_OTHER, 'text': 'surrounding speaker'},
+                                       {'senderId': _T3_OTHER, 'text': text, 'messageId': 'COLLISION'}]
+        records.append(row)
+    write_jsonl(root / 'backfill/memory.jsonl', records)
+    write_jsonl(root / 'owner/attestations.jsonl', _t3_contacts() + [
+        make('author', 10, 'synthetic exact-row correction', source_ref=f'backfill/memory.jsonl#{i}/1',
+             anchor=_T3_OWNER) for i in (1, 2)])
+    db = tmp_path / 'history.db'
+    report = project([root], db)
+    collision = report['review']['message_id_collisions']
+    assert collision == [{'message_id': f'whatsapp:{_T3_CHAT}:COLLISION',
+                          'copies': [{'source_ref': f'backfill/memory.jsonl#{i}/1', 'text': text,
+                                      'attestation_ref': f'owner/attestations.jsonl#{i+2}'}
+                                     for i, text in enumerate(('synthetic request', 'synthetic follow-up'), 1)]}]
+    with closing(sqlite3.connect(db)) as conn:
+        owner = conn.execute("SELECT contact_id FROM contacts WHERE role='owner'").fetchone()[0]
+        row = conn.execute("SELECT text, sender_contact_id, sender_identifier, source_refs FROM messages WHERE native_message_id='COLLISION'").fetchone()
+        assert row[:3] == ('synthetic request', owner, _T3_OTHER)
+        assert set(json.loads(row[3])) == {'backfill/memory.jsonl#1/1', 'backfill/memory.jsonl#2/1',
+                                         'owner/attestations.jsonl#3', 'owner/attestations.jsonl#4'}
+        assert conn.execute("SELECT count(*) FROM messages WHERE text='surrounding speaker' AND sender_contact_id=?", (owner,)).fetchone()[0] == 0
+    assert report['accounting_ok']
+
+
+@pytest.mark.parametrize('case,offset,time_basis,transfer,expected', [
+    ('within', 50, 'provider_timestamp', False, 'A'),
+    ('expired', 200, 'provider_timestamp', False, None),
+    ('transfer_exact', 50, 'provider_timestamp', True, 'A'),
+    ('transfer_approximate_before', 50, 'capture_time_approx', True, 'A'),
+    ('transfer_approximate', 200, 'capture_time_approx', True, None),
+    ('transfer_unknown', None, 'unknown', True, None),
+])
+def test_author_correction_uses_target_copy_time(tmp_path, case, offset, time_basis, transfer, expected):
+    from yeoman_gateway.history.verify import verify
+
+    a, b, phone = '95001@lid', '95002@lid', '95003@s.whatsapp.net'
+    root = tmp_path / 'layer1'
+    occurred = T0 + offset if offset is not None else None
+    contacts = [make('contact', 1, 'synthetic A', identifiers=[a]),
+                make('contact', 1, 'synthetic B', identifiers=[b]),
+                make('identifier', 2, 'synthetic old window', anchor=a, identifier=phone,
+                     valid_from_ms=T0, valid_until_ms=T0 + 100)]
+    if transfer:
+        contacts.append(make('identifier', 3, 'synthetic transfer', anchor=b, identifier=phone,
+                             valid_from_ms=T0 + 100))
+    message = _bf('memory', 'message', {'messageId': 'TIMED', 'text': 'synthetic timed message'},
+                  chat=_T3_CHAT, ms=occurred, certainty=time_basis)
+    event = _bf('memory', 'edit', {'targetMessageId': 'TIMED', 'nativeEventId': 'TIMED-EDIT',
+                                 'text': 'synthetic timed revision'},
+                chat=_T3_CHAT, ms=occurred, certainty=time_basis)
+    write_jsonl(root / 'backfill/memory.jsonl', [message, event])
+    # One legacy decision targets two message copies: unresolved accounting/review is per decision.
+    write_jsonl(root / 'backfill/journal.jsonl', [message])
+    write_jsonl(root / 'owner/attestations.jsonl', contacts)
+    db = tmp_path / 'history.db'
+    project([root], db)
+    with closing(sqlite3.connect(db)) as conn:
+        before = conn.execute('SELECT event_id FROM message_events').fetchone()[0]
+    corrections = [make('message_author', T0 + 500, 'synthetic timed legacy author',
+                        message_id=f'whatsapp:{_T3_CHAT}:TIMED', anchor=phone),
+                   make('author', T0 + 500, 'synthetic timed event author',
+                        source_ref='backfill/memory.jsonl#2', anchor=phone)]
+    write_jsonl(root / 'owner/attestations.jsonl', contacts + corrections)
+    report = project([root], db)
+    with closing(sqlite3.connect(db)) as conn:
+        ids = dict(conn.execute('SELECT value, contact_id FROM identifier_history WHERE value IN (?,?)', (a, b)))
+        contact = ids[a] if expected == 'A' else None
+        basis = 'owner_attested' if expected else 'unknown'
+        assert conn.execute('SELECT sender_contact_id, sender_basis, sender_identifier FROM messages').fetchone() == (contact, basis, None)
+        edit = conn.execute('SELECT actor_contact_id, actor_basis, actor_identifier, event_id FROM message_events').fetchone()
+        assert edit[:3] == (contact, basis, None)
+        assert (edit[3] != before) == bool(expected)
+    reviews = report['review']['author_targets']
+    if expected:
+        assert reviews == []
+        assert report['outcomes']['owner/attestations.jsonl']['attestation'] == len(contacts) + 2
+    else:
+        assert len(reviews) == 2 and all(r['reason'] == 'unresolved_author_anchor' for r in reviews)
+        assert {r['attestation_ref'] for r in reviews} == {
+            f'owner/attestations.jsonl#{len(contacts)+i}' for i in (1, 2)}
+        assert report['outcomes']['owner/attestations.jsonl']['skipped:invalid_author_target'] == 2
+        assert report['outcomes']['owner/attestations.jsonl']['attestation'] == len(contacts)
+    verified = verify([root], db, scratch=None)
+    assert report['accounting_ok'] and verified['accounting_ok']
+    assert report['accounting'] == verified['accounting']
+    assert reviews == verified['review']['author_targets']
+
+
+def test_event_author_contradiction_retains_divergent_payloads(tmp_path):
+    from yeoman_gateway.history.verify import verify
+
+    root = tmp_path / 'layer1'
+    write_jsonl(root / 'backfill/memory.jsonl', [
+        _bf('memory', 'edit', {'nativeEventId': 'SHARED-EDIT', 'targetMessageId': target,
+                             'text': text, 'senderId': _T3_OTHER}, chat=_T3_CHAT, ms=T0+i)
+        for i, (target, text) in enumerate([('TARGET-A', 'synthetic revision one'),
+                                           ('TARGET-B', 'synthetic revision two')])])
+    write_jsonl(root / 'owner/attestations.jsonl', _t3_contacts() + [
+        make('author', 10, 'synthetic divergent event correction',
+             source_ref=f'backfill/memory.jsonl#{i}', anchor=anchor)
+        for i, anchor in enumerate((_T3_OWNER, _T3_OTHER), 1)])
+    db = tmp_path / 'history.db'
+    report = project([root], db)
+    (conflict,) = [r for r in report['review']['author_targets']
+                   if r['reason'] == 'conflicting_entity_authors']
+    assert conflict['entity'] == ['edit', 'whatsapp', _T3_CHAT, 'SHARED-EDIT']
+    assert [(c['source_ref'], c['target_native_id'], c['payload']) for c in conflict['claims']] == [
+        ('backfill/memory.jsonl#1', 'TARGET-A', {'text': 'synthetic revision one'}),
+        ('backfill/memory.jsonl#2', 'TARGET-B', {'text': 'synthetic revision two'})]
+    assert {c['attestation_ref'] for c in conflict['claims']} == {
+        'owner/attestations.jsonl#3', 'owner/attestations.jsonl#4'}
+    with closing(sqlite3.connect(db)) as conn:
+        rows = conn.execute('SELECT native_event_id, target_native_id, payload_json, actor_contact_id, actor_identifier, source_refs FROM message_events').fetchall()
+        assert len(rows) == 2 and len({r[3] for r in rows}) == 2
+        assert {r[0] for r in rows} == {'SHARED-EDIT'}
+        assert {r[1] for r in rows} == {'TARGET-A', 'TARGET-B'}
+        assert {json.loads(r[2])['text'] for r in rows} == {'synthetic revision one', 'synthetic revision two'}
+        assert {r[4] for r in rows} == {_T3_OTHER}
+        assert set().union(*(set(json.loads(r[5])) for r in rows)) == {
+            'backfill/memory.jsonl#1', 'backfill/memory.jsonl#2',
+            'owner/attestations.jsonl#3', 'owner/attestations.jsonl#4'}
+    assert verify([root], db, scratch=None)['review']['author_targets'] == report['review']['author_targets']
+
+
+def test_author_purged_segment_keeps_surviving_refs_and_accounting(tmp_path):
+    from yeoman_gateway.history.attestations import resolve_author_targets
+    from yeoman_gateway.history.extract import extract
+    from yeoman_gateway.history.layer1 import iter_layer1
+    from yeoman_gateway.history.verify import verify
+
+    root = tmp_path / 'layer1'
+    parent = _t3_message('SURVIVING-LAST', 'synthetic parent text')
+    parent['payload']['segments'] = [
+        {'senderId': '96001@lid', 'text': 'synthetic first', 'messageId': None},
+        {},  # Grammar-neutral content-free purged slot; Task 4 owns the marker.
+        {'senderId': '96002@lid', 'text': 'synthetic last', 'messageId': 'SURVIVING-LAST'}]
+    write_jsonl(root / 'backfill/memory.jsonl', [parent])
+    write_jsonl(root / 'owner/attestations.jsonl', _t3_contacts() + [
+        make('author', 10, 'synthetic purged segment target', source_ref='backfill/memory.jsonl#1/1',
+             anchor=_T3_OWNER)])
+    ex = extract(iter_layer1([root]))
+    assert [(c.ref, c.sender_raw, c.native_id) for c in ex.messages] == [
+        ('backfill/memory.jsonl#1/0', '96001@lid', None),
+        ('backfill/memory.jsonl#1/2', '96002@lid', 'SURVIVING-LAST')]
+    winners, review = resolve_author_targets(ex.attestations, ex.messages, ex.events)
+    assert winners == {} and len(review) == 1
+    assert review[0]['reason'] == 'missing_or_non_content_target'
+    assert review[0]['target'] == 'backfill/memory.jsonl#1/1'
+    db = tmp_path / 'history.db'
+    report = project([root], db)
+    with closing(sqlite3.connect(db)) as conn:
+        rows = conn.execute('SELECT text, sender_identifier, native_message_id, source_refs, sender_basis FROM messages ORDER BY text').fetchall()
+        assert rows == [('synthetic first', '96001@lid', None, '["backfill/memory.jsonl#1/0"]', 'derived_claim'),
+                        ('synthetic last', '96002@lid', 'SURVIVING-LAST', '["backfill/memory.jsonl#1/2"]', 'derived_claim')]
+    verified = verify([root], db, scratch=None)
+    for result in (report, verified):
+        assert result['accounting_ok']
+        assert result['accounting']['backfill/memory.jsonl'] == {'lines': 1, 'accounted': 1}
+        assert len(result['review']['author_targets']) == 1
+    assert report['review']['author_targets'] == verified['review']['author_targets']
+    assert report['outcomes']['owner/attestations.jsonl']['skipped:invalid_author_target'] == 1

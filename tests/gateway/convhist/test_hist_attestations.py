@@ -123,3 +123,43 @@ def test_author_and_legacy_attestations_round_trip():
         "message_id": "M1", "anchor": "1@lid"}
     legacy.pop("attestation_version")
     assert parse(Layer1Line("owner/attestations.jsonl#2", legacy)).type == "message_author"
+
+
+def test_author_precedence_across_legacy_and_source_ref():
+    from itertools import permutations
+
+    from yeoman_gateway.history import attestations
+
+    assert callable(getattr(attestations, "resolve_author_targets", None)), "Task 3 target resolver missing"
+    resolve_author_targets = attestations.resolve_author_targets
+    from yeoman_gateway.history.extract import extract
+
+    chat, a, b = '93000@g.us', '93001@lid', '93002@lid'
+    lines = [Layer1Line('whatsapp/messages.jsonl#1', {
+        'channel': 'whatsapp', 'kind': 'message', 'native': {'type': 'message', 'payload': {
+            'chatJid': chat, 'messageId': 'SYNTHETIC', 'senderId': a, 'text': 'synthetic text'}}})]
+    ex = extract(lines)
+    claims = [parse(Layer1Line(ref, make(kind, at, 'synthetic decision', anchor=anchor, **fields)))
+              for ref, kind, at, anchor, fields in [
+                  ('owner/a.jsonl#1', 'message_author', 20, a, {'message_id': f'whatsapp:{chat}:SYNTHETIC'}),
+                  ('owner/b.jsonl#1', 'author', 10, b, {'source_ref': lines[0].ref}),
+                  ('owner/z.jsonl#1', 'author', 20, b, {'source_ref': lines[0].ref})]]
+    expected = None
+    for order in permutations(claims):
+        winners, review = resolve_author_targets(order, ex.messages, ex.events)
+        assert winners == {lines[0].ref: claims[2]}
+        assert len(review) == 1 and review[0]['reason'] == 'conflicting_author_claims'
+        assert review[0]['winner_ref'] == claims[2].ref
+        assert {c['attestation_ref'] for c in review[0]['claims']} == {c.ref for c in claims}
+        assert [c['anchor'] for c in review[0]['claims']].count(a) == 1
+        if expected is None:
+            expected = review
+        assert review == expected
+    winners, _ = resolve_author_targets(claims[:2], ex.messages, ex.events)
+    assert winners[lines[0].ref] == claims[0]  # timestamp beats type/source-ref form
+    assert ex.messages[0].sender_raw == a
+    for target in (123, True, {"invalid": "target"}, ["invalid"]):
+        invalid = parse(Layer1Line("owner/invalid.jsonl#1", make(
+            "message_author", 1, "synthetic malformed legacy target", message_id=target, anchor=a)))
+        winners, review = resolve_author_targets([invalid], ex.messages, ex.events)
+        assert not winners and review[0]["reason"] == "invalid_target"

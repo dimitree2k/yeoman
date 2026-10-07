@@ -59,6 +59,8 @@ class MessageCopy:
     inferred_sender: bool = False
     extra_refs: tuple[str, ...] = ()
     batch_key: str | None = None
+    segmented: bool = False
+    parent_native_id: str | None = None
 
 
 @dataclass
@@ -166,7 +168,8 @@ def _observe(out: Extracted, idents: list[Ident], sender: Ident | None, name: An
 def _message(out: Extracted, ref: str, p: dict[str, Any], *, channel: str, chat: str,
              native_id: Any, direction: str, ms: int | None, certainty: str, provenance: str,
              from_assistant: bool | None = None, media: Any = None, description: str | None = None,
-             mentions: Any = None, extra_refs: tuple[str, ...] = (), batch_key: str | None = None) -> None:
+             mentions: Any = None, extra_refs: tuple[str, ...] = (), batch_key: str | None = None,
+             segmented: bool = False, parent_native_id: str | None = None) -> None:
     assistant = bool(p.get("fromAssistant")) if from_assistant is None else from_assistant
     sender, sender_raw, idents = (None, None, []) if assistant else _sender(p, allow_group=False)
     name = None if assistant else p.get("senderName")
@@ -182,7 +185,7 @@ def _message(out: Extracted, ref: str, p: dict[str, Any], *, channel: str, chat:
         description=description or cleaned.description, reply_to=p.get("replyToMessageId") or None,
         mentions=mentions if isinstance(mentions, list) and mentions else None, provenance=provenance,
         inferred_sender=bool(p.get("senderInferredFromChat")), extra_refs=extra_refs,
-        batch_key=batch_key,
+        batch_key=batch_key, segmented=segmented, parent_native_id=parent_native_id,
     ))
     if not assistant:
         _observe(out, idents, sender, name, ms, ref,
@@ -392,7 +395,8 @@ def _backfill(line: Layer1Line, out: Extracted) -> None:
             parent_media = p.get("media") if isinstance(p.get("media"), dict) else (
                 {"kind": p["mediaKind"]} if p.get("mediaKind") else None)
             for index, segment in enumerate(segments):
-                if not isinstance(segment, dict):
+                if not isinstance(segment, dict) or not any(
+                        key in segment for key in ("text", "messageId", "senderId", "media", "mediaKind")):
                     continue
                 segment_payload = {**p, **segment}
                 segment_payload.pop("segments", None)
@@ -410,7 +414,8 @@ def _backfill(line: Layer1Line, out: Extracted) -> None:
                          certainty=record.get("time_certainty") or "unknown",
                          provenance=segment.get("provenance") or provenance,
                          media=segment_media, description=segment.get("description"),
-                         batch_key=batch_key)
+                         batch_key=batch_key, segmented=True,
+                         parent_native_id=str(last_id) if last_id else None)
             out.count(line.ref, "message")
             return
         media = p.get("media") if isinstance(p.get("media"), dict) else (

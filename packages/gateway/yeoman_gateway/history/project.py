@@ -9,13 +9,15 @@ import os
 import sqlite3
 from collections import defaultdict
 from collections.abc import Sequence
+from dataclasses import dataclass
 from pathlib import Path
 from typing import Any
 
 from yeoman_shared.raw_archive.paths import is_protected
 
+from .attestations import Attestation, message_copy_id, resolve_author_targets
 from .extract import EventCopy, Extracted, MessageCopy, extract
-from .ids import Ident
+from .ids import Ident, classify
 from .layer1 import canonical_json, iter_layer1, layer1_files
 from .resolve import Resolution, resolve
 from .schema import PROJECTOR_VERSION, create
@@ -26,6 +28,12 @@ _PROVENANCE = {"native": 0, "recovered_text": 1, "verbatim_unverified": 2, "deri
 Key = tuple[str, str, str]
 
 
+@dataclass(frozen=True)
+class AuthorCorrection:
+    attestation: Attestation
+    contact_id: str | None
+
+
 def project(roots: Sequence[Path], db_path: Path) -> dict[str, Any]:
     if is_protected(db_path):
         raise PermissionError(f"refusing to write history.db into the raw archive: {db_path}")
@@ -33,13 +41,49 @@ def project(roots: Sequence[Path], db_path: Path) -> dict[str, Any]:
     ex = extract(iter_layer1(roots))
     res = resolve(ex.identity)
     arvid = res.role_contact.get("assistant")
-    authors = {a.fields["message_id"]: res.contact_for_anchor(a.fields["anchor"])
-               for a in sorted(ex.attestations, key=lambda a: (a.at_ms, a.ref))
-               if a.type == "message_author"}
+    authors = _authors(ex, res)
     messages, unattached = _messages(ex, res, arvid, authors)
-    events = _events(ex, res, arvid, {m["message_id"] for m in messages}, res.review)
+    events = _events(ex, res, arvid, {m["message_id"] for m in messages}, res.review, authors)
     line_counts = _write(db_path, res, messages, events, files)
     return _report(ex, res, messages, events, line_counts, unattached)
+
+
+def _authors(ex: Extracted, res: Resolution) -> dict[str, AuthorCorrection]:
+    winners, review = resolve_author_targets(ex.attestations, ex.messages, ex.events)
+    copies = {copy.ref: copy for copy in [*ex.messages, *ex.events]}
+    authors: dict[str, AuthorCorrection] = {}
+    unresolved: dict[str, dict[str, Any]] = {}
+    for ref, att in winners.items():
+        copy = copies[ref]
+        contact, _ = res.resolve(classify(att.fields["anchor"]), occurred_ms=copy.occurred_ms,
+                                 time_basis=copy.time_certainty)
+        authors[ref] = AuthorCorrection(att, contact)
+        if contact is None:
+            item = unresolved.setdefault(att.ref, {
+                "reason": "unresolved_author_anchor", "attestation_ref": att.ref,
+                "anchor": att.fields["anchor"], "targets": []})
+            item["targets"].append({"source_ref": ref, "occurred_ms": copy.occurred_ms,
+                                    "time_basis": copy.time_certainty})
+    review.extend(unresolved.values())
+    invalid = {r["attestation_ref"] for r in review if "attestation_ref" in r}
+    for att in ex.attestations:
+        if att.ref in invalid:
+            file = att.ref.split("#", 1)[0]
+            ex.outcomes[(file, "attestation")] -= 1
+            ex.count(att.ref, "skipped:invalid_author_target")
+    res.review["author_targets"] = sorted(review, key=canonical_json)
+    keyed: dict[str, list[MessageCopy]] = defaultdict(list)
+    for copy in ex.messages:
+        if copy.native_id:
+            keyed[message_copy_id(copy)].append(copy)
+    res.review["message_id_collisions"] = [
+        {"message_id": key, "copies": [
+            {"source_ref": c.ref, "text": c.text,
+             "attestation_ref": authors[c.ref].attestation.ref if c.ref in authors else None}
+            for c in sorted(copies, key=_order)]}
+        for key, copies in sorted(keyed.items())
+        if len({c.text for c in copies if c.text is not None}) > 1]
+    return authors
 
 
 def _order(copy: MessageCopy | EventCopy) -> tuple[int, str]:
@@ -59,7 +103,7 @@ def _direction(copies: Sequence[MessageCopy]) -> str:
 
 
 def _messages(ex: Extracted, res: Resolution, arvid: str | None,
-              authors: dict[str, str | None]) -> tuple[list[dict[str, Any]], int]:
+              authors: dict[str, AuthorCorrection]) -> tuple[list[dict[str, Any]], int]:
     keyed: dict[Key, list[MessageCopy]] = defaultdict(list)
     loose: list[MessageCopy] = []
     for copy in ex.messages:
@@ -159,7 +203,7 @@ def _text_and_provenance(copies: Sequence[MessageCopy]) -> tuple[str | None, str
 
 
 def _message_row(channel: str, chat: str, native_id: str | None, copies: list[MessageCopy],
-                 res: Resolution, arvid: str | None, authors: dict[str, str | None],
+                 res: Resolution, arvid: str | None, authors: dict[str, AuthorCorrection],
                  stable_key: str | None = None) -> dict[str, Any]:
     if native_id:
         message_id = f"{channel}:{chat}:{native_id}"
@@ -171,8 +215,10 @@ def _message_row(channel: str, chat: str, native_id: str | None, copies: list[Me
     sender_identifier = sender_copy.sender_raw if sender_copy is not None and not from_assistant else None
     sent_ms, certainty = _best_time(copies)
     contact: str | None
-    if authors.get(message_id):
-        contact, basis = authors[message_id], "owner_attested"
+    correction = max((authors[c.ref] for c in copies if c.ref in authors),
+                     key=lambda a: (a.attestation.at_ms, a.attestation.ref), default=None)
+    if correction is not None:
+        contact, basis = correction.contact_id, "owner_attested"
     elif from_assistant:
         native = any(c.from_assistant and c.provenance == "native" for c in copies)
         contact, basis = arvid, "native_identifier" if native else "derived_claim"
@@ -195,8 +241,10 @@ def _message_row(channel: str, chat: str, native_id: str | None, copies: list[Me
         "direction": _direction(copies), "sent_ms": sent_ms, "time_certainty": certainty, "text": text,
         "media": media, "reply_to_native_id": next((c.reply_to for c in copies if c.reply_to), None),
         "mentions": next((c.mentions for c in copies if c.mentions), None), "provenance": provenance,
-        "source_refs": sorted({r for c in copies for r in (c.ref, *c.extra_refs)}),
+        "source_refs": sorted({r for c in copies for r in (c.ref, *c.extra_refs)}
+                              | {authors[c.ref].attestation.ref for c in copies if c.ref in authors}),
         "_sender_name": next((c.sender_name for c in copies if c.sender_name), None),
+        "_author_corrected": correction is not None,
     }
 
 
@@ -206,7 +254,7 @@ def _name_fallback(rows: list[dict[str, Any]]) -> None:
         if row["sender_contact_id"] and row["_sender_name"]:
             index[(row["chat_id"], row["_sender_name"])].add(row["sender_contact_id"])
     for row in rows:
-        if (row["sender_contact_id"] is None and row["sender_identifier"] is None
+        if (not row["_author_corrected"] and row["sender_contact_id"] is None and row["sender_identifier"] is None
                 and row["direction"] == "in" and row["_sender_name"]):
             found = index.get((row["chat_id"], row["_sender_name"]), set())
             if len(found) == 1:
@@ -236,7 +284,10 @@ def _attach_media(rows: list[dict[str, Any]], ex: Extracted) -> int:
     return unattached
 
 
-def _actor(copy: EventCopy, res: Resolution, arvid: str | None) -> tuple[str | None, str]:
+def _actor(copy: EventCopy, res: Resolution, arvid: str | None,
+           correction: AuthorCorrection | None = None) -> tuple[str | None, str]:
+    if correction is not None:
+        return correction.contact_id, "owner_attested" if correction.contact_id is not None else "unknown"
     if copy.from_assistant:
         contact, basis = arvid, "native_identifier" if copy.provenance == "native" else "derived_claim"
     elif copy.actor is None:
@@ -244,7 +295,12 @@ def _actor(copy: EventCopy, res: Resolution, arvid: str | None) -> tuple[str | N
     else:
         contact, match = res.resolve(copy.actor, occurred_ms=copy.occurred_ms, time_basis=copy.time_certainty)
         if match == "group":
-            contact, basis = (arvid, "reaction_echo") if copy.kind == "reaction" else (None, "unknown")
+            if copy.kind == "reaction":
+                contact, basis = arvid, "reaction_echo"
+            elif copy.kind.startswith("member_") or copy.kind in ("group_subject", "group_description"):
+                return None, "native_identifier" if copy.provenance == "native" else "derived_claim"
+            else:
+                contact, basis = None, "unknown"
         elif copy.provenance != "native":
             basis = "derived_claim"
         elif match == "numeric_match":
@@ -263,11 +319,11 @@ def _event_complete(copy: EventCopy) -> bool:
 
 
 def _events(ex: Extracted, res: Resolution, arvid: str | None, message_ids: set[str],
-            review: dict[str, Any]) -> list[dict[str, Any]]:
+            review: dict[str, Any], authors: dict[str, AuthorCorrection]) -> list[dict[str, Any]]:
     groups: dict[tuple[str, ...], list[tuple[EventCopy, str | None, str]]] = defaultdict(list)
     purged: list[tuple[tuple[str, ...], tuple[EventCopy, str | None, str]]] = []
     for copy in ex.events:
-        actor, basis = _actor(copy, res, arvid)
+        actor, basis = _actor(copy, res, arvid, authors.get(copy.ref))
         actor_key = actor or (copy.actor.value if copy.actor is not None else "")
         base = (copy.kind, copy.channel, copy.chat_id, copy.target_native_id or "", actor_key)
         item = (copy, actor, basis)
@@ -317,23 +373,26 @@ def _events(ex: Extracted, res: Resolution, arvid: str | None, message_ids: set[
 
     rows: list[dict[str, Any]] = []
     for key, members in clusters:
-        rows.append(_event_row(key, members, message_ids))
+        rows.append(_event_row(key, members, message_ids, authors))
     for copy, actor, basis in unmatched:
         key = (copy.kind, copy.channel, copy.chat_id, copy.target_native_id or "",
                actor or (copy.actor.value if copy.actor is not None else ""), canonical_json(copy.payload))
-        rows.append(_event_row(key, [(copy, actor, basis)], message_ids))
+        rows.append(_event_row(key, [(copy, actor, basis)], message_ids, authors))
     _mark_current_reactions(rows)
     rows.sort(key=lambda r: r["event_id"])
     return rows
 
 
 def _event_row(key: tuple[str, ...], members: list[tuple[EventCopy, str | None, str]],
-               message_ids: set[str]) -> dict[str, Any]:
+               message_ids: set[str], authors: dict[str, AuthorCorrection]) -> dict[str, Any]:
     kind, channel, chat, target, _, payload_json = key
     copies = [c for c, _, _ in members]
     actor_item = min((item for item in members if item[0].actor_raw), default=min(members, key=lambda x: _order(x[0])),
                      key=lambda x: _order(x[0]))
-    actor, basis = actor_item[1], actor_item[2]
+    corrected = [item for item in members if item[0].ref in authors]
+    actor, basis = (max(corrected, key=lambda item: (authors[item[0].ref].attestation.at_ms,
+                                                   authors[item[0].ref].attestation.ref))[1:]
+                    if corrected else actor_item[1:])
     occurred_ms, certainty = _best_time(copies)
     first = min(copies, key=lambda c: (c.occurred_ms is None, c.occurred_ms or 0, c.rank, c.ref))
     event_id = hashlib.sha256(canonical_json([*key, first.occurred_ms, first.ref]).encode()).hexdigest()[:32]
@@ -347,7 +406,9 @@ def _event_row(key: tuple[str, ...], members: list[tuple[EventCopy, str | None, 
         "occurred_ms": occurred_ms, "time_certainty": certainty,
         "payload": json.loads(payload_json),
         "provenance": min((c.provenance for c in copies), key=lambda p: _PROVENANCE.get(p, 3)),
-        "source_refs": sorted(c.ref for c in copies), "native_event_id": native_event_id,
+        "source_refs": sorted({c.ref for c in copies}
+                              | {authors[c.ref].attestation.ref for c in copies if c.ref in authors}),
+        "native_event_id": native_event_id,
     }
 
 

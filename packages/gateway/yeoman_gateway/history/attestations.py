@@ -2,16 +2,22 @@
 
 from __future__ import annotations
 
+import hashlib
 import os
 import re
+from collections import defaultdict
+from collections.abc import Sequence
 from dataclasses import dataclass
 from pathlib import Path
-from typing import Any
+from typing import TYPE_CHECKING, Any
 
 from yeoman_shared.raw_archive.paths import ProtectedPathError, is_protected
 
 from .ids import classify
 from .layer1 import Layer1Line, canonical_json, write_jsonl_once
+
+if TYPE_CHECKING:
+    from .extract import EventCopy, MessageCopy
 
 ATTESTATION_VERSION = 2
 SEED_AT_MS = 1_791_158_400_000
@@ -171,3 +177,79 @@ def append(path: Path, record: dict[str, Any]) -> None:
         out.write(canonical_json(record) + "\n")
         out.flush()
         os.fsync(out.fileno())
+
+
+def message_copy_id(copy: MessageCopy) -> str:
+    """Use the same entity identity for legacy author targets and projection."""
+    prefix = f"{copy.channel}:{copy.chat_id}:"
+    if copy.native_id:
+        return prefix + copy.native_id
+    identity = copy.batch_key or copy.ref
+    return prefix + "derived:" + hashlib.sha256(identity.encode()).hexdigest()[:32]
+
+
+def _claim(att: Attestation, source_ref: str) -> dict[str, Any]:
+    return {"source_ref": source_ref, "attestation_ref": att.ref,
+            "anchor": att.fields["anchor"], "at_ms": att.at_ms}
+
+
+def resolve_author_targets(
+    attestations: Sequence[Attestation], messages: Sequence[MessageCopy], events: Sequence[EventCopy],
+) -> tuple[dict[str, Attestation], list[dict[str, Any]]]:
+    """Select per-copy corrections without altering the preserved source evidence."""
+    refs: dict[str, set[str]] = defaultdict(set)
+    bases: dict[str, list[MessageCopy]] = defaultdict(list)
+    legacy: dict[str, set[str]] = defaultdict(set)
+    entities: dict[tuple[str, ...], list[str]] = defaultdict(list)
+    for copy in messages:
+        for ref in (copy.ref, *copy.extra_refs):
+            refs[ref].add(copy.ref)
+        legacy[message_copy_id(copy)].add(copy.ref)
+        if copy.parent_native_id is not None or copy.segmented:
+            bases[copy.ref.rsplit("/", 1)[0]].append(copy)
+        if copy.native_id:
+            entities[("message", copy.channel, copy.chat_id, copy.native_id)].append(copy.ref)
+    event_evidence: dict[str, dict[str, Any]] = {}
+    for event in events:
+        refs[event.ref].add(event.ref)
+        if event.native_event_id:
+            entities[(event.kind, event.channel, event.chat_id, event.native_event_id)].append(event.ref)
+            event_evidence[event.ref] = {"target_native_id": event.target_native_id,
+                                         "payload": event.payload}
+    claims: dict[str, list[Attestation]] = defaultdict(list)
+    review: list[dict[str, Any]] = []
+    for att in sorted(attestations, key=lambda a: (a.at_ms, a.ref)):
+        if att.type not in ("author", "message_author"):
+            continue
+        target = att.fields.get("source_ref" if att.type == "author" else "message_id")
+        if not isinstance(target, str):
+            review.append({"reason": "invalid_target", "attestation_ref": att.ref, "target": target})
+            continue
+        selected = refs.get(target, set()) if att.type == "author" else legacy.get(target, set())
+        if att.type == "author" and target in bases:
+            selected = {c.ref for c in bases[target]
+                        if c.parent_native_id and c.native_id == c.parent_native_id}
+        if not selected or (att.type == "author" and len(selected) != 1):
+            review.append({"reason": "ambiguous_target" if selected else "missing_or_non_content_target",
+                           "attestation_ref": att.ref, "target": target,
+                           "selected_refs": sorted(selected)})
+            continue
+        anchor = classify(att.fields.get("anchor"))
+        if anchor is None or anchor.kind not in ("lid", "pn_jid"):
+            review.append({"reason": "invalid_author_anchor", "attestation_ref": att.ref,
+                           "target": target})
+            continue
+        for ref in selected:
+            claims[ref].append(att)
+    winners = {ref: max(items, key=lambda a: (a.at_ms, a.ref)) for ref, items in sorted(claims.items())}
+    for ref, items in sorted(claims.items()):
+        if len({a.fields["anchor"] for a in items}) > 1:
+            review.append({"reason": "conflicting_author_claims", "source_ref": ref,
+                           "winner_ref": winners[ref].ref, "claims": [_claim(a, ref) for a in items]})
+    for entity, source_refs in sorted(entities.items()):
+        corrected = [(ref, winners[ref]) for ref in sorted(source_refs) if ref in winners]
+        if len({a.fields["anchor"] for _, a in corrected}) > 1:
+            review.append({"reason": "conflicting_entity_authors", "entity": list(entity),
+                           "claims": [{**_claim(a, ref), **event_evidence.get(ref, {})}
+                                      for ref, a in corrected]})
+    return winners, review
