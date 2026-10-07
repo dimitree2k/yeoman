@@ -64,6 +64,7 @@ def history_verify(
     layer1: list[Path] = typer.Option(..., "--layer1", help="Layer 1 root (repeat for several)"),
     db: Path = typer.Option(..., "--db", help="Built history.db"),
     scratch: Path | None = typer.Option(None, "--scratch", help="On-disk folder for two rebuilds; not /tmp"),
+    frozen: bool = typer.Option(False, "--frozen", help="Explicitly frozen DB and Layer 1 inputs"),
 ) -> None:
     from yeoman_gateway.history.verify import verify
 
@@ -71,7 +72,9 @@ def history_verify(
         scratch = scratch.expanduser()
         if scratch.resolve().is_relative_to(Path(tempfile.gettempdir()).resolve()):
             raise typer.BadParameter("--scratch must be on disk, not the temporary directory")
-    _emit(verify([path.expanduser() for path in layer1], db.expanduser(), scratch=scratch))
+    if scratch is not None and not frozen:
+        raise typer.BadParameter("--scratch requires --frozen")
+    _emit(verify([path.expanduser() for path in layer1], db.expanduser(), scratch=scratch, frozen=frozen))
 
 
 def _owner_mode(dry_run: bool, confirm: bool) -> None:
