@@ -329,7 +329,10 @@ def _events(ex: Extracted, res: Resolution, arvid: str | None, message_ids: set[
         base = (copy.kind, copy.channel, copy.chat_id, copy.target_native_id or "", actor_key)
         item = (copy, actor, basis)
         if _event_complete(copy):
-            groups[(*base, canonical_json(copy.payload))].append(item)
+            payload = copy.payload
+            if copy.kind in ("group_subject", "group_description") and not payload["snapshot"] and "occurredMs" in payload:
+                payload = {k: v for k, v in payload.items() if k != "observedAtMs"}
+            groups[(*base, canonical_json(payload))].append(item)
         else:
             purged.append((base, item))
 
@@ -405,7 +408,7 @@ def _event_row(key: tuple[str, ...], members: list[tuple[EventCopy, str | None, 
         "target_native_id": target or None, "actor_contact_id": actor,
         "actor_identifier": actor_item[0].actor_raw, "actor_basis": basis,
         "occurred_ms": occurred_ms, "time_certainty": certainty,
-        "payload": json.loads(payload_json),
+        "payload": first.payload if kind in ("group_subject", "group_description") else json.loads(payload_json),
         "provenance": min((c.provenance for c in copies), key=lambda p: _PROVENANCE.get(p, 3)),
         "source_refs": sorted({r for c in copies for r in (c.ref, *c.extra_refs)}
                               | {authors[c.ref].attestation.ref for c in copies if c.ref in authors}),

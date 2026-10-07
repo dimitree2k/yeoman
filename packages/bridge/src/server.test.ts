@@ -741,3 +741,38 @@ for (const [name, type, wrapper, payload, returned] of [
     assert.equal(failure.error.code, 'ERR_INTERNAL');
   });
 }
+
+test('group_metadata_persists_until_ack', async (t) => {
+  const root = await mkdtemp(join(tmpdir(), 'yeoman-group-outbox-'));
+  t.after(() => rm(root, { recursive: true, force: true }));
+  const server: any = makeServer(root);
+  const client = fakeClient();
+  const meta = clientMeta(client.ws, true);
+  server.clients.add(meta);
+  server.canonicalSubscriber = meta;
+  let deliveredAfterPersistence = false;
+  const deliver = server.deliverReplayable.bind(server);
+  server.deliverReplayable = async (m: any, e: any) => {
+    deliveredAfterPersistence = (await server.outbox.pending()).some((p: any) => p.eventId === e.eventId);
+    deliver(m, e);
+  };
+  const event = createEventEnvelope({ type: 'group_description' as any, accountId: 'default', payload: {
+    chatJid: 'members@g.us', value: '', occurredMs: 1700000000000,
+    observedAtMs: 1700000001000, snapshot: false,
+  } });
+  await server.broadcastReplayable(event);
+  await new Promise(resolve => setImmediate(resolve));
+  assert.equal(deliveredAfterPersistence, true);
+  const [persisted] = await server.outbox.pending();
+  await server.broadcastReplayable({ ...event, payload: { ...event.payload, observedAtMs: 1700000002000 } });
+  assert.equal((await server.outbox.pending()).length, 1);
+  const replay: any = makeServer(root);
+  await replay.outbox.open();
+  const [replayed] = await replay.outbox.pending();
+  assert.equal(replayed.eventId, persisted.eventId);
+  assert.equal(replayed.eventKey, persisted.eventKey);
+  assert.deepEqual(replayed.payload, persisted.payload);
+  assert.ok(persisted.eventKey.includes('group_description'));
+  await replay.outbox.ack(persisted.eventId);
+  assert.deepEqual(await replay.outbox.pending(), []);
+});

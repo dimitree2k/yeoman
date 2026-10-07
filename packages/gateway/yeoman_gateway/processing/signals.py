@@ -22,7 +22,11 @@ from dataclasses import dataclass, field, replace
 from typing import Any
 
 from loguru import logger
-from yeoman_shared.whatsapp_protocol import MAX_BRIDGE_FRAME_BYTES, MEDIA_METADATA_FIELDS
+from yeoman_shared.whatsapp_protocol import (
+    MAX_BRIDGE_FRAME_BYTES,
+    MEDIA_METADATA_FIELDS,
+    valid_group_metadata,
+)
 
 from yeoman_gateway.knowledge.models import Identifier, TrustedIdentityObservation
 from yeoman_gateway.processing.models import (
@@ -37,7 +41,8 @@ CHANNEL = "whatsapp"
 
 #: Signal kinds the bridge can report (the canonical event kinds of spec R01).
 SIGNAL_KINDS: tuple[str, ...] = (
-    "message", "edit", "reaction", "delete", "receipt", "membership_change", "membership_snapshot"
+    "message", "edit", "reaction", "delete", "receipt", "membership_change", "membership_snapshot",
+    "group_subject", "group_description"
 )
 _MEMBERSHIP_ACTIONS = frozenset({"add", "remove", "promote", "demote", "modify"})
 _MAX_MEMBERSHIP_PARTICIPANTS = 2048
@@ -293,6 +298,17 @@ class WhatsAppSignalMapper:
             signal = self._delete(payload, chat_id)
         elif kind == "reaction":
             signal = self._reaction(payload, chat_id)
+        elif kind in {"group_subject", "group_description"}:
+            if not valid_group_metadata(dict(payload)):
+                if strict:
+                    raise ValueError(f"malformed WhatsApp {kind}")
+                return None
+            moment = payload.get("occurredMs", payload["observedAtMs"])
+            signal = self._signal(
+                kind=kind, event_key=f"{self._channel}:{chat_id}:{kind}:{canonical_hash(dict(payload))}",
+                chat_id=chat_id, principal=_token(payload.get("actorJid")),
+                payload=payload, body=dict(payload), occurred_ms=int(moment),
+            )
         elif kind in {"membership_change", "membership_snapshot"}:
             signal = self._membership(kind, payload, chat_id, strict=strict)
         else:

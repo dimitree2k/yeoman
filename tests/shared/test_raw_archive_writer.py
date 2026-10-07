@@ -602,3 +602,24 @@ def test_owner_append_receipt_is_after_fsync_and_inode_recheck(tmp_path: Path, m
     monkeypatch.setattr(records.os, "stat", stale_after_sync)
     with pytest.raises(OSError, match="replaced"):
         records.append_owner_record(root, record)
+
+
+def test_append_durable_distinguishes_spool_memory_and_recovery(tmp_path, monkeypatch):
+    archive = _archive(tmp_path)
+    append_line = archive._append_archive_line
+    spool_line = archive._spool_line_locked
+
+    def failed_archive(*args, **kwargs):
+        raise OSError("synthetic archive unavailable")
+
+    monkeypatch.setattr(archive, "_append_archive_line", failed_archive)
+    assert archive.append_durable(_event("spooled")) is True
+    assert list(archive.spool.glob("*.json"))
+    monkeypatch.setattr(archive, "_spool_line_locked", lambda *args, **kwargs: False)
+    assert archive.append_durable(_event("memory")) is False
+    assert not archive._pending
+    monkeypatch.setattr(archive, "_append_archive_line", append_line)
+    monkeypatch.setattr(archive, "_spool_line_locked", spool_line)
+    assert archive.append_durable(_event("recovered")) is True
+    assert [r["native"]["payload"]["text"] for r in _lines(archive._month_file("whatsapp", NOW))] == [
+        "spooled", "recovered"]

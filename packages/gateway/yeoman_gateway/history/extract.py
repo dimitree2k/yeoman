@@ -12,6 +12,7 @@ from yeoman_shared.whatsapp_protocol import (
     bridge_string,
     normalize_whatsapp_jid,
     valid_forward_content,
+    valid_group_metadata,
     valid_poll_result,
 )
 
@@ -315,6 +316,18 @@ def _raw(line: Layer1Line, out: Extracted) -> None:
     elif kind in ("reaction", "edit", "delete") and type_ == kind:
         _event(out, line.ref, kind, p, channel=channel, chat=chat, ms=ms, certainty=certainty,
                provenance="native")
+        out.count(line.ref, "event")
+    elif type_ in ("group_subject", "group_description"):
+        if not valid_group_metadata(p):
+            out.count(line.ref, "skipped:invalid_group_metadata")
+            return
+        ms = int(p.get("occurredMs", p["observedAtMs"]))
+        certainty = "provider_timestamp" if "occurredMs" in p else "capture_time_approx"
+        actor_raw = p.get("actorJid")
+        actor = classify(actor_raw)
+        out.identity.see(actor, ms, line.ref)
+        out.events.append(EventCopy(line.ref, rank_of(line.ref), type_, channel, chat, None,
+                                    actor, actor_raw, False, ms, certainty, dict(p), "native"))
         out.count(line.ref, "event")
     elif type_ in ("membership_snapshot", "membership_change"):
         out.count(line.ref, _membership(out, line.ref, type_, p, channel=channel, chat=chat, ms=ms,

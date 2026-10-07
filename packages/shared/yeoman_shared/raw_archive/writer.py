@@ -299,19 +299,34 @@ class RawArchive:
     def append_with_media(self, event: RawEvent, source: str | Path, *, kind: str) -> bool:
         """Store media and its event under one purge guard, without an unlinkable gap."""
         with self._lock:
-            received_ms = int(event.received_ms if event.received_ms is not None else self._clock())
-            event = replace(event, received_ms=received_ms)
-            try:
-                lease = self._media_guard.acquire()
-            except OSError as exc:
-                self._note_error(exc)
-                media = _unstored_media(kind, "coordination_unavailable")
-                return self._append_locked(replace(event, media=media))
-            try:
-                media = self._store_media(event.channel, source, kind=kind, received_ms=received_ms)
-                return self._append_locked(replace(event, media=media), media_lease=lease)
-            finally:
-                lease.release()
+            return self._append_with_media_locked(event, source, kind=kind)
+
+    def append_durable(self, event: RawEvent, source: str | Path | None = None, *, kind: str = "") -> bool:
+        """Publish durably or suppress by disposition; never retain a volatile record.
+
+        The Bridge owns retries for this API. Legacy append callers still retain
+        their bounded memory backlog when persistent storage is unavailable.
+        """
+        with self._lock:
+            return (self._append_locked(event, durable_only=True) if source is None else
+                    self._append_with_media_locked(event, source, kind=kind, durable_only=True))
+
+    def _append_with_media_locked(
+        self, event: RawEvent, source: str | Path, *, kind: str, durable_only: bool = False
+    ) -> bool:
+        received_ms = int(event.received_ms if event.received_ms is not None else self._clock())
+        event = replace(event, received_ms=received_ms)
+        try:
+            lease = self._media_guard.acquire()
+        except OSError as exc:
+            self._note_error(exc)
+            media = _unstored_media(kind, "coordination_unavailable")
+            return self._append_locked(replace(event, media=media), durable_only=durable_only)
+        try:
+            media = self._store_media(event.channel, source, kind=kind, received_ms=received_ms)
+            return self._append_locked(replace(event, media=media), media_lease=lease, durable_only=durable_only)
+        finally:
+            lease.release()
 
     def drain_spool(self) -> int:
         with self._lock:
@@ -456,7 +471,7 @@ class RawArchive:
         )
 
     def _append_locked(
-        self, event: RawEvent, *, media_lease: _MediaGuardLease | None = None
+        self, event: RawEvent, *, media_lease: _MediaGuardLease | None = None, durable_only: bool = False
     ) -> bool:
         lease = media_lease
         try:
@@ -492,16 +507,16 @@ class RawArchive:
             line = dumps(record)
             self._drain_locked()
             if self._has_backlog_locked():
-                self._defer_locked(channel, received_ms, line, None, lease)
+                spooled = self._defer_locked(channel, received_ms, line, None, lease, retain=not durable_only)
                 self._publish_status_locked()
-                return False
+                return durable_only and spooled
             try:
                 self._append_archive_line(channel, received_ms, line, record)
             except OSError as exc:
                 self._note_error(exc)
-                self._defer_locked(channel, received_ms, line, None, lease)
+                spooled = self._defer_locked(channel, received_ms, line, None, lease, retain=not durable_only)
                 self._publish_status_locked()
-                return False
+                return durable_only and spooled
             self._publish_status_locked()
             return True  # A false append means the owner disposition drained this event.
         finally:
@@ -577,7 +592,8 @@ class RawArchive:
         line: str,
         destination: str | None,
         media_lease: _MediaGuardLease | None,
-    ) -> None:
+        *, retain: bool = True,
+    ) -> bool:
         if self._pending:
             # Persist older memory entries before letting a newer line past them.
             while self._pending:
@@ -589,10 +605,16 @@ class RawArchive:
                     pending[4].release()
             if self._capacity_blocked and len(self._pending) < MAX_MEMORY_PENDING:
                 self._capacity_blocked = False
+            if retain:
+                self._remember_locked(channel, received_ms, line, destination, media_lease)
+                return False
+            if self._pending:
+                return False
+        if self._spool_line_locked(channel, received_ms, line, destination):
+            return True
+        if retain:
             self._remember_locked(channel, received_ms, line, destination, media_lease)
-            return
-        if not self._spool_line_locked(channel, received_ms, line, destination):
-            self._remember_locked(channel, received_ms, line, destination, media_lease)
+        return False
 
     def _spool_line_locked(
         self, channel: str, received_ms: int, line: str, destination: str | None = None
@@ -772,6 +794,21 @@ class RawArchive:
             self._published = key
         except OSError:
             logger.error("raw archive status file could not be written")
+
+
+async def append_durable_async(
+    archive: RawArchive | None, event: RawEvent, source: str | Path | None = None, *, kind: str = ""
+) -> bool:
+    """Canonical intake requires a durable raw copy before acknowledging its provider."""
+    if archive is None:
+        return False
+    try:
+        return await asyncio.to_thread(archive.append_durable, event, source, kind=kind)
+    except RawArchiveCapacityError:
+        raise
+    except Exception as exc:  # noqa: BLE001 - leave the durable provider envelope unacknowledged
+        logger.error("raw archive durable append crashed kind=%s error=%s", event.kind, type(exc).__name__)
+        return False
 
 
 async def append_async(archive: RawArchive | None, event: RawEvent) -> None:

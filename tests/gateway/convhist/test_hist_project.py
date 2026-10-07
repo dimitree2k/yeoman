@@ -1060,3 +1060,65 @@ def test_outbound_identifiers_follow_bridge_normalization(tmp_path):
         assert [(row["kind"], row["chat_id"], row["target_native_id"], row["target_message_id"]) for row in events] == [
             (kind, chat, "FORWARD", f"whatsapp:{chat}:FORWARD") for kind in ("delete", "reaction")]
     assert records == original and path.read_bytes() == raw_bytes
+
+
+def test_group_metadata_replay_and_snapshot_time(tmp_path):
+    root = tmp_path / "layer1"
+    update = {"chatJid": G, "value": " exact subject ", "actorJid": G,
+              "occurredMs": T0, "observedAtMs": T0 + 1000, "snapshot": False}
+    snapshot = {"chatJid": G, "value": "", "observedAtMs": T0 + 5000, "snapshot": True}
+    rows = [_raw("group_subject", "group_subject", update),
+            _raw("group_subject", "group_subject", update | {"observedAtMs": T0 + 2000}, received=T0 + 2000),
+            _raw("group_description", "group_description", snapshot),
+            _raw("group_description", "group_description", {k: v for k, v in snapshot.items() if k != "value"})]
+    write_jsonl(root / "whatsapp/2026-10.jsonl", rows)
+    project([root], tmp_path / "history.db")
+    with closing(sqlite3.connect(tmp_path / "history.db")) as conn:
+        conn.row_factory = sqlite3.Row
+        events = conn.execute("SELECT * FROM message_events ORDER BY kind DESC").fetchall()
+        assert len(events) == 2
+        subject, description = events
+        assert subject["kind"] == "group_subject"
+        assert subject["occurred_ms"] == T0 and subject["time_certainty"] == "provider_timestamp"
+        assert subject["actor_identifier"] == G and subject["actor_contact_id"] is None
+        assert subject["actor_basis"] == "native_identifier"
+        assert json.loads(subject["payload_json"])["value"] == " exact subject "
+        assert len(json.loads(subject["source_refs"])) == 2
+        assert description["occurred_ms"] == T0 + 5000
+        assert description["time_certainty"] == "capture_time_approx"
+        assert description["actor_identifier"] is None and description["actor_basis"] == "unknown"
+        assert json.loads(description["payload_json"]) == snapshot
+        assert conn.execute("SELECT count(*) FROM messages").fetchone()[0] == 0
+        assert all(e["target_message_id"] is None for e in events)
+
+
+def test_group_provider_observations_preserve_capture_basis_and_actor(tmp_path):
+    root = tmp_path / "layer1"
+    # Envelopes produced by the listener's provider-shaped fetch/notification fixtures.
+    payloads = [
+        ("group_subject", {"chatJid": G, "value": "current", "observedAtMs": T0, "snapshot": True}),
+        ("group_description", {"chatJid": G, "value": "", "observedAtMs": T0, "snapshot": True}),
+        ("group_subject", {"chatJid": G, "value": "concurrent", "actorJid": "222@lid",
+                           "observedAtMs": T0 + 1000, "snapshot": False}),
+        ("group_description", {"chatJid": G, "value": "changed", "actorJid": "333@lid",
+                               "observedAtMs": T0 + 2000, "snapshot": False}),
+    ]
+    rows = [_raw(kind, kind, payload, received=T0 - 1000) | {"chat_id": "outer@g.us"}
+            for kind, payload in payloads]
+    write_jsonl(root / "whatsapp/2026-10.jsonl", rows)
+    project([root], tmp_path / "history.db")
+    with closing(sqlite3.connect(tmp_path / "history.db")) as conn:
+        conn.row_factory = sqlite3.Row
+        events = conn.execute("SELECT * FROM message_events ORDER BY occurred_ms, kind").fetchall()
+        assert len(events) == 4
+        assert all(e["chat_id"] == G and e["time_certainty"] == "capture_time_approx" for e in events)
+        assert all(e["occurred_ms"] >= T0 for e in events)
+        for event in events:
+            payload = json.loads(event["payload_json"])
+            assert event["occurred_ms"] == payload["observedAtMs"]
+            assert event["actor_identifier"] == payload.get("actorJid")
+            if payload["snapshot"]:
+                assert event["actor_basis"] == "unknown" and event["actor_contact_id"] is None
+            else:
+                assert event["actor_basis"] == "native_identifier"
+        assert conn.execute("SELECT count(*) FROM messages").fetchone()[0] == 0

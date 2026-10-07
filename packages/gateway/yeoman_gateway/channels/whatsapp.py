@@ -9,6 +9,7 @@ import math
 import random
 import re
 import threading
+import time
 import unicodedata
 import uuid
 from dataclasses import dataclass, replace
@@ -22,11 +23,16 @@ from yeoman_shared.raw_archive.writer import (
     RawArchiveCapacityError,
     RawEvent,
     append_async,
+    append_durable_async,
     append_media_description_async,
     append_with_media_async,
     media_kind_from_mime,
 )
-from yeoman_shared.whatsapp_protocol import PROTOCOL_VERSION, REPLAYABLE_EVENT_TYPES
+from yeoman_shared.whatsapp_protocol import (
+    PROTOCOL_VERSION,
+    REPLAYABLE_EVENT_TYPES,
+    valid_group_metadata,
+)
 
 from yeoman_gateway.bus.events import OutboundMessage, ReactionMessage
 from yeoman_gateway.bus.queue import MessageBus
@@ -284,6 +290,7 @@ class WhatsAppChannel(BaseChannel):
         )
         self._document_cache = document_cache
         self._raw_archive: RawArchive | None = None
+        self._raw_archive_legacy_warned = False
         self._vision_describer = (
             VisionDescriber(provider_factory) if provider_factory is not None else None
         )
@@ -326,6 +333,14 @@ class WhatsAppChannel(BaseChannel):
         self._bridge_event_lock: asyncio.Lock | None = None
         self._bridge_inflight: dict[str, _BridgeEventWork] = {}
         self._bridge_capture_events: set[threading.Event] = set()
+        self._bridge_raw_retries: dict[str, asyncio.Task[None]] = {}
+        self._bridge_raw_writes: set[asyncio.Task[bool | None]] = set()
+        self._raw_shed_count = 0
+        self._shed_replay_needed = False
+        self._shed_replay_task: asyncio.Task[None] | None = None
+        self._raw_retry_maxsize = 64
+        self._raw_retry_initial_seconds = 0.25
+        self._raw_retry_max_seconds = 30.0
         self._bridge_intake_closed = False
         self._stopping = False
         self._ack_queue_maxsize = BRIDGE_ACK_QUEUE_MAXSIZE
@@ -461,6 +476,7 @@ class WhatsAppChannel(BaseChannel):
                 await asyncio.sleep(delay)
             finally:
                 self._connected = False
+                self._bridge_intake_closed = True
                 self._events_subscribed = False
                 self._events_subscription_pending = False
                 self._pending_bridge_events.clear()
@@ -502,6 +518,7 @@ class WhatsAppChannel(BaseChannel):
         for chat_id in list(self._typing_tasks):
             await self._stop_typing(chat_id)
 
+        await self._stop_raw_retries()
         while self._bridge_capture_events:
             await asyncio.sleep(0.001)
         # Do not cancel the ACK worker here.  Once an event is ACKed, its
@@ -817,6 +834,7 @@ class WhatsAppChannel(BaseChannel):
 
     async def _subscribe_bridge_events(self, token: str, timeout_seconds: float) -> None:
         """Authenticate this connection as the sole durable event subscriber."""
+        self._shed_replay_needed = False  # This subscription replays the prior connection's shed envelopes.
         self._events_subscription_pending = True
         try:
             response = await self._send_command(
@@ -1060,6 +1078,8 @@ class WhatsAppChannel(BaseChannel):
 
     def set_raw_archive(self, archive: RawArchive | None) -> None:
         """Attach the append-only raw archive (V1 spec §4.0)."""
+        if archive is not self._raw_archive:
+            self._raw_archive_legacy_warned = False
         self._raw_archive = archive
 
     async def _archive_media_description(
@@ -1082,10 +1102,10 @@ class WhatsAppChannel(BaseChannel):
 
     async def _raw_archive_bridge_frame(
         self, frame: dict[str, Any], kind: str, payload: dict[str, Any]
-    ) -> None:
+    ) -> bool:
         archive = self._raw_archive
         if archive is None:
-            return
+            return True  # Raw capture is disabled; preserve the journal-only ACK contract.
         media_meta: dict[str, Any] | None = None
         media_source: Any | None = None
         media_kind = ""
@@ -1107,10 +1127,16 @@ class WhatsAppChannel(BaseChannel):
             account=str(frame.get("accountId") or ""),
             media=media_meta,
         )
+        if callable(getattr(archive, "append_durable", None)):
+            return await append_durable_async(archive, event, media_source, kind=media_kind)
+        if not self._raw_archive_legacy_warned:
+            self._raw_archive_legacy_warned = True
+            logger.warning("WhatsApp raw archive lacks durability reporting; using legacy append/ACK behavior")
         if media_source is not None:
             await append_with_media_async(archive, event, media_source, kind=media_kind)
         else:
             await append_async(archive, event)
+        return True
 
     async def _raw_archive_outbound(
         self,
@@ -1284,6 +1310,9 @@ class WhatsAppChannel(BaseChannel):
         self, frame: dict[str, Any], kind: str, payload: dict[str, Any]
     ) -> bool:
         """Commit one Bridge event before queueing its ACK/projection work."""
+        if kind in {"group_subject", "group_description"} and not valid_group_metadata(payload):
+            self._reject_replayable_frame(kind, "invalid_group_metadata")
+            return False
         event_id = frame.get("eventId")
         event_key = frame.get("eventKey")
         account_id = frame.get("accountId")
@@ -1348,16 +1377,105 @@ class WhatsAppChannel(BaseChannel):
                 self._bridge_inflight[event_id] = work
 
         if wait_for_completion is not None:
+            if event_id in self._bridge_raw_retries:
+                return True
             if current_task is not reader_task:
                 return bool(await wait_for_completion)
             return True
 
+        queued = await self._write_and_queue_bridge_work(work)
+        if queued is None:
+            if len(self._bridge_raw_retries) < max(1, self._raw_retry_maxsize):
+                logger.warning("WhatsApp raw publication deferred event_id={}", event_id)
+                self._bridge_raw_retries[event_id] = asyncio.create_task(self._retry_raw_work(work))
+            else:
+                # The Bridge owns this durable envelope. Never stall response reading
+                # or retain another frame when the bounded local retry set is full.
+                self._raw_shed_count += 1
+                self._shed_replay_needed = True
+                await self._forget_bridge_work(work)
+                if self._shed_replay_task is None or self._shed_replay_task.done():
+                    self._shed_replay_task = asyncio.create_task(self._replay_shed_after_recovery())
+            return True
+        if not queued:
+            return False
+
+        if current_task is not reader_task:
+            return bool(await work.completion)
+        return True
+
+    async def _retry_raw_work(self, work: _BridgeEventWork) -> None:
+        delay = self._raw_retry_initial_seconds
+        next_log = time.monotonic() + 60
         try:
-            await self._raw_archive_bridge_frame(frame, kind, payload)
+            while not self._stopping and not self._bridge_intake_closed:
+                await asyncio.sleep(delay)
+                if await self._write_and_queue_bridge_work(work) is not None:
+                    return
+                if time.monotonic() >= next_log:
+                    logger.warning("WhatsApp raw publication still deferred event_id={}", work.event_id)
+                    next_log = time.monotonic() + 60
+                delay = min(delay * 2, self._raw_retry_max_seconds)
+        finally:
+            self._bridge_raw_retries.pop(work.event_id, None)
+
+    async def _replay_shed_after_recovery(self) -> None:
+        while not self._stopping and not self._bridge_intake_closed:
+            if not (self._bridge_raw_retries or self._bridge_raw_writes or
+                    self._bridge_inflight or self._pending or self._events_subscription_pending):
+                websocket = self._ws
+                if self._shed_replay_needed and websocket is not None and self._events_subscribed:
+                    # Re-subscribing on the same socket does not replay in the Bridge.
+                    # Fence new envelopes only after all ACKs/command waiters settled.
+                    self._shed_replay_needed = False
+                    self._bridge_intake_closed = True
+                    self._connected = False
+                    await websocket.close()
+                return
+            await asyncio.sleep(self._raw_retry_initial_seconds)
+
+    async def _stop_raw_retries(self) -> None:
+        replay = self._shed_replay_task
+        if replay is not None and replay is not asyncio.current_task():
+            replay.cancel()
+            await asyncio.gather(replay, return_exceptions=True)
+        self._shed_replay_task = None
+        tasks = tuple(self._bridge_raw_retries.values())
+        for task in tasks:
+            task.cancel()
+        # Use the existing finite ACK/drain budget for raw publication settlement.
+        # A timeout fails stop rather than reporting shutdown while a writer is active.
+        async with asyncio.timeout(BRIDGE_ACK_TIMEOUT_SECONDS):
+            if tasks:
+                await asyncio.gather(*tasks, return_exceptions=True)
+            if self._bridge_raw_writes:
+                await asyncio.shield(asyncio.gather(*self._bridge_raw_writes))
+        self._bridge_raw_retries.clear()
+
+    async def _write_and_queue_bridge_work(self, work: _BridgeEventWork) -> bool | None:
+        # Shield both raw publication and its local journal continuation. Cancelling
+        # the owner must not orphan a to_thread write or discard a durable result.
+        publication = asyncio.create_task(self._publish_and_queue_bridge_work(work))
+        self._bridge_raw_writes.add(publication)
+        publication.add_done_callback(self._bridge_raw_writes.discard)
+        try:
+            return await asyncio.shield(publication)
+        except asyncio.CancelledError:
+            await asyncio.shield(publication)
+            raise
+
+    async def _publish_and_queue_bridge_work(self, work: _BridgeEventWork) -> bool | None:
+        frame, kind, payload = work.frame, work.kind, work.payload
+        event_id = work.event_id
+        event_key, account_id, observed_at = frame["eventKey"], frame["accountId"], frame["observedAt"]
+        try:
+            durable = await self._raw_archive_bridge_frame(frame, kind, payload)
         except RawArchiveCapacityError:
             await self._forget_bridge_work(work)
             await self._stop_for_raw_archive_capacity()
             return False
+        if not durable:
+            return None
 
         capture = getattr(self._processing_signals, "capture", None)
         if not callable(capture):
@@ -1378,7 +1496,7 @@ class WhatsAppChannel(BaseChannel):
                 observed_at_ms=int(observed_at),
             )
         except JournalConflictError as exc:
-            if kind in {"membership_change", "membership_snapshot"}:
+            if kind in {"membership_change", "membership_snapshot", "group_subject", "group_description"}:
                 logger.warning(
                     "WhatsApp membership capture conflict detail={} event_id={} "
                     "event_key={}; refusing ACK",
@@ -1432,8 +1550,6 @@ class WhatsAppChannel(BaseChannel):
             await self._close_bridge_intake("ack_queue_full")
             return False
 
-        if current_task is not reader_task:
-            return bool(await work.completion)
         return True
 
     async def _forget_bridge_work(self, work: _BridgeEventWork) -> None:
@@ -1576,6 +1692,7 @@ class WhatsAppChannel(BaseChannel):
                 return
 
     async def _stop_bridge_worker(self) -> None:
+        await self._stop_raw_retries()
         worker = self._bridge_ack_worker
         if worker is not None and worker is not asyncio.current_task():
             worker.cancel()
@@ -2862,6 +2979,10 @@ class WhatsAppChannel(BaseChannel):
             await self._stop_for_raw_archive_capacity()
             raise
 
+        # Do not register a new waiter after the shed-replay reconnect fence.
+        # Startup health runs before subscription and is allowed on the new socket.
+        if getattr(self, "_bridge_intake_closed", False) and getattr(self, "_events_subscribed", False):
+            raise RuntimeError("Bridge intake is closing")
         future: asyncio.Future[dict[str, Any]] = asyncio.get_running_loop().create_future()
         self._pending[request_id] = future
 

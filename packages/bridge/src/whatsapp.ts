@@ -177,7 +177,7 @@ export interface WhatsAppClientOptions {
   onMessage: (msg: InboundMessageV2) => void | Promise<void>;
   /** Journal evidence from the provider, including membership changes and rosters. */
   onSignal?: (
-    kind: 'edit' | 'delete' | 'reaction' | 'receipt' | 'membership_change' | 'membership_snapshot',
+    kind: 'edit' | 'delete' | 'reaction' | 'receipt' | 'membership_change' | 'membership_snapshot' | 'group_subject' | 'group_description',
     payload: Record<string, unknown>,
   ) => void | Promise<void>;
   onQR: (qr: string) => void;
@@ -1067,10 +1067,42 @@ export class WhatsAppClient {
    * Populate the LID→phone cache from group metadata participants.
    * Each participant may carry both `id` (phone JID) and `lid` (LID JID).
    */
+  private groupMetadataFetchSequence = 0;
+  private groupMetadataFetch?: {
+    operation: number; fetching: boolean;
+    observations: Map<string, { at: number; emitted: boolean; fetched: boolean }>;
+  };
+
+  private groupMetadataSnapshotTime(update: any, side: 'emitted' | 'fetched'): number {
+    const fetch = this.groupMetadataFetch;
+    const digest = createHash('sha256').update(JSON.stringify([
+      normalizeJid(update?.id ?? ''), update?.subject, update?.desc,
+    ])).digest('hex');
+    const key = `${fetch?.operation ?? 0}:${digest}`;
+    const linked = fetch && (fetch.fetching || side === 'fetched' || fetch.observations.has(key));
+    let observation = linked ? fetch.observations.get(key) : undefined;
+    if (!observation) {
+      const at = Math.max(nowMs(), this.lastSnapshotAtMs + 1);
+      this.lastSnapshotAtMs = at;
+      observation = { at, emitted: false, fetched: false };
+      if (linked) {
+        // Only this fetch's metadata is retained; the next operation replaces the map.
+        fetch.observations.set(key, observation);
+      }
+    }
+    observation[side] = true;
+    if (linked && observation.emitted && observation.fetched) fetch.observations.delete(key);
+    return observation.at;
+  }
+
   private async refreshLidCache(): Promise<void> {
     if (!this.sock || !this.connected) return;
     try {
+      this.groupMetadataFetch = {
+        operation: ++this.groupMetadataFetchSequence, fetching: true, observations: new Map(),
+      };
       const all = await this.sock.groupFetchAllParticipating();
+      this.groupMetadataFetch.fetching = false;
       let added = 0;
       for (const meta of Object.values(all || {})) {
         const participants = (meta as any)?.participants;
@@ -1119,11 +1151,39 @@ export class WhatsAppClient {
           payload.participants = [];
         }
         await this.options.onSignal?.('membership_snapshot', payload);
+        const observation = { ...(meta as object), id: chatJid };
+        await this.handleGroupUpdate(observation, true, this.groupMetadataSnapshotTime(observation, 'fetched'));
       }
       this.options.onStatus('lid_cache_refreshed', { size: this.lidToPhone.size, added });
     } catch (err) {
       this.lastError = safeErrorMessage(err);
       this.options.onError(`lid_cache_refresh_failed: ${this.lastError}`);
+    }
+  }
+
+  private async handleGroupUpdate(update: any, snapshot = false, observedAtMs = nowMs()): Promise<void> {
+    const chatJid = normalizeJid(typeof update?.id === 'string' ? update.id : '');
+    if (!chatJid.endsWith('@g.us') || chatJid.length > 128) return;
+    for (const [field, kind, owner, time] of [
+      ['subject', 'group_subject', 'subjectOwner', 'subjectTime'],
+      ['desc', 'group_description', 'descOwner', 'descTime'],
+    ] as const) {
+      if (typeof update[field] !== 'string') continue;
+      const payload: Record<string, unknown> = { chatJid, value: update[field], observedAtMs, snapshot };
+      if (!snapshot) {
+        // Notification author is the actor; metadata owner is only a fallback.
+        const actorRaw = [update.author, update.authorPn, update[owner]].find(
+          value => typeof value === 'string' && value.trim());
+        const actorJid = normalizeJid(actorRaw ?? '');
+        if (actorJid) payload.actorJid = actorJid;
+        const seconds = update[time];
+        if (typeof seconds === 'number' && Number.isSafeInteger(seconds * 1000) && seconds >= 0) {
+          payload.occurredMs = seconds * 1000;
+        }
+      }
+      const identity = deriveProviderEventIdentity(kind, this.options.accountId ?? 'default', payload);
+      if (!identity) throw new Error('Invalid group metadata payload');
+      await this.emitSignal(kind, identity.eventKey, payload);
     }
   }
 
@@ -1273,7 +1333,7 @@ export class WhatsAppClient {
    * provider event is dropped instead of journaled twice.
    */
   private emitSignal(
-    kind: 'edit' | 'delete' | 'reaction' | 'receipt',
+    kind: 'edit' | 'delete' | 'reaction' | 'receipt' | 'group_subject' | 'group_description',
     identity: string,
     payload: Record<string, unknown>,
   ): Promise<void> | undefined {
@@ -2043,6 +2103,21 @@ export class WhatsAppClient {
   }
 
   private registerInboundMessageHandler(): void {
+    this.sock.ev.on('groups.update', (updates: any[]) => {
+      // Stamp the entire batch before yielding: fetch() can return while delivery awaits.
+      const observations = updates.map(update => {
+        // Baileys full fetches (including dirty-group refresh) emit current metadata.
+        // Stub notifications have an own author field, even when its value is undefined.
+        const snapshot = Array.isArray(update?.participants) && !Object.hasOwn(update, 'author');
+        const observedAtMs = snapshot ? this.groupMetadataSnapshotTime(update, 'emitted') : nowMs();
+        return { update, snapshot, observedAtMs };
+      });
+      void (async () => {
+        for (const { update, snapshot, observedAtMs } of observations) {
+          await this.handleGroupUpdate(update, snapshot, observedAtMs);
+        }
+      })().catch((err) => this.options.onError(`group_metadata_failed: ${safeErrorMessage(err)}`));
+    });
     this.sock.ev.on('group-participants.update', (update: any) => this.handleParticipantUpdate(update));
     this.sock.ev.on('messages.upsert', ({ messages, type }: { messages: any[]; type: string }) => {
       if (type !== 'notify' && type !== 'append') return;

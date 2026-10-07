@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import asyncio
 import json
+import re
 from pathlib import Path
 
 import pytest
@@ -66,9 +67,10 @@ def test_protocol_is_v5_and_gateway_rejects_older_frames(tmp_path: Path) -> None
 
 
 def test_v5_payload_constants_match_supported_event_and_media_shapes() -> None:
-    assert REPLAYABLE_EVENT_TYPES == frozenset(
-        {"message", "edit", "delete", "reaction", "receipt", "membership_change", "membership_snapshot"}
-    )
+    protocol = (Path(__file__).resolve().parents[2] / "packages/bridge/src/protocol.ts").read_text()
+    event_types = re.search(r"export const REPLAYABLE_EVENT_TYPES = \[(.*?)\] as const;", protocol, re.S)
+    assert event_types is not None
+    assert REPLAYABLE_EVENT_TYPES == frozenset(re.findall(r"'([^']+)'", event_types[1]))
     assert MAX_BRIDGE_FRAME_BYTES == 262_144
     assert MEDIA_METADATA_FIELDS == frozenset(
         {"kind", "mimeType", "fileName", "bytes", "path", "ref", "sha256", "hash"}
@@ -409,8 +411,8 @@ def _to_inbound(channel: WhatsAppChannel, payload: dict):
     return event
 
 
-def test_a_phone_and_lid_pair_travels_as_two_typed_identifiers() -> None:
-    channel = _channel(ProcessingStore(Path("/tmp") / "signal-identity.db"))
+def test_a_phone_and_lid_pair_travels_as_two_typed_identifiers(tmp_path: Path) -> None:
+    channel = _channel(ProcessingStore(tmp_path / "signal-identity.db"))
     event = _to_inbound(
         channel,
         {
@@ -433,8 +435,8 @@ def test_a_phone_and_lid_pair_travels_as_two_typed_identifiers() -> None:
     assert "@lid" not in (event.sender_phone_jid or "")
 
 
-def test_a_bare_sender_number_does_not_become_a_phone_jid() -> None:
-    channel = _channel(ProcessingStore(Path("/tmp") / "signal-identity-bare.db"))
+def test_a_bare_sender_number_does_not_become_a_phone_jid(tmp_path: Path) -> None:
+    channel = _channel(ProcessingStore(tmp_path / "signal-identity-bare.db"))
     event = _to_inbound(
         channel,
         {
@@ -450,8 +452,8 @@ def test_a_bare_sender_number_does_not_become_a_phone_jid() -> None:
     assert event.sender_id == "491111111111"
 
 
-def test_a_provider_mapping_conflict_is_preserved_for_the_identity_path() -> None:
-    channel = _channel(ProcessingStore(Path("/tmp") / "signal-identity-conflict.db"))
+def test_a_provider_mapping_conflict_is_preserved_for_the_identity_path(tmp_path: Path) -> None:
+    channel = _channel(ProcessingStore(tmp_path / "signal-identity-conflict.db"))
     event = _to_inbound(
         channel,
         {
@@ -657,3 +659,41 @@ def test_partial_encrypted_edit_fields_are_canonical_but_not_projected() -> None
     assert len(memory.indexed) == 1
     assert sources.registered == ["ordinary-after-opaque"]
     store.close()
+
+
+def test_group_metadata_signal_contract_and_journal(tmp_path):
+    from yeoman_shared.whatsapp_protocol import valid_group_metadata
+
+    payload = {"chatJid": CHAT, "value": "", "snapshot": True, "observedAtMs": T0}
+    mapper = WhatsAppSignalMapper()
+    store = ProcessingStore(tmp_path / "metadata.db")
+    try:
+        sink = SignalJournalSink(store, clock=lambda: T0)
+        for kind in ("group_subject", "group_description"):
+            assert kind in REPLAYABLE_EVENT_TYPES
+            signal = mapper.map(payload, kind=kind, strict=True)
+            assert signal.kind == kind and signal.principal == ""
+            assert signal.occurred_ms == T0
+            assert signal.source_message_id is None and signal.target_message_id is None
+            assert signal.payload["value"] == ""
+            sink.capture(kind, payload, event_id=kind, event_key=kind, account="a", strict=True)
+            sink.capture(kind, payload, event_id=kind, event_key=kind, account="a", strict=True)
+        assert store.count_events() == 2
+        for changes in ({"value": None}, {"snapshot": 1}, {"actorJid": "123@lid"},
+                        {"occurredMs": T0}, {"observedAtMs": True},
+                        {"observedAtMs": 9007199254740992}, {"extra": "x"},
+                        {"chatJid": "123@lid"}, {"value": "😀" * 131073}):
+            invalid = payload | changes
+            assert not valid_group_metadata(invalid)
+            with pytest.raises(ValueError):
+                mapper.map(invalid, kind="group_subject", strict=True)
+        assert not valid_group_metadata({k: v for k, v in payload.items() if k != "value"})
+        update = payload | {"snapshot": False, "actorJid": CHAT, "occurredMs": T0 - 1000}
+        signal = mapper.map(update, kind="group_subject", strict=True)
+        assert signal.occurred_ms == T0 - 1000 and signal.payload == update
+        sink.capture("group_subject", update, event_id="update", event_key="update", strict=True)
+        sink.capture("group_subject", update | {"observedAtMs": T0 + 1000},
+                     event_id="update", event_key="update", strict=True)
+        assert store.count_events() == 3
+    finally:
+        store.close()

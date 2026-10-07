@@ -329,7 +329,7 @@ test('test_connect_emits_one_bounded_snapshot_per_group', async (t) => {
   client.sock = { groupFetchAllParticipating: async () => {
     fetches += 1;
     return {
-      'members@g.us': { subject: 'omit', participants: [
+      'members@g.us': { participants: [
         { id: '123@lid', phoneNumber: '491123@s.whatsapp.net', admin: 'admin', name: 'omit' },
       ] },
       'empty@g.us': { participants: [] },
@@ -1717,4 +1717,134 @@ test('delete_result_keeps_target_not_new_message_id', async (t) => {
   assert.deepEqual(calls, [['target@g.us', { delete: { remoteJid: 'target@g.us', fromMe: true, id: 'TARGET' } }]]);
   (client as any).sock.sendMessage = async () => { throw new Error('provider failed'); };
   await assert.rejects(client.deleteMessage({ chatJid: 'target@g.us', messageId: 'TARGET' }), /provider failed/);
+});
+
+test('group_metadata_snapshot_not_historical_change', async (t) => {
+  const { client, signals } = await membershipClient(t);
+  client.connected = true;
+  client.sock = { groupFetchAllParticipating: async () => ({
+    'members@g.us': { subject: ' exact subject ', desc: '', subjectOwner: '123@lid', subjectTime: 1 },
+    'empty@g.us': {},
+  }) };
+  await client.refreshLidCache();
+  const metadata = signals.filter((s: any) => s.kind.startsWith('group_'));
+  assert.equal(metadata.length, 2);
+  for (const { payload } of metadata) {
+    assert.equal(payload.snapshot, true);
+    assert.ok(Number.isSafeInteger(payload.observedAtMs));
+    assert.equal(payload.actorJid, undefined);
+    assert.equal(payload.occurredMs, undefined);
+  }
+  assert.equal(metadata[0].payload.value, ' exact subject ');
+  assert.equal(metadata[1].payload.value, '');
+  await client.handleGroupUpdate({ id: 'members@g.us', subject: ' exact subject ',
+    subjectOwner: '123@lid', subjectTime: 1700000000, desc: '' });
+  const updates = signals.filter((s: any) => s.kind.startsWith('group_') && !s.payload.snapshot);
+  assert.equal(updates.length, 2);
+  assert.equal(updates[0].payload.actorJid, '123@lid');
+  assert.equal(updates[0].payload.occurredMs, 1700000000000);
+  assert.equal(updates[1].payload.value, '');
+  await client.handleGroupUpdate({ id: 'members@g.us' });
+  assert.equal(signals.filter((s: any) => s.kind.startsWith('group_')).length, 4);
+});
+
+test('group_metadata_provider_fetch_snapshot_and_concurrent_author', async (t) => {
+  const root = await mkdtemp(join(tmpdir(), 'yeoman-group-provider-'));
+  t.after(() => rm(root, { recursive: true, force: true }));
+  const outbox = new BridgeOutbox(join(root, 'outbox'));
+  await outbox.open();
+  const handlers = new Map<string, (value: any) => unknown>();
+  const captured: any[] = [];
+  const client: any = new WhatsAppClient({
+    authDir: root, messageReferenceDir: join(root, 'references'), readReceipts: false,
+    onMessage: () => assert.fail('metadata opened a message'),
+    onSignal: async (type, payload) => {
+      if (!type.startsWith('group_')) return;
+      const identity = deriveProviderEventIdentity(type, 'default', payload);
+      captured.push(createEventEnvelope({ type, payload, ...identity }));
+    },
+    onQR: () => {}, onStatus: () => {}, onError: (error) => assert.fail(error),
+  });
+  await client.referenceStore.open();
+  client.acceptingProviderEvents = true;
+  client.connected = true;
+  const fetched = { id: 'members@g.us', subject: 'current', desc: '', participants: [],
+    subjectOwner: '111@lid', subjectTime: 1, descOwner: '111@lid', descTime: 2 };
+  const second = { ...fetched, id: 'second@g.us', subject: 'second current' };
+  client.sock = {
+    ev: { on: (name: string, listener: (value: any) => unknown) => handlers.set(name, listener) },
+    groupFetchAllParticipating: async () => {
+      handlers.get('groups.update')!([fetched, second]); // installed Baileys fetch side effect
+      handlers.get('groups.update')!([{ id: fetched.id, subject: 'concurrent',
+        author: '222@lid', authorPn: '49222@s.whatsapp.net', subjectOwner: '111@lid' }]);
+      return { [fetched.id]: fetched, [second.id]: second };
+    },
+  };
+  client.registerInboundMessageHandler();
+  await client.refreshLidCache();
+  await waitFor(() => captured.length >= 5);
+  await new Promise(resolve => setImmediate(resolve));
+  const pending = captured;
+  assert.equal(pending.length, 5);
+  const snapshots = pending.filter(e => e.payload.snapshot);
+  assert.equal(snapshots.length, 4);
+  for (const { payload } of snapshots) {
+    assert.ok((payload.observedAtMs as number) > 2000);
+    assert.equal(payload.actorJid, undefined);
+    assert.equal(payload.occurredMs, undefined);
+  }
+  const [change] = pending.filter(e => !e.payload.snapshot);
+  assert.equal(change.payload.value, 'concurrent');
+  assert.equal(change.payload.actorJid, '222@lid');
+  assert.equal(change.payload.occurredMs, undefined);
+  handlers.get('groups.update')!([{ id: fetched.id, desc: 'changed',
+    author: '333@lid', authorPn: '49333@s.whatsapp.net' }]);
+  await waitFor(() => captured.length >= 6);
+  assert.equal(captured.filter(e => !e.payload.snapshot).length, 2);
+  const description = captured.find(e => e.payload.value === 'changed')!;
+  assert.equal(description.payload.actorJid, '333@lid');
+  assert.equal(description.payload.occurredMs, undefined);
+  // Provider dirty-group refresh outside reconnect also emits full metadata.
+  handlers.get('groups.update')!([{ ...fetched, subject: 'later current' }]);
+  await waitFor(() => captured.some(e => e.payload.value === 'later current'));
+  assert.equal(captured.find(e => e.payload.value === 'later current').payload.snapshot, true);
+  for (const envelope of captured) await outbox.append(envelope);
+  assert.equal((await outbox.pending()).length, 8);
+});
+
+test('group_metadata_provider_author_listener', async (t) => {
+  const { client, signals } = await membershipClient(t);
+  const handlers = new Map<string, (value: any) => unknown>();
+  client.sock = { ev: { on: (name: string, handler: (value: any) => unknown) => handlers.set(name, handler) } };
+  client.registerInboundMessageHandler();
+  handlers.get('groups.update')!([{ id: 'members@g.us', desc: 'native change',
+    author: '222@lid', authorPn: '49222@s.whatsapp.net', descOwner: '111@lid' }]);
+  await waitFor(() => signals.length === 1);
+  assert.equal(signals[0].payload.actorJid, '222@lid');
+  assert.equal(signals[0].payload.occurredMs, undefined);
+  assert.equal(signals[0].payload.snapshot, false);
+});
+
+
+test('group_metadata_provider_buffered_fetch_single_snapshot', async (t) => {
+  const { makeEventBuffer } = await import('@whiskeysockets/baileys/lib/Utils/event-buffer.js');
+  const { default: pino } = await import('pino');
+  const ev = makeEventBuffer(pino({ level: 'silent' }));
+  t.after(() => ev.destroy());
+  const { client, signals } = await membershipClient(t);
+  client.connected = true;
+  const metadata = { id: 'members@g.us', subject: 'current', desc: '', participants: [] };
+  client.sock = { ev, groupFetchAllParticipating: async () => {
+    ev.emit('groups.update', [metadata]);
+    return { [metadata.id]: metadata };
+  } };
+  client.registerInboundMessageHandler();
+  ev.buffer();
+  await client.refreshLidCache();
+  const before = signals.filter((s: any) => s.kind.startsWith('group_'));
+  assert.equal(before.length, 2);
+  ev.flush();
+  await new Promise(resolve => setImmediate(resolve));
+  assert.equal(signals.filter((s: any) => s.kind.startsWith('group_')).length, 2);
+  assert.ok(before.every((s: any) => s.payload.snapshot && !s.payload.actorJid && !s.payload.occurredMs));
 });

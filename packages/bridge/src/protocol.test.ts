@@ -460,3 +460,16 @@ test('outbound_result_validator_parity', async () => {
   const results = cases.map(([name, type, result, expected]) => [name, validateOutboundResult(type, result), expected]);
   assert.ok(results.every(([, actual, expected]) => actual === expected), JSON.stringify(results));
 });
+
+test('group_metadata_snapshot_not_historical_change validator mirror', async () => {
+  const { validGroupMetadata } = await import('./protocol.js');
+  const payload = { chatJid: 'members@g.us', value: '', snapshot: true, observedAtMs: 1700000000000 };
+  assert.equal(validGroupMetadata(payload), true);
+  for (const changes of [{ value: null }, { snapshot: 1 }, { actorJid: '123@lid' },
+    { occurredMs: 1700000000000 }, { observedAtMs: true }, { observedAtMs: 9007199254740992 },
+    { extra: 'x' }, { chatJid: '123@lid' }, { value: '😀'.repeat(131073) }]) {
+    assert.equal(validGroupMetadata({ ...payload, ...changes }), false);
+  }
+  assert.equal(validGroupMetadata({ chatJid: payload.chatJid, snapshot: true, observedAtMs: payload.observedAtMs }), false);
+  assert.equal(validGroupMetadata({ ...payload, snapshot: false, actorJid: 'members@g.us', occurredMs: 1700000000000 }), true);
+});

@@ -107,6 +107,11 @@ def _inline_raw_append(monkeypatch: pytest.MonkeyPatch) -> None:
 
     monkeypatch.setattr("yeoman_gateway.channels.whatsapp.append_async", append_inline)
 
+    async def append_durable_inline(archive, event, source=None, *, kind="") -> bool:
+        return archive is not None and archive.append_durable(event, source, kind=kind)
+
+    monkeypatch.setattr("yeoman_gateway.channels.whatsapp.append_durable_async", append_durable_inline)
+
 
 def _records(root: Path) -> list[dict]:
     return [r for path in archive_files(root) for _, r, _ in iter_records(path) if r]
@@ -150,12 +155,12 @@ def test_frame_is_archived_even_when_journal_capture_fails(tmp_path: Path) -> No
 def test_membership_change_is_raw_archived_before_journaling(tmp_path: Path) -> None:
     channel, archive, store = _setup(tmp_path)
     order: list[str] = []
-    append_raw = archive.append
+    append_raw = archive.append_durable
     append_event = store.append_event
 
-    def record_raw(event):
+    def record_raw(event, source=None, *, kind=""):
         order.append("raw")
-        return append_raw(event)
+        return append_raw(event, source, kind=kind)
 
     def record_journal(*args, **kwargs):
         order.append("journal")
@@ -165,7 +170,7 @@ def test_membership_change_is_raw_archived_before_journaling(tmp_path: Path) -> 
         order.append("ack")
         return {"acknowledged": True}
 
-    archive.append = record_raw  # type: ignore[method-assign]
+    archive.append_durable = record_raw  # type: ignore[method-assign]
     store.append_event = record_journal  # type: ignore[method-assign]
     channel._send_command = ack  # type: ignore[method-assign]
     frame = json.loads(
@@ -205,7 +210,7 @@ def test_empty_complete_membership_snapshot_is_archived_journaled_and_acked(
     order: list[str] = []
     issued: list[object] = []
     recorded: list[object] = []
-    append_raw = archive.append
+    append_raw = archive.append_durable
     append_event = store.append_event
 
     class Issuer:
@@ -226,9 +231,9 @@ def test_empty_complete_membership_snapshot_is_archived_journaled_and_acked(
     )
     _inline_raw_append(monkeypatch)
 
-    def record_raw(event):
+    def record_raw(event, source=None, *, kind=""):
         order.append("raw")
-        return append_raw(event)
+        return append_raw(event, source, kind=kind)
 
     def record_journal(*args, **kwargs):
         order.append("journal")
@@ -241,7 +246,7 @@ def test_empty_complete_membership_snapshot_is_archived_journaled_and_acked(
         order.append("ack")
         return {"acknowledged": True}
 
-    archive.append = record_raw  # type: ignore[method-assign]
+    archive.append_durable = record_raw  # type: ignore[method-assign]
     store.append_event = record_journal  # type: ignore[method-assign]
     channel._send_command = ack  # type: ignore[method-assign]
     _use_inline_bridge_ack(channel)
@@ -286,18 +291,18 @@ def test_membership_conflict_is_archived_but_not_acked_or_projected(
     order: list[str] = []
     issued: list[object] = []
     recorded: list[object] = []
-    append_raw = archive.append
+    append_raw = archive.append_durable
     append_event = store.append_event
 
-    def record_raw(event):
+    def record_raw(event, source=None, *, kind=""):
         order.append("raw")
-        return append_raw(event)
+        return append_raw(event, source, kind=kind)
 
     def record_journal(*args, **kwargs):
         order.append("journal")
         return append_event(*args, **kwargs)
 
-    archive.append = record_raw  # type: ignore[method-assign]
+    archive.append_durable = record_raw  # type: ignore[method-assign]
     store.append_event = record_journal  # type: ignore[method-assign]
     _use_inline_bridge_ack(channel)
     _inline_raw_append(monkeypatch)
@@ -469,10 +474,10 @@ def test_inbound_capacity_stops_before_capture_and_ack(tmp_path: Path) -> None:
         ack_calls.append(command_type)
         return {"acknowledged": True}
 
-    def capacity_error(event):
+    def capacity_error(event, source=None, *, kind=""):
         raise RawArchiveCapacityError("raw archive capacity reached")
 
-    archive.append = capacity_error  # type: ignore[method-assign]
+    archive.append_durable = capacity_error  # type: ignore[method-assign]
     channel.set_processing_signals(Capture())
     channel._send_command = ack  # type: ignore[method-assign]
 
@@ -859,10 +864,10 @@ def test_startup_replay_capacity_does_not_repair_or_ack(tmp_path: Path, monkeypa
             yield _frame(_message(), event_id="evt-replay")
             await self.closed.wait()
 
-    def capacity_error(event):
+    def capacity_error(event, source=None, *, kind=""):
         raise RawArchiveCapacityError("raw archive capacity reached")
 
-    archive.append = capacity_error  # type: ignore[method-assign]
+    archive.append_durable = capacity_error  # type: ignore[method-assign]
     runtime = Runtime()
     channel._runtime = runtime  # type: ignore[assignment]
     socket = ReplaySocket()
@@ -937,3 +942,488 @@ def test_outbound_normalized_result_fields_are_archived(tmp_path, command, paylo
     assert request["correlation_id"] == response["correlation_id"] == ws.sent[0]["requestId"]
     assert response["native_id"] == provider_id  # delete target is not an outbound provider ID
     assert "synthetic-token" not in json.dumps([request, response])
+
+
+@pytest.mark.asyncio
+async def test_group_metadata_raw_before_ack_no_response(tmp_path):
+    channel, archive, store = _setup(tmp_path)
+    payload = {"chatJid": CHAT, "value": "", "snapshot": True, "observedAtMs": NOW}
+    acknowledged = []
+    published = []
+
+    async def ack(command_type, body, timeout_seconds, **kwargs):
+        assert command_type == "ack_event"
+        records = _records(archive.root)
+        assert any(r["native"]["payload"] == payload for r in records)
+        acknowledged.append(body["eventId"])
+        return {"acknowledged": True}
+
+    async def publish(event):
+        published.append(event)
+
+    channel._send_command = ack
+    channel._publish_event = publish
+    try:
+        await channel._handle_bridge_message(_frame(payload, kind="group_description"))
+        await channel._drain_bridge_worker()
+        assert acknowledged == ["evt-1"]
+        assert published == [] and store.count_events() == 1
+        await channel._handle_bridge_message(_frame(payload | {"value": None}, event_id="bad", kind="group_description"))
+        assert acknowledged == ["evt-1"] and store.count_events() == 1
+    finally:
+        await channel.stop()
+        store.close()
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("kind", ["message", "group_subject"])
+async def test_replay_withholds_ack_until_raw_is_durable(tmp_path, monkeypatch, kind):
+    channel, archive, store = _setup(tmp_path)
+    payload = (_message() if kind == "message" else
+               {"chatJid": CHAT, "value": "change", "actorJid": "222@lid",
+                "observedAtMs": NOW, "snapshot": False})
+    acknowledged = []
+    published = []
+
+    async def ack(command_type, body, timeout_seconds, **kwargs):
+        assert any(r["native"]["payload"] == payload for r in _records(archive.root))
+        acknowledged.append(body["eventId"])
+        return {"acknowledged": True}
+
+    async def publish(event):
+        published.append(event)
+
+    channel._send_command = ack
+    channel._publish_event = publish
+    append_line = archive._append_archive_line
+    spool_line = archive._spool_line_locked
+
+    def failed_archive(*args, **kwargs):
+        raise OSError("synthetic archive unavailable")
+
+    monkeypatch.setattr(archive, "_append_archive_line", failed_archive)
+    monkeypatch.setattr(archive, "_spool_line_locked", lambda *args, **kwargs: False)
+    try:
+        await channel._handle_bridge_message(_frame(payload, kind=kind))
+        await channel._drain_bridge_worker()
+        assert acknowledged == [] and published == []
+        assert store.count_events() == 0  # journal is writable, but raw is not durable
+        assert not archive._pending
+        monkeypatch.setattr(archive, "_append_archive_line", append_line)
+        monkeypatch.setattr(archive, "_spool_line_locked", spool_line)
+        await channel._handle_bridge_message(_frame(payload, kind=kind))
+        await _until(lambda: acknowledged == ["evt-1"])
+        await channel._drain_bridge_worker()
+        await channel._drain_debounce_projections()
+        assert acknowledged == ["evt-1"] and store.count_events() == 1
+        assert len(published) == (1 if kind == "message" else 0)
+        assert not archive._pending
+        assert len(_records(archive.root)) == 1
+        if kind == "group_subject":
+            assert _records(archive.root)[0]["native"]["payload"]["actorJid"] == "222@lid"
+    finally:
+        await channel.stop()
+        store.close()
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("mode", ["disabled", "legacy", "legacy_media"])
+async def test_raw_disabled_and_legacy_archive_keep_journal_ack_order(tmp_path, monkeypatch, mode):
+    channel, _, store = _setup(tmp_path)
+    order = []
+    warnings = []
+    append_event = store.append_event
+
+    class LegacyArchive:
+        def append(self, event):
+            order.append("raw")
+            assert event.native_id in {"legacy-0", "legacy-1"}
+            return False  # Old API's deferred result must not be treated as durability failure.
+
+        def append_with_media(self, event, source, *, kind):
+            assert kind == "document" and Path(source).is_file()
+            return self.append(event)
+
+    channel.set_raw_archive(None if mode == "disabled" else LegacyArchive())
+    monkeypatch.setattr(whatsapp_module.logger, "warning", lambda message, *args: warnings.append(message))
+
+    def journal(*args, **kwargs):
+        order.append("journal")
+        return append_event(*args, **kwargs)
+
+    async def ack(command_type, body, timeout_seconds, **kwargs):
+        assert command_type == "ack_event"
+        assert store.get_event(body["eventId"]) is not None
+        order.append("ack")
+        return {"acknowledged": True}
+
+    store.append_event = journal
+    channel._send_command = ack
+    payload = {"chatJid": CHAT, "value": "current", "observedAtMs": NOW, "snapshot": True}
+    if mode == "legacy_media":
+        source = tmp_path / "incoming" / "synthetic.txt"
+        source.parent.mkdir(exist_ok=True)
+        source.write_text("synthetic media")
+        # Exercise legacy media through a message; metadata has no media field.
+        payload = _message(media={"kind": "document", "path": str(source)})
+    try:
+        for index in range(2):
+            current = payload if mode != "legacy_media" else payload | {"messageId": f"media-{index}"}
+            await channel._handle_bridge_message(_frame(current, event_id=f"legacy-{index}",
+                                                        kind="message" if mode == "legacy_media" else "group_subject"))
+            await channel._drain_bridge_worker()
+        assert order == (["journal", "ack"] if mode == "disabled" else ["raw", "journal", "ack"]) * 2
+        assert store.count_events() == 2
+        assert len(warnings) == (0 if mode == "disabled" else 1)
+        assert channel._bridge_intake_closed is False
+    finally:
+        await channel.stop()
+        store.close()
+
+
+async def _until(predicate):
+    async with asyncio.timeout(5):
+        while not predicate():
+            await asyncio.sleep(0.005)
+
+
+@pytest.mark.asyncio
+async def test_raw_retry_recovery_is_single_publication(tmp_path, monkeypatch):
+    channel, archive, store = _setup(tmp_path)
+    channel._raw_retry_initial_seconds = 0.01
+    channel._raw_retry_max_seconds = 0.04
+    failed = True
+    attempts = []
+    original = archive._append_archive_line
+
+    def write(*args):
+        attempts.append(len(attempts))
+        if failed:
+            raise OSError("synthetic unavailable")
+        return original(*args)
+
+    monkeypatch.setattr(archive, "_append_archive_line", write)
+    monkeypatch.setattr(archive, "_spool_line_locked", lambda *args: False)
+    published = []
+    acked = []
+    async def ack(command, payload, **kwargs):
+        acked.append(payload["eventId"])
+        return {"acknowledged": True}
+    async def project(work):
+        published.append(work.event_id)
+    channel._send_command = ack
+    channel._project_bridge_event = project
+    frame = _frame(_message())
+    try:
+        await channel._handle_bridge_message(frame)
+        assert not channel._bridge_intake_closed
+        assert not archive._pending
+        await _until(lambda: len(attempts) >= 3)
+        await channel._handle_bridge_message(frame)  # reuse retry entry
+        assert acked == [] and store.count_events() == 0
+        failed = False
+        await _until(lambda: len(published) == 1)
+        assert acked == ["evt-1"] and store.count_events() == 1
+        assert len(_records(archive.root)) == 1
+        assert not archive._pending
+    finally:
+        await channel.stop()
+        store.close()
+
+
+@pytest.mark.asyncio
+async def test_raw_failure_preserves_another_inflight_ack(tmp_path, monkeypatch):
+    channel, archive, store = _setup(tmp_path)
+    ack_sent = asyncio.Event()
+    ack_response = asyncio.Event()
+    published = []
+    acknowledged = []
+    failed = True
+    write = archive._append_archive_line
+    def append(*args):
+        if args[3]["native_id"] == "B" and failed:
+            raise OSError("synthetic B unavailable")
+        return write(*args)
+    monkeypatch.setattr(archive, "_append_archive_line", append)
+    monkeypatch.setattr(archive, "_spool_line_locked", lambda *args: False)
+    channel._raw_retry_initial_seconds = 0.01
+    channel._raw_retry_max_seconds = 0.04
+    class Socket:
+        closed = False
+        async def close(self):
+            self.closed = True
+    channel._ws = Socket()
+    async def ack(command, payload, **kwargs):
+        event_id = payload["eventId"]
+        acknowledged.append(event_id)  # Bridge durably deletes before responding.
+        if event_id == "A":
+            ack_sent.set()
+            await ack_response.wait()
+        return {"acknowledged": True}
+    async def project(work):
+        published.append(work.event_id)
+    channel._send_command = ack
+    channel._project_bridge_event = project
+    first = asyncio.create_task(channel._handle_bridge_message(_frame(_message(), event_id="A")))
+    try:
+        await ack_sent.wait()
+        await channel._handle_bridge_message(_frame(_message(messageId="b"), event_id="B"))
+        assert channel._ws.closed is False and channel._bridge_intake_closed is False
+        assert acknowledged == ["A"] and published == []
+        ack_response.set()
+        await first
+        assert published == ["A"]
+        failed = False
+        await _until(lambda: published == ["A", "B"])
+        assert acknowledged == ["A", "B"] and store.count_events() == 2
+        assert len(_records(archive.root)) == 2
+    finally:
+        ack_response.set()
+        await first
+        await channel.stop()
+        store.close()
+
+
+@pytest.mark.asyncio
+async def test_startup_raw_retry_keeps_subscription_healthy(tmp_path, monkeypatch):
+    import websockets
+    channel, archive, store = _setup(tmp_path)
+    del channel._send_command
+    channel._raw_retry_initial_seconds = 0.01
+    channel._raw_retry_max_seconds = 0.04
+    failures = []
+    recovered = False
+    write = archive._append_archive_line
+    def append(*args):
+        if not recovered:
+            failures.append(1)
+            raise OSError("synthetic unavailable")
+        return write(*args)
+    monkeypatch.setattr(archive, "_append_archive_line", append)
+    monkeypatch.setattr(archive, "_spool_line_locked", lambda *args: False)
+    repairs = []
+    channel._runtime.ensure_ready = lambda **kwargs: None
+    channel._runtime.repair_once = lambda: repairs.append(1)
+    published = []
+    acked = []
+    async def project(work):
+        published.append(work.event_id)
+    channel._project_bridge_event = project
+    async def bridge(socket):
+        async for encoded in socket:
+            command = json.loads(encoded)
+            if command["type"] == "subscribe_events":
+                await socket.send(_frame(_message(), event_id="startup"))
+                result = {"subscribed": True}
+            elif command["type"] == "health":
+                result = {"protocolVersion": PROTOCOL_VERSION}
+            else:
+                assert command["type"] == "ack_event"
+                acked.append(command["payload"]["eventId"])
+                result = {"acknowledged": True}
+            await socket.send(json.dumps({"version": PROTOCOL_VERSION, "type": "response",
+                "requestId": command["requestId"], "payload": {"ok": True, "result": result}}))
+    async with websockets.serve(bridge, "127.0.0.1", 0) as server:
+        channel.config.bridge_host = "127.0.0.1"
+        channel.config.bridge_port = server.sockets[0].getsockname()[1]
+        channel.config.bridge_token = "synthetic"
+        run = asyncio.create_task(channel.start())
+        try:
+            await _until(lambda: len(failures) >= 3 or run.done())
+            assert not run.done() and channel._running and channel._connected
+            assert repairs == [] and not channel._bridge_intake_closed
+            assert acked == [] and store.count_events() == 0 and not archive._pending
+            recovered = True
+            await _until(lambda: published == ["startup"])
+            assert acked == ["startup"] and store.count_events() == 1
+            assert len(_records(archive.root)) == 1 and repairs == []
+        finally:
+            await channel.stop()
+            await run
+            store.close()
+
+
+@pytest.mark.asyncio
+async def test_raw_retry_capacity_sheds_and_replay_conflicts(tmp_path, monkeypatch):
+    channel, archive, store = _setup(tmp_path)
+    channel._raw_retry_maxsize = 1
+    channel._raw_retry_initial_seconds = 0.01
+    channel._raw_retry_max_seconds = 0.04
+    failed = True
+    write = archive._append_archive_line
+    def append(*args):
+        if failed:
+            raise OSError("synthetic unavailable")
+        return write(*args)
+    monkeypatch.setattr(archive, "_append_archive_line", append)
+    monkeypatch.setattr(archive, "_spool_line_locked", lambda *args: False)
+    first = _frame(_message(), event_id="A")
+    second = None
+    try:
+        await channel._handle_bridge_message(first)
+        assert len(channel._bridge_raw_retries) == 1
+        await channel._handle_bridge_message(first)
+        await channel._handle_bridge_message(_frame(_message("conflict"), event_id="A"))
+        assert len(channel._bridge_raw_retries) == 1 and store.count_events() == 0
+        second = asyncio.create_task(channel._handle_bridge_message(_frame(_message(messageId="b"), event_id="B")))
+        await asyncio.sleep(0.05)
+        assert second.done() and len(channel._bridge_raw_retries) == 1
+        assert channel._raw_shed_count == 1 and "B" not in channel._bridge_inflight
+        assert not channel._bridge_intake_closed
+        failed = False
+        await second
+        await _until(lambda: store.count_events() == 1)
+        await channel._handle_bridge_message(_frame(_message(messageId="b"), event_id="B"))
+        await _until(lambda: store.count_events() == 2)
+        await channel._drain_bridge_worker()
+        assert len(_records(archive.root)) == 2
+        assert not channel._bridge_raw_retries and not archive._pending
+    finally:
+        if second is not None and not second.done():
+            second.cancel()
+            await asyncio.gather(second, return_exceptions=True)
+        await channel.stop()
+        store.close()
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("delivery", ["live", "replay"])
+async def test_saturation_reads_delayed_ack_and_replays_shed_after_recovery(tmp_path, monkeypatch, delivery):
+    import websockets
+    channel, archive, store = _setup(tmp_path)
+    del channel._send_command
+    channel._raw_retry_maxsize = 1
+    channel._raw_retry_initial_seconds = 0.01
+    channel._raw_retry_max_seconds = 0.04
+    monkeypatch.setattr(whatsapp_module, "BRIDGE_ACK_TIMEOUT_SECONDS", 0.2)
+    channel._runtime.ensure_ready = lambda **kwargs: None
+    channel._runtime.repair_once = lambda: pytest.fail("healthy Bridge repaired")
+    failed = delivery == "replay"
+    write = archive._append_archive_line
+    def append(*args):
+        if failed and args[3]["native_id"] != "A":
+            raise OSError("synthetic storage unavailable")
+        return write(*args)
+    monkeypatch.setattr(archive, "_append_archive_line", append)
+    monkeypatch.setattr(archive, "_spool_line_locked", lambda *args: False)
+    pending = {name: _frame(_message(messageId=name), event_id=name) for name in "ABC"}
+    projected = []
+    subscriptions = []
+    a_reply_sent = asyncio.Event()
+    async def project(work):
+        projected.append(work.event_id)
+    channel._project_bridge_event = project
+    async def bridge(socket):
+        nonlocal failed
+        async for encoded in socket:
+            command = json.loads(encoded)
+            kind = command["type"]
+            if kind == "health":
+                result = {"protocolVersion": PROTOCOL_VERSION}
+            elif kind == "subscribe_events":
+                subscriptions.append(1)
+                result = {"subscribed": True}
+            else:
+                assert kind == "ack_event"
+                name = command["payload"]["eventId"]
+                pending.pop(name)  # deletion is durable before the delayed response
+                if name == "A":
+                    failed = True
+                    if delivery == "live":
+                        await socket.send(pending["B"])
+                        await socket.send(pending["C"])
+                    # The reply reaches the wire after saturation, independently of
+                    # the new shedding implementation (the old reader must fail).
+                    await _until(lambda: len(channel._bridge_raw_retries) == 1)
+                    await asyncio.sleep(0.02)
+                result = {"acknowledged": True}
+            await socket.send(json.dumps({"version": PROTOCOL_VERSION, "type": "response",
+                "requestId": command["requestId"], "payload": {"ok": True, "result": result}}))
+            if kind == "ack_event" and name == "A":
+                a_reply_sent.set()
+            if kind == "subscribe_events":
+                if delivery == "live":
+                    await _until(lambda: channel._connected and not channel._events_subscription_pending)
+                first = ([pending[name] for name in ("A" if delivery == "live" else "BCA")]
+                         if len(subscriptions) == 1 else [])
+                for frame in (first if len(subscriptions) == 1 else list(pending.values())):
+                    await socket.send(frame)
+    async with websockets.serve(bridge, "127.0.0.1", 0) as server:
+        channel.config.bridge_host = "127.0.0.1"
+        channel.config.bridge_port = server.sockets[0].getsockname()[1]
+        channel.config.bridge_token = "synthetic"
+        run = asyncio.create_task(channel.start())
+        try:
+            await _until(lambda: (projected == ["A"] and a_reply_sent.is_set()) or run.done())
+            assert projected == ["A"] and channel._connected
+            await asyncio.sleep(0.3)  # storage outage exceeds A's ACK budget
+            assert projected == ["A"] and channel._connected and not channel._bridge_intake_closed
+            assert len(channel._bridge_raw_retries) == 1 and channel._raw_shed_count == 1
+            assert "C" not in channel._bridge_inflight and set(pending) == {"B", "C"}
+            failed = False
+            await _until(lambda: len(projected) == 3)
+            assert projected == ["A", "B", "C"] and len(subscriptions) == 2
+            assert not pending and store.count_events() == 3 and len(_records(archive.root)) == 3
+        finally:
+            failed = False
+            await channel.stop()
+            await run
+            store.close()
+
+
+@pytest.mark.asyncio
+async def test_stop_settles_raw_thread_and_journals_without_ack(tmp_path, monkeypatch):
+    import threading
+    channel, archive, store = _setup(tmp_path)
+    channel._raw_retry_initial_seconds = 0.01
+    channel._raw_retry_max_seconds = 0.04
+    entered = threading.Event()
+    release = threading.Event()
+    mode = "fail"
+    write = archive._append_archive_line
+    def append(*args):
+        if mode == "fail":
+            raise OSError("synthetic storage unavailable")
+        if mode == "barrier":
+            entered.set()
+            assert release.wait(5)
+        return write(*args)
+    monkeypatch.setattr(archive, "_append_archive_line", append)
+    monkeypatch.setattr(archive, "_spool_line_locked", lambda *args: False)
+    acked = []
+    projected = []
+    async def ack(command, payload, **kwargs):
+        acked.append(payload["eventId"])
+        return {"acknowledged": True}
+    async def project(work):
+        projected.append(work.event_id)
+    channel._send_command = ack
+    channel._project_bridge_event = project
+    stop = None
+    try:
+        await channel._handle_bridge_message(_frame(_message()))
+        mode = "barrier"
+        assert await asyncio.to_thread(entered.wait, 5)
+        stop = asyncio.create_task(channel.stop())
+        await asyncio.sleep(0.05)
+        assert not stop.done() and acked == [] and projected == []
+        release.set()
+        await stop
+        assert store.count_events() == 1 and len(_records(archive.root)) == 1
+        assert acked == [] and projected == [] and not channel._bridge_raw_writes
+        before = _records(archive.root)
+        await asyncio.sleep(0.05)
+        assert _records(archive.root) == before  # no archive mutation after normal stop
+        mode = "success"
+        channel._stopping = False
+        channel._bridge_intake_closed = False
+        await channel._handle_bridge_message(_frame(_message()))
+        await channel._drain_bridge_worker()
+        assert store.count_events() == 1 and acked == ["evt-1"] and projected == ["evt-1"]
+        assert len(_records(archive.root)) == 2  # accepted append-only copy across stop/replay
+    finally:
+        release.set()
+        if stop is not None:
+            await stop
+        await channel.stop()
+        store.close()

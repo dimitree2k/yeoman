@@ -7,7 +7,8 @@ MAX_BRIDGE_FRAME_BYTES = 262_144
 """UTF-8 serialized event and WebSocket frame ceiling shared with the Bridge."""
 
 REPLAYABLE_EVENT_TYPES = frozenset(
-    {"message", "edit", "delete", "reaction", "receipt", "membership_change", "membership_snapshot"}
+    {"message", "edit", "delete", "reaction", "receipt", "membership_change", "membership_snapshot",
+     "group_subject", "group_description"}
 )
 """Business event kinds retained by the Bridge outbox."""
 
@@ -74,3 +75,21 @@ FORWARD_CONTENT_FIELDS = frozenset(
     {"text", "caption", "media", "forwarded", "sourceChatJid", "sourceMessageId", "provenance"}
 )
 """Forward provenance identifies the body used: provider sent body or original source fallback."""
+
+
+def valid_group_metadata(value: object) -> bool:
+    """Exact additive v5 group observation contract, including empty clears."""
+    if not isinstance(value, dict) or not set(value) <= {
+        "chatJid", "value", "actorJid", "occurredMs", "observedAtMs", "snapshot"
+    }:
+        return False
+    chat = bridge_string(value.get("chatJid"))
+    return (chat is not None and chat.endswith("@g.us")
+            and len(chat.encode("utf-16-le", errors="surrogatepass")) <= 256
+            and isinstance(value.get("value"), str)
+            and len(value["value"].encode("utf-16-le", errors="surrogatepass")) <= MAX_BRIDGE_FRAME_BYTES * 2
+            and isinstance(value.get("snapshot"), bool)
+            and _js_safe_integer(value.get("observedAtMs")) and value["observedAtMs"] >= 0
+            and ("actorJid" not in value or bridge_string(value["actorJid"]) is not None)
+            and ("occurredMs" not in value or _js_safe_integer(value["occurredMs"]) and value["occurredMs"] >= 0)
+            and (not value["snapshot"] or not {"actorJid", "occurredMs"} & set(value)))

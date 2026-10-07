@@ -137,17 +137,26 @@ def test_purge_requires_confirmation(home: Path) -> None:
 
 
 def test_purge_with_yes_removes_and_audits(home: Path) -> None:
+    [month_file] = archive_files(home / "data" / "raw")
+    original_lines = month_file.read_bytes().splitlines(keepends=True)
     result = runner.invoke(
         app,
         ["raw", "purge", "--channel", "whatsapp", "--message", "m1", "--yes"],
     )
     assert result.exit_code == 0, result.output
-    assert (home / "data" / "raw" / "AUDIT").is_file()
+    audit_path = home / "data" / "raw" / "AUDIT"
+    assert audit_path.is_file()
+    [audit] = [record for _, record, _ in iter_records(audit_path) if record]
+    assert audit["removed_lines"] == 1
+    lines = month_file.read_bytes().splitlines(keepends=True)
+    assert len(lines) == len(original_lines) == 2
+    assert lines[0] == b'{"purged_version":1}\n'
+    assert lines[1:] == original_lines[1:]
     ids = [
         record["native_id"]
         for path in archive_files(home / "data" / "raw")
         for _, record, _ in iter_records(path)
-        if record
+        if record and record.get("native_id")
     ]
     assert ids == ["evt-m2"]
 

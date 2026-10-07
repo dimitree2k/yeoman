@@ -27,7 +27,8 @@ from typing import Any, ClassVar, Literal
 DAY_MS = 86_400_000
 
 EventKind = Literal[
-    "message", "edit", "reaction", "delete", "receipt", "membership_change", "membership_snapshot"
+    "message", "edit", "reaction", "delete", "receipt", "membership_change", "membership_snapshot",
+    "group_subject", "group_description"
 ]
 EffectState = Literal[
     "planned",
@@ -46,7 +47,8 @@ DecisionOutcome = Literal["allow", "deny"]
 DecisionStage = Literal["fast", "final", "admin"]
 
 EVENT_KINDS: tuple[str, ...] = (
-    "message", "edit", "reaction", "delete", "receipt", "membership_change", "membership_snapshot"
+    "message", "edit", "reaction", "delete", "receipt", "membership_change", "membership_snapshot",
+    "group_subject", "group_description"
 )
 CANONICAL_WHATSAPP_ORIGIN = "whatsapp_canonical"
 EFFECT_STATES: tuple[str, ...] = (

@@ -619,12 +619,15 @@ def test_telegram_purge_uses_effective_message_scope_and_removes_associated_medi
         now_ms=NOW + 1,
     )
     assert result.removed_lines == 3
-    remaining = [
+    records = [
         record
         for path in archive_files(archive.root)
         for _, record, _ in iter_records(path)
         if record
     ]
+    # Purged lines stay in place as content-free tombstones so later refs keep their positions.
+    assert [record for record in records if "purged_version" in record] == [{"purged_version": 1}] * 3
+    remaining = [record for record in records if "purged_version" not in record]
     assert [(record["native_id"], record["chat_id"], record["kind"]) for record in remaining] == [
         ("1003", "202", "update"),
         ("1004", "101", "update"),

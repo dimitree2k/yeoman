@@ -19,6 +19,7 @@ import {
   PROTOCOL_VERSION,
   REPLAYABLE_EVENT_TYPES,
   deriveProviderEventIdentity,
+  validGroupMetadata,
   type BridgeEventEnvelope,
 } from './protocol.js';
 
@@ -107,6 +108,9 @@ function asReplayableEvent(event: BridgeEventEnvelope): ReplayableBridgeEvent {
     throw new Error(`Invalid replayable event type: ${event.type}`);
   }
   const type = event.type;
+  if ((type === 'group_subject' || type === 'group_description') && !validGroupMetadata(event.payload)) {
+    throw new Error('Invalid group metadata payload');
+  }
   const derived = deriveProviderEventIdentity(type, event.accountId, event.payload);
   const eventId = typeof event.eventId === 'string' && event.eventId.trim()
     ? event.eventId
@@ -122,6 +126,15 @@ function asReplayableEvent(event: BridgeEventEnvelope): ReplayableBridgeEvent {
   return { ...event, type, eventId, eventKey, observedAt };
 }
 
+function metadataComparisonPayload(event: ReplayableBridgeEvent): Record<string, unknown> {
+  if ((event.type === 'group_subject' || event.type === 'group_description') &&
+      !event.payload.snapshot && event.payload.occurredMs !== undefined) {
+    const { observedAtMs, ...payload } = event.payload;
+    return payload;
+  }
+  return event.payload;
+}
+
 function sameReplayableEvent(a: ReplayableBridgeEvent, b: ReplayableBridgeEvent): boolean {
   return JSON.stringify({
     version: a.version,
@@ -129,14 +142,14 @@ function sameReplayableEvent(a: ReplayableBridgeEvent, b: ReplayableBridgeEvent)
     accountId: a.accountId,
     eventId: a.eventId,
     eventKey: a.eventKey,
-    payload: canonicalProviderValue(a.payload),
+    payload: canonicalProviderValue(metadataComparisonPayload(a)),
   }) === JSON.stringify({
     version: b.version,
     type: b.type,
     accountId: b.accountId,
     eventId: b.eventId,
     eventKey: b.eventKey,
-    payload: canonicalProviderValue(b.payload),
+    payload: canonicalProviderValue(metadataComparisonPayload(b)),
   });
 }
 

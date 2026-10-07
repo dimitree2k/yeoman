@@ -11,6 +11,8 @@ export const REPLAYABLE_EVENT_TYPES = [
   'receipt',
   'membership_change',
   'membership_snapshot',
+  'group_subject',
+  'group_description',
 ] as const;
 
 export const MEDIA_METADATA_FIELDS = [
@@ -54,6 +56,8 @@ export type BridgeEventType =
   | 'receipt'
   | 'membership_change'
   | 'membership_snapshot'
+  | 'group_subject'
+  | 'group_description'
   | 'status'
   | 'qr'
   | 'error'
@@ -269,6 +273,19 @@ export function validateOutboundResult(type: string, result: Record<string, unkn
       (key === 'bytes' ? Number.isSafeInteger(value) && (value as number) >= 0 : typeof value === 'string')));
 }
 
+export function validGroupMetadata(value: unknown): value is Record<string, unknown> {
+  if (!isRecord(value) || !Object.keys(value).every(k =>
+      ['chatJid', 'value', 'actorJid', 'occurredMs', 'observedAtMs', 'snapshot'].includes(k))) return false;
+  const chat = asString(value.chatJid);
+  return Boolean(chat && chat.endsWith('@g.us') && chat.length <= 128) &&
+    typeof value.value === 'string' && value.value.length <= MAX_BRIDGE_FRAME_BYTES &&
+    typeof value.snapshot === 'boolean' && Number.isSafeInteger(value.observedAtMs) &&
+    (value.observedAtMs as number) >= 0 &&
+    (!('actorJid' in value) || asString(value.actorJid) !== null) &&
+    (!('occurredMs' in value) || Number.isSafeInteger(value.occurredMs) && (value.occurredMs as number) >= 0) &&
+    (!value.snapshot || !('actorJid' in value) && !('occurredMs' in value));
+}
+
 export interface ProviderEventIdentity {
   eventId: string;
   eventKey: string;
@@ -333,7 +350,14 @@ export function deriveProviderEventIdentity(
   }
 
   let providerIdentity: string[];
-  if (type === 'membership_snapshot') {
+  if (type === 'group_subject' || type === 'group_description') {
+    if (!validGroupMetadata(payload)) return undefined;
+    // Bound the key because outbox staging includes its encoded form in a filename.
+    const digest = createHash('sha256').update(JSON.stringify([account, chat, type, payload.snapshot,
+      payload.occurredMs ?? payload.observedAtMs, identityPart(payload.actorJid), payload.value]), 'utf8').digest('hex');
+    const eventKey = `whatsapp:${type}:${digest}`;
+    return { eventKey, eventId: `wa_${createHash('sha256').update(eventKey, 'utf8').digest('hex').slice(0, 32)}` };
+  } else if (type === 'membership_snapshot') {
     const timestamp = payload.snapshotAtMs;
     if (typeof timestamp !== 'number' || !Number.isSafeInteger(timestamp) || timestamp < 0) return undefined;
     providerIdentity = [String(timestamp)];

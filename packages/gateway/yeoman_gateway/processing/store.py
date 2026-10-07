@@ -101,10 +101,13 @@ def _canonical_event_value(value: Any) -> Any:
         return [_canonical_event_value(item) for item in value]
     if not isinstance(value, Mapping):
         return value
+    timed_group_update = (value.get("kind") in {"group_subject", "group_description"}
+                          and value.get("snapshot") is False and "occurredMs" in value)
     return {
         str(key): _canonical_event_value(item)
         for key, item in sorted(value.items(), key=lambda pair: str(pair[0]))
         if str(key) not in _VOLATILE_EVENT_PAYLOAD_KEYS
+        and not (timed_group_update and key == "observedAtMs")
     }
 
 
