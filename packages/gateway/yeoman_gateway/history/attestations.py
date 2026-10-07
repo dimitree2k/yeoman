@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import os
+import re
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Any
@@ -12,7 +13,7 @@ from yeoman_shared.raw_archive.paths import ProtectedPathError, is_protected
 from .ids import classify
 from .layer1 import Layer1Line, canonical_json, write_jsonl_once
 
-ATTESTATION_VERSION = 1
+ATTESTATION_VERSION = 2
 SEED_AT_MS = 1_791_158_400_000
 REQUIRED: dict[str, tuple[str, ...]] = {
     "contact": ("identifiers",),
@@ -21,10 +22,17 @@ REQUIRED: dict[str, tuple[str, ...]] = {
     "unmerge": ("a", "b"),
     "name": ("anchor", "name"),
     "message_author": ("message_id", "anchor"),
+    "author": ("source_ref", "anchor"),
     "identifier_ended": ("identifier", "ended_ms"),
 }
 _IDENTIFIER_FIELDS = ("anchor", "identifier", "a", "b")
 _ENVELOPE = frozenset({"attestation_version", "type", "at_ms", "by", "note"})
+_WHATSAPP_ID = re.compile(
+    r"[0-9]+(?::[0-9]+)?@(lid|s\.whatsapp\.net|c\.us|newsletter)", re.IGNORECASE
+)
+_SOURCE_REF = re.compile(
+    r"(?:whatsapp|backfill|derived|owner)/[^/\\#\s]+\.jsonl#[1-9][0-9]*(?:/(?:0|[1-9][0-9]*))?"
+)
 
 
 @dataclass(frozen=True)
@@ -36,8 +44,17 @@ class Attestation:
 
 
 def _is_strong(value: Any) -> bool:
+    if not isinstance(value, str) or value != value.strip():
+        return False
     ident = classify(value)
-    return ident is not None and ident.strong
+    return ident is not None and ident.strong and _WHATSAPP_ID.fullmatch(value) is not None
+
+
+def _is_stored_identifier(value: Any) -> bool:
+    return _is_strong(value) or (
+        isinstance(value, str) and value == value.strip()
+        and (ident := classify(value)) is not None and ident.kind == "telegram"
+    )
 
 
 def _check(record: Any) -> None:
@@ -48,20 +65,41 @@ def _check(record: Any) -> None:
         raise ValueError("attestation type must be a string")
     if type_ not in REQUIRED:
         raise ValueError(f"unknown attestation type: {type_!r}")
+    version = record.get("attestation_version", 1)
+    if type(version) is not int or version not in (1, ATTESTATION_VERSION):
+        raise ValueError("unsupported attestation_version")
     if not isinstance(record.get("at_ms"), int) or isinstance(record["at_ms"], bool):
         raise ValueError("at_ms must be an integer")
+    if version == ATTESTATION_VERSION or type_ == "author":
+        if not isinstance(record.get("note"), str) or not record["note"].strip():
+            raise ValueError("note must be a nonempty string")
     for name in REQUIRED[type_]:
         if record.get(name) in (None, "", []):
             raise ValueError(f"{type_} needs {name}")
     for name in _IDENTIFIER_FIELDS:
-        if name in record and not _is_strong(record[name]):
-            raise ValueError(f"{name} must be a full WhatsApp identifier: {record[name]!r}")
+        check = _is_stored_identifier if name == "identifier" else _is_strong
+        if name in record and not check(record[name]):
+            raise ValueError(f"{name} must be a supported full identifier: {record[name]!r}")
+    if type_ == "author":
+        source_ref = record["source_ref"]
+        if not isinstance(source_ref, str) or _SOURCE_REF.fullmatch(source_ref) is None:
+            raise ValueError("source_ref must be a relative Layer 1 file#positive-line[/segment] ref")
+        anchor = classify(record["anchor"])
+        if anchor is None or anchor.kind not in ("lid", "pn_jid"):
+            raise ValueError("author anchor must be a person WhatsApp identifier")
+    if type_ == "identifier":
+        start, end = record.get("valid_from_ms"), record.get("valid_until_ms")
+        for name in ("valid_from_ms", "valid_until_ms"):
+            if record.get(name) is not None and type(record[name]) is not int:
+                raise ValueError(f"{name} must be an integer or null")
+        if start is not None and end is not None and start >= end:
+            raise ValueError("valid_from_ms must be less than valid_until_ms")
     if type_ == "contact":
         identifiers = record["identifiers"]
         if not isinstance(identifiers, list) or not identifiers or not all(
-            _is_strong(value) for value in identifiers
+            _is_stored_identifier(value) for value in identifiers
         ):
-            raise ValueError("contact identifiers must be full WhatsApp identifiers")
+            raise ValueError("contact identifiers must be supported full identifiers")
         if record.get("role") not in (None, "owner", "assistant"):
             raise ValueError("role must be owner, assistant or absent")
     if type_ == "identifier_ended" and (

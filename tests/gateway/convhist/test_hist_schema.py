@@ -1,7 +1,7 @@
 import sqlite3
 
 import pytest
-from yeoman_gateway.history.schema import SCHEMA_VERSION, create
+from yeoman_gateway.history.schema import PROJECTOR_VERSION, SCHEMA_VERSION, create
 
 
 @pytest.fixture
@@ -87,3 +87,38 @@ def test_native_event_id_is_nullable_indexed_and_non_unique(db):
         " VALUES ('e3', 'delete', 'whatsapp', 'g@g.us', 'M1', 'unknown', 'unknown', '{}', 'native', '[]')"
     )
     assert db.execute("SELECT count(*) FROM message_events WHERE native_event_id = 'P1'").fetchone()[0] == 2
+
+
+def test_identifier_schema_distinguishes_ownership_from_observation(db):
+    columns = {row[1]: row[3] for row in db.execute("PRAGMA table_info(identifier_history)")}
+    assert columns.get("valid_from_ms") == 0 and columns.get("valid_until_ms") == 0
+    assert SCHEMA_VERSION == 2
+    assert PROJECTOR_VERSION == 2
+    tables = {row[0] for row in db.execute("SELECT name FROM sqlite_master WHERE type = 'table'")}
+    assert tables == {"contacts", "identifier_history", "messages", "message_events", "projector_state"}
+    _contact(db)
+    sql = ("INSERT INTO identifier_history (contact_id, channel, kind, value, strength, evidence,"
+           " first_seen_ms, last_seen_ms, valid_from_ms, valid_until_ms, source_refs)"
+           " VALUES ('c1', 'whatsapp', 'pn_jid', '2@s.whatsapp.net', 'strong', 'owner_attested',"
+           " 150, 450, ?, ?, '[]')")
+    for bounds in ((100, 200), (300, 400), (None, 100), (400, None), (None, None), (0, None)):
+        db.execute(sql, bounds)
+        with pytest.raises(sqlite3.IntegrityError):
+            db.execute(sql, bounds)
+    assert db.execute("SELECT first_seen_ms, last_seen_ms, valid_from_ms, valid_until_ms"
+                      " FROM identifier_history ORDER BY id").fetchall() == [
+        (150, 450, 100, 200), (150, 450, 300, 400), (150, 450, None, 100),
+        (150, 450, 400, None), (150, 450, None, None), (150, 450, 0, None)]
+    for bounds in ((200, 100), (100, 100), (1.5, 200), (100, "invalid")):
+        with pytest.raises(sqlite3.IntegrityError):
+            db.execute(sql, bounds)
+    old = sqlite3.connect(":memory:")
+    try:
+        old.executescript("CREATE TABLE contacts (contact_id TEXT);"
+                          "INSERT INTO contacts VALUES ('keep'); PRAGMA user_version = 1;")
+        before = list(old.iterdump())
+        with pytest.raises(ValueError, match="rebuild"):
+            create(old)
+        assert list(old.iterdump()) == before
+    finally:
+        old.close()

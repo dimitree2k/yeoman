@@ -70,3 +70,56 @@ def test_append_refuses_protected_path_before_open(tmp_path, monkeypatch):
     with pytest.raises(ProtectedPathError):
         append(path, make("name", 7, "nickname", anchor="4915140189391@s.whatsapp.net", name="Matze"))
     assert not path.exists()
+
+
+def test_attestation_windows_validate_types_and_order():
+    fields = {"anchor": "1@lid", "identifier": "2@s.whatsapp.net"}
+    for bounds in ({}, {"valid_from_ms": None, "valid_until_ms": None},
+                   {"valid_from_ms": 100}, {"valid_until_ms": 200},
+                   {"valid_from_ms": 100, "valid_until_ms": 200}):
+        record = make("identifier", 5, "ownership", **fields, **bounds)
+        assert parse(Layer1Line("owner/attestations.jsonl#1", record)).fields == fields | bounds
+    for bounds in ({"valid_from_ms": True}, {"valid_until_ms": False},
+                   {"valid_from_ms": 1.5}, {"valid_until_ms": 2.0},
+                   {"valid_from_ms": "100"}, {"valid_until_ms": []},
+                   {"valid_from_ms": 200, "valid_until_ms": 100},
+                   {"valid_from_ms": 100, "valid_until_ms": 100}):
+        with pytest.raises(ValueError):
+            make("identifier", 5, "invalid window", **fields, **bounds)
+    for identifier in ("bad@lid", "@s.whatsapp.net", "1x@newsletter", "1:2:3@lid", "telegram:abc",
+                       "telegram:", "other:123", "1@lid\n", 123, True):
+        with pytest.raises(ValueError):
+            make("identifier", 5, "invalid identifier", anchor="1@lid", identifier=identifier)
+
+
+def test_author_and_legacy_attestations_round_trip():
+    for ref in ("whatsapp/2026-10.jsonl#176", "backfill/memory.jsonl#9/0",
+                "backfill/memory.jsonl#9/6"):
+        record = make("author", 10, "owner correction", source_ref=ref, anchor="1@lid")
+        assert record["attestation_version"] == 2
+        att = parse(Layer1Line("owner/attestations.jsonl#3", record))
+        assert (att.type, att.at_ms, att.fields) == (
+            "author", 10, {"source_ref": ref, "anchor": "1@lid"})
+    for ref in ("/whatsapp/x.jsonl#1", "../x.jsonl#1", "backfill/../x.jsonl#1",
+                "whatsapp/x.jsonl#0", "whatsapp/x.jsonl#-1", "whatsapp/x.jsonl#01",
+                "whatsapp/x.jsonl#1/-1", "whatsapp/x.jsonl#1/01", "whatsapp/x.jsonl#1/",
+                "whatsapp/x.jsonl#1/0/1", "whatsapp/x.jsonl#1\n", "whatsapp/x.jsonl", 1):
+        with pytest.raises(ValueError):
+            make("author", 10, "invalid ref", source_ref=ref, anchor="1@lid")
+    valid = make("author", 10, "correction", source_ref="whatsapp/x.jsonl#1", anchor="1@lid")
+    for field in ("source_ref", "anchor", "at_ms", "note"):
+        invalid = {key: value for key, value in valid.items() if key != field}
+        with pytest.raises(ValueError):
+            parse(Layer1Line("owner/attestations.jsonl#1", invalid))
+    for fields in ({"at_ms": True}, {"at_ms": 1.0}, {"note": None}, {"note": ""},
+                   {"note": "   "}, {"note": 1}, {"anchor": "telegram:453897507"},
+                   {"anchor": "1@newsletter"}, {"anchor": "1@g.us"},
+                   {"attestation_version": True}, {"attestation_version": 3}):
+        with pytest.raises(ValueError):
+            parse(Layer1Line("owner/attestations.jsonl#1", valid | fields))
+    legacy = {"attestation_version": 1, "type": "message_author", "at_ms": 5,
+              "by": "owner", "note": "old correction", "message_id": "M1", "anchor": "1@lid"}
+    assert parse(Layer1Line("owner/attestations.jsonl#2", legacy)).fields == {
+        "message_id": "M1", "anchor": "1@lid"}
+    legacy.pop("attestation_version")
+    assert parse(Layer1Line("owner/attestations.jsonl#2", legacy)).type == "message_author"

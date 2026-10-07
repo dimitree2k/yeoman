@@ -4,7 +4,9 @@ from __future__ import annotations
 
 import sqlite3
 
-SCHEMA_VERSION = 1
+SCHEMA_VERSION = 2
+# Contract version for the temporal projector; legacy bookkeeping defaults stay at 1.
+PROJECTOR_VERSION = 2
 
 _DDL = """
 CREATE TABLE contacts (
@@ -28,8 +30,15 @@ CREATE TABLE identifier_history (
   first_seen_ms INTEGER,
   last_seen_ms  INTEGER,
   ended_ms      INTEGER,
+  valid_from_ms INTEGER CHECK (valid_from_ms IS NULL OR typeof(valid_from_ms) = 'integer'),
+  valid_until_ms INTEGER CHECK (valid_until_ms IS NULL OR typeof(valid_until_ms) = 'integer'),
   source_refs   TEXT NOT NULL CHECK (json_valid(source_refs)),
-  UNIQUE (channel, kind, value, contact_id)
+  CHECK (valid_from_ms IS NULL OR valid_until_ms IS NULL OR valid_from_ms < valid_until_ms)
+);
+CREATE UNIQUE INDEX identifier_history_ownership ON identifier_history(
+  channel, kind, value, contact_id,
+  (valid_from_ms IS NULL), COALESCE(valid_from_ms, 0),
+  (valid_until_ms IS NULL), COALESCE(valid_until_ms, 0)
 );
 CREATE INDEX identifier_history_value ON identifier_history(channel, kind, value);
 CREATE TABLE messages (
@@ -108,5 +117,9 @@ FROM messages m;
 
 
 def create(conn: sqlite3.Connection) -> None:
+    version = conn.execute("PRAGMA user_version").fetchone()[0]
+    existing = conn.execute("SELECT 1 FROM sqlite_master WHERE type = 'table' LIMIT 1").fetchone()
+    if version not in (0, SCHEMA_VERSION) or existing:
+        raise ValueError(f"history schema {version} requires rebuild; no in-place migration")
     conn.executescript(_DDL)
     conn.execute(f"PRAGMA user_version = {SCHEMA_VERSION}")

@@ -15,6 +15,7 @@ STRONG_KINDS = frozenset({"lid", "pn_jid", "newsletter"})
 _DEVICE = re.compile(r":\d+(?=@)")
 _DIGITS = re.compile(r"^\d{5,}$")
 _OLD_GROUP = re.compile(r"^\d{5,}-\d{5,}$")
+_TELEGRAM = re.compile(r"telegram:[1-9][0-9]*")
 
 
 @dataclass(frozen=True, order=True)
@@ -36,6 +37,8 @@ def classify(raw: object) -> Ident | None:
         return None
     if text == SPEAKUP:
         return Ident("assistant", SPEAKUP)
+    if _TELEGRAM.fullmatch(text):
+        return Ident("telegram", text)
     low = _DEVICE.sub("", text.lower())
     if low.endswith(LID_SUFFIX):
         return Ident("lid", low)
