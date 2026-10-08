@@ -15,6 +15,7 @@ import logging
 import os
 import re
 import time
+import uuid
 from collections.abc import Callable, Iterator, Mapping, Sequence
 from dataclasses import dataclass
 from datetime import date, datetime
@@ -325,6 +326,195 @@ def append_owner_record(raw_root: Path, record: Mapping[str, Any], *,
         os.close(fd)
 
 
+# One disposable reservation index; stat changes invalidate it under the root lock.
+_contact_id_cache: tuple[Path, tuple[int, int, int, int], dict[str, tuple[dict[str, Any], CommittedLine]], int] | None = None
+
+_CONTACT_ID_NAMESPACE = uuid.UUID("5b0f9d4e-2c61-5f0a-8d3e-6a7c1e2f9b40")
+_CONTACT_ID_REF = re.compile(r"(?:whatsapp|backfill|derived|owner)/[^/\\#\s]+\.jsonl#[1-9][0-9]*(?:/(?:0|[1-9][0-9]*))?")
+_CONTACT_ID_VALUE = re.compile(r"(?:[0-9]{5,}|[0-9]+@(?:lid|s\.whatsapp\.net|newsletter))")
+
+
+def _validate_contact_id_record(record: Mapping[str, Any]) -> None:
+    keys = {'raw_archive_version', 'kind', 'channel', 'contact_id', 'seed', 'value',
+            'valid_from_ms', 'valid_until_ms', 'source_refs', 'first_published_ms'}
+    if (set(record) != keys or type(record['raw_archive_version']) is not int
+            or record['raw_archive_version'] != 1 or record['kind'] != 'contact_id'
+            or record['channel'] != 'whatsapp' or type(record['first_published_ms']) is not int):
+        raise ValueError('invalid contact ID lineage envelope')
+    value, seed = record['value'], record['seed']
+    start, end = record['valid_from_ms'], record['valid_until_ms']
+    if (not isinstance(value, str) or _CONTACT_ID_VALUE.fullmatch(value) is None
+            or not isinstance(seed, str)
+            or any(v is not None and type(v) is not int for v in (start, end))
+            or (start is not None and end is not None and start >= end)):
+        raise ValueError('invalid contact ID lineage value or bounds')
+    if seed.startswith('window:'):
+        prefix = f'window:{value}:{start}:{end}:'
+        anchor = seed[len(prefix):] if seed.startswith(prefix) else None
+        if '@' not in value or (start is None and end is None) or anchor is None or (anchor and not (
+                _CONTACT_ID_VALUE.fullmatch(anchor) and '@' in anchor
+                or anchor.startswith('ref:') and len(anchor) > 4 and not any(c.isspace() for c in anchor))):
+            raise ValueError('invalid contact ID lineage seed')
+    elif (start is not None or end is not None
+          or seed != (value if '@' in value else 'numeric:' + value)):
+        raise ValueError('invalid contact ID lineage seed')
+    if record['contact_id'] != str(uuid.uuid5(_CONTACT_ID_NAMESPACE, seed)):
+        raise ValueError('invalid contact ID lineage UUID')
+    refs = record['source_refs']
+    if (not isinstance(refs, list) or any(not isinstance(ref, str) or _CONTACT_ID_REF.fullmatch(ref) is None for ref in refs)
+            or refs != sorted(set(refs))):
+        raise ValueError('invalid contact ID lineage refs')
+
+
+def _contact_id_disposed_refs(raw_root: Path, refs: set[str],
+                              audits: Sequence[tuple[int, dict[str, Any] | None, str]]) -> set[str]:
+    requested: dict[str, dict[int, list[tuple[str, str]]]] = {}
+    for ref in refs:
+        relative, locator = ref.split('#')
+        number, _, segment = locator.partition('/')
+        requested.setdefault(relative, {}).setdefault(int(number), []).append((ref, segment))
+    disposed = set()
+    for relative, numbers in requested.items():
+        path = raw_root / relative
+        _no_symlinks(path)
+        try:
+            with path.open('rb') as handle:
+                remaining = set(numbers)
+                for number, physical in enumerate(handle, 1):
+                    if number not in remaining:
+                        continue
+                    source = json.loads(physical)
+                    if source != TOMBSTONE and not isinstance(source, dict):
+                        raise ValueError('contact ID lineage source invalid')
+                    removed = source == TOMBSTONE or _record_is_disposed(audits, source, dumps(source))
+                    for ref, segment in numbers[number]:
+                        if removed:
+                            disposed.add(ref)
+                        elif segment:
+                            parts = (source.get('payload') or {}).get('segments')
+                            if not isinstance(parts, list) or int(segment) >= len(parts):
+                                raise ValueError('contact ID lineage segment unavailable')
+                            if parts[int(segment)] == TOMBSTONE:
+                                disposed.add(ref)
+                    remaining.remove(number)
+                    if not remaining:
+                        break
+                if remaining:
+                    raise ValueError('contact ID lineage source unavailable')
+        except FileNotFoundError:
+            continue  # Multi-root projections may retain refs in another source root.
+    return disposed
+
+
+def append_contact_id_record(raw_root: Path, record: Mapping[str, Any], *,
+                             on_committed: CommitCallback | None = None) -> CommittedLine | None:
+    """Reserve one ID through the protected batch path."""
+    return append_contact_id_records(raw_root, [record], on_committed=on_committed)[0]
+
+
+def append_contact_id_records(raw_root: Path, batch: Sequence[Mapping[str, Any]], *,
+                              on_committed: CommitCallback | None = None) -> tuple[CommittedLine | None, ...]:
+    """Reserve a batch; no receipt or notification precedes its final canonical fsync."""
+    global _contact_id_cache
+    for record in batch:
+        _validate_contact_id_record(record)
+    if not batch:
+        return ()
+    relative = 'derived/contact-ids.jsonl'
+    path = raw_root / relative
+    for item in (raw_root / PURGE_DISPOSITION_LOCK, raw_root / 'AUDIT', path):
+        _no_symlinks(item)
+    root_fd = lock_file(raw_root / PURGE_DISPOSITION_LOCK, create=True)
+    try:
+        recover_pending_append(raw_root, path)
+        fd = lock_file(path, create=True)
+        try:
+            info = os.fstat(fd)
+            signature = (info.st_dev, info.st_ino, info.st_size, info.st_mtime_ns)
+            if info.st_size and os.pread(fd, 1, info.st_size - 1) != b'\n':
+                raise ValueError('incomplete contact ID lineage prefix')
+            reservations = {}
+            line_number = 0
+            if _contact_id_cache is not None and _contact_id_cache[:2] == (path, signature):
+                reservations = dict(_contact_id_cache[2])
+                line_number = _contact_id_cache[3]
+            else:
+                byte_end = 0
+                with path.open('rb') as source:
+                    for line_number, physical in enumerate(source, 1):
+                        byte_end += len(physical)
+                        if not physical.strip():
+                            continue
+                        try:
+                            prior = json.loads(physical)
+                        except (ValueError, UnicodeError):
+                            raise ValueError('invalid contact ID lineage reservation') from None
+                        if prior == TOMBSTONE:
+                            continue
+                        if not isinstance(prior, dict):
+                            raise ValueError('invalid contact ID lineage reservation')
+                        _validate_contact_id_record(prior)
+                        previous = reservations.get(prior['contact_id'])
+                        if previous and any(previous[0][key] != prior[key] for key in ('seed', 'value', 'valid_from_ms', 'valid_until_ms')):
+                            raise ValueError('conflicting contact ID lineage reservation')
+                        reservations.setdefault(prior['contact_id'], (prior, CommittedLine(relative, line_number, byte_end)))
+            try:
+                audits = list(iter_records(raw_root / 'AUDIT'))
+            except FileNotFoundError:
+                audits = []
+            refs = {ref for record in batch for ref in record['source_refs']}
+            for record in batch:
+                found = reservations.get(record['contact_id'])
+                if found is not None:
+                    refs.update(found[0]['source_refs'])
+            disposed_refs = _contact_id_disposed_refs(raw_root, refs, audits)
+
+            def disposed(record: Mapping[str, Any]) -> bool:
+                return bool(disposed_refs.intersection(record['source_refs'])) or _record_is_disposed(audits, dict(record), dumps(record))
+
+            receipts = []
+            new_records = []
+            byte_end = info.st_size
+            for record in batch:
+                if disposed(record):
+                    receipts.append(None)
+                    continue
+                found = reservations.get(record['contact_id'])
+                if found is not None:
+                    if any(found[0][key] != record[key] for key in ('seed', 'value', 'valid_from_ms', 'valid_until_ms')):
+                        raise ValueError('conflicting contact ID lineage reservation')
+                    receipts.append(None if disposed(found[0]) else found[1])
+                    continue
+                data = (dumps(record) + '\n').encode('utf-8')
+                line_number += 1
+                byte_end += len(data)
+                receipt = CommittedLine(relative, line_number, byte_end)
+                reservations[record['contact_id']] = (dict(record), receipt)
+                new_records.append((data, receipt))
+                receipts.append(receipt)
+            os.lseek(fd, 0, os.SEEK_END)
+            for data, _ in new_records:
+                view = memoryview(data)
+                while view:
+                    written = os.write(fd, view)
+                    if written <= 0:
+                        raise OSError('raw archive append made no progress')
+                    view = view[written:]
+            os.fsync(fd)
+            _fsync_directory(path.parent)
+            if os.fstat(fd).st_ino != os.stat(path).st_ino:
+                raise OSError('raw archive path replaced after publication')
+            info = os.fstat(fd)
+            _contact_id_cache = (path, (info.st_dev, info.st_ino, info.st_size, info.st_mtime_ns), reservations, line_number)
+            for _, receipt in new_records:
+                _notify_committed(on_committed, receipt)
+            return tuple(receipts)
+        finally:
+            os.close(fd)
+    finally:
+        os.close(root_fd)
+
+
 def _owner_is_disposed(raw_root: Path, record: Mapping[str, Any], line: str) -> bool:
     if append_is_disposed(raw_root / "AUDIT", dict(record), line):
         return True
@@ -487,6 +677,8 @@ def record_identities(record: dict[str, Any]) -> set[str]:
                     ids.add(str(original_payload.get(key) or ""))
     if (channel == "telegram" and kind == "media") or record.get("provenance") == "journal":
         ids.add(str(record.get("correlation_id") or ""))
+    if record.get('kind') == 'contact_id':
+        ids.update([str(record.get('value') or ''), *record.get('source_refs', [])])
     ids.discard("")
     return ids
 
@@ -508,6 +700,18 @@ def derived_from_disposed(record: dict[str, Any], identities: set[str] | frozens
 
 def append_is_disposed(audit_path: Path, record: dict[str, Any], line: str) -> bool:
     """Match a locked month append against durable owner purge dispositions."""
+    try:
+        return _record_is_disposed(iter_records(audit_path), record, line)
+    except FileNotFoundError:
+        if audit_path.is_symlink():
+            raise OSError("raw archive AUDIT symlink is broken")
+        return False
+    except (OSError, UnicodeError, ValueError, TypeError) as exc:
+        raise OSError("could not read raw archive purge dispositions") from exc
+
+
+def _record_is_disposed(audits: Iterator[tuple[int, dict[str, Any] | None, str]] | Sequence[tuple[int, dict[str, Any] | None, str]],
+                        record: dict[str, Any], line: str) -> bool:
     channel = str(record.get("channel") or "")
     chat_id = str(record.get("chat_id") or "")
     received_ms = record_capture_ms(record)
@@ -515,64 +719,57 @@ def append_is_disposed(audit_path: Path, record: dict[str, Any], line: str) -> b
     correlations = record_correlations(record)
     digest = line_sha256(line)
     disposed = False
-    try:
-        for _, audit, _ in iter_records(audit_path):
-            if audit is None:
-                raise OSError("raw archive AUDIT contains an invalid line")
-            if "disposition" not in audit:
-                continue  # Historical AUDIT records predate durable dispositions.
-            disposition = audit["disposition"]
-            if not isinstance(disposition, dict):
-                raise OSError("raw archive AUDIT disposition is invalid")
-            scope = disposition.get("scope")
-            disposition_channel = disposition.get("channel")
-            scoped_chat = disposition.get("chat_id")
-            before_ms = disposition.get("before_ms")
-            message_ids = disposition.get("message_identities")
-            correlation_ids = disposition.get("correlation_ids")
-            removed_hashes = audit.get("removed_sha256")
-            if (
-                scope not in {"chat", "message"}
-                or not isinstance(disposition_channel, str)
-                or (scoped_chat is not None and not isinstance(scoped_chat, str))
-                or (
-                    before_ms is not None
-                    and (not isinstance(before_ms, int) or isinstance(before_ms, bool))
-                )
-                or (scope == "chat" and before_ms is None)
-                or not isinstance(message_ids, list)
-                or any(not isinstance(value, str) for value in message_ids)
-                or not isinstance(correlation_ids, list)
-                or any(not isinstance(value, str) for value in correlation_ids)
-                or not isinstance(removed_hashes, list)
-                or any(not isinstance(value, str) for value in removed_hashes)
-            ):
-                raise OSError("raw archive AUDIT disposition is malformed")
-            if disposition_channel != channel:
-                continue
-            if scoped_chat is not None and scoped_chat != chat_id:
-                continue
-            if scope == "message" and scoped_chat is None and chat_id:
-                continue  # Do not let an unscoped numeric ID collide across chats.
-            if (before_ms is not None and received_ms >= before_ms
-                    and not derived_from_disposed(record, set(message_ids))):
-                continue
-            if scope == "chat":
-                if before_ms is None:
-                    raise OSError("raw archive chat disposition has no cutoff")
-                disposed = True
-            if digest in removed_hashes:
-                disposed = True
-            if identities.intersection(message_ids):
-                disposed = True
-            if correlations.intersection(correlation_ids):
-                disposed = True
-    except FileNotFoundError:
-        if audit_path.is_symlink():
-            raise OSError("raw archive AUDIT symlink is broken")
-        return False
-    except (OSError, UnicodeError, ValueError, TypeError) as exc:
-        raise OSError("could not read raw archive purge dispositions") from exc
+    for _, audit, _ in audits:
+        if audit is None:
+            raise OSError("raw archive AUDIT contains an invalid line")
+        if "disposition" not in audit:
+            continue  # Historical AUDIT records predate durable dispositions.
+        disposition = audit["disposition"]
+        if not isinstance(disposition, dict):
+            raise OSError("raw archive AUDIT disposition is invalid")
+        scope = disposition.get("scope")
+        disposition_channel = disposition.get("channel")
+        scoped_chat = disposition.get("chat_id")
+        before_ms = disposition.get("before_ms")
+        message_ids = disposition.get("message_identities")
+        correlation_ids = disposition.get("correlation_ids")
+        removed_hashes = audit.get("removed_sha256")
+        if (
+            scope not in {"chat", "message"}
+            or not isinstance(disposition_channel, str)
+            or (scoped_chat is not None and not isinstance(scoped_chat, str))
+            or (
+                before_ms is not None
+                and (not isinstance(before_ms, int) or isinstance(before_ms, bool))
+            )
+            or (scope == "chat" and before_ms is None)
+            or not isinstance(message_ids, list)
+            or any(not isinstance(value, str) for value in message_ids)
+            or not isinstance(correlation_ids, list)
+            or any(not isinstance(value, str) for value in correlation_ids)
+            or not isinstance(removed_hashes, list)
+            or any(not isinstance(value, str) for value in removed_hashes)
+        ):
+            raise OSError("raw archive AUDIT disposition is malformed")
+        if disposition_channel != channel:
+            continue
+        if scoped_chat is not None and scoped_chat != chat_id:
+            continue
+        if scope == "message" and scoped_chat is None and chat_id:
+            continue  # Do not let an unscoped numeric ID collide across chats.
+        if (before_ms is not None and received_ms >= before_ms
+                and not derived_from_disposed(record, set(message_ids))):
+            continue
+        if scope == "chat":
+            if before_ms is None:
+                raise OSError("raw archive chat disposition has no cutoff")
+            disposed = True
+        if digest in removed_hashes:
+            disposed = True
+        if identities.intersection(message_ids):
+            disposed = True
+        if correlations.intersection(correlation_ids):
+            disposed = True
     return disposed
 
 

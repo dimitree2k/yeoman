@@ -24,7 +24,7 @@ def test_checkpoint_uses_physical_bytes_lines_and_prefix_hash(tmp_path):
     data = (json.dumps(native, ensure_ascii=False) + '\n\n{malformed\n{"purged_version":1}\n').encode()
     source.write_bytes(data)
     db = tmp_path / "history.db"
-    report = project([root], db)
+    report = project([root], db, publish_lineage_root=root)
     with closing(sqlite3.connect(db)) as conn:
         columns = [r[1] for r in conn.execute("PRAGMA table_info(projector_state)")]
         assert columns == ["file", "lines", "end_offset", "sha256", "projector_version", "state_json"]
@@ -42,8 +42,9 @@ def test_checkpoint_uses_physical_bytes_lines_and_prefix_hash(tmp_path):
         assert state["review"] == {key: len(items) for key, items in report["review"].items()}
         assert "Grüße" not in runtime[4] and "native" not in state
     assert report["projector_state_line_basis"] == "physical"
-    assert report["blank_lines_skipped"] == {"whatsapp/2026-10.jsonl": 1}
-    assert report["accounting"] == {"whatsapp/2026-10.jsonl": {"lines": 4, "accounted": 4}}
+    assert report["blank_lines_skipped"] == {"whatsapp/2026-10.jsonl": 1, "derived/contact-ids.jsonl": 0}
+    assert report["accounting"] == {"whatsapp/2026-10.jsonl": {"lines": 4, "accounted": 4},
+                                    "derived/contact-ids.jsonl": {"lines": 1, "accounted": 1}}
     assert report["outcomes"]["whatsapp/2026-10.jsonl"] == {
         "message": 1, "invalid_json": 1, "skipped:blank": 1, "skipped:purged": 1}
     assert report["accounting_ok"]
@@ -129,7 +130,7 @@ class EngineFixture:
             ])
             write_jsonl(self.root / 'backfill/reply_context.jsonl', [
                 _bf('reply_context', 'message', {'messageId': 'SEED', 'senderId': PN, 'text': 'original'}, chat=G)])
-        project([self.root], self.db)
+        project([self.root], self.db, publish_lineage_root=self.root)
         self.conn = sqlite3.connect(self.db)
         self.conn.execute('PRAGMA foreign_keys=ON')
         self.restart()
@@ -629,6 +630,7 @@ def test_incremental_pair_keys_accept_hashes_and_unicode(engine):
     assert engine.conn.execute("SELECT count(*) FROM messages WHERE native_message_id='S'").fetchone()[0] == 1
 
 
+@pytest.mark.perf
 def test_incremental_apply_cost_is_independent_of_archive_size(tmp_path):
     from statistics import median
     from time import perf_counter

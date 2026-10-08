@@ -251,3 +251,61 @@ def test_prefix_copy_rejects_mutation_and_closes_descriptors(tmp_path):
     assert not (tmp_path / "copy" / boundaries[0].relative_path).exists()
     with pytest.raises(ValueError):
         records.copy_committed(archive.root, [records.SourceBoundary("../escape", 1, 1, "x")], tmp_path / "unsafe")
+
+
+def contact_id_record():
+    import uuid
+    value = '777000000001@lid'
+    return {'raw_archive_version': 1, 'kind': 'contact_id', 'channel': 'whatsapp',
+            'contact_id': str(uuid.uuid5(uuid.UUID('5b0f9d4e-2c61-5f0a-8d3e-6a7c1e2f9b40'), value)),
+            'seed': value, 'value': value, 'valid_from_ms': None, 'valid_until_ms': None,
+            'source_refs': [], 'first_published_ms': NOW}
+
+
+@pytest.mark.parametrize('change', [
+    {'raw_archive_version': True}, {'first_published_ms': True}, {'valid_from_ms': True},
+    {'valid_from_ms': 200, 'valid_until_ms': 100}, {'contact_id': 'invalid'},
+    {'seed': 'text'}, {'value': 'person name'}, {'source_refs': ['../escape#1']},
+    {'source_refs': ['owner/a.jsonl#1', 'owner/a.jsonl#1']}, {'destination': '../escape'},
+    {'channel': 'telegram'}, {'valid_until_ms': 200},
+])
+def test_contact_id_record_rejects_invalid_envelope(tmp_path, change):
+    row = contact_id_record() | change
+    with pytest.raises(ValueError):
+        records.append_contact_id_record(tmp_path / 'raw', row)
+    assert not (tmp_path / 'raw/derived/contact-ids.jsonl').exists()
+
+
+def test_contact_id_record_durable_fixed_path_and_collision(tmp_path, monkeypatch):
+    root, row, seen = tmp_path / 'raw', contact_id_record(), []
+    order = []
+    original = os.fsync
+
+    def synced(fd):
+        original(fd)
+        order.append('fsync')
+
+    monkeypatch.setattr(os, 'fsync', synced)
+
+    def committed(receipt):
+        assert order
+        assert (root / receipt.relative_path).read_bytes()[:receipt.end_offset].endswith(b'\n')
+        seen.append(receipt)
+
+    receipt = records.append_contact_id_record(root, row, on_committed=committed)
+    assert receipt == seen[0] == records.CommittedLine('derived/contact-ids.jsonl', 1, len((records.dumps(row) + '\n').encode()))
+    assert records.append_contact_id_record(root, row | {'first_published_ms': NOW + 1}) is not None
+    assert len((root / receipt.relative_path).read_text().splitlines()) == 1
+    assert len(seen) == 1
+    path = root / receipt.relative_path
+    path.write_bytes(b'\n' + records.dumps(records.TOMBSTONE).encode() + b'\n' + path.read_bytes())
+    existing = records.append_contact_id_record(root, row)
+    assert existing == records.CommittedLine(receipt.relative_path, 3, path.stat().st_size)
+    # An incompatible existing reservation blocks rather than becoming an issued ID.
+    path.write_text(records.dumps(row | {'seed': 'other'}) + '\n')
+    with pytest.raises(ValueError):
+        records.append_contact_id_record(root, row)
+    linked = tmp_path / 'linked'
+    linked.symlink_to(root, target_is_directory=True)
+    with pytest.raises(ValueError):
+        records.append_contact_id_record(linked, row)

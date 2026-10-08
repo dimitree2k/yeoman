@@ -121,6 +121,7 @@ class Extracted:
     media_records: list[MediaRecord] = field(default_factory=list)
     identity: IdentityInput = field(default_factory=IdentityInput)
     attestations: list[Attestation] = field(default_factory=list)
+    contact_id_records: list[Layer1Line] = field(default_factory=list)
     pending_pairs: dict[str, list[str]] = field(default_factory=dict)
     outcomes: Counter[tuple[str, str]] = field(default_factory=Counter)
     review: dict[str, list[dict[str, Any]]] = field(default_factory=lambda: {
@@ -133,13 +134,22 @@ class Extracted:
 def extract(lines: Iterable[Layer1Line]) -> Extracted:
     out = Extracted()
     pairs: dict[tuple[str, str], list[Layer1Line]] = defaultdict(list)
+    lineage = []
+    purged_refs = set()
     for line in lines:
+        if line.ref.split('#')[0] == 'derived/contact-ids.jsonl' and not is_tombstone(line.record or {}):
+            lineage.append(line)
+            continue
         if line.record is None:
             out.count(line.ref, "invalid_json")
             continue
         if is_tombstone(line.record):
+            purged_refs.add(line.ref)
             out.count(line.ref, "skipped:purged")
             continue
+        segments = (line.record.get('payload') or {}).get('segments') if isinstance(line.record.get('payload'), dict) else None
+        if isinstance(segments, list):
+            purged_refs.update(f'{line.ref}/{i}' for i, part in enumerate(segments) if part == {'purged_version': 1})
         sub = line.ref.split("/", 1)[0]
         if sub == "owner":
             _owner(line, out)
@@ -160,6 +170,21 @@ def extract(lines: Iterable[Layer1Line]) -> Extracted:
                 _raw(line, out)
         else:
             _backfill(line, out)
+    from yeoman_shared.raw_archive.records import _validate_contact_id_record
+
+    for line in lineage:
+        try:
+            _validate_contact_id_record(line.record or {})
+        except ValueError:
+            out.count(line.ref, 'skipped:invalid_contact_id_lineage')
+            out.review.setdefault('lineage_health', []).append({'ref': line.ref, 'reason': 'invalid_contact_id_lineage'})
+            continue
+        refs = (line.record or {})['source_refs']
+        if any(ref in purged_refs or ref.split('#')[0] + '#' + ref.split('#')[1].split('/')[0] in purged_refs for ref in refs):
+            out.count(line.ref, 'skipped:purged')
+            continue
+        out.contact_id_records.append(line)
+        out.count(line.ref, 'contact_id_lineage')
     for (account, correlation), copies in sorted(pairs.items()):
         if {line.record["kind"] for line in copies if line.record} != {"outbound_request", "outbound_result"}:
             out.pending_pairs[canonical_json([account, correlation])] = sorted(line.ref for line in copies)

@@ -14,8 +14,7 @@ from typing import Any
 from .convert.common import open_ro
 from .extract import extract
 from .layer1 import canonical_json, iter_layer1, layer1_files
-from .project import _authors, _events, project
-from .resolve import resolve
+from .project import build_rows, project
 from .schema import SCHEMA_VERSION
 
 TABLES = ("contacts", "identifier_history", "messages", "message_events")
@@ -96,15 +95,12 @@ def verify(roots: Sequence[Path], db_path: Path, *, scratch: Path | None,
     pinned = _input_pin(roots) if frozen else None
     with closing(_open(db_path, frozen=frozen)) as conn:
         report: dict[str, Any] = {"coverage": _coverage(conn), "digests": _table_digest(conn)}
-        message_ids = {row[0] for row in conn.execute("SELECT message_id FROM messages")}
     report["boundary"] = {"mode": "frozen" if frozen else "live",
                           "database": "single_read_transaction", "tail_freshness": False}
     if pinned is not None:
         report["input_digests"] = pinned
     ex = extract(iter_layer1(roots))
-    resolution = resolve(ex.identity)
-    authors = _authors(ex, resolution)
-    _events(ex, resolution, resolution.role_contact.get("assistant"), message_ids, resolution.review, authors)
+    resolution = build_rows(ex).resolution
     report["review"] = resolution.review
     accounted: Counter[str] = Counter()
     for (file, _), count in ex.outcomes.items():

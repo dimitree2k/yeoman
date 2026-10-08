@@ -7,6 +7,7 @@ import hashlib
 import json
 import os
 import sqlite3
+import time
 from collections import defaultdict
 from collections.abc import Sequence
 from dataclasses import dataclass, field
@@ -14,11 +15,13 @@ from pathlib import Path
 from typing import Any
 
 from yeoman_shared.raw_archive.paths import is_protected
+from yeoman_shared.raw_archive.records import enumerate_committed, iter_records
 
 from .attestations import Attestation, message_copy_id, resolve_author_targets
 from .extract import EventCopy, Extracted, MessageCopy, extract
 from .ids import Ident, classify
-from .layer1 import canonical_json, iter_layer1, layer1_files
+from .layer1 import Layer1Line, canonical_json, iter_layer1, layer1_files
+from .lineage import apply_lineage, publish_lineage
 from .resolve import ContactRow, IdentRow, Resolution, resolve
 from .schema import PROJECTOR_VERSION, create
 
@@ -44,7 +47,10 @@ class ProjectionRows:
 
 
 def build_rows(ex: Extracted) -> ProjectionRows:
+    if ex.review.get('lineage_health'):
+        raise ValueError('invalid contact ID lineage blocks history publication')
     res = resolve(ex.identity)
+    apply_lineage(res, ex.contact_id_records)
     arvid = res.role_contact.get("assistant")
     authors = _authors(ex, res)
     messages, unattached = _messages(ex, res, arvid, authors)
@@ -56,12 +62,33 @@ def build_rows(ex: Extracted) -> ProjectionRows:
     return ProjectionRows(res, messages, events, report)
 
 
-def project(roots: Sequence[Path], db_path: Path) -> dict[str, Any]:
+def project(roots: Sequence[Path], db_path: Path, *,
+            publish_lineage_root: Path | None = None) -> dict[str, Any]:
     if is_protected(db_path):
         raise PermissionError(f"refusing to write history.db into the raw archive: {db_path}")
-    files = layer1_files(roots)
     ex = extract(iter_layer1(roots))
     rows = build_rows(ex)
+    reserved = {line.record['contact_id'] for line in ex.contact_id_records if line.record is not None}
+    missing = [item for item in rows.resolution.generated_ids if item.contact_id not in reserved]
+    if missing and publish_lineage_root is not None:
+        lineage_root = publish_lineage_root
+        receipts = publish_lineage(lineage_root, missing, first_published_ms=int(time.time() * 1000))
+        new_numbers = {receipt.line_number for receipt in receipts}
+        reserved_lines = [Layer1Line(f'derived/contact-ids.jsonl#{number}', record)
+                          for number, record, _ in iter_records(lineage_root / 'derived/contact-ids.jsonl')
+                          if number in new_numbers]
+        contribution = extract(reserved_lines)
+        ex.contact_id_records.extend(contribution.contact_id_records)
+        ex.outcomes.update(contribution.outcomes)
+        apply_lineage(rows.resolution, contribution.contact_id_records)
+        # Reservations add aliases/accounting only; ownership and normalized copies stay fixed.
+        rows.report = _report(ex, rows.resolution, rows.messages, rows.events, {}, {},
+                              rows.report['unattached_media'])
+    if publish_lineage_root is not None and ex.contact_id_records:
+        # A restart may see a complete append whose previous fsync failed.
+        enumerate_committed(publish_lineage_root)
+    rows.report['unpublished_generated_ids'] = len(missing) if publish_lineage_root is None else 0
+    files = layer1_files(roots)
     _write(db_path, rows, files, ex.pending_pairs)
     return rows.report
 

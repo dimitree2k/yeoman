@@ -440,3 +440,20 @@ def test_superseded_contact_window_has_no_alias_across_two_owners():
     assert after.contact_for_anchor(TRANSFER) is None
     for row in after.contacts:
         after.terminal(row.contact_id)
+
+
+
+def test_generated_id_seeds_exclude_preserved_knowledge_uuid():
+    from yeoman_gateway.history.ids import classify
+    from yeoman_gateway.history.resolve import ContactRecord, IdentityInput
+
+    inp = IdentityInput()
+    value = '777000000001@lid'
+    preserved = str(uuid.uuid5(NAMESPACE, 'preserved-source-contact'))
+    inp.contact_record(ContactRecord(preserved, 1, None, None, 'backfill/knowledge.jsonl#1'))
+    inp.bind(preserved, classify(value), 'backfill/knowledge.jsonl#2')
+    res = resolve(inp)
+    assert preserved not in {item.contact_id for item in res.generated_ids}
+    assert {item.seed for item in res.generated_ids} == {value}
+    assert all(item.contact_id == str(uuid.uuid5(NAMESPACE, item.seed)) for item in res.generated_ids)
+    assert all(item.source_refs for item in res.generated_ids)

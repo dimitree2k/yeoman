@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import uuid
 from collections import defaultdict
+from collections.abc import Sequence
 from dataclasses import dataclass, field, replace
 from typing import Any
 
@@ -151,6 +152,16 @@ def _compatible(start: int | None, end: int | None, ms: int | None, basis: str,
     return (end is None or ms < end) and (start is None or start <= (last_ms if last_ms is not None else ms))
 
 
+@dataclass(frozen=True)
+class GeneratedContactId:
+    contact_id: str
+    seed: str
+    value: str
+    valid_from_ms: int | None
+    valid_until_ms: int | None
+    source_refs: tuple[str, ...]
+
+
 @dataclass
 class Resolution:
     contacts: list[ContactRow]
@@ -159,6 +170,7 @@ class Resolution:
     role_contact: dict[str, str]
     canonical: dict[str, Ident]
     review: dict[str, list[dict[str, Any]]]
+    generated_ids: tuple[GeneratedContactId, ...] = ()
 
     _identifier_index: dict[tuple[str, str], list[IdentRow]] = field(init=False, repr=False, compare=False)
     _contact_snapshot: list[ContactRow] | None = field(default=None, init=False, repr=False, compare=False)
@@ -520,6 +532,14 @@ def resolve(inp: IdentityInput) -> Resolution:
     components: dict[str, list[str]] = defaultdict(list)
     for node in list(uf.parent):
         components[uf.find(node)].append(node)
+    generated_ids: dict[str, GeneratedContactId] = {}
+
+    def generated(seed: str, window: _Window, refs: Sequence[str | None]) -> str:
+        contact_id = str(uuid.uuid5(NAMESPACE, seed))
+        generated_ids.setdefault(contact_id, GeneratedContactId(contact_id, seed, window.value,
+                                window.start, window.end, _cap(set(refs))))
+        return contact_id
+
     contacts: list[ContactRow] = []
     identifiers: list[IdentRow] = []
     node_contact: dict[str, str] = {}
@@ -536,9 +556,11 @@ def resolve(inp: IdentityInput) -> Resolution:
         elif strong:
             first = min(strong, key=lambda w: (w.start is not None or w.end is not None,
                 sightings[idents[w.value]].first_ms if sightings[idents[w.value]].first_ms is not None else _INF, w.value, w.node))
-            chosen = str(uuid.uuid5(NAMESPACE, first.node if first.start is not None or first.end is not None else first.value))
+            chosen = generated(first.node if first.start is not None or first.end is not None else first.value, first,
+                               (*first.refs, sightings[idents[first.value]].first_ref))
         else:
-            chosen = str(uuid.uuid5(NAMESPACE, "numeric:" + owned[0].value))
+            chosen = generated("numeric:" + owned[0].value, owned[0],
+                               (sightings[idents[owned[0].value]].first_ref,))
         for member in members:
             node_contact[member] = chosen
         role = role_by_root.get(root)
@@ -588,19 +610,22 @@ def resolve(inp: IdentityInput) -> Resolution:
         contact = res.resolve(ident)[0]
         if contact:
             node_contact[value] = contact
-            generated = str(uuid.uuid5(NAMESPACE, ("numeric:" if ident.kind == "numeric" else "") + value))
-            if generated not in rows:
+            alias_id = str(uuid.uuid5(NAMESPACE, ("numeric:" if ident.kind == "numeric" else "") + value))
+            if alias_id not in rows:
                 c = rows[contact]
-                rows[generated] = ContactRow(generated, c.kind, None, None, c.status, contact, c.source_refs)
+                generated(("numeric:" if ident.kind == "numeric" else "") + value,
+                          _Window(value, None, None), c.source_refs)
+                rows[alias_id] = ContactRow(alias_id, c.kind, None, None, c.status, contact, c.source_refs)
     # Bounded nodes also expose UUIDs before a later Knowledge binding/merge.
     # Their seed is stable even when the surviving contact changes.
     for node, w in sorted(node_window.items()):
         if idents[w.value].strong and (w.start is not None or w.end is not None):
             contact = res.terminal(node_contact[node])
-            generated = str(uuid.uuid5(NAMESPACE, node))
-            if generated not in rows:
+            alias_id = str(uuid.uuid5(NAMESPACE, node))
+            if alias_id not in rows:
                 c = rows[contact]
-                rows[generated] = ContactRow(generated, c.kind, None, None, c.status, contact, c.source_refs)
+                generated(node, w, (*c.source_refs, *w.refs))
+                rows[alias_id] = ContactRow(alias_id, c.kind, None, None, c.status, contact, c.source_refs)
     # Former native-pair slices derive from the same retained window evidence.
     # A finer current slice must not erase a uniquely owned earlier slice alias.
     pair_members: dict[str, list[str]] = defaultdict(list)
@@ -623,12 +648,14 @@ def resolve(inp: IdentityInput) -> Resolution:
                         w.end if w.end is not None else _INF)}
         if len(owners) == 1:
             contact = next(iter(owners))
-            generated = str(uuid.uuid5(NAMESPACE, seed))
-            if generated not in rows:
+            alias_id = str(uuid.uuid5(NAMESPACE, seed))
+            if alias_id not in rows:
                 c = rows[contact]
-                rows[generated] = ContactRow(generated, c.kind, None, None, c.status, contact,
+                generated(seed, prior, (*c.source_refs, *prior.refs))
+                rows[alias_id] = ContactRow(alias_id, c.kind, None, None, c.status, contact,
                                              _cap(set(c.source_refs) | prior.refs))
     res.contacts = sorted(rows.values(), key=lambda c: c.contact_id)
+    res.generated_ids = tuple(generated_ids[key] for key in sorted(generated_ids))
     # Consolidate equal output windows (e.g. a propagated slice and duplicate evidence).
     combined: dict[tuple[Any, ...], IdentRow] = {}
     for row in identifiers:

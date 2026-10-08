@@ -6,6 +6,7 @@ import json
 import os
 import sqlite3
 import stat
+import time
 from bisect import bisect_left, bisect_right, insort
 from collections import Counter, defaultdict
 from collections.abc import Sequence
@@ -24,6 +25,7 @@ from yeoman_shared.raw_archive.records import (
 from .extract import Description, EventCopy, Extracted, MediaRecord, MessageCopy, extract
 from .ids import Ident, classify, numeric_part
 from .layer1 import SUBDIRS, Layer1Line, canonical_json
+from .lineage import apply_lineage, publish_lineage
 from .project import (
     WINDOW_MS,
     ProjectionRows,
@@ -120,7 +122,7 @@ def _combine(units: dict[str, Extracted]) -> Extracted:
                       key if key.startswith('pair:') else key.split('#')[0],
                       0 if key.startswith('pair:') else int(key.split('#')[1]))):
         ex = units[key]
-        for name in ('messages', 'events', 'descriptions', 'media_records', 'attestations'):
+        for name in ('messages', 'events', 'descriptions', 'media_records', 'attestations', 'contact_id_records'):
             getattr(out, name).extend(getattr(ex, name))
         out.pending_pairs.update(ex.pending_pairs)
         out.outcomes.update(ex.outcomes)
@@ -267,6 +269,8 @@ class _Plan:
 
 
 class ProjectionIndex:
+    _lineage_records: list[Layer1Line]
+    _reserved_ids: set[str]
     _blanks: dict[str, int]
     _boundaries: tuple[SourceBoundary, ...]
     _files: dict[str, _File]
@@ -311,6 +315,8 @@ class ProjectionIndex:
         self._extracted = {key: extract(group) for key, group in self._groups.items()}
         combined = _combine(self._extracted)
         rows = build_rows(combined)
+        self._lineage_records = combined.contact_id_records
+        self._reserved_ids = {line.record['contact_id'] for line in self._lineage_records if line.record is not None}
         self._input = combined.identity
         self._resolution = rows.resolution
         self._report = rows.report
@@ -591,6 +597,7 @@ class ProjectionIndex:
         contact_replacements: dict[int, Any] = {}
         if not slow:
             res = copy(self._resolution)
+            res.generated_ids = ()
             res.review = dict(self._resolution.review)
             for ident, seen in sightings.items():
                 effective = self._resolution.canonical.get(ident.value, ident) if ident.kind == 'numeric' else ident
@@ -675,6 +682,8 @@ class ProjectionIndex:
                 affected_values.update(row.value for row in self._idents_by_contact.get(cid, ()))
         old_units = {key for value in affected_values for key in self._copies_by_ident.get(value, ())}
         res = resolve(inp)
+        apply_lineage(res, self._lineage_records)
+        res.generated_ids = tuple(item for item in res.generated_ids if item.contact_id not in self._reserved_ids)
         if _identity_change(self._resolution, res, self._local(old_units, {})):
             raise RebuildRequired('identifier component or applicability changed')
         return res, inp, sightings, replacements, contact_replacements
@@ -700,6 +709,8 @@ class ProjectionIndex:
             for line in additions:
                 if line.ref in prior:
                     raise RebuildRequired('source ref replayed outside checkpoint')
+                if line.ref.split('#')[0] == 'derived/contact-ids.jsonl':
+                    raise RebuildRequired('external contact ID lineage requires fenced rebuild')
                 if line.ref.startswith('owner/') or (line.record or {}).get('kind') in ('contact_record', 'identifier_record', 'pair_record', 'name_record'):
                     raise RebuildRequired('owner or identity decision requires fenced rebuild')
                 prior[line.ref] = line
@@ -844,6 +855,38 @@ def apply_committed(conn: sqlite3.Connection, index: ProjectionIndex, raw_root: 
     delta = index.plan(lines)
     if delta.requires_rebuild:
         raise RebuildRequired(delta.reason or 'closure requires rebuild')
+    generated = delta.rows.resolution.generated_ids
+    if generated:
+        # Read a reservation tail before committing; external additions need fenced repair.
+        before = index.target(raw_root)
+        if before != target:
+            index._staged = None
+            raise RebuildRequired('source advanced before lineage publication')
+        try:
+            receipts = publish_lineage(raw_root, generated, first_published_ms=int(time.time() * 1000))
+        except BaseException:
+            index._staged = None
+            raise
+        refreshed = index.target(raw_root)
+        lineage_boundary = next(b for b in refreshed if b.relative_path == 'derived/contact-ids.jsonl')
+        own_lines, count, state = _tail(raw_root, lineage_boundary, files.get(lineage_boundary.relative_path))
+        if {line.ref for line in own_lines} != {f'{r.relative_path}#{r.line_number}' for r in receipts}:
+            index._staged = None
+            raise RebuildRequired('external contact ID lineage arrived during publication')
+        contribution = extract(own_lines)
+        if contribution.review.get('lineage_health'):
+            raise RebuildRequired('invalid contact ID lineage')
+        apply_lineage(delta.rows.resolution, contribution.contact_id_records)
+        files[lineage_boundary.relative_path] = state
+        blanks[lineage_boundary.relative_path] = blanks.get(lineage_boundary.relative_path, 0) + count
+        target = tuple(sorted([b for b in target if b.relative_path != lineage_boundary.relative_path] + [lineage_boundary], key=lambda b: b.relative_path))
+        for file, outcome in contribution.outcomes:
+            dest = delta.rows.report['outcomes'].setdefault(file, {})
+            dest[outcome] = dest.get(outcome, 0) + contribution.outcomes[(file, outcome)]
+        # Own lineage is metadata only, absorbed into the accepted cache after commit.
+        own_records = contribution.contact_id_records
+    else:
+        own_records = []
     report = delta.rows.report
     outcomes = report['outcomes']
     for rel, count in blanks.items():
@@ -874,5 +917,7 @@ def apply_committed(conn: sqlite3.Connection, index: ProjectionIndex, raw_root: 
         index._staged = None
         raise
     index.accept(delta)
+    index._lineage_records.extend(own_records)
+    index._reserved_ids.update(line.record['contact_id'] for line in own_records if line.record is not None)
     index._boundaries, index._blanks, index._files = target, blanks, files
     return report
