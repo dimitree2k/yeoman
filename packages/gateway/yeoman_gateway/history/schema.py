@@ -4,9 +4,9 @@ from __future__ import annotations
 
 import sqlite3
 
-SCHEMA_VERSION = 3
+SCHEMA_VERSION = 4
 # Contract version for normalization and exact physical checkpoints.
-PROJECTOR_VERSION = 3
+PROJECTOR_VERSION = 4
 
 _DDL = """
 CREATE TABLE contacts (
@@ -63,7 +63,7 @@ CREATE TABLE messages (
                        ('native', 'recovered_text', 'verbatim_unverified', 'derived_only')),
   source_refs        TEXT NOT NULL CHECK (json_valid(source_refs))
 );
-CREATE INDEX messages_chat_time ON messages(channel, chat_id, sent_ms);
+CREATE INDEX messages_chat_time ON messages(channel, chat_id, sent_ms, message_id);
 CREATE INDEX messages_native ON messages(channel, chat_id, native_message_id);
 CREATE INDEX messages_sender ON messages(sender_contact_id);
 CREATE TABLE message_events (
@@ -90,7 +90,7 @@ CREATE TABLE message_events (
   native_event_id  TEXT
 );
 CREATE INDEX message_events_target ON message_events(target_message_id, kind);
-CREATE INDEX message_events_chat_time ON message_events(channel, chat_id, occurred_ms);
+CREATE INDEX message_events_chat_time ON message_events(channel, chat_id, kind, occurred_ms, event_id);
 CREATE INDEX message_events_native_event ON message_events(native_event_id);
 CREATE TABLE projector_state (
   file              TEXT PRIMARY KEY,

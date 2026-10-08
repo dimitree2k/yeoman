@@ -66,9 +66,9 @@ def test_projector_state_requires_explicit_version_and_valid_json(db):
         db.execute("INSERT INTO projector_state (file, lines, end_offset, sha256, state_json)"
                    " VALUES ('messages.jsonl', 1, 10, 'abc', '{}')")
     with pytest.raises(sqlite3.IntegrityError):
-        db.execute("INSERT INTO projector_state VALUES ('messages.jsonl', 1, 10, 'abc', 3, 'bad')")
-    db.execute("INSERT INTO projector_state VALUES ('messages.jsonl', 1, 10, 'abc', 3, '{}')")
-    assert db.execute("SELECT projector_version FROM projector_state").fetchone()[0] == 3
+        db.execute("INSERT INTO projector_state VALUES ('messages.jsonl', 1, 10, 'abc', 4, 'bad')")
+    db.execute("INSERT INTO projector_state VALUES ('messages.jsonl', 1, 10, 'abc', 4, '{}')")
+    assert db.execute("SELECT projector_version FROM projector_state").fetchone()[0] == 4
 
 
 def test_native_event_id_is_nullable_indexed_and_non_unique(db):
@@ -98,8 +98,8 @@ def test_native_event_id_is_nullable_indexed_and_non_unique(db):
 def test_identifier_schema_distinguishes_ownership_from_observation(db):
     columns = {row[1]: row[3] for row in db.execute("PRAGMA table_info(identifier_history)")}
     assert columns.get("valid_from_ms") == 0 and columns.get("valid_until_ms") == 0
-    assert SCHEMA_VERSION == 3
-    assert PROJECTOR_VERSION == 3
+    assert SCHEMA_VERSION == 4
+    assert PROJECTOR_VERSION == 4
     tables = {row[0] for row in db.execute("SELECT name FROM sqlite_master WHERE type = 'table'")}
     assert tables == {"contacts", "identifier_history", "messages", "message_events", "projector_state"}
     _contact(db)

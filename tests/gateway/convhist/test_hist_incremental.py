@@ -10,6 +10,7 @@ from yeoman_gateway.history.attestations import make, write_seed
 from yeoman_gateway.history.incremental import ProjectionIndex, RebuildRequired, apply_committed
 from yeoman_gateway.history.layer1 import canonical_json
 from yeoman_gateway.history.project import project
+from yeoman_gateway.history.schema import PROJECTOR_VERSION
 from yeoman_gateway.history.verify import table_digest, verify
 from yeoman_shared.raw_archive.records import SourceBoundary, append_line, enumerate_committed
 
@@ -30,11 +31,11 @@ def test_checkpoint_uses_physical_bytes_lines_and_prefix_hash(tmp_path):
         assert columns == ["file", "lines", "end_offset", "sha256", "projector_version", "state_json"]
         row = conn.execute("SELECT lines, end_offset, sha256, projector_version, state_json "
                            "FROM projector_state WHERE file='whatsapp/2026-10.jsonl'").fetchone()
-        assert row[:4] == (4, len(data), hashlib.sha256(data).hexdigest(), 3)
+        assert row[:4] == (4, len(data), hashlib.sha256(data).hexdigest(), PROJECTOR_VERSION)
         assert json.loads(row[4]) == {}
         runtime = conn.execute("SELECT lines, end_offset, sha256, projector_version, state_json "
                                "FROM projector_state WHERE file='@runtime'").fetchone()
-        assert runtime[:4] == (0, 0, hashlib.sha256(b"").hexdigest(), 3)
+        assert runtime[:4] == (0, 0, hashlib.sha256(b"").hexdigest(), PROJECTOR_VERSION)
         state = json.loads(runtime[4])
         assert state["generation"] == 1 and state["status"] == "ready"
         assert state["pending_pairs"] == {}

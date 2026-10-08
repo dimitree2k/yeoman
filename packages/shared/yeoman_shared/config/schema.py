@@ -1011,11 +1011,24 @@ class RawArchiveConfig(BaseModel):
     media: RawArchiveMediaConfig = Field(default_factory=RawArchiveMediaConfig)
 
 
+class HistoryReaderConfig(BaseModel):
+    """File-only selectors; effective selection also requires live projection."""
+
+    participation: bool = False
+    whatsapp: bool = False
+    responder: bool = False
+    tools: bool = False
+    secondary: bool = False
+    knowledge: bool = False
+
+
 class HistoryConfig(BaseModel):
     """Dormant projection capability; activation requires file/initializer data."""
 
     model_config = ConfigDict(populate_by_name=True)
     live_projection_enabled: bool = Field(default=False, alias="liveProjectionEnabled")
+    readers: HistoryReaderConfig = Field(default_factory=HistoryReaderConfig)
+    legacy_writers_disabled: bool = Field(default=False, alias="legacyWritersDisabled")
 
 
 class Config(BaseSettings):

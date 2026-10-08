@@ -486,7 +486,7 @@ def test_telegram_attestations_stay_provenance_only(tmp_path):
         assert conn.execute("SELECT count(*) FROM identifier_history WHERE channel != 'whatsapp' OR value LIKE 'telegram:%'").fetchone()[0] == 0
         assert conn.execute('SELECT count(*) FROM messages').fetchone()[0] == 0
         assert conn.execute('SELECT count(*) FROM message_events').fetchone()[0] == 0
-        assert conn.execute('PRAGMA user_version').fetchone()[0] == 3
+        assert conn.execute('PRAGMA user_version').fetchone()[0] == 4
         assert {r[0] for r in conn.execute('SELECT projector_version FROM projector_state')} == {PROJECTOR_VERSION}
 
 

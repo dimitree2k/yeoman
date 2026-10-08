@@ -46,3 +46,43 @@ def test_history_env_filter_preserves_other_config_sources(tmp_path, monkeypatch
     assert config.providers.openai.api_key == 'synthetic-key'
     assert os.environ['YEOMAN_HISTORY'] == 'invalid json must never decode'
     assert os.environ['YEOMAN_GATEWAY__PORT'] == '19001'
+
+
+@pytest.mark.parametrize("key", [
+    "YEOMAN_HISTORY", "yeOMaN_HisTory__READERS", "YEOMAN_HISTORY__READERS__TOOLS",
+    "yeoman_history__readers__whatsapp", "YEOMAN_HISTORY__legacyWritersDisabled",
+    "yeOMAN_history__LEGACY_WRITERS_DISABLED", "YEOMAN_HISTORY__LIVE_PROJECTION_ENABLED",
+    *[f"{prefix}__READERS__{family}" for prefix in ("YEOMAN_HISTORY", "yeOMaN_HisTory")
+      for family in ("PARTICIPATION", "WHATSAPP", "RESPONDER", "TOOLS", "SECONDARY", "KNOWLEDGE")],
+])
+@pytest.mark.parametrize("dotenv", [False, True])
+def test_history_selectors_off_and_environment_cannot_activate(tmp_path, monkeypatch, key, dotenv):
+    from yeoman_gateway.app.bootstrap import build_history_projector
+
+    monkeypatch.setenv("YEOMAN_HOME", str(tmp_path))
+    value = "invalid-json-before-decode" if key.casefold() in ("yeoman_history", "yeoman_history__readers") else "true"
+    envfile = tmp_path / "synthetic.env"
+    if dotenv:
+        envfile.write_text(f"{key}={value}\n")
+    else:
+        monkeypatch.setenv(key, value)
+    for data in ({}, {"history": {"liveProjectionEnabled": False}}):
+        config = Config(_env_file=envfile if dotenv else None, **data)
+        assert not config.history.live_projection_enabled
+        assert not config.history.legacy_writers_disabled
+        assert not any(config.history.readers.model_dump().values())
+        assert build_history_projector(config, object()) is None
+    for enabled in (False, True):
+        data = {"history": {"liveProjectionEnabled": enabled, "readers": {"tools": True, "whatsapp": True},
+                            "legacyWritersDisabled": False}}
+        path = tmp_path / "synthetic-settings.json"
+        path.write_text(json.dumps(data))
+        for config in (Config(_env_file=envfile if dotenv else None, **data), load_config(path)):
+            selected = {family for family, value in config.history.readers.model_dump().items()
+                        if config.history.live_projection_enabled and value}
+            assert selected == ({"tools", "whatsapp"} if enabled else set())
+            assert not config.history.legacy_writers_disabled
+            if not enabled:
+                assert build_history_projector(config, object()) is None
+    assert Config(history={"legacyWritersDisabled": True}).history.legacy_writers_disabled
+    assert not (tmp_path / "data" / "operational" / "history").exists()
