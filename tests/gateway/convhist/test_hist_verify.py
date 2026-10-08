@@ -75,6 +75,9 @@ def test_verify_live_wal_without_immutable(tmp_path):
         row['message_id'] = 'wal-new-message'
         writer.execute(f"INSERT INTO messages ({', '.join(row)}) VALUES ({', '.join('?' for _ in row)})",
                        tuple(row.values()))
+        writer.execute("INSERT INTO messages_fts(rowid,message_id,chat_id,text) "
+                       "SELECT rowid,message_id,chat_id,text FROM messages WHERE message_id=?",
+                       (row['message_id'],))
         writer.commit()
         before = {p: p.read_bytes() for p in [db, db.with_name(db.name + '-wal')]}
         report = verify([live, dev], db, scratch=None)
@@ -235,3 +238,46 @@ def test_rebuild_candidate_rejects_invalid_runtime_accounting(tmp_path, damage):
             conn.execute("UPDATE projector_state SET state_json=? WHERE file='@runtime'", (json.dumps(state),))
     with pytest.raises(ValueError):
         verify_rebuild_candidate([root], db, boundaries=enumerate_committed(root))
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize('damage', ['stale', 'missing', 'extra', 'duplicate', 'absent', 'corrupt', 'rowid'])
+async def test_rebuild_candidate_with_stale_fts_is_refused(tmp_path, monkeypatch, damage):
+    from test_hist_live import projector_fixture, start_ready
+    from yeoman_gateway.history import live
+
+    root, db, archive, p = projector_fixture(tmp_path)
+    await start_ready(p)
+    generation = p.health()['generation']
+    before = table_digest(db)
+    original = live.verify_rebuild_candidate
+    replacements = []
+    monkeypatch.setattr(p, '_replace_candidate', lambda candidate: replacements.append(candidate))
+
+    def damage_index(roots, candidate, **kwargs):
+        with sqlite3.connect(candidate) as conn:
+            sql = {
+                'rowid': "UPDATE messages_fts SET rowid=rowid+1000",
+                'stale': "UPDATE messages_fts SET text='stale'",
+                'missing': "DELETE FROM messages_fts",
+                'extra': "INSERT INTO messages_fts VALUES ('extra','synthetic@g.us','extra')",
+                'duplicate': "INSERT INTO messages_fts SELECT message_id,chat_id,text FROM messages_fts",
+                'absent': "DROP TABLE messages_fts",
+                'corrupt': "DELETE FROM messages_fts_data WHERE id>10",
+            }[damage]
+            conn.execute(sql)
+        with pytest.raises(ValueError, match='fts'):
+            verify(roots, candidate, scratch=None)
+        return original(roots, candidate, **kwargs)
+
+    monkeypatch.setattr(live, 'verify_rebuild_candidate', damage_index)
+    try:
+        with pytest.raises(ValueError, match='fts|integrity_mismatch'):
+            await p.rebuild(reason='fts_test')
+        assert replacements == []
+        assert table_digest(db) == before and p.health()['generation'] == generation
+        assert p.health()['status'] == 'failed'
+        with pytest.raises(live.HistoryPaused):
+            await p.read_turn()
+    finally:
+        await p.stop()

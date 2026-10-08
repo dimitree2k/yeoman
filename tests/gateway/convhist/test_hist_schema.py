@@ -101,7 +101,11 @@ def test_identifier_schema_distinguishes_ownership_from_observation(db):
     assert SCHEMA_VERSION == 4
     assert PROJECTOR_VERSION == 4
     tables = {row[0] for row in db.execute("SELECT name FROM sqlite_master WHERE type = 'table'")}
-    assert tables == {"contacts", "identifier_history", "messages", "message_events", "projector_state"}
+    assert tables == {
+        "contacts", "identifier_history", "messages", "message_events", "projector_state",
+        "messages_fts", "messages_fts_data", "messages_fts_idx", "messages_fts_content",
+        "messages_fts_docsize", "messages_fts_config",
+    }
     _contact(db)
     sql = ("INSERT INTO identifier_history (contact_id, channel, kind, value, strength, evidence,"
            " first_seen_ms, last_seen_ms, valid_from_ms, valid_until_ms, source_refs)"

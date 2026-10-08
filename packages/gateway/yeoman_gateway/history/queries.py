@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import json
+import re
 from typing import Any
 
 from yeoman_gateway.knowledge import EvidenceAudience
@@ -98,19 +99,22 @@ class HistoryQueries:
         _limit(limit)
         _time(after_ms)
         _time(before_ms)
-        if not chat_ids:
+        terms = re.findall(r"[^\W_]+", query, flags=re.UNICODE)
+        if not chat_ids or not terms:
             return []
-        literal = query.replace("\\", "\\\\").replace("%", "\\%").replace("_", "\\_")
+        match = " ".join(f'"{term}"*' for term in terms)
         conditions = ""
-        parameters: tuple[Any, ...] = (*chat_ids, f"%{literal}%")
+        parameters: tuple[Any, ...] = (*chat_ids, match)
         for operator, moment in ((">", after_ms), ("<", before_ms)):
             if moment is not None:
                 conditions += f" AND sent_ms{operator}?"
                 parameters += (moment,)
         return self._rows(
-            f"SELECT * FROM messages_current WHERE {_VISIBLE}"
-            f" AND chat_id IN ({','.join('?' for _ in chat_ids)})"
-            f" AND current_text LIKE ? ESCAPE '\\'{conditions} ORDER BY {_ORDER} LIMIT ?",
+            f"SELECT m.* FROM messages_fts JOIN messages_current m"
+            f" ON m.message_id=messages_fts.message_id WHERE {_VISIBLE}"
+            f" AND m.chat_id IN ({','.join('?' for _ in chat_ids)})"
+            f" AND messages_fts MATCH ?{conditions}"
+            " ORDER BY bm25(messages_fts), sent_ms DESC, m.message_id LIMIT ?",
             (*parameters, limit),
         )
 

@@ -158,7 +158,8 @@ class EngineFixture:
 
     def state(self):
         return (table_digest(self.db), self.conn.execute(
-            'SELECT * FROM projector_state ORDER BY file').fetchall(), self.current())
+            'SELECT * FROM projector_state ORDER BY file').fetchall(), self.current(),
+            self.conn.execute('SELECT message_id,chat_id,text FROM messages_fts ORDER BY message_id').fetchall())
 
     def current(self):
         return self.conn.execute('SELECT * FROM messages_current ORDER BY message_id').fetchall()
@@ -169,6 +170,8 @@ class EngineFixture:
         assert table_digest(self.db) == table_digest(self.oracle)
         with closing(sqlite3.connect(self.oracle)) as conn:
             assert self.current() == conn.execute('SELECT * FROM messages_current ORDER BY message_id').fetchall()
+            assert self.conn.execute('SELECT message_id,chat_id,text FROM messages_fts ORDER BY message_id').fetchall() == conn.execute(
+                'SELECT message_id,chat_id,text FROM messages_fts ORDER BY message_id').fetchall()
             assert self.boundaries() == tuple(SourceBoundary(*row) for row in conn.execute(
                 "SELECT file, lines, end_offset, sha256 FROM projector_state WHERE file!='@runtime' ORDER BY file"))
             actual = json.loads(self.conn.execute(
@@ -1051,3 +1054,46 @@ def test_current_reactions_match_with_opposite_event_insertion_order(engine):
         query = "SELECT reactions FROM messages_current WHERE native_message_id='SEED'"
         assert engine.conn.execute(query).fetchone() == full.execute(query).fetchone()
     engine.parity()
+
+
+def test_fts_tracks_edit_delete_purge_incrementally_and_matches_full_rebuild(engine):
+    def indexed():
+        return engine.conn.execute("SELECT message_id,chat_id,text FROM messages_fts ORDER BY message_id").fetchall()
+
+    def matches(term):
+        return engine.conn.execute("SELECT message_id FROM messages_fts WHERE messages_fts MATCH ?", (term,)).fetchall()
+
+    def parity():
+        engine.parity()
+        with closing(sqlite3.connect(engine.oracle)) as conn:
+            assert indexed() == conn.execute("SELECT message_id,chat_id,text FROM messages_fts ORDER BY message_id").fetchall()
+
+    engine.append(observation(native_id='M', text='oldword'))
+    engine.apply()
+    assert matches('oldword') == [(f'whatsapp:{G}:M',)]
+    parity()
+    engine.append(observation('edit', native_id='M', text='newword', ms=T0 + 1000))
+    engine.apply()
+    assert matches('oldword') == [] and matches('newword') == [(f'whatsapp:{G}:M',)]
+    parity()
+    engine.append({'kind': 'media_transcript', 'native_message_id': 'M', 'chat_id': G,
+                   'text': 'voiceword', 'generated_ms': T0}, 'derived/media-transcripts.jsonl')
+    engine.apply()
+    assert matches('voiceword') == [(f'whatsapp:{G}:M',)]
+    assert '[derived transcript] voiceword' in next(r[2] for r in indexed() if r[0].endswith(':M'))
+    parity()
+    engine.append(observation('delete', native_id='M', ms=T0 + 2000))
+    engine.apply()
+    assert matches('newword') == matches('voiceword') == []
+    parity()
+    # Physical erasure changes a committed prefix and must use the existing rebuild fence.
+    source = engine.root / 'whatsapp/2026-01.jsonl'
+    source.write_text(canonical_json({'purged_version': 1}) + '\n')
+    with pytest.raises(RebuildRequired):
+        engine.apply()
+    engine.conn.close()
+    project([engine.root], engine.db, publish_lineage_root=engine.root)
+    engine.conn = sqlite3.connect(engine.db)
+    engine.restart()
+    assert indexed() == []
+    parity()

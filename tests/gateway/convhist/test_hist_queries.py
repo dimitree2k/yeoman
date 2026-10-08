@@ -52,6 +52,11 @@ def case():
 
 def queries(snapshot):
     from yeoman_gateway.history.queries import HistoryQueries
+    # Direct SQL fixtures bypass the projector; populate their derived index explicitly.
+    snapshot.connection.execute("DELETE FROM messages_fts")
+    snapshot.connection.execute(
+        "INSERT INTO messages_fts(message_id,chat_id,text) SELECT message_id,chat_id,current_text"
+        " FROM messages_current WHERE deleted=0 AND current_text IS NOT NULL AND current_text!=''")
     return HistoryQueries(snapshot)
 
 
@@ -96,7 +101,8 @@ def test_query_scope_limit_and_sql_literals(case):
     db, snapshot = case
     message(db, "literal", text="100%_\\")
     q = queries(snapshot)
-    assert q.search(chat_ids=("g@g.us",), query="%_\\", limit=1)[0]["message_id"] == "literal"
+    assert q.search(chat_ids=("g@g.us",), query="100", limit=1)[0]["message_id"] == "literal"
+    assert q.search(chat_ids=("g@g.us",), query="%_\\", limit=1) == []
     assert q.search(chat_ids=("g@g.us",), query="' OR 1=1 --", limit=1) == []
     assert q.search(chat_ids=("g@g.us' OR 1=1 --",), query="", limit=1) == []
     assert q.search(chat_ids=(), query="", limit=1) == []
@@ -156,3 +162,25 @@ def test_v3_reader_indexes_require_rebuild(case):
     assert _table_digest(rebuilt) == before
     assert rebuilt.execute("PRAGMA user_version").fetchone()[0] == 4
     rebuilt.close()
+
+
+def test_fts_search_ranks_terms_and_ignores_fts_syntax(case):
+    db, snapshot = case
+    message(db, "strong", text="Haus Haus Haus grüße", ms=100)
+    message(db, "weak", text="Haus grüße viele andere lange Wörter im Garten", ms=200)
+    message(db, "tie-a", text="Gleichstand", ms=300)
+    message(db, "tie-b", text="Gleichstand", ms=300)
+    message(db, "tie-old", text="Gleichstand", ms=200)
+    message(db, "foreign", text="Haus grüße", chat="other@g.us")
+    message(db, "deleted", text="Haus grüße")
+    message(db, "syntax", text="OR NOT NEAR text haus")
+    event(db, "delete", "delete", 500, {}, target="deleted")
+    q = queries(snapshot)
+    assert [r["message_id"] for r in q.search(chat_ids=("g@g.us",), query="HAU gruße", limit=10)] == ["strong", "weak"]
+    assert [r["message_id"] for r in q.search(chat_ids=("g@g.us",), query="gleich", limit=10)] == ["tie-a", "tie-b", "tie-old"]
+    for text in ('"haus" OR NOT NEAR text:haus', 'NEAR(haus OR, 3)', 'haus NOT missing'):
+        expected = ["syntax"] if text.startswith('"haus"') else []
+        assert [r["message_id"] for r in q.search(chat_ids=("g@g.us",), query=text, limit=10)] == expected
+    assert q.search(chat_ids=("g@g.us",), query="*** : ()", limit=10) == []
+    assert [r["message_id"] for r in q.search(chat_ids=("other@g.us",), query="haus", limit=1)] == ["foreign"]
+    assert [r["message_id"] for r in q.search(chat_ids=("g@g.us",), query="grüße", limit=1, after_ms=100, before_ms=201)] == ["weak"]

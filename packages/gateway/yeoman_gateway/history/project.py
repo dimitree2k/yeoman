@@ -23,7 +23,7 @@ from .ids import Ident, classify
 from .layer1 import Layer1Line, canonical_json, iter_layer1, layer1_files
 from .lineage import apply_lineage, publish_lineage
 from .resolve import ContactRow, IdentRow, Resolution, resolve
-from .schema import PROJECTOR_VERSION, create
+from .schema import FTS_ROWS, PROJECTOR_VERSION, create
 
 WINDOW_MS = 120_000
 _CERTAINTY = {"native": 0, "provider_timestamp": 0, "capture_time_approx": 1, "unknown": 2}
@@ -510,6 +510,19 @@ def write_rows(conn: sqlite3.Connection, rows: ProjectionRows, *,
         if target not in contact_ids and (rows._identity_rows is None or
                 conn.execute('SELECT 1 FROM contacts WHERE contact_id=?', (target,)).fetchone() is None):
             raise ValueError("contact redirect target is missing")
+    affected = None
+    if message_ids is not None and event_ids is not None:
+        affected = message_ids | {m["message_id"] for m in rows.messages}
+        affected.update(e["target_message_id"] for e in rows.events if e["target_message_id"] is not None)
+        for eid in event_ids:
+            affected.update(r[0] for r in conn.execute(
+                "SELECT target_message_id FROM message_events WHERE event_id=? AND target_message_id IS NOT NULL",
+                (eid,)))
+        # FTS rowids mirror message rowids so per-message deletion never scans the archive.
+        conn.executemany("DELETE FROM messages_fts WHERE rowid=(SELECT rowid FROM messages WHERE message_id=?)",
+                         [(mid,) for mid in sorted(affected)])
+    else:
+        conn.execute("DELETE FROM messages_fts")
     if event_ids is None:
         conn.execute("DELETE FROM message_events")
     else:
@@ -574,6 +587,14 @@ def write_rows(conn: sqlite3.Connection, rows: ProjectionRows, *,
          e["target_native_id"], e["actor_contact_id"], e["actor_identifier"], e["actor_basis"],
          e["occurred_ms"], e["time_certainty"], (e["_payload_json"] if e["kind"] != "reaction" else canonical_json(e["payload"])), e["provenance"],
          json.dumps(e["source_refs"]), e["native_event_id"]) for e in rows.events])
+
+    if affected is None:
+        conn.execute("INSERT INTO messages_fts(rowid,message_id,chat_id,text) "
+                     f"SELECT m.rowid,f.* FROM ({FTS_ROWS}) f JOIN messages m USING(message_id)")
+    else:
+        conn.executemany("INSERT INTO messages_fts(rowid,message_id,chat_id,text) "
+                         f"SELECT m.rowid,f.* FROM ({FTS_ROWS}) f JOIN messages m USING(message_id)"
+                         " WHERE f.message_id=?", [(mid,) for mid in sorted(affected)])
 
 
 def _write(db_path: Path, rows: ProjectionRows, files: list[tuple[str, Path]],

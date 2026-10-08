@@ -8,6 +8,15 @@ SCHEMA_VERSION = 4
 # Contract version for normalization and exact physical checkpoints.
 PROJECTOR_VERSION = 4
 
+# Derived text remains labelled and never replaces the message's current spoken text.
+FTS_TEXT = """coalesce(current_text, '') ||
+  CASE WHEN json_type(media_json, '$.transcript.text') = 'text'
+         AND json_extract(media_json, '$.transcript.text') != ''
+    THEN char(10) || '[derived transcript] ' || json_extract(media_json, '$.transcript.text')
+    ELSE '' END"""
+FTS_ROWS = f"""SELECT message_id, chat_id, {FTS_TEXT} AS text
+  FROM messages_current WHERE deleted=0 AND ({FTS_TEXT}) != ''"""
+
 _DDL = """
 CREATE TABLE contacts (
   contact_id   TEXT PRIMARY KEY,
@@ -92,6 +101,10 @@ CREATE TABLE message_events (
 CREATE INDEX message_events_target ON message_events(target_message_id, kind);
 CREATE INDEX message_events_chat_time ON message_events(channel, chat_id, kind, occurred_ms, event_id);
 CREATE INDEX message_events_native_event ON message_events(native_event_id);
+CREATE VIRTUAL TABLE messages_fts USING fts5(
+  message_id UNINDEXED, chat_id UNINDEXED, text,
+  tokenize='unicode61 remove_diacritics 2'
+);
 CREATE TABLE projector_state (
   file              TEXT PRIMARY KEY,
   lines             INTEGER NOT NULL,

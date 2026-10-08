@@ -17,7 +17,7 @@ from .convert.common import open_ro
 from .extract import extract
 from .layer1 import canonical_json, iter_layer1, layer1_files
 from .project import build_rows, project
-from .schema import SCHEMA_VERSION
+from .schema import FTS_ROWS, SCHEMA_VERSION
 
 TABLES = ("contacts", "identifier_history", "messages", "message_events")
 
@@ -50,6 +50,21 @@ def _table_digest(conn: sqlite3.Connection) -> dict[str, str]:
             digest.update(canonical_json(list(row)).encode("utf-8") + b"\n")
         digests[table] = digest.hexdigest()
     return digests
+
+
+def _verify_fts(conn: sqlite3.Connection) -> None:
+    try:
+        actual = conn.execute("SELECT rowid,message_id,chat_id,text FROM messages_fts ORDER BY message_id").fetchall()
+        expected = conn.execute(f"SELECT m.rowid,f.* FROM ({FTS_ROWS}) f JOIN messages m USING(message_id)"
+                                " ORDER BY f.message_id").fetchall()
+        if actual != expected:
+            raise ValueError("fts_rows_mismatch")
+        # FTS5's integrity command is an INSERT; verify a snapshot copy to keep the source read-only.
+        with closing(sqlite3.connect(":memory:")) as check:
+            conn.backup(check)
+            check.execute("INSERT INTO messages_fts(messages_fts) VALUES ('integrity-check')")
+    except sqlite3.Error as exc:
+        raise ValueError("fts_integrity_mismatch") from exc
 
 
 def coverage(db_path: Path, *, frozen: bool = False) -> dict[str, Any]:
@@ -96,7 +111,9 @@ def verify(roots: Sequence[Path], db_path: Path, *, scratch: Path | None,
         raise ValueError("determinism requires explicitly frozen inputs")
     pinned = _input_pin(roots) if frozen else None
     with closing(_open(db_path, frozen=frozen)) as conn:
-        report: dict[str, Any] = {"coverage": _coverage(conn), "digests": _table_digest(conn)}
+        _verify_fts(conn)
+        report: dict[str, Any] = {"coverage": _coverage(conn), "digests": _table_digest(conn),
+                                  "fts_consistent": True}
     report["boundary"] = {"mode": "frozen" if frozen else "live",
                           "database": "single_read_transaction", "tail_freshness": False}
     if pinned is not None:
@@ -245,7 +262,8 @@ def verify_rebuild_candidate(roots: Sequence[Path], db_path: Path, *,
         candidate = _table_digest(conn)
         if candidate != expected:
             raise ValueError('semantic_digest_mismatch')
+        _verify_fts(conn)
     if pin() != expected_pin:
         raise ValueError('prefix_changed')
     return {'verified': True, 'expected_digests': expected, 'candidate_digests': candidate,
-            'checkpoints_match': True, 'integrity_ok': True, 'foreign_keys_ok': True, 'accounting_ok': True}
+            'fts_consistent': True, 'checkpoints_match': True, 'integrity_ok': True, 'foreign_keys_ok': True, 'accounting_ok': True}
