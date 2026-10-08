@@ -63,6 +63,20 @@ _PREVIOUS_ENV: dict[str, str | None] = {}
 _SESSION_ROOT: list[Path] = []
 
 
+def pytest_addoption(parser: pytest.Parser) -> None:
+    parser.addoption("--run-perf", action="store_true", default=False,
+                     help="run tests marked perf (slow cost benchmarks); also YEOMAN_RUN_PERF=1")
+
+
+def pytest_collection_modifyitems(config: pytest.Config, items: list[pytest.Item]) -> None:
+    if config.getoption("--run-perf") or os.environ.get("YEOMAN_RUN_PERF") == "1":
+        return
+    skip = pytest.mark.skip(reason="perf benchmark: run with --run-perf")
+    for item in items:
+        if "perf" in item.keywords:
+            item.add_marker(skip)
+
+
 def pytest_configure(config: pytest.Config) -> None:
     # Runs before collection: some modules resolve runtime paths at import time.
     # Next to --basetemp when given (always writable for the runner, including sandboxes);

@@ -10,6 +10,7 @@ hermes-yeoman-a2a-contracts = { git = "https://github.com/dimitree2k/hermes-yeom
 [tool.pytest.ini_options]
 asyncio_mode = "auto"
 testpaths = ["tests"]
+markers = ["perf: slow cost benchmark; skipped unless --run-perf or YEOMAN_RUN_PERF=1"]
 
 [tool.ruff]
 line-length = 100
