@@ -1279,3 +1279,22 @@ def test_write_rows_validates_terminal_chains_before_deleting(tmp_path, bad_redi
             write_rows(conn, rows)
         assert not conn.in_transaction
     assert table_digest(db) == before
+
+
+def test_write_rows_deleting_message_removes_all_referencing_events(built):
+    from yeoman_gateway.history.extract import extract
+    from yeoman_gateway.history.layer1 import iter_layer1
+    from yeoman_gateway.history.project import ProjectionRows, build_rows, write_rows
+
+    _, conn, _, (live, dev, _) = built
+    rows = build_rows(extract(iter_layer1([live, dev])))
+    mid = conn.execute("SELECT message_id FROM messages WHERE native_message_id='AC1'").fetchone()[0]
+    assert conn.execute('SELECT count(*) FROM message_events WHERE target_message_id=?', (mid,)).fetchone()[0] > 0
+    conn.execute('PRAGMA foreign_keys=ON')
+    write_rows(conn, ProjectionRows(rows.resolution, [], [], {}), message_ids={mid}, event_ids=set())
+    assert conn.in_transaction
+    assert conn.execute('SELECT count(*) FROM message_events WHERE target_message_id=?', (mid,)).fetchone()[0] == 0
+    assert conn.execute('SELECT count(*) FROM messages WHERE message_id=?', (mid,)).fetchone()[0] == 0
+    assert not conn.execute('PRAGMA foreign_key_check').fetchall()
+    conn.rollback()
+    assert conn.execute('SELECT count(*) FROM messages WHERE message_id=?', (mid,)).fetchone()[0] == 1

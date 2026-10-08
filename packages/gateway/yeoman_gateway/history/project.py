@@ -9,7 +9,7 @@ import os
 import sqlite3
 from collections import defaultdict
 from collections.abc import Sequence
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any
 
@@ -19,7 +19,7 @@ from .attestations import Attestation, message_copy_id, resolve_author_targets
 from .extract import EventCopy, Extracted, MessageCopy, extract
 from .ids import Ident, classify
 from .layer1 import canonical_json, iter_layer1, layer1_files
-from .resolve import Resolution, resolve
+from .resolve import ContactRow, IdentRow, Resolution, resolve
 from .schema import PROJECTOR_VERSION, create
 
 WINDOW_MS = 120_000
@@ -40,6 +40,7 @@ class ProjectionRows:
     messages: list[dict[str, Any]]
     events: list[dict[str, Any]]
     report: dict[str, Any]
+    _identity_rows: tuple[list[ContactRow], list[IdentRow], set[str]] | None = field(default=None, repr=False)
 
 
 def build_rows(ex: Extracted) -> ProjectionRows:
@@ -457,23 +458,31 @@ def _mark_current_reactions(rows: list[dict[str, Any]]) -> None:
 
 def write_rows(conn: sqlite3.Connection, rows: ProjectionRows, *,
                message_ids: set[str] | None = None, event_ids: set[str] | None = None) -> None:
-    contact_ids = {c.contact_id for c in rows.resolution.contacts}
-    for contact in rows.resolution.contacts:
-        if rows.resolution.terminal(contact.contact_id) not in contact_ids:
+    identity_contacts, identity_identifiers, identifier_contacts = (
+        (rows.resolution.contacts, rows.resolution.identifiers,
+         {c.contact_id for c in rows.resolution.contacts}) if rows._identity_rows is None else rows._identity_rows)
+    contact_ids = {c.contact_id for c in (rows.resolution.contacts if rows._identity_rows is None else identity_contacts)}
+    for contact in identity_contacts:
+        target = rows.resolution.terminal(contact.contact_id)
+        if target not in contact_ids and (rows._identity_rows is None or
+                conn.execute('SELECT 1 FROM contacts WHERE contact_id=?', (target,)).fetchone() is None):
             raise ValueError("contact redirect target is missing")
     if event_ids is None:
         conn.execute("DELETE FROM message_events")
     else:
         conn.executemany("DELETE FROM message_events WHERE event_id=?", [(eid,) for eid in sorted(event_ids)])
     if message_ids is None:
+        conn.execute("DELETE FROM message_events WHERE target_message_id IS NOT NULL")
         conn.execute("DELETE FROM messages")
     else:
+        conn.executemany("DELETE FROM message_events WHERE target_message_id=?",
+                         [(mid,) for mid in sorted(message_ids)])
         conn.executemany("DELETE FROM messages WHERE message_id=?", [(mid,) for mid in sorted(message_ids)])
     if message_ids is None and event_ids is None:
         conn.execute("DELETE FROM identifier_history")
         conn.execute("UPDATE contacts SET merged_into=NULL")
         conn.execute("DELETE FROM contacts")
-    contacts = sorted(rows.resolution.contacts, key=lambda c: (c.merged_into is not None, c.contact_id))
+    contacts = sorted(identity_contacts, key=lambda c: (c.merged_into is not None, c.contact_id))
     conn.executemany("INSERT INTO contacts (contact_id, kind, role, display_name, status, merged_into, source_refs) "
                       "VALUES (?, ?, ?, ?, ?, ?, ?) ON CONFLICT(contact_id) DO UPDATE SET "
                       "kind=excluded.kind, role=excluded.role, display_name=excluded.display_name, "
@@ -483,14 +492,14 @@ def write_rows(conn: sqlite3.Connection, rows: ProjectionRows, *,
     conn.executemany("UPDATE contacts SET merged_into=? WHERE contact_id=?",
                      [(c.merged_into, c.contact_id) for c in contacts])
     conn.executemany("DELETE FROM identifier_history WHERE contact_id=?",
-                     [(c.contact_id,) for c in contacts])
+                     [(cid,) for cid in sorted(identifier_contacts)])
     conn.executemany(
         "INSERT INTO identifier_history (contact_id, channel, kind, value, strength, evidence,"
         " first_seen_ms, last_seen_ms, ended_ms, source_refs, valid_from_ms, valid_until_ms)"
         " VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)", [
             (i.contact_id, i.channel, i.kind, i.value, i.strength, i.evidence, i.first_seen_ms,
              i.last_seen_ms, i.ended_ms, json.dumps(list(i.source_refs)), i.valid_from_ms, i.valid_until_ms)
-            for i in sorted(rows.resolution.identifiers, key=lambda i: (i.contact_id, i.kind, i.value))])
+            for i in sorted(identity_identifiers, key=lambda i: (i.contact_id, i.kind, i.value))])
     conn.executemany("INSERT INTO messages (message_id, channel, chat_id, native_message_id, sender_contact_id, "
                       "sender_identifier, sender_basis, direction, sent_ms, time_certainty, text, media_json, "
                       "reply_to_native_id, mentions_json, provenance, source_refs) "
