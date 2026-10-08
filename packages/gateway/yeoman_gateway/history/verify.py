@@ -16,6 +16,7 @@ from .extract import extract
 from .layer1 import canonical_json, iter_layer1, layer1_files
 from .project import _authors, _events, project
 from .resolve import resolve
+from .schema import SCHEMA_VERSION
 
 TABLES = ("contacts", "identifier_history", "messages", "message_events")
 
@@ -24,6 +25,12 @@ def _open(db_path: Path, *, frozen: bool = False) -> sqlite3.Connection:
     conn = (open_ro(db_path) if frozen else
             sqlite3.connect(db_path.resolve().as_uri() + "?mode=ro", uri=True))
     conn.execute("BEGIN")
+    version = conn.execute("PRAGMA user_version").fetchone()[0]
+    if version != SCHEMA_VERSION:
+        conn.close()
+        from .incremental import RebuildRequired
+
+        raise RebuildRequired(f"history schema {version} requires rebuild; no in-place migration")
     return conn
 
 
@@ -105,9 +112,12 @@ def verify(roots: Sequence[Path], db_path: Path, *, scratch: Path | None,
     lines = {}
     blanks = {}
     for rel, path in layer1_files(roots):
-        physical = path.read_bytes().splitlines()
+        data = path.read_bytes()
+        if data and not data.endswith(b"\n"):
+            raise ValueError(f"incomplete Layer 1 tail: {rel}")
+        physical = data.split(b"\n")[:-1]
         lines[rel] = len(physical)
-        blanks[rel] = sum(not line.strip() for line in physical)
+        blanks[rel] = sum(not line.decode("utf-8", errors="replace").strip() for line in physical)
         accounted[rel] += blanks[rel]
     report["blank_lines_skipped"] = blanks
     report["accounting"] = {rel: {"lines": count, "accounted": accounted.get(rel, 0)}

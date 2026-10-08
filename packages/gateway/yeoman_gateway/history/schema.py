@@ -4,9 +4,9 @@ from __future__ import annotations
 
 import sqlite3
 
-SCHEMA_VERSION = 2
-# Contract version for the temporal projector; legacy bookkeeping defaults stay at 1.
-PROJECTOR_VERSION = 2
+SCHEMA_VERSION = 3
+# Contract version for normalization and exact physical checkpoints.
+PROJECTOR_VERSION = 3
 
 _DDL = """
 CREATE TABLE contacts (
@@ -95,8 +95,10 @@ CREATE INDEX message_events_native_event ON message_events(native_event_id);
 CREATE TABLE projector_state (
   file              TEXT PRIMARY KEY,
   lines             INTEGER NOT NULL,
+  end_offset        INTEGER NOT NULL,
   sha256            TEXT NOT NULL,
-  projector_version INTEGER NOT NULL DEFAULT 1
+  projector_version INTEGER NOT NULL,
+  state_json        TEXT NOT NULL CHECK (json_valid(state_json))
 );
 CREATE VIEW messages_current AS
 SELECT m.*,
@@ -120,6 +122,8 @@ def create(conn: sqlite3.Connection) -> None:
     version = conn.execute("PRAGMA user_version").fetchone()[0]
     existing = conn.execute("SELECT 1 FROM sqlite_master WHERE type = 'table' LIMIT 1").fetchone()
     if version not in (0, SCHEMA_VERSION) or existing:
-        raise ValueError(f"history schema {version} requires rebuild; no in-place migration")
+        from .incremental import RebuildRequired
+
+        raise RebuildRequired(f"history schema {version} requires rebuild; no in-place migration")
     conn.executescript(_DDL)
     conn.execute(f"PRAGMA user_version = {SCHEMA_VERSION}")

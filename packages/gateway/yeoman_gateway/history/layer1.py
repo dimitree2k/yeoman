@@ -123,8 +123,9 @@ def layer1_files(roots: Sequence[Path]) -> list[tuple[str, Path]]:
 
 def iter_layer1(roots: Sequence[Path]) -> Iterator[Layer1Line]:
     for rel, path in layer1_files(roots):
-        with path.open("r", encoding="utf-8", errors="replace") as handle:
-            for number, text in enumerate(handle, start=1):
+        with path.open("rb") as handle:
+            for number, data in enumerate(handle, start=1):
+                text = data.decode("utf-8", errors="replace")
                 if not text.strip():
                     continue
                 try:

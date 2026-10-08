@@ -34,18 +34,35 @@ class AuthorCorrection:
     contact_id: str | None
 
 
-def project(roots: Sequence[Path], db_path: Path) -> dict[str, Any]:
-    if is_protected(db_path):
-        raise PermissionError(f"refusing to write history.db into the raw archive: {db_path}")
-    files = layer1_files(roots)
-    ex = extract(iter_layer1(roots))
+@dataclass
+class ProjectionRows:
+    resolution: Resolution
+    messages: list[dict[str, Any]]
+    events: list[dict[str, Any]]
+    report: dict[str, Any]
+
+
+def build_rows(ex: Extracted) -> ProjectionRows:
     res = resolve(ex.identity)
     arvid = res.role_contact.get("assistant")
     authors = _authors(ex, res)
     messages, unattached = _messages(ex, res, arvid, authors)
     events = _events(ex, res, arvid, {m["message_id"] for m in messages}, res.review, authors)
-    line_counts, blanks = _write(db_path, res, messages, events, files)
-    return _report(ex, res, messages, events, line_counts, blanks, unattached)
+    counts: dict[str, int] = defaultdict(int)
+    for (file, _), count in ex.outcomes.items():
+        counts[file] += count
+    report = _report(ex, res, messages, events, dict(counts), {}, unattached)
+    return ProjectionRows(res, messages, events, report)
+
+
+def project(roots: Sequence[Path], db_path: Path) -> dict[str, Any]:
+    if is_protected(db_path):
+        raise PermissionError(f"refusing to write history.db into the raw archive: {db_path}")
+    files = layer1_files(roots)
+    ex = extract(iter_layer1(roots))
+    rows = build_rows(ex)
+    _write(db_path, rows, files, ex.pending_pairs)
+    return rows.report
 
 
 def _authors(ex: Extracted, res: Resolution) -> dict[str, AuthorCorrection]:
@@ -438,8 +455,63 @@ def _mark_current_reactions(rows: list[dict[str, Any]]) -> None:
         row["payload"]["current"] = not row["payload"].get("removed")
 
 
-def _write(db_path: Path, res: Resolution, messages: list[dict[str, Any]], events: list[dict[str, Any]],
-           files: list[tuple[str, Path]]) -> tuple[dict[str, int], dict[str, int]]:
+def write_rows(conn: sqlite3.Connection, rows: ProjectionRows, *,
+               message_ids: set[str] | None = None, event_ids: set[str] | None = None) -> None:
+    contact_ids = {c.contact_id for c in rows.resolution.contacts}
+    for contact in rows.resolution.contacts:
+        if rows.resolution.terminal(contact.contact_id) not in contact_ids:
+            raise ValueError("contact redirect target is missing")
+    if event_ids is None:
+        conn.execute("DELETE FROM message_events")
+    else:
+        conn.executemany("DELETE FROM message_events WHERE event_id=?", [(eid,) for eid in sorted(event_ids)])
+    if message_ids is None:
+        conn.execute("DELETE FROM messages")
+    else:
+        conn.executemany("DELETE FROM messages WHERE message_id=?", [(mid,) for mid in sorted(message_ids)])
+    if message_ids is None and event_ids is None:
+        conn.execute("DELETE FROM identifier_history")
+        conn.execute("UPDATE contacts SET merged_into=NULL")
+        conn.execute("DELETE FROM contacts")
+    contacts = sorted(rows.resolution.contacts, key=lambda c: (c.merged_into is not None, c.contact_id))
+    conn.executemany("INSERT INTO contacts (contact_id, kind, role, display_name, status, merged_into, source_refs) "
+                      "VALUES (?, ?, ?, ?, ?, ?, ?) ON CONFLICT(contact_id) DO UPDATE SET "
+                      "kind=excluded.kind, role=excluded.role, display_name=excluded.display_name, "
+                      "status=excluded.status, merged_into=NULL, source_refs=excluded.source_refs", [
+        (c.contact_id, c.kind, c.role, c.display_name, c.status, None,
+         json.dumps(list(c.source_refs))) for c in contacts])
+    conn.executemany("UPDATE contacts SET merged_into=? WHERE contact_id=?",
+                     [(c.merged_into, c.contact_id) for c in contacts])
+    conn.executemany("DELETE FROM identifier_history WHERE contact_id=?",
+                     [(c.contact_id,) for c in contacts])
+    conn.executemany(
+        "INSERT INTO identifier_history (contact_id, channel, kind, value, strength, evidence,"
+        " first_seen_ms, last_seen_ms, ended_ms, source_refs, valid_from_ms, valid_until_ms)"
+        " VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)", [
+            (i.contact_id, i.channel, i.kind, i.value, i.strength, i.evidence, i.first_seen_ms,
+             i.last_seen_ms, i.ended_ms, json.dumps(list(i.source_refs)), i.valid_from_ms, i.valid_until_ms)
+            for i in sorted(rows.resolution.identifiers, key=lambda i: (i.contact_id, i.kind, i.value))])
+    conn.executemany("INSERT INTO messages (message_id, channel, chat_id, native_message_id, sender_contact_id, "
+                      "sender_identifier, sender_basis, direction, sent_ms, time_certainty, text, media_json, "
+                      "reply_to_native_id, mentions_json, provenance, source_refs) "
+                      "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)", [
+        (m["message_id"], m["channel"], m["chat_id"], m["native_message_id"], m["sender_contact_id"],
+         m["sender_identifier"], m["sender_basis"], m["direction"], m["sent_ms"], m["time_certainty"],
+         m["text"], canonical_json(m["media"]) if m["media"] else None, m["reply_to_native_id"],
+         canonical_json(m["mentions"]) if m["mentions"] else None, m["provenance"],
+         json.dumps(m["source_refs"])) for m in rows.messages])
+    conn.executemany("INSERT INTO message_events (event_id, kind, channel, chat_id, target_message_id, "
+                      "target_native_id, actor_contact_id, actor_identifier, actor_basis, occurred_ms, "
+                      "time_certainty, payload_json, provenance, source_refs, native_event_id) "
+                      "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)", [
+        (e["event_id"], e["kind"], e["channel"], e["chat_id"], e["target_message_id"],
+         e["target_native_id"], e["actor_contact_id"], e["actor_identifier"], e["actor_basis"],
+         e["occurred_ms"], e["time_certainty"], canonical_json(e["payload"]), e["provenance"],
+         json.dumps(e["source_refs"]), e["native_event_id"]) for e in rows.events])
+
+
+def _write(db_path: Path, rows: ProjectionRows, files: list[tuple[str, Path]],
+           pending_pairs: dict[str, list[str]]) -> None:
     building = db_path.with_name(db_path.name + ".building")
     if is_protected(building):
         raise PermissionError(f"refusing to write history.db staging file into the raw archive: {building}")
@@ -454,48 +526,36 @@ def _write(db_path: Path, res: Resolution, messages: list[dict[str, Any]], event
         try:
             conn.execute("PRAGMA foreign_keys = ON")
             create(conn)
-            contacts = sorted(res.contacts, key=lambda c: (c.merged_into is not None, c.contact_id))
-            conn.executemany("INSERT INTO contacts (contact_id, kind, role, display_name, status, merged_into, source_refs) "
-                              "VALUES (?, ?, ?, ?, ?, ?, ?)", [
-                (c.contact_id, c.kind, c.role, c.display_name, c.status, c.merged_into,
-                 json.dumps(list(c.source_refs))) for c in contacts])
-            conn.executemany(
-                "INSERT INTO identifier_history (contact_id, channel, kind, value, strength, evidence,"
-                " first_seen_ms, last_seen_ms, ended_ms, source_refs, valid_from_ms, valid_until_ms)"
-                " VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)", [
-                    (i.contact_id, i.channel, i.kind, i.value, i.strength, i.evidence, i.first_seen_ms,
-                     i.last_seen_ms, i.ended_ms, json.dumps(list(i.source_refs)), i.valid_from_ms, i.valid_until_ms)
-                    for i in sorted(res.identifiers, key=lambda i: (i.contact_id, i.kind, i.value))])
-            conn.executemany("INSERT INTO messages (message_id, channel, chat_id, native_message_id, sender_contact_id, "
-                              "sender_identifier, sender_basis, direction, sent_ms, time_certainty, text, media_json, "
-                              "reply_to_native_id, mentions_json, provenance, source_refs) "
-                              "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)", [
-                (m["message_id"], m["channel"], m["chat_id"], m["native_message_id"], m["sender_contact_id"],
-                 m["sender_identifier"], m["sender_basis"], m["direction"], m["sent_ms"], m["time_certainty"],
-                 m["text"], canonical_json(m["media"]) if m["media"] else None, m["reply_to_native_id"],
-                 canonical_json(m["mentions"]) if m["mentions"] else None, m["provenance"],
-                 json.dumps(m["source_refs"])) for m in messages])
-            conn.executemany("INSERT INTO message_events (event_id, kind, channel, chat_id, target_message_id, "
-                              "target_native_id, actor_contact_id, actor_identifier, actor_basis, occurred_ms, "
-                              "time_certainty, payload_json, provenance, source_refs, native_event_id) "
-                              "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)", [
-                (e["event_id"], e["kind"], e["channel"], e["chat_id"], e["target_message_id"],
-                 e["target_native_id"], e["actor_contact_id"], e["actor_identifier"], e["actor_basis"],
-                 e["occurred_ms"], e["time_certainty"], canonical_json(e["payload"]), e["provenance"],
-                 json.dumps(e["source_refs"]), e["native_event_id"]) for e in events])
+            write_rows(conn, rows)
             for rel, path in files:
                 data = path.read_bytes()
-                physical = data.splitlines()
+                if data and not data.endswith(b"\n"):
+                    raise ValueError(f"incomplete Layer 1 tail: {rel}")
+                physical = data.split(b"\n")[:-1]
                 counts[rel] = len(physical)
-                blanks[rel] = sum(not line.strip() for line in physical)
-                conn.execute("INSERT INTO projector_state (file, lines, sha256, projector_version) VALUES (?, ?, ?, ?)",
-                             (rel, counts[rel] - blanks[rel], hashlib.sha256(data).hexdigest(), PROJECTOR_VERSION))
+                blanks[rel] = sum(not line.decode("utf-8", errors="replace").strip() for line in physical)
+                conn.execute("INSERT INTO projector_state VALUES (?, ?, ?, ?, ?, ?)",
+                             (rel, counts[rel], len(data), hashlib.sha256(data).hexdigest(),
+                              PROJECTOR_VERSION, "{}"))
+            report = rows.report
+            for rel, count in blanks.items():
+                if count:
+                    report["outcomes"].setdefault(rel, {})["skipped:blank"] = count
+            report.update(files=len(counts), blank_lines_skipped=blanks,
+                          accounting={rel: {"lines": count,
+                                           "accounted": sum(report["outcomes"].get(rel, {}).values())}
+                                      for rel, count in counts.items()})
+            report["accounting_ok"] = all(v["lines"] == v["accounted"] for v in report["accounting"].values())
+            runtime = {"generation": 1, "pending_pairs": pending_pairs, "outcomes": report["outcomes"],
+                       "review": {key: len(items) for key, items in report["review"].items()}, "status": "ready"}
+            conn.execute("INSERT INTO projector_state VALUES (?, ?, ?, ?, ?, ?)",
+                         ("@runtime", 0, 0, hashlib.sha256(b"").hexdigest(), PROJECTOR_VERSION,
+                          canonical_json(runtime)))
             conn.commit()
         finally:
             conn.close()
         os.chmod(building, 0o600)
         os.replace(building, db_path)
-        return counts, blanks
     finally:
         try:
             current = building.lstat()
@@ -519,7 +579,7 @@ def _report(ex: Extracted, res: Resolution, messages: list[dict[str, Any]], even
     live = [c for c in res.contacts if c.merged_into is None]
     return {
         "files": len(line_counts), "outcomes": dict(outcomes), "accounting": accounting,
-        "blank_lines_skipped": blanks, "projector_state_line_basis": "nonblank",
+        "blank_lines_skipped": blanks, "projector_state_line_basis": "physical",
         "accounting_ok": all(v["lines"] == v["accounted"] for v in accounting.values()),
         "contacts": len(live), "provisional_contacts": sum(c.status == "provisional" for c in live),
         "merged_contacts": len(res.contacts) - len(live), "messages": len(messages),

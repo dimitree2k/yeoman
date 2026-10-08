@@ -486,7 +486,7 @@ def test_telegram_attestations_stay_provenance_only(tmp_path):
         assert conn.execute("SELECT count(*) FROM identifier_history WHERE channel != 'whatsapp' OR value LIKE 'telegram:%'").fetchone()[0] == 0
         assert conn.execute('SELECT count(*) FROM messages').fetchone()[0] == 0
         assert conn.execute('SELECT count(*) FROM message_events').fetchone()[0] == 0
-        assert conn.execute('PRAGMA user_version').fetchone()[0] == 2
+        assert conn.execute('PRAGMA user_version').fetchone()[0] == 3
         assert {r[0] for r in conn.execute('SELECT projector_version FROM projector_state')} == {PROJECTOR_VERSION}
 
 
@@ -1168,3 +1168,114 @@ def test_transcript_projects_as_derived_media_not_native_text(tmp_path):
     project([root], db)
     with closing(sqlite3.connect(db)) as conn:
         assert conn.execute("SELECT count(*) FROM messages").fetchone()[0] == 0
+
+
+def _normalization_fixture(tmp_path):
+    live, dev = sample_layer1(tmp_path)
+    source = live / "whatsapp/2026-10.jsonl"
+    records = [json.loads(line) for line in source.read_text().splitlines()[:-1]]
+    write_jsonl(live / "whatsapp/duplicates.jsonl", [records[0], records[3]])
+    write_jsonl(dev / "owner/corrections.jsonl", [
+        make("author", T0 + 500, "synthetic actor correction",
+             source_ref="whatsapp/2026-10.jsonl#4", anchor=FRANK_PN),
+        make("author", T0 + 501, "synthetic duplicate correction",
+             source_ref="whatsapp/duplicates.jsonl#2", anchor=FRANK_PN),
+    ])
+    return live, dev
+
+
+# Captured from Task 1 HEAD's unfactored full projector on this synthetic fixture.
+_NORMALIZATION_BEFORE = {'digests': {'contacts': '98c4f39302ee59bb4f64c1124c407af4253fef6739bab7a6b0cafb598d4be55c', 'identifier_history': 'ac86858d7c78b7e64cf6c5c7c28f868aa67d042a27998271810fc261dab3bcb2', 'messages': 'f8634da6550b15c76e21f6cd46392bc8038c93154663ac82118a95f22e0603a5', 'message_events': '07a8b2153e981743fc14c296e93446dc5775b82b4d82ecffb4ab233284f4249b'}, 'views': [['whatsapp:4917623568044-1542142755@g.us:3EB0P', 'whatsapp', '4917623568044-1542142755@g.us', '3EB0P', '40619b3e-23f8-5bf0-88a2-6c3a352cccf4', None, 'native_identifier', 'out', 1791000060000, 'capture_time_approx', 'Antwort an Matthias', None, None, None, 'verbatim_unverified', '["backfill/journal.jsonl#1", "backfill/session_jsonl.jsonl#1"]', 'Antwort an Matthias', 0, '[]'], ['whatsapp:4917623568044-1542142755@g.us:AC1', 'whatsapp', '4917623568044-1542142755@g.us', 'AC1', '945ae43e', '46918273106072@lid', 'native_identifier', 'in', 1791000000000, 'provider_timestamp', 'hallo', None, None, None, 'native', '["backfill/memory.jsonl#1", "backfill/reply_context.jsonl#1", "whatsapp/2026-10.jsonl#1", "whatsapp/duplicates.jsonl#1"]', 'hallo!!', 0, '[{"actor":"945ae43e","emoji":"😂"}]'], ['whatsapp:4917623568044-1542142755@g.us:AC2', 'whatsapp', '4917623568044-1542142755@g.us', 'AC2', '035a6f69-1eef-58cf-8cbf-abd623d8ca0a', '4915253696948', 'derived_claim', 'in', 1791000000000, 'provider_timestamp', None, '{"description":{"generated_ms":null,"generator":null,"provenance":"derived_only","text":"Eine Stahlbrücke"},"kind":"image"}', None, None, 'verbatim_unverified', '["backfill/session_jsonl.jsonl#2"]', None, 0, '[]'], ['whatsapp:4917623568044-1542142755@g.us:derived:e4c5a66dbceef3762bb39c90fc319736', 'whatsapp', '4917623568044-1542142755@g.us', None, '945ae43e', '4917632625469', 'derived_claim', 'in', 1771000000000, 'capture_time_approx', 'Februar-Nachricht', None, None, None, 'verbatim_unverified', '["backfill/memory.jsonl#2"]', 'Februar-Nachricht', 0, '[]']]}
+
+
+def test_shared_normalization_preserves_full_projection_contract(tmp_path):
+    from yeoman_gateway.history.extract import extract
+    from yeoman_gateway.history.layer1 import iter_layer1
+    from yeoman_gateway.history.project import build_rows, write_rows
+    from yeoman_gateway.history.schema import create
+    from yeoman_gateway.history.verify import table_digest
+
+    roots = _normalization_fixture(tmp_path)
+    db = tmp_path / "full.db"
+    project(roots, db)
+    assert set(table_digest(db)) == {"contacts", "identifier_history", "messages", "message_events"}
+    assert table_digest(db) == _NORMALIZATION_BEFORE["digests"]
+    with closing(sqlite3.connect(db)) as conn:
+        actual = [list(r) for r in conn.execute("SELECT * FROM messages_current ORDER BY message_id")]
+    assert actual == _NORMALIZATION_BEFORE["views"]
+    shared = tmp_path / "shared.db"
+    with closing(sqlite3.connect(shared)) as conn:
+        conn.execute("PRAGMA foreign_keys = ON")
+        create(conn)
+        rows = build_rows(extract(iter_layer1(roots)))
+        write_rows(conn, rows)
+        assert conn.in_transaction
+        assert conn.execute("PRAGMA foreign_key_check").fetchall() == []
+        conn.commit()
+        assert [list(r) for r in conn.execute("SELECT * FROM messages_current ORDER BY message_id")] == actual
+    assert table_digest(shared) == _NORMALIZATION_BEFORE["digests"]
+
+
+def test_write_rows_retracts_closure_without_committing_or_cascading(tmp_path):
+    from dataclasses import replace
+
+    from yeoman_gateway.history.extract import extract
+    from yeoman_gateway.history.layer1 import iter_layer1
+    from yeoman_gateway.history.project import build_rows, write_rows
+    from yeoman_gateway.history.verify import table_digest
+
+    roots = _normalization_fixture(tmp_path)
+    db = tmp_path / "history.db"
+    project(roots, db)
+    rows = build_rows(extract(iter_layer1(roots)))
+    mid = next(m["message_id"] for m in rows.messages if m["native_message_id"] == "AC1")
+    event_ids = {e["event_id"] for e in rows.events if e["target_message_id"] == mid}
+    closure = replace(rows, messages=[], events=[])
+    with closing(sqlite3.connect(db)) as conn:
+        conn.execute("PRAGMA foreign_keys=ON")
+        # An unrelated event remains attached to a different message throughout.
+        other_mid = next(m["message_id"] for m in rows.messages if m["native_message_id"] == "AC2")
+        conn.execute("INSERT INTO message_events (event_id, kind, channel, chat_id, target_message_id,"
+                     " actor_basis, time_certainty, payload_json, provenance, source_refs)"
+                     " VALUES ('unrelated', 'delete', 'whatsapp', 'synthetic@g.us', ?,"
+                     " 'unknown', 'unknown', '{}', 'native', '[]')", (other_mid,))
+        conn.commit()
+        before = table_digest(db)
+        write_rows(conn, closure, message_ids={mid}, event_ids=event_ids)
+        assert conn.in_transaction
+        assert table_digest(db) == before  # caller owns publication
+        assert conn.execute("SELECT target_message_id FROM message_events WHERE event_id='unrelated'").fetchone() == (other_mid,)
+        assert conn.execute("PRAGMA foreign_key_check").fetchall() == []
+        conn.rollback()
+        assert table_digest(db) == before
+        write_rows(conn, closure, message_ids={mid}, event_ids=event_ids)
+        conn.commit()
+        assert conn.execute("SELECT count(*) FROM messages WHERE message_id=?", (mid,)).fetchone() == (0,)
+        assert conn.execute("SELECT count(*) FROM message_events").fetchone() == (1,)
+        assert conn.execute("SELECT count(*) FROM messages").fetchone()[0] == len(rows.messages) - 1
+
+
+@pytest.mark.parametrize("bad_redirect", ["cycle", "missing"])
+def test_write_rows_validates_terminal_chains_before_deleting(tmp_path, bad_redirect):
+    from dataclasses import replace
+
+    from yeoman_gateway.history.extract import extract
+    from yeoman_gateway.history.layer1 import iter_layer1
+    from yeoman_gateway.history.project import build_rows, write_rows
+    from yeoman_gateway.history.verify import table_digest
+
+    roots = _normalization_fixture(tmp_path)
+    db = tmp_path / "history.db"
+    project(roots, db)
+    before = table_digest(db)
+    rows = build_rows(extract(iter_layer1(roots)))
+    contact = rows.resolution.contacts[0]
+    rows.resolution.contacts = [
+        replace(c, merged_into=c.contact_id if bad_redirect == "cycle" else "absent")
+        if c.contact_id == contact.contact_id else c for c in rows.resolution.contacts]
+    with closing(sqlite3.connect(db)) as conn:
+        conn.execute("PRAGMA foreign_keys=ON")
+        with pytest.raises(ValueError, match="redirect"):
+            write_rows(conn, rows)
+        assert not conn.in_transaction
+    assert table_digest(db) == before

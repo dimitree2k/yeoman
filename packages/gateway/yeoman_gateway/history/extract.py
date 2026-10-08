@@ -19,7 +19,7 @@ from yeoman_shared.whatsapp_protocol import (
 from .attestations import Attestation, parse
 from .convert.common import clean_text, media_kind
 from .ids import Ident, classify
-from .layer1 import Layer1Line, is_tombstone
+from .layer1 import Layer1Line, canonical_json, is_tombstone
 from .resolve import REF, ContactRecord, IdentityInput
 
 SOURCE_RANKS = {"journal": 1, "bridge_refs": 2, "reply_context": 3, "inbound_archive": 3,
@@ -121,6 +121,7 @@ class Extracted:
     media_records: list[MediaRecord] = field(default_factory=list)
     identity: IdentityInput = field(default_factory=IdentityInput)
     attestations: list[Attestation] = field(default_factory=list)
+    pending_pairs: dict[str, list[str]] = field(default_factory=dict)
     outcomes: Counter[tuple[str, str]] = field(default_factory=Counter)
     review: dict[str, list[dict[str, Any]]] = field(default_factory=lambda: {
         "outbound_correlations": [], "outbound_content_gaps": []})
@@ -160,6 +161,8 @@ def extract(lines: Iterable[Layer1Line]) -> Extracted:
         else:
             _backfill(line, out)
     for (account, correlation), copies in sorted(pairs.items()):
+        if {line.record["kind"] for line in copies if line.record} != {"outbound_request", "outbound_result"}:
+            out.pending_pairs[canonical_json([account, correlation])] = sorted(line.ref for line in copies)
         _outbound(copies, out, account, correlation)
     out.identity.attestations.extend(out.attestations)
     return out

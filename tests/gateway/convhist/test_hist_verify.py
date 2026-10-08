@@ -109,8 +109,8 @@ def test_verify_determinism_requires_pinned_inputs(tmp_path, monkeypatch):
     assert checked['accounting']['backfill/tombstone.jsonl'] == {'lines': 2, 'accounted': 2}
     import sqlite3
     with sqlite3.connect(db) as conn:
-        assert conn.execute("SELECT lines FROM projector_state WHERE file='backfill/tombstone.jsonl'").fetchone() == (1,)
-    assert projected['projector_state_line_basis'] == 'nonblank'
+        assert conn.execute("SELECT lines FROM projector_state WHERE file='backfill/tombstone.jsonl'").fetchone() == (2,)
+    assert projected['projector_state_line_basis'] == 'physical'
     assert projected['accounting'] == checked['accounting']
     assert projected['blank_lines_skipped'] == checked['blank_lines_skipped']
     assert projected['outcomes']['backfill/tombstone.jsonl'] == {'skipped:purged': 1, 'skipped:blank': 1}

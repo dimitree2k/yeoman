@@ -58,11 +58,16 @@ def test_messages_current_view(db):
     assert '"😂"' in row[2] and "👍" not in row[2]
 
 
-def test_projector_state_defaults_projector_version_to_one(db):
+def test_projector_state_requires_explicit_version_and_valid_json(db):
     columns = {row[1] for row in db.execute("PRAGMA table_info(projector_state)")}
-    assert "projector_version" in columns
-    db.execute("INSERT INTO projector_state (file, lines, sha256) VALUES ('messages.jsonl', 1, 'abc')")
-    assert db.execute("SELECT projector_version FROM projector_state").fetchone()[0] == 1
+    assert columns == {"file", "lines", "end_offset", "sha256", "projector_version", "state_json"}
+    with pytest.raises(sqlite3.IntegrityError):
+        db.execute("INSERT INTO projector_state (file, lines, end_offset, sha256, state_json)"
+                   " VALUES ('messages.jsonl', 1, 10, 'abc', '{}')")
+    with pytest.raises(sqlite3.IntegrityError):
+        db.execute("INSERT INTO projector_state VALUES ('messages.jsonl', 1, 10, 'abc', 3, 'bad')")
+    db.execute("INSERT INTO projector_state VALUES ('messages.jsonl', 1, 10, 'abc', 3, '{}')")
+    assert db.execute("SELECT projector_version FROM projector_state").fetchone()[0] == 3
 
 
 def test_native_event_id_is_nullable_indexed_and_non_unique(db):
@@ -92,8 +97,8 @@ def test_native_event_id_is_nullable_indexed_and_non_unique(db):
 def test_identifier_schema_distinguishes_ownership_from_observation(db):
     columns = {row[1]: row[3] for row in db.execute("PRAGMA table_info(identifier_history)")}
     assert columns.get("valid_from_ms") == 0 and columns.get("valid_until_ms") == 0
-    assert SCHEMA_VERSION == 2
-    assert PROJECTOR_VERSION == 2
+    assert SCHEMA_VERSION == 3
+    assert PROJECTOR_VERSION == 3
     tables = {row[0] for row in db.execute("SELECT name FROM sqlite_master WHERE type = 'table'")}
     assert tables == {"contacts", "identifier_history", "messages", "message_events", "projector_state"}
     _contact(db)
@@ -122,3 +127,21 @@ def test_identifier_schema_distinguishes_ownership_from_observation(db):
         assert list(old.iterdump()) == before
     finally:
         old.close()
+
+
+def test_history_v2_requires_rebuild(tmp_path):
+    from yeoman_gateway.history.incremental import RebuildRequired
+    from yeoman_gateway.history.verify import table_digest
+
+    path = tmp_path / "v2.db"
+    with sqlite3.connect(path) as old:
+        old.executescript("CREATE TABLE contacts (contact_id TEXT);"
+                         "INSERT INTO contacts VALUES ('synthetic-keep'); PRAGMA user_version = 2;")
+    before = path.read_bytes()
+    with sqlite3.connect(path) as old:
+        with pytest.raises(RebuildRequired, match="history schema 2 requires rebuild"):
+            create(old)
+    with pytest.raises(RebuildRequired, match="history schema 2 requires rebuild"):
+        table_digest(path)
+    assert path.read_bytes() == before
+    assert not path.with_name(path.name + ".building").exists()
