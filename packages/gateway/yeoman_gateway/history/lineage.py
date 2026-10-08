@@ -16,14 +16,15 @@ from .layer1 import Layer1Line
 from .resolve import ContactRow, GeneratedContactId, Resolution
 
 
-def apply_lineage(resolution: Resolution, records: Sequence[Layer1Line]) -> None:
+def apply_lineage(resolution: Resolution, records: Sequence[Layer1Line], *, validated: bool = False) -> None:
     rows = {row.contact_id: row for row in resolution.contacts}
     generated = {item.contact_id for item in resolution.generated_ids}
     review = resolution.review.setdefault('contact_id_lineage', [])
     seen: dict[str, tuple[object, ...]] = {}
     for line in records:
         record = line.record or {}
-        _validate_contact_id_record(record)
+        if not validated:
+            _validate_contact_id_record(record)
         cid = record['contact_id']
         signature = tuple(record[key] for key in ('seed', 'value', 'valid_from_ms', 'valid_until_ms'))
         if cid in seen:

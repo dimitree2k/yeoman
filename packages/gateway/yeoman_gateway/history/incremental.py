@@ -8,15 +8,17 @@ import sqlite3
 import stat
 import time
 from bisect import bisect_left, bisect_right, insort
-from collections import Counter, defaultdict
+from collections import ChainMap, Counter, defaultdict
 from collections.abc import Sequence
 from copy import copy, deepcopy
 from dataclasses import dataclass, replace
+from functools import cache
 from pathlib import Path
-from typing import Any
+from typing import Any, cast
 
 from yeoman_shared.raw_archive.records import (
     PURGE_DISPOSITION_LOCK,
+    CommittedLine,
     SourceBoundary,
     _no_symlinks,
     lock_file,
@@ -36,7 +38,7 @@ from .project import (
     build_rows,
     write_rows,
 )
-from .resolve import MAX_REFS, IdentityInput, Resolution, Sighting, resolve
+from .resolve import _EDGE_PRIORITY, MAX_REFS, IdentityInput, Resolution, Sighting, resolve
 from .schema import PROJECTOR_VERSION, SCHEMA_VERSION
 
 
@@ -266,6 +268,7 @@ class _Plan:
     sightings: dict[Ident, Sighting]
     replacements: dict[int, Any]
     contact_replacements: dict[int, Any]
+    local: Resolution | None
 
 
 class ProjectionIndex:
@@ -355,7 +358,24 @@ class ProjectionIndex:
 
     def _identity_indexes(self) -> None:
         self._contact_positions = {row.contact_id: i for i, row in enumerate(self._resolution.contacts)}
+        self._links_by_value = defaultdict(list)
+        for link in self._input.links:
+            for value in link[:2]:
+                self._links_by_value[value].append(link)
+        self._lineage_by_value = defaultdict(list)
+        for line in self._lineage_records:
+            self._lineage_by_value[(line.record or {})['value']].append(line)
+        self._aliases_by_contact = defaultdict(list)
+        for alias in self._resolution.contacts:
+            if alias.merged_into:
+                self._aliases_by_contact[self._resolution.terminal(alias.contact_id)].append(alias)
+        self._group_numbers = {numeric_part(group.value) for group in self._input.groups}
         self._known_links = {tuple(link[:3]) for link in self._input.links}
+        self._blocked_links = {tuple(item[key] for key in ('a', 'b', 'evidence'))
+                               for item in self._resolution.review.get('blocked_by_unmerge', [])}
+        self._link_order = {link.ref: (_EDGE_PRIORITY[link.evidence],
+                           link.occurred_ms is None or link.time_basis == 'unknown', link.occurred_ms or 0, link.ref)
+                           for link in self._input.timed_links}
         self._known_names = {node: {name for _, name, _ in names} for node, names in self._input.names.items()}
         self._fixed_names = {ref for ref, record in self._input.contact_records.items() if record.preferred_name or record.display_name}
         for att in self._input.attestations:
@@ -552,50 +572,168 @@ class ProjectionIndex:
         ex.attestations = list(relevant.values())
         return ex
 
-    def _identity_plan(self, changes: dict[str, Extracted]) -> tuple[Resolution, IdentityInput | None, dict[Ident, Sighting], dict[int, Any], dict[int, Any]]:
+    def _component_resolution(self, changes: dict[str, Extracted], sightings: dict[Ident, Sighting],
+                              dirty: set[str]) -> Resolution | None:
+        # Only isolated, unbounded source components can be patched without global decisions.
+        links = {link for ex in changes.values() for link in ex.identity.links}
+        by_value: dict[str, set[tuple[str, str, str, str]]] = defaultdict(set)
+        for link in links:
+            for value in link[:2]:
+                by_value[value].add(link)
+        group_numbers = self._group_numbers | {numeric_part(group.value) for ex in changes.values() for group in ex.identity.groups}
+        incoming_numbers: dict[str, set[str]] = defaultdict(set)
+        for sighted_ident in sightings:
+            incoming_numbers[numeric_part(sighted_ident.value)].add(sighted_ident.value)
+        values, pending, contacts = set(), list(dirty), set()
+        while pending:
+            value = pending.pop()
+            if value in values:
+                continue
+            values.add(value)
+            ident = classify(value)
+            if ident is None or ident.kind not in ('lid', 'pn_jid', 'newsletter', 'numeric'):
+                return None
+            numeric = numeric_part(value)
+            if numeric in group_numbers:
+                return None
+            peers = self._numeric_values.get(numeric, set()) | incoming_numbers.get(numeric, set())
+            owners = {self._resolution.resolve(typed)[0] for peer in peers
+                      if (typed := classify(peer)) is not None and typed.strong}
+            owners.discard(None)
+            if len(owners) > 1:
+                return None
+            pending.extend(peers)
+            bare = Ident('numeric', numeric)
+            if bare in self._input.sightings or bare in sightings:
+                pending.append(numeric)
+            canonical = self._resolution.canonical.get(numeric)
+            if canonical is not None:
+                pending.append(canonical.value)
+            effective = self._resolution.canonical.get(ident.value, ident) if ident.kind == 'numeric' else ident
+            bindings = self._resolution._identifier_index.get((effective.kind, effective.value), ())
+            for row in bindings:
+                if (row.valid_from_ms is not None or row.valid_until_ms is not None or row.ended_ms is not None
+                        or row.evidence in ('owner_attested', 'knowledge_binding')):
+                    return None
+                cid = self._resolution.terminal(row.contact_id)
+                contact = self._resolution.contacts[self._contact_positions[cid]]
+                if contact.role or cid in self._fixed_names:
+                    return None
+                contacts.add(cid)
+                pending.extend(r.value for r in self._idents_by_contact[cid] if r.kind != 'push_name')
+            for link in (*self._links_by_value.get(value, ()), *by_value.get(value, ())):
+                if link[2] != 'native_pair':
+                    return None
+                links.add(link)
+                pending.extend(link[:2])
+        inp = IdentityInput()
+        for value in values:
+            ident = classify(value)
+            assert ident is not None
+            seen = sightings.get(ident, self._input.sightings.get(ident))
+            if seen is not None:
+                inp.sightings[ident] = seen
+            inp.names[value].extend(self._input.names.get(value, ()))
+        for ex in changes.values():
+            for node, names in ex.identity.names.items():
+                if node in values:
+                    inp.names[node].extend(names)
+        inp.links = sorted((link for link in links if set(link[:2]) <= values), key=lambda link: _ref_order(link[3]))
+        inp.link_times = {link: self._input.link_times[link] for link in inp.links if link in self._input.link_times}
+        for ex in changes.values():
+            inp.link_times.update({link: timed for link, timed in ex.identity.link_times.items() if link in inp.links})
+        for names in inp.names.values():
+            names.sort(key=lambda item: _ref_order(item[2]))
+        local = resolve(inp)
+        previous_ambiguity = [item for item in self._resolution.review.get('numeric_ambiguous', ())
+                              if item['value'] in values]
+        if (any(items for category, items in local.review.items() if category != 'numeric_ambiguous')
+                or local.review.get('numeric_ambiguous', []) != previous_ambiguity):
+            return None
+        apply_lineage(local, [line for value in values for line in self._lineage_by_value.get(value, ())], validated=True)
+        old_contacts = [self._resolution.contacts[self._contact_positions[cid]] for cid in contacts]
+        old_contacts.extend(alias for cid in contacts for alias in self._aliases_by_contact[cid])
+        old_identifiers = [row for cid in contacts for row in self._idents_by_contact[cid]]
+        old_canonical = {number: self._resolution.canonical[number] for number in values if number in self._resolution.canonical}
+        old = Resolution(old_contacts, old_identifiers, {}, {}, old_canonical, {})
+        units = {key for value in values for key in self._copies_by_ident.get(value, ())}
+        if _identity_change(old, local, self._local(units, {})):
+            raise RebuildRequired('identifier component or applicability changed')
+        local.generated_ids = tuple(item for item in local.generated_ids if item.contact_id not in self._reserved_ids)
+        return local
+
+    def _identity_plan(self, changes: dict[str, Extracted]) -> tuple[Resolution, IdentityInput | None, dict[Ident, Sighting], dict[int, Any], dict[int, Any], Resolution | None]:
+        ident_for = cache(classify)
         sightings: dict[Ident, Sighting] = {}
         slow = False
+        dirty: set[str] = set()
+        rejected: dict[tuple[str, str, str, str], str] = {}
         for key, ex in changes.items():
-            old = self._extracted.get(key)
-            if old and _identity_evidence(old):
+            prior_unit = self._extracted.get(key)
+            if prior_unit and _identity_evidence(prior_unit):
                 raise RebuildRequired('identity contribution retraction requires rebuild')
             inp = ex.identity
-            slow |= bool(inp.contact_records or ex.attestations or inp.groups - self._input.groups)
+            slow |= bool(inp.contact_records or ex.attestations)
+            for group in inp.groups - self._input.groups:
+                if Ident('numeric', numeric_part(group.value)) in self._input.sightings:
+                    slow = True
+                    dirty.add(group.value)
             for link in inp.links:
                 a, b, evidence, _ = link
-                aa = self._resolution._identifier_index.get((classify(a).kind, a), []) if classify(a) else []
-                bb = self._resolution._identifier_index.get((classify(b).kind, b), []) if classify(b) else []
-                slow |= (tuple(link[:3]) not in self._known_links or evidence != 'native_pair' or
-                         len(aa) != 1 or len(bb) != 1 or aa[0].contact_id != bb[0].contact_id or
-                         any(row.valid_from_ms is not None or row.valid_until_ms is not None for row in [*aa, *bb]))
+                aa = self._resolution._identifier_index.get((ident_for(a).kind, a), []) if ident_for(a) else []
+                bb = self._resolution._identifier_index.get((ident_for(b).kind, b), []) if ident_for(b) else []
+                changed = (tuple(link[:3]) not in self._known_links or not aa or not bb or
+                           any(row.valid_from_ms is not None or row.valid_until_ms is not None or
+                               row.ended_ms is not None for row in [*aa, *bb]))
+                slow |= changed
+                if changed:
+                    dirty.update((a, b))
+                else:
+                    owners_a = {self._resolution.terminal(row.contact_id) for row in aa}
+                    owners_b = {self._resolution.terminal(row.contact_id) for row in bb}
+                    if len(owners_a) != 1 or len(owners_b) != 1:
+                        rejected[link] = 'temporal_links_ambiguous'
+                    elif owners_a != owners_b:
+                        rejected[link] = 'blocked_by_unmerge' if tuple(link[:3]) in self._blocked_links else 'temporal_links_ambiguous'
             for node, names in inp.names.items():
-                slow |= any(name not in self._known_names.get(node, ()) for _, name, _ in names)
-                ident = classify(node)
+                if any(name not in self._known_names.get(node, ()) for _, name, _ in names):
+                    slow = True
+                    dirty.add(node)
+                ident = ident_for(node)
                 if ident is not None and ident.kind == 'numeric':
                     ident = self._resolution.canonical.get(ident.value, ident)
                 bindings = self._resolution._identifier_index.get((ident.kind, ident.value), []) if ident else []
-                slow |= len(bindings) != 1 or any(row.valid_from_ms is not None or row.valid_until_ms is not None for row in bindings)
+                if len(bindings) != 1 or any(row.valid_from_ms is not None or row.valid_until_ms is not None for row in bindings):
+                    slow = True
+                    dirty.add(node)
                 if len(bindings) == 1:
                     for ms, name, ref in names:
                         for row in self._idents_by_contact[bindings[0].contact_id]:
                             if row.kind == 'push_name' and row.value == name:
-                                slow |= (ms is not None and (row.first_seen_ms is None or ms < row.first_seen_ms)) or (
+                                changed = (ms is not None and (row.first_seen_ms is None or ms < row.first_seen_ms)) or (
                                     ms == row.first_seen_ms and bool(row.source_refs) and _ref_order(ref) < _ref_order(row.source_refs[0]))
+                                slow |= changed
+                                if changed:
+                                    dirty.add(node)
             for ident, seen in inp.sightings.items():
                 previous = sightings.get(ident, self._input.sightings.get(ident))
                 if previous is None:
-                    sightings[ident] = deepcopy(seen)
+                    sightings[ident] = replace(seen)
                     slow = True
+                    dirty.add(ident.value)
                 else:
-                    merged = deepcopy(previous)
+                    merged = replace(previous)
                     merged.merge(seen)
                     if seen.first_ms == previous.first_ms and seen.first_ref and previous.first_ref and _ref_order(seen.first_ref) < _ref_order(previous.first_ref):
                         merged.first_ref = seen.first_ref
                     sightings[ident] = merged
-                    slow |= merged.first_ms != previous.first_ms or merged.first_ref != previous.first_ref
+                    if merged.first_ms != previous.first_ms or merged.first_ref != previous.first_ref:
+                        slow = True
+                        dirty.add(ident.value)
         replacements: dict[int, Any] = {}
         contact_replacements: dict[int, Any] = {}
-        if not slow:
+        local = self._component_resolution(changes, sightings, dirty) if slow and dirty else None
+        if not slow or local is not None:
             res = copy(self._resolution)
             res.generated_ids = ()
             res.review = dict(self._resolution.review)
@@ -605,53 +743,92 @@ class ProjectionIndex:
                     updated = replace(row, last_seen_ms=max((v for v in (row.last_seen_ms, seen.last_ms) if v is not None), default=None))
                     if updated != row:
                         replacements[self._ident_positions[id(row)]] = updated
+            references: dict[str, set[str]] = defaultdict(set)
+            link_order = ChainMap({}, self._link_order)
             for unit in changes.values():
-                for a, b, _, ref in unit.identity.links:
-                    cid = None
-                    for value in (a, b):
-                        ident = classify(value)
-                        for row in self._resolution._identifier_index.get((ident.kind, ident.value), ()) if ident else ():
-                            position = self._ident_positions[id(row)]
-                            updated = replacements.get(position, row)
-                            replacements[position] = replace(updated, source_refs=tuple(sorted(set(updated.source_refs) | {ref})[:MAX_REFS]))
-                            cid = row.contact_id
-                    if cid:
-                        position = self._contact_positions[cid]
-                        contact = contact_replacements.get(position, self._resolution.contacts[position])
-                        updated_contact = replace(contact, source_refs=tuple(sorted(set(contact.source_refs) | {ref})[:MAX_REFS]))
-                        contact_replacements[position] = updated_contact
-                        # Generated aliases share their terminal contact's source evidence.
-                        for value in (a, b):
-                            import uuid
+                for timed in unit.identity.timed_links:
+                    link_order.maps[0][timed.ref] = (_EDGE_PRIORITY[timed.evidence],
+                        timed.occurred_ms is None or timed.time_basis == 'unknown', timed.occurred_ms or 0, timed.ref)
+                for link in unit.identity.links:
+                    a, b, evidence, ref = link
+                    if link in rejected:
+                        category = rejected[link]
+                        if res.review.get(category) is self._resolution.review.get(category):
+                            res.review[category] = list(res.review.get(category, []))
+                        res.review.setdefault(category, []).append({'a': a, 'b': b, 'evidence': evidence, 'ref': ref})
+                        continue  # Rejected edges update sightings, never binding/contact refs.
+                    references[a].add(ref)
+                    references[b].add(ref)
+            for category in set(rejected.values()):
+                res.review[category].sort(key=lambda item: link_order.get(item['ref'], (-1, False, 0, '')))
+            contact_refs: dict[str, set[str]] = defaultdict(set)
+            contact_values: dict[str, set[str]] = defaultdict(set)
+            for value, refs in references.items():
+                ident = ident_for(value)
+                for row in self._resolution._identifier_index.get((ident.kind, ident.value), ()) if ident else ():
+                    position = self._ident_positions[id(row)]
+                    updated = replacements.get(position, row)
+                    replacements[position] = replace(updated, source_refs=tuple(sorted(set(updated.source_refs) | refs)[:MAX_REFS]))
+                    contact_refs[row.contact_id].update(refs)
+                    contact_values[row.contact_id].add(value)
+            import uuid
 
-                            from .resolve import NAMESPACE
-                            alias = str(uuid.uuid5(NAMESPACE, value))
-                            alias_position = self._contact_positions.get(alias)
-                            if alias_position is not None and alias != cid:
-                                alias_row = self._resolution.contacts[alias_position]
-                                if alias_row.merged_into == cid and alias_row.source_refs == self._resolution.contacts[position].source_refs:
-                                    contact_replacements[alias_position] = replace(alias_row, source_refs=updated_contact.source_refs)
+            from .resolve import NAMESPACE
+
+            for cid, refs in contact_refs.items():
+                position = self._contact_positions[cid]
+                contact = self._resolution.contacts[position]
+                updated_contact = replace(contact, source_refs=tuple(sorted(set(contact.source_refs) | refs)[:MAX_REFS]))
+                contact_replacements[position] = updated_contact
+                for value in contact_values[cid]:
+                    alias = str(uuid.uuid5(NAMESPACE, value))
+                    alias_position = self._contact_positions.get(alias)
+                    if alias_position is not None and alias != cid:
+                        alias_row = self._resolution.contacts[alias_position]
+                        if alias_row.merged_into == cid and alias_row.source_refs == contact.source_refs:
+                            contact_replacements[alias_position] = replace(alias_row, source_refs=updated_contact.source_refs)
+            for unit in changes.values():
                 for node, names in unit.identity.names.items():
-                    cid = res.resolve(classify(node))[0]
-                    if not cid:
+                    named_contact = res.resolve(ident_for(node))[0]
+                    if not named_contact:
                         continue
                     for ms, name, _ in names:
-                        for row in self._idents_by_contact[cid]:
+                        for row in self._idents_by_contact[named_contact]:
                             if row.kind == 'push_name' and row.value == name:
                                 position = self._ident_positions[id(row)]
                                 updated = replacements.get(position, row)
                                 if ms is not None and (row.first_seen_ms is None or ms < row.first_seen_ms):
                                     raise RebuildRequired('earlier name sighting requires rebuild')
                                 replacements[position] = replace(updated, last_seen_ms=max((v for v in (updated.last_seen_ms, ms) if v is not None), default=None))
-                    if cid not in self._fixed_names:
-                        push = [replacements.get(self._ident_positions[id(row)], row) for row in self._idents_by_contact[cid] if row.kind == 'push_name']
+                    if named_contact not in self._fixed_names:
+                        push = [replacements.get(self._ident_positions[id(row)], row) for row in self._idents_by_contact[named_contact] if row.kind == 'push_name']
                         if push:
                             latest = max(push, key=lambda row: (row.last_seen_ms or -1, row.value)).value
-                            position = self._contact_positions[cid]
+                            position = self._contact_positions[named_contact]
                             contact_replacements[position] = replace(contact_replacements.get(position, self._resolution.contacts[position]), display_name=latest)
             replacements = {position: row for position, row in replacements.items() if row != self._resolution.identifiers[position]}
             contact_replacements = {position: row for position, row in contact_replacements.items() if row != self._resolution.contacts[position]}
-            return res, None, sightings, replacements, contact_replacements
+            if local is not None:
+                for row in local.identifiers:
+                    candidates = self._resolution._identifier_index.get((row.kind, row.value), ())
+                    old = next((item for item in candidates if item.contact_id == row.contact_id), None)
+                    position = self._ident_positions[id(old)] if old else len(self._resolution.identifiers) + sum(
+                        p >= len(self._resolution.identifiers) for p in replacements)
+                    if old != row:
+                        replacements[position] = row
+                for contact_row in local.contacts:
+                    position = self._contact_positions.get(contact_row.contact_id, len(self._resolution.contacts) + sum(
+                        p >= len(self._resolution.contacts) for p in contact_replacements))
+                    if position >= len(self._resolution.contacts) or self._resolution.contacts[position] != contact_row:
+                        contact_replacements[position] = contact_row
+                res._identifier_index = cast(Any, ChainMap(dict(local._identifier_index), self._resolution._identifier_index))
+                res.node_contact = cast(Any, ChainMap(local.node_contact, self._resolution.node_contact))
+                res.canonical = cast(Any, ChainMap(local.canonical, self._resolution.canonical))
+                self._resolution.terminal('')
+                res._contact_snapshot = res.contacts
+                res._redirects = cast(Any, ChainMap({row.contact_id: row.merged_into for row in local.contacts if row.merged_into}, self._resolution._redirects))
+                res.generated_ids = local.generated_ids
+            return res, None, sightings, replacements, contact_replacements, local
         inp = copy(self._input)
         inp.sightings = dict(self._input.sightings) | sightings
         inp.groups = set(self._input.groups)
@@ -669,24 +846,24 @@ class ProjectionIndex:
             for node, names in other.names.items():
                 inp.names[node].extend(names)
                 inp.names[node].sort(key=lambda item: _ref_order(item[2]))
-            for ref, contact in other.contact_records.items():
-                inp.contact_records.setdefault(ref, contact)
+            for ref, contact_record in other.contact_records.items():
+                inp.contact_records.setdefault(ref, contact_record)
             inp.attestations.extend(ex.attestations)
             for link in other.links:
                 affected_values.update(link[:2])
         # Include existing identifier components and numeric aliases before checking old copies.
         for value in list(affected_values):
             affected_values.update(self._numeric_values.get(numeric_part(value), ()))
-            cid = self._resolution.resolve(classify(value))[0]
-            if cid:
-                affected_values.update(row.value for row in self._idents_by_contact.get(cid, ()))
+            resolved_contact = self._resolution.resolve(ident_for(value))[0]
+            if resolved_contact:
+                affected_values.update(row.value for row in self._idents_by_contact.get(resolved_contact, ()))
         old_units = {key for value in affected_values for key in self._copies_by_ident.get(value, ())}
         res = resolve(inp)
-        apply_lineage(res, self._lineage_records)
+        apply_lineage(res, self._lineage_records, validated=True)
         res.generated_ids = tuple(item for item in res.generated_ids if item.contact_id not in self._reserved_ids)
         if _identity_change(self._resolution, res, self._local(old_units, {})):
             raise RebuildRequired('identifier component or applicability changed')
-        return res, inp, sightings, replacements, contact_replacements
+        return res, inp, sightings, replacements, contact_replacements, None
 
     def _normalize(self, ex: Extracted, resolution: Resolution, removed: set[str]) -> tuple[list[dict[str, Any]], list[dict[str, Any]], int, dict[str, list[Any]]]:
         res = copy(resolution)
@@ -716,7 +893,7 @@ class ProjectionIndex:
                 prior[line.ref] = line
             groups[key] = list(prior.values())
             changes[key] = extract(groups[key])
-        res, identity, sightings, replacements, contact_replacements = self._identity_plan(changes)
+        res, identity, sightings, replacements, contact_replacements, local = self._identity_plan(changes)
         selected = self._closure(changes)
         old_ex, ex = self._local(selected, {}), self._local(selected, changes)
         if any(att.ref in self._unresolved_authors for att in ex.attestations):
@@ -749,7 +926,7 @@ class ProjectionIndex:
                 pending.pop(key[5:], None)
                 pending.update(unit.pending_pairs)
         adjust_reviews(old_review, new_review)
-        if identity is not None:
+        if identity is not None or res.review != self._resolution.review:
             for category in res.review:
                 if category not in ('message_id_collisions', 'author_targets', 'unmatched_event_payloads', *ex.review):
                     reviews[category] = res.review[category]
@@ -760,8 +937,8 @@ class ProjectionIndex:
         rows = ProjectionRows(res, messages, events, report)
         if identity is None:
             dirty = {row.contact_id for row in replacements.values()}
-            identifiers = [replacements.get(self._ident_positions[id(row)], row) for cid in dirty
-                           for row in self._idents_by_contact[cid]]
+            identifiers = list(replacements.values())
+            dirty = set()  # Metadata patches delete individual ownership rows, not contact cohorts.
             rows._identity_rows = list(contact_replacements.values()), identifiers, dirty
         else:
             old_contacts = {row.contact_id: row for row in self._resolution.contacts}
@@ -776,8 +953,13 @@ class ProjectionIndex:
             live = [c for c in res.contacts if c.merged_into is None]
             report.update(contacts=len(live), provisional_contacts=sum(c.status == 'provisional' for c in live),
                           merged_contacts=len(res.contacts) - len(live))
+        if local is not None:
+            added = [row for position, row in contact_replacements.items() if position >= len(self._resolution.contacts)]
+            report['contacts'] += sum(row.merged_into is None for row in added)
+            report['provisional_contacts'] += sum(row.merged_into is None and row.status == 'provisional' for row in added)
+            report['merged_contacts'] += sum(row.merged_into is not None for row in added)
         delta = ProjectionDelta(rows, old_mids, old_eids, False, None, pending)
-        self._staged = _Plan(delta, groups, changes, identity, sightings, replacements, contact_replacements)
+        self._staged = _Plan(delta, groups, changes, identity, sightings, replacements, contact_replacements, local)
         return delta
 
     def accept(self, delta: ProjectionDelta) -> None:
@@ -806,21 +988,52 @@ class ProjectionIndex:
             self._resolution = delta.rows.resolution
             self._identity_indexes()
         else:
+            self._resolution.review = delta.rows.resolution.review
             self._input.sightings.update(staged.sightings)
             for unit in staged.units.values():
+                self._input.groups.update(unit.identity.groups)
+                self._group_numbers.update(numeric_part(group.value) for group in unit.identity.groups)
                 self._input.links.extend(unit.identity.links)
+                self._known_links.update(tuple(link[:3]) for link in unit.identity.links)
+                for link in unit.identity.links:
+                    for value in link[:2]:
+                        self._links_by_value[value].append(link)
                 self._input.link_times.update(unit.identity.link_times)
+                for timed in unit.identity.timed_links:
+                    self._link_order[timed.ref] = (_EDGE_PRIORITY[timed.evidence],
+                        timed.occurred_ms is None or timed.time_basis == 'unknown', timed.occurred_ms or 0, timed.ref)
                 for node, names in unit.identity.names.items():
                     self._input.names[node].extend(names)
+                    self._known_names.setdefault(node, set()).update(name for _, name, _ in names)
             for position, row in staged.contact_replacements.items():
-                self._resolution.contacts[position] = row
+                if position == len(self._resolution.contacts):
+                    self._resolution.contacts.append(row)
+                    self._contact_positions[row.contact_id] = position
+                else:
+                    self._resolution.contacts[position] = row
+                if row.merged_into:
+                    aliases = self._aliases_by_contact[row.merged_into]
+                    aliases[:] = [item for item in aliases if item.contact_id != row.contact_id]
+                    aliases.append(row)
             for position, row in staged.replacements.items():
-                old_row = self._resolution.identifiers[position]
-                self._resolution.identifiers[position] = row
-                self._ident_positions.pop(id(old_row))
+                old_row = self._resolution.identifiers[position] if position < len(self._resolution.identifiers) else None
+                if old_row is None:
+                    self._resolution.identifiers.append(row)
+                    self._resolution._identifier_index[(row.kind, row.value)].append(row)
+                    self._idents_by_contact[row.contact_id].append(row)
+                else:
+                    self._resolution.identifiers[position] = row
+                    self._ident_positions.pop(id(old_row))
                 self._ident_positions[id(row)] = position
                 for items in (self._resolution._identifier_index[(row.kind, row.value)], self._idents_by_contact[row.contact_id]):
-                    items[items.index(old_row)] = row
+                    if old_row is not None:
+                        items[items.index(old_row)] = row
+                if row.kind != 'push_name':
+                    self._numeric_values[numeric_part(row.value)].add(row.value)
+            if staged.local is not None:
+                self._resolution.node_contact.update(staged.local.node_contact)
+                self._resolution.canonical.update(staged.local.canonical)
+                self._resolution._contact_snapshot = None
         self._report = delta.rows.report
         self._outcomes = self._report['outcomes']
         self._pending = delta.pending_pairs
@@ -859,14 +1072,20 @@ def apply_committed(conn: sqlite3.Connection, index: ProjectionIndex, raw_root: 
     if generated:
         # Read a reservation tail before committing; external additions need fenced repair.
         before = index.target(raw_root)
-        if before != target:
+        lineage_before = next((b for b in before if b.relative_path == 'derived/contact-ids.jsonl'), None)
+        lineage_target = next((b for b in target if b.relative_path == 'derived/contact-ids.jsonl'), None)
+        if lineage_before != lineage_target:
             index._staged = None
-            raise RebuildRequired('source advanced before lineage publication')
+            raise RebuildRequired('external contact ID lineage arrived before publication')
+        published: list[CommittedLine] = []
         try:
-            receipts = publish_lineage(raw_root, generated, first_published_ms=int(time.time() * 1000))
+            receipts = publish_lineage(raw_root, generated, first_published_ms=int(time.time() * 1000), on_committed=published.append)
         except BaseException:
             index._staged = None
             raise
+        if set(receipts) != set(published):
+            index._staged = None
+            raise RebuildRequired('external contact ID lineage reused during publication')
         refreshed = index.target(raw_root)
         lineage_boundary = next(b for b in refreshed if b.relative_path == 'derived/contact-ids.jsonl')
         own_lines, count, state = _tail(raw_root, lineage_boundary, files.get(lineage_boundary.relative_path))
@@ -876,7 +1095,7 @@ def apply_committed(conn: sqlite3.Connection, index: ProjectionIndex, raw_root: 
         contribution = extract(own_lines)
         if contribution.review.get('lineage_health'):
             raise RebuildRequired('invalid contact ID lineage')
-        apply_lineage(delta.rows.resolution, contribution.contact_id_records)
+        # These IDs already exist in the staged resolution; reservations add no new ownership.
         files[lineage_boundary.relative_path] = state
         blanks[lineage_boundary.relative_path] = blanks.get(lineage_boundary.relative_path, 0) + count
         target = tuple(sorted([b for b in target if b.relative_path != lineage_boundary.relative_path] + [lineage_boundary], key=lambda b: b.relative_path))
@@ -918,6 +1137,8 @@ def apply_committed(conn: sqlite3.Connection, index: ProjectionIndex, raw_root: 
         raise
     index.accept(delta)
     index._lineage_records.extend(own_records)
+    for line in own_records:
+        index._lineage_by_value[(line.record or {})['value']].append(line)
     index._reserved_ids.update(line.record['contact_id'] for line in own_records if line.record is not None)
     index._boundaries, index._blanks, index._files = target, blanks, files
     return report

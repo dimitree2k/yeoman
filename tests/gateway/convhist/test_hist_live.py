@@ -161,8 +161,12 @@ async def test_startup_pending_purge_cannot_publish_ready_before_repair(tmp_path
     monkeypatch.setattr(purge_module, '_publish_pending', original)
     await start_ready(p)
     assert p.health()['status'] == 'rebuilding'
-    assert p.health()['reason'] == 'rebuild_required'
-    await p.stop()
+    try:
+        await p._automatic_rebuild_task
+        assert p.health()['status'] == 'ready'
+        await oracle_parity(p, root, tmp_path)
+    finally:
+        await p.stop()
 
 
 @pytest.mark.asyncio
@@ -177,7 +181,7 @@ async def test_projector_shutdown_settles_commit_and_releases_ownership(tmp_path
     real = live.apply_committed
     def blocked(*args):
         reached.set()
-        assert release.wait(5)
+        assert release.wait(30)  # upper bound only; generous for full-suite load
         return real(*args)
     if block_at == 'commit':
         monkeypatch.setattr(live, 'apply_committed', blocked)
@@ -185,12 +189,12 @@ async def test_projector_shutdown_settles_commit_and_releases_ownership(tmp_path
         original_drain = archive.drain_spool
         def blocked_drain():
             reached.set()
-            assert release.wait(5)
+            assert release.wait(30)  # upper bound only; generous for full-suite load
             return original_drain()
         monkeypatch.setattr(archive, 'drain_spool', blocked_drain)
     append_line(root / 'whatsapp/2026-10.jsonl', dumps(observation(native_id='M1')))
     turn = asyncio.create_task(p.read_turn())
-    await asyncio.to_thread(reached.wait, 5)
+    await asyncio.to_thread(reached.wait, 30)  # upper bound only
     turn.cancel()
     stop = asyncio.create_task(p.stop())
     await asyncio.sleep(0.02)
@@ -227,7 +231,7 @@ async def test_barrier_waits_for_all_prior_committed_destinations(tmp_path, monk
     def blocked(conn, index, root, target):
         assert {'whatsapp/2026-10.jsonl', 'derived/media-transcripts.jsonl', 'owner/attestations.jsonl'} <= {b.relative_path for b in target}
         reached.set()
-        assert release.wait(5)
+        assert release.wait(30)  # upper bound only; generous for full-suite load
         return real(conn, index, root, target)
     monkeypatch.setattr(live, 'apply_committed', blocked)
     append_line(root / 'whatsapp/2026-10.jsonl', dumps(observation(native_id='M1')))
@@ -239,7 +243,7 @@ async def test_barrier_waits_for_all_prior_committed_destinations(tmp_path, monk
         calls.append('context')
         return snapshot
     task = asyncio.create_task(consumer())
-    await asyncio.to_thread(reached.wait, 5)
+    await asyncio.to_thread(reached.wait, 30)  # upper bound only
     assert not task.done() and not calls
     release.set()
     try:
@@ -340,7 +344,7 @@ async def test_barrier_30k_no_backlog_p95(tmp_path):
 
 @pytest.mark.asyncio
 @pytest.mark.parametrize('kind', ['absent', 'schema2'])
-async def test_startup_incompatible_database_stays_paused_and_untouched(tmp_path, kind):
+async def test_startup_incompatible_database_pauses_until_automatic_repair(tmp_path, kind):
     from yeoman_gateway.history.live import HistoryPaused, HistoryProjector
     root = tmp_path / 'raw'
     write_jsonl(root / 'whatsapp/2026-10.jsonl', [{'purged_version': 1}])
@@ -351,7 +355,6 @@ async def test_startup_incompatible_database_stays_paused_and_untouched(tmp_path
         conn.execute('CREATE TABLE marker(value TEXT)')
         conn.commit()
         conn.close()
-    before = db.read_bytes() if db.exists() else None
     archive = RawArchive(root, spool=tmp_path / 'spool', status_path=tmp_path / 'status.json')
     p = HistoryProjector(root, db, archive)
     await start_ready(p)
@@ -359,8 +362,9 @@ async def test_startup_incompatible_database_stays_paused_and_untouched(tmp_path
         assert p.health()['status'] == 'rebuilding'
         with pytest.raises(HistoryPaused):
             await p.read_turn()
-        assert (db.read_bytes() if db.exists() else None) == before
-        assert not db.with_name(db.name + '-wal').exists()
+        await p._automatic_rebuild_task
+        assert p.health()['status'] == 'ready'
+        await oracle_parity(p, root, tmp_path)
     finally:
         await p.stop()
 
@@ -470,7 +474,10 @@ async def test_startup_unreserved_generated_ids_require_repair(tmp_path):
     try:
         with pytest.raises(HistoryPaused):
             await p.read_turn()
-        assert p.health()['reason'] == 'rebuild_required'
+        assert p.health()['reason'] == 'unpublished generated IDs require fenced repair'
+        await p._automatic_rebuild_task
+        assert p.health()['status'] == 'ready'
+        await oracle_parity(p, root, tmp_path)
     finally:
         await p.stop()
 
@@ -490,7 +497,7 @@ async def test_gateway_history_lifecycle_starts_before_producers_and_stops_last(
         real = live.ProjectionIndex.from_prefix
         def slow(raw_root, boundaries):
             reached.set()
-            assert release.wait(5)
+            assert release.wait(30)  # upper bound only; generous for full-suite load
             return real(raw_root, boundaries)
         monkeypatch.setattr(live.ProjectionIndex, 'from_prefix', slow)
         async def history_start():
@@ -503,7 +510,7 @@ async def test_gateway_history_lifecycle_starts_before_producers_and_stops_last(
         history = SimpleNamespace(start=history_start, stop=history_stop)
     async def channels_start():
         if slow_index:
-            assert await asyncio.to_thread(reached.wait, 3)
+            assert await asyncio.to_thread(reached.wait, 30)  # upper bound only
             assert p.health()['status'] == 'starting'
             with pytest.raises(live.HistoryPaused, match='starting'):
                 await p.read_turn()
@@ -591,12 +598,12 @@ async def test_projector_start_returns_before_index_build(tmp_path, monkeypatch,
     real = live.ProjectionIndex.from_prefix
     def slow(raw_root, boundaries):
         reached.set()
-        assert release.wait(5)
+        assert release.wait(30)  # upper bound only; generous for full-suite load
         return real(raw_root, boundaries)
     monkeypatch.setattr(live.ProjectionIndex, 'from_prefix', slow)
     start = asyncio.create_task(p.start())
     try:
-        assert await asyncio.to_thread(reached.wait, 3)
+        assert await asyncio.to_thread(reached.wait, 30)  # upper bound only
         assert start.done(), 'start must return while index build is blocked'
         await start
         assert p.health()['status'] == 'starting'
@@ -725,6 +732,175 @@ async def oracle_parity(p, root, tmp_path):
         assert snapshot.sources == enumerate_committed(root)
     finally:
         snapshot.close()
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize('signal', ['read_turn', 'catch_up', 'notification'])
+async def test_rebuild_required_triggers_one_automatic_fenced_rebuild(tmp_path, monkeypatch, signal):
+    import yeoman_gateway.history.live as live
+    from test_hist_incremental import PN
+    from yeoman_gateway.history.attestations import make
+    root, db, archive, p = projector_fixture(tmp_path)
+    await start_ready(p)
+    generation = p.health()['generation']
+    reached, release = threading.Event(), threading.Event()
+    verified = []
+    real = live.verify_rebuild_candidate
+
+    def verify(*args, **kwargs):
+        result = real(*args, **kwargs)
+        verified.append(result)
+        append_line(root / 'whatsapp/2026-10.jsonl', dumps(observation(native_id='REPAIR-TAIL')))
+        reached.set()
+        assert release.wait(30)  # upper bound only; generous for full-suite load
+        return result
+
+    monkeypatch.setattr(live, 'verify_rebuild_candidate', verify)
+    append_line(root / 'owner/attestations.jsonl', dumps(make('name', T0, 'synthetic repair', anchor=PN, name='Synthetic name')))
+    try:
+        if signal == 'notification':
+            assert archive.append_durable(RawEvent(channel='whatsapp', kind='message', direction='in', native=observation(native_id='NOTIFICATION')['native'], received_ms=T0))
+        else:
+            with pytest.raises(live.HistoryPaused):
+                if signal == 'catch_up':
+                    await p.catch_up(enumerate_committed(root))
+                else:
+                    await p.read_turn()
+        assert await asyncio.to_thread(reached.wait, 30)  # upper bound only
+        assert p.health()['status'] == 'rebuilding'
+        assert p.health()['reason'] == 'owner or identity decision requires fenced rebuild'
+        with pytest.raises(live.HistoryPaused):
+            await p.read_turn()
+        release.set()
+        await p._automatic_rebuild_task
+        assert len(verified) == 1
+        assert p.health()['status'] == 'ready'
+        assert p.health()['generation'] == generation + 1
+        assert p._index._boundaries == enumerate_committed(root)
+        await oracle_parity(p, root, tmp_path)
+    finally:
+        release.set()
+        await p.stop()
+
+
+@pytest.mark.asyncio
+async def test_failed_automatic_rebuild_does_not_retry(tmp_path, monkeypatch):
+    import yeoman_gateway.history.live as live
+    from yeoman_gateway.history.incremental import RebuildRequired
+    root, db, archive, p = projector_fixture(tmp_path)
+    await start_ready(p)
+    attempts = []
+    real = live.verify_rebuild_candidate
+
+    def fail(*args, **kwargs):
+        attempts.append(True)
+        raise ValueError('synthetic verification failure')
+
+    monkeypatch.setattr(live, 'verify_rebuild_candidate', fail)
+    try:
+        p._failed(RebuildRequired('synthetic repair category'))
+        assert p._automatic_rebuild_task is not None
+        await p._automatic_rebuild_task
+        assert p.health()['status'] == 'failed'
+        assert p.health()['reason'] == 'rebuild_failed'
+        for _ in range(3):
+            p._failed(RebuildRequired('synthetic later signal'))
+            assert archive.append_durable(RawEvent(channel='whatsapp', kind='message', direction='in', native=observation(native_id=f'AFTER-FAIL-{_}')['native'], received_ms=T0))
+            with pytest.raises(live.HistoryPaused):
+                await p.read_turn()
+        await asyncio.sleep(0)
+        assert attempts == [True]
+        assert p.health()['status'] == 'failed'
+        assert p.health()['reason'] == 'rebuild_failed'
+        assert p.health()['lag_lines'] >= 3
+        monkeypatch.setattr(live, 'verify_rebuild_candidate', real)
+        await p.rebuild(reason='owner_repair')
+        assert p.health()['status'] == 'ready'
+        assert not p._automatic_rebuild_failed
+        await oracle_parity(p, root, tmp_path)
+    finally:
+        await p.stop()
+
+
+@pytest.mark.asyncio
+async def test_automatic_rebuild_coalesces_scheduled_and_running_signals(tmp_path, monkeypatch):
+    from yeoman_gateway.history.incremental import RebuildRequired
+    root, db, archive, p = projector_fixture(tmp_path)
+    await start_ready(p)
+    reached, release = threading.Event(), threading.Event()
+    attempts = []
+    real = p._build_replace_release
+
+    def build():
+        attempts.append(True)
+        reached.set()
+        assert release.wait(30)  # upper bound only; generous for full-suite load
+        return real()
+
+    monkeypatch.setattr(p, '_build_replace_release', build)
+    try:
+        p._failed(RebuildRequired('first category'))
+        task = p._automatic_rebuild_task
+        assert task is not None
+        for _ in range(3):
+            p._failed(RebuildRequired('scheduled category'))
+            assert p._automatic_rebuild_task is task
+        assert await asyncio.to_thread(reached.wait, 30)  # upper bound only
+        for _ in range(3):
+            p._failed(RebuildRequired('running category'))
+            assert p._automatic_rebuild_task is task
+        assert p.health()['reason'] == 'first category'
+        release.set()
+        await task
+        assert attempts == [True]
+        assert p.health()['status'] == 'ready'
+    finally:
+        release.set()
+        await p.stop()
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize('phase', ['scheduled', 'reader_lease', 'building'])
+async def test_stop_settles_automatic_rebuild_without_retry(tmp_path, monkeypatch, phase):
+    from yeoman_gateway.history.incremental import RebuildRequired
+    root, db, archive, p = projector_fixture(tmp_path)
+    await start_ready(p)
+    snapshot = await p.read_turn() if phase == 'reader_lease' else None
+    reached, release = threading.Event(), threading.Event()
+    real = p._build_replace_release
+    attempts = []
+
+    def build():
+        attempts.append(True)
+        reached.set()
+        assert release.wait(30)  # upper bound only; generous for full-suite load
+        return real()
+
+    monkeypatch.setattr(p, '_build_replace_release', build)
+    try:
+        p._failed(RebuildRequired('synthetic shutdown category'))
+        task = p._automatic_rebuild_task
+        assert task is not None
+        if phase == 'building':
+            assert await asyncio.to_thread(reached.wait, 30)  # upper bound only
+        elif phase == 'reader_lease':
+            await asyncio.sleep(0)
+        stop = asyncio.create_task(p.stop())
+        if phase == 'building':
+            await asyncio.sleep(0.01)
+            assert not stop.done()
+        release.set()
+        await asyncio.wait_for(stop, 30)  # upper bound only
+        assert task.done()
+        assert p.health()['status'] == 'disabled'
+        assert p._executor is None and p._connection is None
+        p._failed(RebuildRequired('while stopping'))
+        assert p.health()['status'] == 'disabled'
+    finally:
+        release.set()
+        if snapshot is not None:
+            snapshot.close()
+        await p.stop()
 
 
 @pytest.mark.asyncio
@@ -893,7 +1069,7 @@ asyncio.run(crash())
         await start_ready(other)
         assert other.health()['status'] == 'failed'
         await other.stop()
-        await p.rebuild(reason='recovery')
+        await p._automatic_rebuild_task
         assert p.health()['generation'] > 2
         await oracle_parity(p, root, tmp_path)
     finally:

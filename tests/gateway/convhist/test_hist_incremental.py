@@ -874,3 +874,99 @@ def test_incremental_reaction_to_named_message_does_not_expand_whole_chat(engine
     engine.apply()
     assert set(seen) <= {'NAMED-0'}
     engine.parity()
+
+
+def test_benchmark_statistics_and_budget_use_peak_barrier_samples(tmp_path):
+    from history_live_benchmark import prepare_output, summarize
+
+    report = summarize(
+        incremental=[1, 2, 3],
+        barriers={'event_burst': [100, 200, 1500], 'message_burst': [10, 20, 30],
+                  'idle': [1] * 100},
+        checks={'baseline_accounting': True, 'oracle_parity': True,
+                'no_lost_observations': True, 'bounded_resources': True,
+                'steady_lag_drained': True},
+    )
+    assert report['barrier_wait_ms']['peak']['p95'] == 1500
+    assert report['barrier_wait_ms']['peak']['sample_count'] == 6
+    assert report['barrier_wait_ms']['event_burst']['p50'] == 200
+    assert report['incremental_ms_per_line']['p95'] == 3
+    assert report['sample_count']['barrier'] == 106
+    assert report['budget_verdict']['peak_barrier_pass'] is False
+    assert report['budget_verdict']['accepted'] is False
+    assert all(report['budget_verdict']['checks'].values())
+    assert 'definition' in report['incremental_ms_per_line']
+    assert 'definition' in report['barrier_wait_ms']['peak']
+    encoded = json.dumps(report)
+    assert 'synthetic@g.us' not in encoded and 'original' not in encoded
+    for check in report['budget_verdict']['checks']:
+        failed = summarize(incremental=[1], barriers={'event_burst': [10], 'message_burst': [10]},
+                           checks={**report['budget_verdict']['checks'], check: False})
+        assert failed['budget_verdict']['accepted'] is False
+    missing_peak = summarize(incremental=[1], barriers={'idle': [1]},
+                             checks=report['budget_verdict']['checks'])
+    assert missing_peak['budget_verdict']['accepted'] is False
+
+    with pytest.raises(ValueError, match='approved synthetic cache'):
+        prepare_output(type(tmp_path)('/not-approved'))
+    link = tmp_path / 'unsafe-link'
+    link.symlink_to(tmp_path, target_is_directory=True)
+    with pytest.raises(ValueError, match='symlink'):
+        prepare_output(link / 'output')
+    fresh = tmp_path / 'fresh'
+    assert prepare_output(fresh) == fresh
+    with pytest.raises(FileExistsError):
+        prepare_output(fresh)
+
+
+@pytest.mark.asyncio
+async def test_benchmark_first_seen_pair_commits_original_vector_then_arriving_tail_without_rebuild(tmp_path, monkeypatch):
+    from history_live_benchmark import Measurements
+    from history_live_benchmark import observation as synthetic_observation
+    from test_hist_live import oracle_parity, start_ready
+    from yeoman_gateway.history import live
+    from yeoman_shared.raw_archive.writer import RawArchive
+
+    root, db = tmp_path / 'raw', tmp_path / 'history.db'
+    write_jsonl(root / 'whatsapp/2026-10.jsonl', [synthetic_observation(native_id='M0')])
+    project([root], db, publish_lineage_root=root)
+    archive = RawArchive(root, spool=tmp_path / 'spool', status_path=tmp_path / 'status.json')
+    p = live.HistoryProjector(root, db, archive)
+    samples = Measurements()
+    samples._original_apply = live.apply_committed
+    monkeypatch.setattr(live, 'apply_committed', samples.apply_committed)
+    await start_ready(p)
+    original = p._index.plan
+
+    def arriving_tail(lines):
+        delta = original(lines)
+        append_line(root / 'whatsapp/2026-10.jsonl', canonical_json(synthetic_observation(native_id='TAIL')))
+        monkeypatch.setattr(p._index, 'plan', original)
+        return delta
+
+    monkeypatch.setattr(p._index, 'plan', arriving_tail)
+    row = synthetic_observation(native_id='FIRST-SEEN', sender='4915553000001@s.whatsapp.net')
+    row['native']['payload'].update(participantJid='987001@lid', senderPhoneJid='4915553000001@s.whatsapp.net')
+    append_line(root / 'whatsapp/2026-10.jsonl', canonical_json(row))
+    target = enumerate_committed(root)
+    generation = p.health()['generation']
+    try:
+        await p.catch_up(target)
+        assert samples.rebuilds == []
+        assert len(samples.apply) == 1
+        native = next(b for b in target if b.relative_path.startswith('whatsapp/'))
+        assert native in p._index._boundaries
+        with sqlite3.connect(db) as conn:
+            assert conn.execute("SELECT native_message_id FROM messages WHERE native_message_id IN ('FIRST-SEEN', 'TAIL')").fetchall() == [('FIRST-SEEN',)]
+        await p.catch_up(enumerate_committed(root))
+        assert samples.rebuilds == []
+        assert len(samples.apply) == 2
+        assert p.health()['generation'] == generation
+        await oracle_parity(p, root, tmp_path)
+        snapshot = await p.read_turn()
+        try:
+            assert snapshot.connection.execute("SELECT count(*) FROM messages WHERE native_message_id IN ('FIRST-SEEN', 'TAIL')").fetchone() == (2,)
+        finally:
+            snapshot.close()
+    finally:
+        await p.stop()

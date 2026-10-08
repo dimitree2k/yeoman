@@ -50,7 +50,7 @@ def build_rows(ex: Extracted) -> ProjectionRows:
     if ex.review.get('lineage_health'):
         raise ValueError('invalid contact ID lineage blocks history publication')
     res = resolve(ex.identity)
-    apply_lineage(res, ex.contact_id_records)
+    apply_lineage(res, ex.contact_id_records, validated=True)
     arvid = res.role_contact.get("assistant")
     authors = _authors(ex, res)
     messages, unattached = _messages(ex, res, arvid, authors)
@@ -80,7 +80,7 @@ def _project(roots: Sequence[Path], db_path: Path, *,
         contribution = extract(reserved_lines)
         ex.contact_id_records.extend(contribution.contact_id_records)
         ex.outcomes.update(contribution.outcomes)
-        apply_lineage(rows.resolution, contribution.contact_id_records)
+        apply_lineage(rows.resolution, contribution.contact_id_records, validated=True)
         # Reservations add aliases/accounting only; ownership and normalized copies stay fixed.
         rows.report = _report(ex, rows.resolution, rows.messages, rows.events, {}, {},
                               rows.report['unattached_media'])
@@ -520,13 +520,27 @@ def write_rows(conn: sqlite3.Connection, rows: ProjectionRows, *,
                      [(c.merged_into, c.contact_id) for c in contacts])
     conn.executemany("DELETE FROM identifier_history WHERE contact_id=?",
                      [(cid,) for cid in sorted(identifier_contacts)])
-    conn.executemany(
-        "INSERT INTO identifier_history (contact_id, channel, kind, value, strength, evidence,"
-        " first_seen_ms, last_seen_ms, ended_ms, source_refs, valid_from_ms, valid_until_ms)"
-        " VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)", [
-            (i.contact_id, i.channel, i.kind, i.value, i.strength, i.evidence, i.first_seen_ms,
-             i.last_seen_ms, i.ended_ms, json.dumps(list(i.source_refs)), i.valid_from_ms, i.valid_until_ms)
-            for i in sorted(identity_identifiers, key=lambda i: (i.contact_id, i.kind, i.value))])
+    if rows._identity_rows is not None and not identifier_contacts:
+        for ident in identity_identifiers:
+            key = (ident.contact_id, ident.channel, ident.kind, ident.value, ident.valid_from_ms, ident.valid_until_ms)
+            values = (ident.strength, ident.evidence, ident.first_seen_ms, ident.last_seen_ms, ident.ended_ms,
+                      json.dumps(list(ident.source_refs)))
+            changed = conn.execute("UPDATE identifier_history SET strength=?, evidence=?, first_seen_ms=?, "
+                                   "last_seen_ms=?, ended_ms=?, source_refs=? WHERE contact_id=? AND channel=? "
+                                   "AND kind=? AND value=? AND valid_from_ms IS ? AND valid_until_ms IS ?",
+                                   (*values, *key))
+            if not changed.rowcount:
+                conn.execute("INSERT INTO identifier_history (contact_id, channel, kind, value, strength, evidence, "
+                             "first_seen_ms, last_seen_ms, ended_ms, source_refs, valid_from_ms, valid_until_ms) "
+                             "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)", (*key[:4], *values, *key[4:]))
+    else:
+        conn.executemany(
+            "INSERT INTO identifier_history (contact_id, channel, kind, value, strength, evidence,"
+            " first_seen_ms, last_seen_ms, ended_ms, source_refs, valid_from_ms, valid_until_ms)"
+            " VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)", [
+                (i.contact_id, i.channel, i.kind, i.value, i.strength, i.evidence, i.first_seen_ms,
+                 i.last_seen_ms, i.ended_ms, json.dumps(list(i.source_refs)), i.valid_from_ms, i.valid_until_ms)
+                for i in sorted(identity_identifiers, key=lambda i: (i.contact_id, i.kind, i.value))])
     conn.executemany("INSERT INTO messages (message_id, channel, chat_id, native_message_id, sender_contact_id, "
                       "sender_identifier, sender_basis, direction, sent_ms, time_certainty, text, media_json, "
                       "reply_to_native_id, mentions_json, provenance, source_refs) "

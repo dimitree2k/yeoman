@@ -76,6 +76,8 @@ class HistoryProjector:
         self._executor: ThreadPoolExecutor | None = None
         self._worker: asyncio.Task[None] | None = None
         self._startup_task: asyncio.Task[None] | None = None
+        self._automatic_rebuild_task: asyncio.Task[None] | None = None
+        self._automatic_rebuild_failed = False
         self._callback_registered = False
         self._connection: sqlite3.Connection | None = None
         self._index: ProjectionIndex | None = None
@@ -105,6 +107,7 @@ class HistoryProjector:
         if self._status != 'disabled':
             return  # Startup failures require repair or an explicit stop/start, never an automatic retry.
         self._stopping = False
+        self._automatic_rebuild_failed = False
         self._status, self._reason = 'starting', None
         collision_reason = 'writer_lock_held'
         try:
@@ -226,8 +229,27 @@ class HistoryProjector:
         self._oldest_wait = None
 
     def _failed(self, exc: Exception) -> None:
-        self._status = 'rebuilding' if isinstance(exc, RebuildRequired) else 'failed'
-        self._reason = 'rebuild_required' if isinstance(exc, RebuildRequired) else 'projection_failed'
+        if self._stopping:
+            return
+        if isinstance(exc, RebuildRequired):
+            if self._automatic_rebuild_failed or (
+                self._automatic_rebuild_task is not None and not self._automatic_rebuild_task.done()
+            ):
+                return
+            self._status, self._reason = 'rebuilding', exc.reason
+            self._automatic_rebuild_task = asyncio.create_task(self._automatic_rebuild(exc.reason))
+        else:
+            self._status, self._reason = 'failed', 'projection_failed'
+
+    async def _automatic_rebuild(self, reason: str) -> None:
+        if self._stopping:
+            return
+        try:
+            await self._rebuild(reason, None)
+        except Exception:
+            if not self._stopping:
+                self._automatic_rebuild_failed = True
+                self._status, self._reason = 'failed', 'rebuild_failed'
 
     def _fence(self) -> HistoryBoundary:
         if self._status not in ('ready', 'backlog') or self._index is None:
@@ -325,16 +347,21 @@ class HistoryProjector:
             try:
                 if self._reader is not None:
                     await self._reader._wait_for_snapshots()
+                if self._stopping:
+                    raise HistoryPaused('disabled')
                 await self._submit(self._persist_fence)
                 if mutation is not None:
                     if self._connection is None:
                         raise HistoryPaused('repair_database_before_mutation')
                     await self._submit(mutation, self._projection_owner_fd)
                 result = await self._submit(self._build_replace_release)
+                if self._stopping:
+                    return result
                 if self._reader is None:
                     from .reader import HistoryReader
                     self._reader = HistoryReader(self.db_path)
                 self._status, self._reason = 'ready', None
+                self._automatic_rebuild_failed = False
                 if self._worker is None:
                     self._worker = asyncio.create_task(self._run_notifications())
                 return result
@@ -468,6 +495,12 @@ class HistoryProjector:
         if self._startup_task is not None:
             await self._startup_task
             self._startup_task = None
+        # Shutdown retires consumer leases before waiting for a repair draining them.
+        if self._reader is not None:
+            self._reader.close()
+        if self._automatic_rebuild_task is not None:
+            await self._automatic_rebuild_task
+            self._automatic_rebuild_task = None
         self._event.set()
         if self._worker is not None:
             await self._worker
