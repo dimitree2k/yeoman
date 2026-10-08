@@ -5,7 +5,7 @@ from typing import Any, Literal
 from urllib.parse import urlparse
 
 from pydantic import BaseModel, ConfigDict, Field, field_validator, model_validator
-from pydantic_settings import BaseSettings
+from pydantic_settings import BaseSettings, EnvSettingsSource, PydanticBaseSettingsSource
 
 from yeoman_shared.config.defaults import (
     DEFAULT_KNOWLEDGE,
@@ -1011,6 +1011,13 @@ class RawArchiveConfig(BaseModel):
     media: RawArchiveMediaConfig = Field(default_factory=RawArchiveMediaConfig)
 
 
+class HistoryConfig(BaseModel):
+    """Dormant projection capability; activation requires file/initializer data."""
+
+    model_config = ConfigDict(populate_by_name=True)
+    live_projection_enabled: bool = Field(default=False, alias="liveProjectionEnabled")
+
+
 class Config(BaseSettings):
     """Root configuration for yeoman."""
 
@@ -1018,6 +1025,20 @@ class Config(BaseSettings):
         extra="ignore", populate_by_name=True, env_prefix="YEOMAN_", env_nested_delimiter="__"
     )
 
+    @classmethod
+    def settings_customise_sources(
+        cls, settings_cls: type[BaseSettings],
+        init_settings: PydanticBaseSettingsSource, env_settings: PydanticBaseSettingsSource,
+        dotenv_settings: PydanticBaseSettingsSource, file_secret_settings: PydanticBaseSettingsSource,
+    ) -> tuple[PydanticBaseSettingsSource, ...]:
+        for source in (env_settings, dotenv_settings):
+            if isinstance(source, EnvSettingsSource):
+                source.env_vars = {key: value for key, value in source.env_vars.items()
+                                   if key.casefold() != "yeoman_history"
+                                   and not key.casefold().startswith("yeoman_history__")}
+        return init_settings, env_settings, dotenv_settings, file_secret_settings
+
+    history: HistoryConfig = Field(default_factory=HistoryConfig)
     config_version: int = 2
     models: ModelRoutingConfig = Field(default_factory=ModelRoutingConfig)
     agents: AgentsConfig = Field(default_factory=AgentsConfig)

@@ -30,6 +30,7 @@ from yeoman_shared.raw_archive.records import (
     iter_records,
     line_sha256,
     lock_file,
+    owner_mutation_guard,
     record_capture_ms,
     record_correlations,
     record_identities,
@@ -455,7 +456,7 @@ def _recover_pending(root: Path, *, now_ms: int, destination: str | None = None)
                 os.close(fd)
 
 
-def purge(
+def _purge(
     root: Path, selector: PurgeSelector, *, operator: str, now_ms: int | None = None
 ) -> PurgeResult:
     """Tombstone selected content and record a durable owner disposition, including zero matches."""
@@ -550,3 +551,10 @@ def purge(
         if media_guard_fd is not None:
             os.close(media_guard_fd)
         os.close(disposition_fd)
+
+
+def purge(root: Path, selector: PurgeSelector, *, operator: str, now_ms: int | None = None,
+          projection_owner_fd: int | None = None) -> PurgeResult:
+    selector.validate()
+    with owner_mutation_guard(root, projection_owner_fd=projection_owner_fd):
+        return _purge(root, selector, operator=operator, now_ms=now_ms)

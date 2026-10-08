@@ -62,7 +62,7 @@ def build_rows(ex: Extracted) -> ProjectionRows:
     return ProjectionRows(res, messages, events, report)
 
 
-def project(roots: Sequence[Path], db_path: Path, *,
+def _project(roots: Sequence[Path], db_path: Path, *,
             publish_lineage_root: Path | None = None) -> dict[str, Any]:
     if is_protected(db_path):
         raise PermissionError(f"refusing to write history.db into the raw archive: {db_path}")
@@ -621,3 +621,16 @@ def _report(ex: Extracted, res: Resolution, messages: list[dict[str, Any]], even
         "merged_contacts": len(res.contacts) - len(live), "messages": len(messages),
         "events": len(events), "unattached_media": unattached, "review": res.review,
     }
+
+
+def project(roots: Sequence[Path], db_path: Path, *,
+            publish_lineage_root: Path | None = None) -> dict[str, Any]:
+    from .live import acquire_history_writer
+
+    if is_protected(db_path):
+        raise PermissionError("history destination is inside the raw archive")
+    fd = acquire_history_writer(db_path)
+    try:
+        return _project(roots, db_path.resolve(), publish_lineage_root=publish_lineage_root)
+    finally:
+        os.close(fd)

@@ -82,6 +82,7 @@ if TYPE_CHECKING:
 
     from yeoman_shared.config.schema import Config, ExecToolConfig
 
+    from yeoman_gateway.history.live import HistoryProjector
     from yeoman_gateway.ipc.gateway_socket import GatewaySocket
     from yeoman_gateway.policy.engine import PolicyEngine
     from yeoman_gateway.processing.dispatch import IntentEffectRouter
@@ -404,6 +405,19 @@ class OrchestratorService:
                     assert_never(intent)
 
 
+def build_history_projector(config: Config, channels: ChannelManager) -> HistoryProjector | None:
+    """Check activation before resolving a destination or constructing any history resource."""
+    if not config.history.live_projection_enabled:
+        return None
+    from yeoman_shared.raw_archive.writer import RawArchive
+
+    from yeoman_gateway.history.live import HistoryProjector, history_db_path
+
+    if not config.raw.enabled or not isinstance(channels.raw_archive, RawArchive):
+        raise ValueError("enabled history requires enabled raw capture")
+    return HistoryProjector(channels.raw_archive.root, history_db_path(), channels.raw_archive)
+
+
 @dataclass(slots=True)
 class GatewayRuntime:
     """Lifecycle holder for the composed gateway runtime."""
@@ -429,6 +443,7 @@ class GatewayRuntime:
     shared_facts: object | None = None
     statement_capture: object | None = None
     startup_hook: Callable[[], Awaitable[None]] | None = None
+    history_projector: HistoryProjector | None = None
 
     async def _start_processing_services(self) -> None:
         """Plan 04 start order: recover and reconcile before any channel consumes input.
@@ -461,6 +476,8 @@ class GatewayRuntime:
         tracing.init()
         try:
             await self._start_processing_services()
+            if self.history_projector is not None:
+                await self.history_projector.start()
             self._resume_a2a_research()
             await self.cron.start()
             await self.heartbeat.start()
@@ -547,6 +564,8 @@ class GatewayRuntime:
             attempt_sync(self.memory.close)
             if self.processing is not None:
                 attempt_sync(self.processing.close)
+            if self.history_projector is not None:
+                await attempt_async(self.history_projector.stop)
             await attempt_async(tracing.shutdown)
 
             if retention_error is not None:
@@ -4278,6 +4297,7 @@ def build_gateway_runtime(
     return GatewayRuntime(
         orchestrator=orchestrator_service,
         channels=channels,
+        history_projector=build_history_projector(config, channels),
         cron=cron,
         heartbeat=heartbeat,
         inbound_archive=inbound_archive,

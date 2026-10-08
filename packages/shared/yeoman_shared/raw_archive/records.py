@@ -14,9 +14,11 @@ import json
 import logging
 import os
 import re
+import stat
 import time
 import uuid
 from collections.abc import Callable, Iterator, Mapping, Sequence
+from contextlib import contextmanager
 from dataclasses import dataclass
 from datetime import date, datetime
 from pathlib import Path
@@ -292,7 +294,74 @@ def preflight_owner_paths(raw_root: Path) -> None:
         _no_symlinks(raw_root / relative)
 
 
-def append_owner_record_locked(raw_root: Path, record: Mapping[str, Any], *,
+PROJECTION_OWNER_LOCK = ".history-projection-owner.lock"
+# Only descriptors acquired here can authorize an internal fenced owner mutation.
+_projection_owners: dict[int, tuple[int, int]] = {}
+
+
+def _acquire_exclusive(path: Path) -> int:
+    _no_symlinks(path)
+    ensure_private_dir(path.parent)
+    fd = os.open(path, os.O_RDWR | os.O_CREAT | os.O_NOFOLLOW | os.O_CLOEXEC, OPEN_FILE_MODE)
+    try:
+        info = os.fstat(fd)
+        if not stat.S_ISREG(info.st_mode):
+            raise PermissionError("ownership lock is not a regular file")
+        os.fchmod(fd, OPEN_FILE_MODE)
+        fcntl.flock(fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
+        current = path.stat(follow_symlinks=False)
+        if (info.st_dev, info.st_ino) != (current.st_dev, current.st_ino):
+            raise PermissionError("ownership lock changed")
+        return fd
+    except BaseException:
+        os.close(fd)
+        raise
+
+
+def acquire_projection_owner(raw_root: Path) -> int:
+    fd = _acquire_exclusive(raw_root / PROJECTION_OWNER_LOCK)
+    info = os.fstat(fd)
+    _projection_owners[fd] = info.st_dev, info.st_ino
+    return fd
+
+
+@contextmanager
+def owner_mutation_guard(raw_root: Path, *, projection_owner_fd: int | None = None) -> Iterator[None]:
+    path = raw_root / PROJECTION_OWNER_LOCK
+    _no_symlinks(path)
+    if projection_owner_fd is not None:
+        try:
+            info, expected = os.fstat(projection_owner_fd), path.stat(follow_symlinks=False)
+            identity = info.st_dev, info.st_ino
+            if (identity != (expected.st_dev, expected.st_ino)
+                    or _projection_owners.get(projection_owner_fd) != identity):
+                raise PermissionError("invalid projection owner descriptor")
+            # A separate open description must collide, proving the lease is still held.
+            probe = os.open(path, os.O_RDWR | os.O_NOFOLLOW | os.O_CLOEXEC)
+            try:
+                try:
+                    fcntl.flock(probe, fcntl.LOCK_EX | fcntl.LOCK_NB)
+                except BlockingIOError:
+                    pass
+                else:
+                    raise PermissionError("projection owner descriptor is not locked")
+            finally:
+                os.close(probe)
+        except OSError as exc:
+            raise PermissionError("invalid projection owner descriptor") from exc
+        yield
+        return
+    try:
+        fd = _acquire_exclusive(path)
+    except BlockingIOError as exc:
+        raise PermissionError("active projection requires fenced owner mutation") from exc
+    try:
+        yield
+    finally:
+        os.close(fd)
+
+
+def _append_owner_record_locked(raw_root: Path, record: Mapping[str, Any], *,
                                on_committed: CommitCallback | None = None) -> CommittedLine | None:
     """Publish a gateway-validated owner envelope to its fixed destination, without a queue."""
     validate_owner_envelope(record)
@@ -314,16 +383,29 @@ def append_owner_record_locked(raw_root: Path, record: Mapping[str, Any], *,
     return receipt
 
 
+def append_owner_record_locked(raw_root: Path, record: Mapping[str, Any], *,
+                               on_committed: CommitCallback | None = None,
+                               projection_owner_fd: int | None = None) -> CommittedLine | None:
+    validate_owner_envelope(record)
+    preflight_owner_paths(raw_root)
+    with owner_mutation_guard(raw_root, projection_owner_fd=projection_owner_fd):
+        return _append_owner_record_locked(raw_root, record, on_committed=on_committed)
+
+
 def append_owner_record(raw_root: Path, record: Mapping[str, Any], *,
-                        on_committed: CommitCallback | None = None) -> CommittedLine | None:
+                        on_committed: CommitCallback | None = None,
+                        projection_owner_fd: int | None = None) -> CommittedLine | None:
     """Publish one owner record while sharing the purge/import root lock."""
     validate_owner_envelope(record)
     preflight_owner_paths(raw_root)
-    fd = lock_file(raw_root / PURGE_DISPOSITION_LOCK, create=True)
-    try:
-        return append_owner_record_locked(raw_root, record, on_committed=on_committed)
-    finally:
-        os.close(fd)
+    with owner_mutation_guard(raw_root, projection_owner_fd=projection_owner_fd):
+        validate_owner_envelope(record)
+        preflight_owner_paths(raw_root)
+        fd = lock_file(raw_root / PURGE_DISPOSITION_LOCK, create=True)
+        try:
+            return _append_owner_record_locked(raw_root, record, on_committed=on_committed)
+        finally:
+            os.close(fd)
 
 
 # One disposable reservation index; stat changes invalidate it under the root lock.
@@ -1147,7 +1229,7 @@ def _publish_import_file(path: Path, addition: bytes, *, write_once: bool,
                 logger.exception("raw commit callback failed after durable publication")
 
 
-def import_backfill(raw_root: Path, staged_root: Path, manifest: Mapping[str, Any], *,
+def _import_backfill(raw_root: Path, staged_root: Path, manifest: Mapping[str, Any], *,
                     on_committed: CommitCallback | None = None) -> dict[str, Any]:
     """Prevalidate, pin a durable partial receipt, and resume exact publications; not atomic."""
     # ponytail: holds one staged package in memory; stream pinned descriptors if package size warrants it.
@@ -1176,3 +1258,14 @@ def import_backfill(raw_root: Path, staged_root: Path, manifest: Mapping[str, An
         return result
     finally:
         os.close(coordinator)
+
+
+def import_backfill(raw_root: Path, staged_root: Path, manifest: Mapping[str, Any], *,
+                    on_committed: CommitCallback | None = None,
+                    projection_owner_fd: int | None = None) -> dict[str, Any]:
+    # Invalid packages retain the existing write-free preflight when no owner lock exists.
+    if not (raw_root / PROJECTION_OWNER_LOCK).exists():
+        validate_import_manifest(staged_root, manifest)
+        preview_import(raw_root, staged_root, manifest)
+    with owner_mutation_guard(raw_root, projection_owner_fd=projection_owner_fd):
+        return _import_backfill(raw_root, staged_root, manifest, on_committed=on_committed)

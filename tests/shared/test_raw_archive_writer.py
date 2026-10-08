@@ -567,7 +567,9 @@ def test_owner_append_receipt_is_after_fsync_and_inode_recheck(tmp_path: Path, m
     monkeypatch.setattr(os, "fsync", fsync)
     receipt = records.append_owner_record(root, record)
     assert receipt == records.CommittedLine("owner/attestations.jsonl", 3, target.stat().st_size)
-    assert locks[:3] == [records.PURGE_DISPOSITION_LOCK, target.name, target.name]
+    # The projection-owner guard (4b Task 5) is checked before the root lock.
+    assert locks[:4] == [".history-projection-owner.lock", records.PURGE_DISPOSITION_LOCK,
+                         target.name, target.name]
     assert target in synced and target.parent in synced
     assert json.loads(target.read_bytes().splitlines()[-1]) == record
     inode = target.stat().st_ino

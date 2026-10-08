@@ -1494,7 +1494,11 @@ def test_ack_queue_full_closes_intake_and_leaves_pending_rows(tmp_path: Path) ->
             )
             for index in range(3)
         ]
-        await asyncio.sleep(0.05)
+        # Poll instead of a fixed sleep: under parallel test load the close can take longer.
+        for _ in range(200):
+            if socket.closed and not channel._connected:
+                break
+            await asyncio.sleep(0.01)
         assert socket.closed is True
         assert channel._connected is False
         gate.set()
