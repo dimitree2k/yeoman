@@ -429,7 +429,7 @@ class GatewayRuntime:
     inbound_archive: InboundArchive
     responder: LLMResponder
     memory: MemoryService
-    contacts: ContactsService
+    contacts: ContactsService | None
     chat_registry: object
     bus: MessageBus | None = None
     gateway_socket: "GatewaySocket | None" = None
@@ -560,7 +560,8 @@ class GatewayRuntime:
                 attempt_sync(self.shared_facts.stop)
             if self.statement_capture is not None and hasattr(self.statement_capture, "stop"):
                 attempt_sync(self.statement_capture.stop)
-            attempt_sync(self.contacts.close)
+            if self.contacts is not None:
+                attempt_sync(self.contacts.close)
             attempt_sync(self.memory.close)
             if self.processing is not None:
                 attempt_sync(self.processing.close)
@@ -2746,6 +2747,7 @@ def build_gateway_runtime(
     # Without it the legacy layout is untouched (no partial cutover, no second writer).
     knowledge_service: object | None = None
     knowledge_sources: object | None = None
+    history_knowledge_selected = config.history.live_projection_enabled and config.history.readers.knowledge
     if getattr(config.knowledge, "enabled", False):
         from yeoman_gateway.knowledge import open_knowledge_store, workspace_id_for
         from yeoman_gateway.knowledge.runtime import (
@@ -2767,6 +2769,7 @@ def build_gateway_runtime(
         try:
             knowledge_service = open_knowledge_store(
                 Path(config.knowledge.db_path).expanduser(),
+                history_mode=history_knowledge_selected,
                 workspace_id=workspace_id_for(workspace),
                 source_authority=knowledge_sources,
                 policy_authority=knowledge_policy,
@@ -2791,11 +2794,14 @@ def build_gateway_runtime(
             store=knowledge_service.memory_store(),
             owns_store=False,
         )
-        contacts_service = ContactsService(store=knowledge_service.contacts_store())
-        contacts_service.mark_owner_from_policy(
-            policy_engine.policy.owners if policy_engine else {},
-        )
-        memory_service.set_contacts(contacts_service)
+        if history_knowledge_selected:
+            contacts_service = None
+        else:
+            contacts_service = ContactsService(store=knowledge_service.contacts_store())
+            contacts_service.mark_owner_from_policy(
+                policy_engine.policy.owners if policy_engine else {},
+            )
+            memory_service.set_contacts(contacts_service)
     else:
         memory_service = MemoryService(
             workspace=workspace, config=config.memory, root_config=config

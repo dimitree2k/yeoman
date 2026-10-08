@@ -312,6 +312,19 @@ class RetrievalEngine:
         """Person filter through *original* ids plus active redirects."""
         if not person_ids:
             return "", []
+        from yeoman_gateway.knowledge._history_identity import current_history_scope
+        scope = current_history_scope(self._store)
+        if scope is not None:
+            originals = {member for person in person_ids for member in scope.identity.merged_member_ids(person)}
+            values = sorted(originals)
+            placeholders = ",".join("?" for _ in values)
+            role_sql = ""
+            params: list[Any] = list(values)
+            if roles:
+                role_sql = " AND kp.role IN (" + ",".join("?" for _ in roles) + ")"
+                params.extend(roles)
+            return ("EXISTS (SELECT 1 FROM knowledge_statement_people kp WHERE kp.statement_id=s.statement_id"
+                    f" AND kp.person_id IN ({placeholders}) AND kp.status='active'{role_sql})", params)
         originals: set[str] = set()
         for person_id in person_ids:
             originals.add(str(person_id))
@@ -376,13 +389,27 @@ class RetrievalEngine:
             f" WHERE {clauses} ORDER BY s.created_ms DESC, s.statement_id DESC LIMIT ?",
             (*params, int(query.limit) * 8),
         )
-        statement_ids = [str(row["statement_id"]) for row in rows]
+        statement_ids = [str(row["statement_id"]) for row in rows
+                         if self._history_sources_permit(str(row["statement_id"]), context, decision)]
         denied = self._denied_count(context, decision, query, clauses=clauses, params=params)
         if not statement_ids:
             return CandidateRows((), denied), decision
 
         ranked = self._rank(query.text, statement_ids, require_match=require_match)
         return CandidateRows(tuple(ranked[: query.limit]), denied), decision
+
+    def _history_sources_permit(self, statement_id: str, context: TrustedReadContext,
+                                decision: ReadDecision) -> bool:
+        from yeoman_gateway.knowledge._history_identity import current_history_scope
+        scope = current_history_scope(self._store)
+        if scope is None:
+            return True
+        sources = self._statements.sources_of(statement_id)
+        return bool(sources) and all(
+            status == 'active' and scope.sources.verify_source(source)
+            and (source.channel != 'whatsapp' or all(scope.sources.permits_principal(source, principal, now_ms=context.now_ms)
+                    for principal in decision.recipients))
+            for source, status in sources)
 
     def _denied_count(
         self,
@@ -880,6 +907,12 @@ class RetrievalEngine:
                 ),
                 reason=decision.reason,
             )
+        from yeoman_gateway.knowledge._history_identity import current_history_scope
+        if current_history_scope(self._store) is not None and result.context_revision != self.context_revision(
+                context, decision, result.statement_ids, group_wide=group_wide):
+            return KnowledgeContext(text='', statement_ids=(), source_refs=(),
+                                    identity_revision=self._store.identity_revision,
+                                    acl_epoch=self._store.acl_epoch, reason='stale_context')
         if result.acl_epoch != self._store.acl_epoch:
             pass  # epoch changed: the id recheck below is the authoritative decision
         allowed_ids = self._recheck_ids(
@@ -1007,6 +1040,8 @@ class RetrievalEngine:
         total = 0
         char_limit = MAX_CONTEXT_CHARS if max_chars is None else max(0, int(max_chars))
         for statement_id in statement_ids:
+            if not self._history_sources_permit(statement_id, context, decision):
+                continue
             content = contents.get(statement_id, "")
             if not content:
                 continue
@@ -1067,8 +1102,16 @@ class RetrievalEngine:
             source_rows = [
                 (str(row["event_id"]), int(row["revision"])) for row in rows
             ]
+        from yeoman_gateway.knowledge._history_identity import current_history_scope
+        scope = current_history_scope(self._store)
+        history_revision = None if scope is None else (
+            scope.queries.snapshot.generation,
+            tuple((event, revision, scope.queries.content_fingerprint(
+                alias.message_id if (alias := scope.sources._alias((event, revision))) else event))
+                  for event, revision in source_rows))
         payload = json.dumps(
             {
+                "history": history_revision,
                 "principal": context.principal_id,
                 "scope": context.scope_key(),
                 "recipients": sorted(decision.recipients),

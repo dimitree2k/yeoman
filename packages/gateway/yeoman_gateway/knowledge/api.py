@@ -11,6 +11,17 @@ runs a migration on the side.
 
 from __future__ import annotations
 
+from collections.abc import Iterator
+from contextlib import contextmanager
+from typing import TYPE_CHECKING
+
+if TYPE_CHECKING:
+    from yeoman_gateway.history.queries import HistoryQueries
+    from yeoman_gateway.knowledge._history_sources import (
+        HistoryKnowledgeSources,
+        HistorySourceLedger,
+    )
+
 import hashlib
 import sqlite3
 from dataclasses import dataclass, replace
@@ -144,7 +155,9 @@ def _probe_schema(db_path: Path) -> _SchemaProbe:
     if not db_path.exists():
         return _SchemaProbe(exists=False, has_meta=False, schema_version=0, migration_complete=False)
     try:
-        conn = sqlite3.connect(f"file:{db_path}?mode=ro", uri=True)
+        wal = Path(str(db_path) + '-wal')
+        immutable = '' if wal.exists() and wal.stat().st_size else '&immutable=1'
+        conn = sqlite3.connect(db_path.resolve().as_uri() + '?mode=ro' + immutable, uri=True)
     except sqlite3.Error:  # pragma: no cover - defensive
         return _SchemaProbe(exists=True, has_meta=False, schema_version=0, migration_complete=False)
     try:
@@ -185,6 +198,7 @@ def open_knowledge_store(
     create: bool = True,
     retention_ms: int | None = None,
     legacy_sources: Iterable[Path] = (),
+    history_mode: bool = False,
 ) -> "KnowledgeService":
     """Open (or create) the knowledge store and return the public service.
 
@@ -202,6 +216,9 @@ def open_knowledge_store(
     legacy = [Path(item).expanduser() for item in legacy_sources]
     probe = _probe_schema(path)
     fresh = not probe.exists
+    expected_schema = 3 if history_mode else SCHEMA_VERSION
+    if history_mode and fresh:
+        raise KnowledgeStartupError("migration_required", "history mode requires an offline schema-3 copy")
     if fresh and any(item.exists() for item in legacy):
         # The consolidated store is missing while legacy data exists.  Migrate
         # explicitly, never write an empty store next to the old data.
@@ -217,20 +234,20 @@ def open_knowledge_store(
                 "migration_required",
                 "the target file carries no knowledge schema and was not migrated",
             )
-        if probe.schema_version < SCHEMA_VERSION:
+        if probe.schema_version < expected_schema:
             # An *older* knowledge store is not corruption: it is data that needs the
             # explicit, audited snapshot upgrade.  Anything newer or non-numeric stays
             # ``schema_incompatible``.
             raise KnowledgeStartupError(
                 "migration_required",
                 f"knowledge schema version {probe.schema_version} needs an explicit"
-                f" snapshot upgrade to {SCHEMA_VERSION}; the normal start never migrates",
+                f" snapshot upgrade to {expected_schema}; the normal start never migrates",
             )
-        if probe.schema_version != SCHEMA_VERSION:
+        if probe.schema_version != expected_schema:
             raise KnowledgeStartupError(
                 "schema_incompatible",
                 f"knowledge schema version {probe.schema_version} is not supported"
-                f" (need {SCHEMA_VERSION}); an explicit snapshot upgrade is required",
+                f" (need {expected_schema}); an explicit snapshot upgrade is required",
             )
         if not probe.migration_complete:
             raise KnowledgeStartupError(
@@ -239,7 +256,7 @@ def open_knowledge_store(
                 " an explicit snapshot upgrade is required",
             )
     try:
-        store = KnowledgeStore(path, create=create)
+        store = KnowledgeStore(path, create=create and not history_mode)
     except sqlite3.Error as exc:  # pragma: no cover - defensive
         raise KnowledgeStartupError("storage_unavailable", str(exc)) from exc
     if fresh and create:
@@ -255,6 +272,7 @@ def open_knowledge_store(
         policy_authority=policy_authority,
         clock=clock,
         retention_ms=retention_ms,
+        history_mode=history_mode,
     )
 
 
@@ -348,15 +366,21 @@ class KnowledgeService:
         policy_authority: PolicyAuthority,
         clock: Any | None = None,
         retention_ms: int | None = None,
+        history_mode: bool = False,
     ) -> None:
         self._store = store
         # One wrapper so administrative sources registered later are visible to the
         # statement engine through the very same object.
-        self._authority = _RecordingSourceAuthority(source_authority)
+        from yeoman_gateway.knowledge._history_identity import ScopedKnowledgeAdapter
+        self._history_mode = history_mode
+        self._legacy_authority = _RecordingSourceAuthority(source_authority)
+        self._authority = ScopedKnowledgeAdapter(store, self._legacy_authority, 'sources', selected=history_mode)
         self._policy = policy_authority
         self.workspace_id = str(workspace_id)
         self._clock = clock
-        self._identity = IdentityEngine(store, authority=self._authority, policy=policy_authority)
+        self._identity = ScopedKnowledgeAdapter(store,
+            IdentityEngine(store, authority=self._authority, policy=policy_authority),
+            'identity', selected=history_mode)
         self._identity_candidates = IdentityCandidateEngine(store, identity=self._identity)
         self._statements = StatementEngine(
             store,
@@ -385,6 +409,33 @@ class KnowledgeService:
             retrieval=self._retrieval,
             workspace_id=self.workspace_id,
         )
+
+    @contextmanager
+    def history_scope(self, queries: HistoryQueries, sources: HistoryKnowledgeSources) -> Iterator[None]:
+        from yeoman_gateway.knowledge._history_identity import (
+            HistoryIdentityEngine,
+            HistoryKnowledgeScope,
+            _scopes,
+        )
+        if self._store.schema_version != 3 or sources.ledger.store is not self._store or sources.queries is not queries:
+            raise KnowledgeError('schema_incompatible', 'history scope requires the shared schema-3 ledger and snapshot')
+        queries.snapshot.assert_current(queries.snapshot.generation)
+        identity = HistoryIdentityEngine(self._store, queries=queries, authority=sources, policy=self._policy)
+        token = _scopes.set((*_scopes.get(), HistoryKnowledgeScope(self._store, queries, sources, identity)))
+        try:
+            yield
+        finally:
+            _scopes.reset(token)
+
+    def _require_legacy_identity(self) -> None:
+        from yeoman_gateway.knowledge._history_identity import current_history_scope
+        if self._history_mode or current_history_scope(self._store) is not None:
+            raise KnowledgeError('history_identity_read_only', 'use the local owner-attestation CLI')
+
+    @property
+    def history_source_ledger(self) -> HistorySourceLedger:
+        from yeoman_gateway.knowledge._history_sources import HistorySourceLedger
+        return HistorySourceLedger(self._store)
 
     # ── lifecycle ────────────────────────────────────────────────────────────
 
@@ -415,6 +466,11 @@ class KnowledgeService:
         """Server-side refresh of the trusted read context (never from a model)."""
         if not isinstance(context, TrustedReadContext):
             raise ValidationError("read context must be a TrustedReadContext")
+        if self._history_mode and context.channel == 'whatsapp':
+            from yeoman_gateway.history.live import HistoryPaused
+            from yeoman_gateway.knowledge._history_identity import current_history_scope
+            if current_history_scope(self._store) is None:
+                raise HistoryPaused('knowledge_history_scope_required')
         if context.now_ms <= 0:
             return replace(context, now_ms=self._now())
         return context
@@ -835,6 +891,7 @@ class KnowledgeService:
         persist: bool = True,
     ) -> tuple[IdentityCandidate, ...]:
         """Refresh the owner-only duplicate queue using available structured evidence."""
+        self._require_legacy_identity()
         self._require_admin_context(context)
         if persist:
             with self._store.transaction():
@@ -852,6 +909,7 @@ class KnowledgeService:
         statuses: tuple[str, ...] = (),
     ) -> tuple[IdentityCandidate, ...]:
         """List owner-only candidate summaries; ordinary read contexts are rejected."""
+        self._require_legacy_identity()
         self._require_admin_context(context)
         return self._identity_candidates.list_candidates(context=context, statuses=statuses)
 
@@ -866,6 +924,7 @@ class KnowledgeService:
         target_id: str | None = None,
     ) -> IdentityCandidate:
         """Record an owner decision, routing merges through the existing redirect API."""
+        self._require_legacy_identity()
         self._require_admin_context(context)
         with self._store.transaction():
             return self._identity_candidates.decide(
@@ -1436,6 +1495,7 @@ class KnowledgeService:
         self, *, context: TrustedAdminContext
     ) -> MaintenanceReport:
         """Populate missing normalized alias keys on this owner-authorized store."""
+        self._require_legacy_identity()
         self._require_admin_context(context)
         with self._store.transaction():
             rows = self._store.query(
@@ -1515,8 +1575,12 @@ class KnowledgeService:
         turns that into the audience record.  Registering evidence is not a capture: no
         statement is published and no read right is granted.
         """
+        from yeoman_gateway.knowledge._history_identity import current_history_scope
         from yeoman_gateway.knowledge.authority import EvidenceAudience
-
+        scope = current_history_scope(self._store)
+        if scope is not None and source.channel == 'whatsapp':
+            issued = scope.sources.issue(source.event_id)
+            return issued == source
         register = getattr(self._authority, "register_source", None)
         if register is None or not source.event_id:
             return False
@@ -1718,6 +1782,7 @@ class KnowledgeService:
         never mints an active authority, because no channel adapter proved the mapping.
         A later audited admin operation or a real platform observation promotes it.
         """
+        self._require_legacy_identity()
         identifier = Identifier(
             channel=str(channel), kind=str(kind), value=str(value), namespace=namespace
         )
@@ -1741,6 +1806,7 @@ class KnowledgeService:
         preserved, names become observed aliases and profile text stays quarantined
         instead of being promoted to a readable statement.
         """
+        self._require_legacy_identity()
         from yeoman_gateway.knowledge._store import QUARANTINE_REASONS
 
         ts = self._now()
@@ -1857,6 +1923,18 @@ class KnowledgeService:
         query = str(name or "").strip()
         if not query:
             return None
+        from yeoman_gateway.knowledge._history_identity import current_history_scope
+        scope = current_history_scope(self._store)
+        if self._history_mode and scope is None:
+            from yeoman_gateway.history.live import HistoryPaused
+            raise HistoryPaused('knowledge_history_scope_required')
+        if scope is not None:
+            candidates = list(scope.identity.delivery_identifiers_for_alias(query, channel=channel, scope_key='global'))
+            if prefer_kind is not None:
+                candidates = [item for item in candidates if item.kind == prefer_kind] or candidates
+            if prefer:
+                candidates = [item for item in candidates if item.value in prefer] or candidates
+            return candidates[0] if len(candidates) == 1 else None
         rows = self._store.query(
             """
             SELECT DISTINCT c.id AS id FROM contacts c
@@ -2219,6 +2297,15 @@ class KnowledgeService:
         projection is not part of it: a legacy row without a proven mapping must not make
         a delivery target look "known".
         """
+        from yeoman_gateway.knowledge._history_identity import current_history_scope
+        scope = current_history_scope(self._store)
+        if self._history_mode and scope is None:
+            from yeoman_gateway.history.live import HistoryPaused
+            raise HistoryPaused('knowledge_history_scope_required')
+        if scope is not None:
+            rows = scope.queries._rows("SELECT DISTINCT value FROM identifier_history"
+                                       " WHERE channel='whatsapp' AND strength='strong' AND valid_until_ms IS NULL ORDER BY value")
+            return tuple(row['value'] for row in rows if scope.identity.owners_of_identifier_value(row['value']))
         rows = self._store.query(
             "SELECT value FROM knowledge_identifier_bindings WHERE status = 'active'"
             " ORDER BY 1"

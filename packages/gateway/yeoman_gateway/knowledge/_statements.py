@@ -144,7 +144,7 @@ class StatementEngine:
         if valid_until is None and self.retention_ms:
             valid_until = valid_from + int(self.retention_ms)
 
-        speaker = self._identity.person_id_for_principal(primary.author_principal)
+        speaker = self._source_person(primary)
         if speaker is not None:
             speaker = self._identity.canonical_id(speaker)
 
@@ -334,6 +334,13 @@ class StatementEngine:
         group_rule = "explicit_principals" if explicit else "chat_members_at_source"
         return effective, visibility, group_rule, snapshot_id, explicit
 
+    def _source_person(self, source: SourceRef) -> str | None:
+        from yeoman_gateway.knowledge._history_identity import current_history_scope
+        scope = current_history_scope(self._store)
+        if scope is not None and source.channel == 'whatsapp':
+            return scope.sources.author_contact(source)
+        return self._identity.person_id_for_principal(source.author_principal)
+
     def _validate_people(
         self,
         candidate: StatementCandidate,
@@ -347,8 +354,7 @@ class StatementEngine:
         claims a different speaker with transport attribution is dropped.
         """
         source_keys = {item.key for item in sources}
-        speaker_principal = sources[0].author_principal
-        speaker_person = self._identity.person_id_for_principal(speaker_principal)
+        speaker_person = self._source_person(sources[0])
         out: list[PersonLinkCandidate] = []
         for link in candidate.people:
             if link.source.key not in source_keys:

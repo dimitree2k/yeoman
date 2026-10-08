@@ -822,6 +822,9 @@ class KnowledgeStore:
 
     def _create_schema(self) -> None:
         with self._lock:
+            existing = self._conn.execute("SELECT 1 FROM sqlite_master WHERE name='knowledge_meta'").fetchone()
+            if existing and self.history_identity_frozen:
+                return
             try:
                 for statement in _CORE_SCHEMA:
                     self._conn.execute(statement)
@@ -890,6 +893,10 @@ class KnowledgeStore:
     @property
     def schema_version(self) -> int:
         return self.int_meta("schema_version", 0)
+
+    @property
+    def history_identity_frozen(self) -> bool:
+        return self.schema_version == 3
 
     @property
     def identity_revision(self) -> int:
@@ -978,7 +985,12 @@ class KnowledgeStore:
 
     def execute(self, sql: str, params: tuple[Any, ...] = ()) -> sqlite3.Cursor:
         with self._lock:
-            return self._conn.execute(sql, params)
+            try:
+                return self._conn.execute(sql, params)
+            except sqlite3.IntegrityError as exc:
+                if str(exc) == 'history_identity_read_only':
+                    raise KnowledgeError('history_identity_read_only', 'use the local owner-attestation CLI') from exc
+                raise
 
     def query(self, sql: str, params: tuple[Any, ...] = ()) -> list[sqlite3.Row]:
         with self._lock:

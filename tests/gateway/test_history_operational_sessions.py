@@ -13,7 +13,7 @@ from yeoman_gateway.core.admin_commands import AdminCommandContext
 from yeoman_gateway.history.live import HistoryPaused
 from yeoman_gateway.history.queries import HistoryQueries
 from yeoman_gateway.history.reader import HistorySnapshot
-from yeoman_gateway.history.schema import create
+from yeoman_gateway.history.schema import FTS_ROWS, create
 from yeoman_gateway.policy.engine import PolicyEngine
 from yeoman_gateway.policy.schema import PolicyConfig
 from yeoman_gateway.processing.responder import ThreadActorResponder
@@ -35,6 +35,7 @@ def case(tmp_path):
             " 'unknown', 'in', ?, 'native', ?, NULL, NULL, NULL, 'native', '[]')",
             (mid, mid, ms, text),
         )
+    db.execute("INSERT INTO messages_fts(message_id,chat_id,text) " + FTS_ROWS)
     snapshot = HistorySnapshot(1, (), db)
     path = get_operational_store_path("session_metadata", data_dir=tmp_path, create=False)
     ops = OperationalSessions(path)
@@ -73,7 +74,7 @@ def test_new_boundary_survives_restart_without_conversation_text(case, monkeypat
     assert session.get_history() == [{"role": "system", "content":
         "[legacy chat context - not thread-bound]\nuser: current"}]
     assert [row["message_id"] for row in HistoryQueries(case.snapshot).search(
-        chat_ids=(ctx.chat_id,), query="older", limit=10)] == ["undated", "old", "equal"]
+        chat_ids=(ctx.chat_id,), query="older", limit=10)] == ["equal", "old", "undated"]
     assert case.ops.boundary(channel="whatsapp", chat_id=ctx.chat_id) == 20
     assert adapter.new_session_handle(replace(ctx, sender_id="10002@s.whatsapp.net"), []).status == "ignored"
     with sqlite3.connect(case.path) as db:

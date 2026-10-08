@@ -48,7 +48,7 @@ class FactAclPredicate:
 class FactPermissionCache:
     """Caches audience resolution per ``acl_epoch``. Never caches membership."""
 
-    _epoch: int = -1
+    _epoch: int | tuple[int, int, int] = -1
     _audiences: dict[str, frozenset[str]] = field(default_factory=dict)
     lookups: int = 0
 
@@ -56,7 +56,12 @@ class FactPermissionCache:
         return store.acl_epoch()
 
     def audience_for(self, store: "MemoryStore", fact_id: str) -> frozenset[str]:
-        epoch = self.epoch_of(store)
+        from yeoman_gateway.knowledge._history_identity import current_history_scope
+        owner = getattr(store, '_owner', None)
+        scope = current_history_scope(owner) if owner is not None else None
+        epoch: int | tuple[int, int, int] = self.epoch_of(store)
+        if scope is not None:
+            epoch = (epoch, scope.queries.snapshot.generation, scope.identity._policy.current_policy_revision())
         if epoch != self._epoch:
             self._audiences.clear()
             self._epoch = epoch
@@ -146,7 +151,7 @@ class FactReadGate:
         rows = self._store.select_fact_ids(
             sql=predicate.sql, params=predicate.params, limit=limit
         )
-        return frozenset(rows)
+        return self.recheck(tuple(rows), read_context)
 
     def recheck(
         self, fact_ids: Sequence[str], read_context: FactReadContext
@@ -162,9 +167,31 @@ class FactReadGate:
             fact = self._store.get_fact(fact_id)
             if fact is None:
                 continue
+            if not self._history_permits(fact_id, read_context):
+                continue
             if can_read_shared(fact=fact, read_context=read_context):
                 allowed.add(fact_id)
         return frozenset(allowed)
+
+    def _history_permits(self, fact_id: str, read_context: FactReadContext) -> bool:
+        from yeoman_gateway.knowledge._history_identity import current_history_scope
+        from yeoman_gateway.knowledge.models import SourceRef
+        owner = getattr(self._store, '_owner', None)
+        scope = current_history_scope(owner) if owner is not None else None
+        if scope is None:
+            if owner is not None and owner.schema_version == 3:
+                from yeoman_gateway.history.live import HistoryPaused
+                raise HistoryPaused('knowledge_history_scope_required')
+            return True
+        rows = scope.store.query('SELECT * FROM knowledge_statement_sources WHERE statement_id=?', (fact_id,))
+        if not rows:
+            # Unmapped legacy facts are withheld rather than trusted by principal string.
+            return False
+        principals = read_context.current_members if read_context.group_wide else {read_context.principal_id}
+        return all(row['status'] == 'active' and all(scope.sources.permits_principal(
+            SourceRef(row['event_id'], row['revision'], row['channel'], row['chat_id'],
+                      row['author_principal'], row['occurred_at_ms']), principal,
+            now_ms=read_context.now_ms) for principal in principals or ()) for row in rows)
 
 
 def chat_scope_key(channel: str, chat_id: str) -> str:
@@ -222,6 +249,12 @@ def registry_members(chat_registry: Any, *, channel: str, chat_id: str) -> set[s
     for those made every group look like unknown membership, which silently suppressed
     shared memory in groups.
     """
+    from yeoman_gateway.knowledge._history_identity import current_history_scope
+    scope = current_history_scope()
+    if scope is not None and channel == 'whatsapp':
+        import time
+        audience = scope.queries.members(chat_id=chat_id, at_ms=int(time.time() * 1000))
+        return set(audience.members) if audience.status == 'known' else set()
     get_chat = getattr(chat_registry, "get_chat", None)
     if get_chat is None:
         return set()

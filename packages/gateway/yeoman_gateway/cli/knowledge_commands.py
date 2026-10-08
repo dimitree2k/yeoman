@@ -467,6 +467,20 @@ def migration_verify(
         _fail("manifest_mismatch", detail)
 
 
+@migration_app.command("upgrade-history")
+def migration_upgrade_history(
+    source: Path = typer.Option(..., "--source", help="Checkpointed isolated schema-2 snapshot"),
+    target: Path = typer.Option(..., "--target", help="New isolated schema-3 copy"),
+) -> None:
+    """Verify and publish an offline history Knowledge copy; never applies it live."""
+    from yeoman_gateway.knowledge._history_upgrade import upgrade_history_knowledge
+    try:
+        receipt = upgrade_history_knowledge(source=source, target=target)
+    except (ValueError, OSError) as exc:
+        raise typer.BadParameter(str(exc)) from exc
+    _line(json.dumps(receipt, sort_keys=True))
+
+
 # ── v1 -> v2 snapshot upgrade ────────────────────────────────────────────────
 
 

@@ -33,6 +33,9 @@ class ContactsStore:
 
     def __init__(self, db_path: Path | None = None, *, owner: object | None = None) -> None:
         if owner is not None:
+            if getattr(owner, 'history_identity_frozen', False):
+                from yeoman_gateway.knowledge.models import KnowledgeError
+                raise KnowledgeError('history_identity_read_only', 'history identity does not use a ContactsStore cache')
             self._owner = owner
             self._owns_connection = False
             self.db_path = Path(str(getattr(owner, "db_path")))

@@ -165,6 +165,7 @@ EPISODE_CLOSURE_MS: Final[int] = 60 * DAY_MS
 EPISODE_STATUSES: Final[tuple[str, ...]] = ("active", "superseded", "stale")
 
 ERROR_CODES: Final[tuple[str, ...]] = (
+    "history_identity_read_only",
     "invalid_input",
     "unresolved",
     "ambiguous",

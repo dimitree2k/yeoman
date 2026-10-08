@@ -94,6 +94,21 @@ class RuntimeKnowledgePolicy:
         return context.request_id
 
     def membership(self, context: TrustedReadContext) -> PolicyMembership | None:
+        from yeoman_gateway.knowledge._history_identity import current_history_scope
+        scope = current_history_scope()
+        if scope is not None and scope.identity._policy is self and context.channel == 'whatsapp':
+            audience = scope.queries.members(chat_id=context.chat_id, at_ms=context.now_ms)
+            if context.is_direct:
+                # Direct peers still require temporal ownership in the source gate.
+                from yeoman_gateway.knowledge._history_sources import principal_identifier
+                value = principal_identifier(context.principal_id)
+                owner = scope.queries.resolve_identifier(value, at_ms=context.now_ms, time_basis='native') if value else None
+                if owner is None or context.chat_id != value:
+                    return None
+                return PolicyMembership(frozenset({context.principal_id}), str(scope.queries.snapshot.generation))
+            if audience.status != 'known':
+                return None
+            return PolicyMembership(audience.members, f"history:{scope.queries.snapshot.generation}:{audience.snapshot_id}")
         if self.chat_registry is None:
             return None
         record = self.chat_registry.get_chat(context.channel, context.chat_id)

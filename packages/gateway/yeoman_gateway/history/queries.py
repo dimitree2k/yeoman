@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import hashlib
 import json
 import re
 from typing import Any
@@ -32,12 +33,35 @@ def _time(value: int | None) -> None:
 class HistoryQueries:
     def __init__(self, snapshot: HistorySnapshot):
         self.snapshot = snapshot
+        self._audiences: dict[str, EvidenceAudience] = {}
+        self._audience_state = (snapshot.generation, snapshot.connection.total_changes)
 
     def _rows(self, sql: str, parameters: tuple[Any, ...] = ()) -> list[Row]:
         self.snapshot.assert_current(self.snapshot.generation)
         cursor = self.snapshot.connection.execute(sql, parameters)
         columns = [item[0] for item in cursor.description]
         return [dict(zip(columns, row, strict=True)) for row in cursor]
+
+    def content_fingerprint(self, message_id: str) -> str | None:
+        rows = self._rows("SELECT * FROM messages_current WHERE message_id=? AND channel='whatsapp'", (message_id,))
+        if not rows:
+            return None
+        row = rows[0]
+        fields = ("message_id", "channel", "chat_id", "native_message_id", "direction",
+                  "sent_ms", "time_certainty", "text", "current_text", "media_json",
+                  "reply_to_native_id", "mentions_json", "provenance", "deleted")
+        payload = {key: row[key] for key in fields}
+        for key in ("media_json", "mentions_json"):
+            payload[key] = json.loads(payload[key]) if payload[key] is not None else None
+        events = self._rows(
+            "SELECT event_id,native_event_id,kind,occurred_ms,time_certainty,provenance,payload_json"
+            " FROM message_events WHERE target_message_id=? AND kind IN ('edit','delete')"
+            " ORDER BY occurred_ms,event_id", (message_id,))
+        for event in events:
+            event["payload_json"] = json.loads(event["payload_json"])
+        payload["events"] = events
+        return hashlib.sha256(json.dumps(payload, sort_keys=True, separators=(",", ":"),
+                                         ensure_ascii=False).encode()).hexdigest()
 
     def window(self, *, chat_id: str, after_ms: int, before_ms: int, limit: int) -> list[Row]:
         _limit(limit)
@@ -377,6 +401,17 @@ class HistoryQueries:
         return EvidenceAudience.known(set(members), snapshot_id=base[0]["event_id"])
 
     def audience(self, message_id: str) -> EvidenceAudience:
+        self.snapshot.assert_current(self.snapshot.generation)
+        state = (self.snapshot.generation, self.snapshot.connection.total_changes)
+        # Production snapshots are immutable; direct-SQL fixtures can change between reads.
+        if state != self._audience_state:
+            self._audiences.clear()
+            self._audience_state = state
+        if message_id not in self._audiences:
+            self._audiences[message_id] = self._audience(message_id)
+        return self._audiences[message_id]
+
+    def _audience(self, message_id: str) -> EvidenceAudience:
         row = self.message(message_id)
         if (row is None or row["sent_ms"] is None
                 or row["time_certainty"] not in ("native", "provider_timestamp")):
