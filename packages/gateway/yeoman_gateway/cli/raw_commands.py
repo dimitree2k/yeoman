@@ -276,6 +276,11 @@ def raw_purge(
     )
     if not yes and not typer.confirm("Permanently apply this purge disposition?", default=False):
         raise typer.Exit(1)
+    from yeoman_gateway.history.control import cli_control, projection_owned
+    if projection_owned(raw_root()):
+        response = cli_control("purge", {"confirm": True, "selector": asdict(selector)})
+        typer.echo(json.dumps(response, sort_keys=True))
+        return
     result = purge(raw_root(), selector, operator=getpass.getuser())
     if result.removed_lines:
         typer.echo(f"Removed {result.removed_lines} line(s); AUDIT updated.")

@@ -11,14 +11,14 @@ from yeoman_gateway.ipc.gateway_socket import GatewaySocket
 
 
 @pytest.mark.asyncio
-async def test_send_message_command() -> None:
+async def test_send_message_command(tmp_path: Path) -> None:
     sent: list[dict] = []
 
     async def mock_send(channel: str, chat_id: str, content: str) -> dict:
         sent.append({"channel": channel, "chat_id": chat_id, "content": content})
         return {"status": "ok"}
 
-    with tempfile.TemporaryDirectory() as tmpdir:
+    with tempfile.TemporaryDirectory(dir=tmp_path) as tmpdir:
         sock_path = Path(tmpdir) / "gateway.sock"
         server = GatewaySocket(
             path=sock_path,
@@ -46,14 +46,14 @@ async def test_send_message_command() -> None:
 
 
 @pytest.mark.asyncio
-async def test_a2a_send_command_forwards_logical_target() -> None:
+async def test_a2a_send_command_forwards_logical_target(tmp_path: Path) -> None:
     received: list[dict] = []
 
     async def mock_a2a_send(**kwargs: str) -> dict:
         received.append(kwargs)
         return {"target": kwargs["target"], "kind": kwargs["kind"], "response": "sent"}
 
-    with tempfile.TemporaryDirectory() as tmpdir:
+    with tempfile.TemporaryDirectory(dir=tmp_path) as tmpdir:
         sock_path = Path(tmpdir) / "gateway.sock"
         server = GatewaySocket(path=sock_path, a2a_delivery_handler=mock_a2a_send)
         await server.start()
@@ -94,8 +94,8 @@ async def test_a2a_send_command_forwards_logical_target() -> None:
 
 
 @pytest.mark.asyncio
-async def test_unknown_command_returns_error() -> None:
-    with tempfile.TemporaryDirectory() as tmpdir:
+async def test_unknown_command_returns_error(tmp_path: Path) -> None:
+    with tempfile.TemporaryDirectory(dir=tmp_path) as tmpdir:
         sock_path = Path(tmpdir) / "gateway.sock"
         server = GatewaySocket(path=sock_path)
         await server.start()
@@ -115,8 +115,8 @@ async def test_unknown_command_returns_error() -> None:
 
 
 @pytest.mark.asyncio
-async def test_rate_limiting() -> None:
-    with tempfile.TemporaryDirectory() as tmpdir:
+async def test_rate_limiting(tmp_path: Path) -> None:
+    with tempfile.TemporaryDirectory(dir=tmp_path) as tmpdir:
         sock_path = Path(tmpdir) / "gateway.sock"
         server = GatewaySocket(path=sock_path, rate_limit=2)
         await server.start()
@@ -248,3 +248,75 @@ async def test_a2a_capabilities_round_trips_available_text_skill_over_real_socke
         },
     }
     assert "voice" not in str(response)
+
+
+@pytest.mark.asyncio
+async def test_ipc_exact_request_limit_and_plus_one(tmp_path):
+    server = GatewaySocket(tmp_path / 'g.sock', rate_limit=100)
+    await server.start()
+    try:
+        for length, code in [(65536, None), (65537, 'REQUEST_TOO_LARGE')]:
+            reader, writer = await asyncio.open_unix_connection(str(server.path))
+            data = b'{"cmd":"ping"}'
+            writer.write(data + b' ' * (length - len(data) - 1) + b'\n')
+            await writer.drain()
+            result = json.loads(await asyncio.wait_for(reader.readline(), 5))
+            if code:
+                assert result['code'] == code
+                assert await reader.read() == b''
+            else:
+                assert result['response'] == 'pong'
+            writer.close()
+            await writer.wait_closed()
+        reader, writer = await asyncio.open_unix_connection(str(server.path))
+        writer.write(b'{"cmd":"history_control","args":{"operation":"status"}}\n')
+        await writer.drain()
+        assert json.loads(await reader.readline())['status'] == 'disabled'
+        writer.close()
+        await writer.wait_closed()
+    finally:
+        await server.stop()
+
+
+@pytest.mark.asyncio
+async def test_ipc_oversize_and_garbled_requests_leave_status_usable(tmp_path):
+    import os
+    server = GatewaySocket(tmp_path / 'g.sock', rate_limit=100)
+    loop = asyncio.get_running_loop()
+    prior_handler, errors = loop.get_exception_handler(), []
+    loop.set_exception_handler(lambda loop, context: errors.append(context))
+    await server.start()
+    fd_count = len(os.listdir('/proc/self/fd'))
+    try:
+        for frame in [b'x' * 65537 + b'\n', b'x' * 65537]:
+            reader, writer = await asyncio.open_unix_connection(str(server.path))
+            writer.write(frame)
+            await writer.drain()
+            assert json.loads(await asyncio.wait_for(reader.readline(), 5))['code'] == 'REQUEST_TOO_LARGE'
+            assert await reader.read() == b''
+            writer.close()
+            await writer.wait_closed()
+            status_reader, status_writer = await asyncio.open_unix_connection(str(server.path))
+            status_writer.write(b'{"cmd":"history_control","args":{"operation":"status"}}\n')
+            await status_writer.drain()
+            assert json.loads(await status_reader.readline())['status'] == 'disabled'
+            status_writer.close()
+            await status_writer.wait_closed()
+        reader, writer = await asyncio.open_unix_connection(str(server.path))
+        for frame in [b'bad\n', b'\xff\n', b'[]\n', b'1\n', b'{"cmd":1}\n', b'{"cmd":"ping","args":[]}\n']:
+            writer.write(frame)
+            await writer.drain()
+            assert json.loads(await reader.readline())['code'] == 'INVALID_REQUEST'
+            writer.write(b'{"cmd":"history_control","args":{"operation":"status"}}\n')
+            await writer.drain()
+            assert json.loads(await reader.readline())['status'] == 'disabled'
+        writer.close()
+        await writer.wait_closed()
+        clients = [t for t in asyncio.all_tasks() if t.get_coro().__qualname__ == 'GatewaySocket._handle_client']
+        await asyncio.wait_for(asyncio.gather(*clients), 2)
+        assert len(os.listdir('/proc/self/fd')) <= fd_count
+        assert not [t for t in asyncio.all_tasks() if t.get_coro().__qualname__ == 'GatewaySocket._handle_client']
+        assert errors == []
+    finally:
+        await server.stop()
+        loop.set_exception_handler(prior_handler)

@@ -302,53 +302,81 @@ def test_incremental_late_evidence_retracts_obsolete_clusters_and_joins(engine, 
     assert engine.conn.execute("SELECT count(*) FROM messages WHERE native_message_id IN ('S','CONFLICT')").fetchone()[0] == 0
 
 
-def test_incremental_late_author_after_restart_removes_obsolete_event_ids(engine):
-    # Distinct pre-existing bound contacts: corrections must change event grouping.
-    engine.append(observation(native_id='OTHER', sender=OTHER))
-    engine.append(observation('reaction', native_id='SEED'))
-    engine.apply()
-    engine.parity()
-    old_sender = engine.conn.execute("SELECT sender_contact_id FROM messages WHERE native_message_id='SEED'").fetchone()[0]
-    old_actor, old_event = engine.conn.execute('SELECT actor_contact_id, event_id FROM message_events').fetchone()
-    corrected = engine.conn.execute("SELECT sender_contact_id FROM messages WHERE native_message_id='OTHER'").fetchone()[0]
-    assert old_sender != corrected and old_actor != corrected
-    engine.restart()
-    before = engine.state()
-    for ref in ['whatsapp/2026-01.jsonl#1', 'whatsapp/2026-01.jsonl#3']:
-        engine.append(make('author', T0 + 1000, 'synthetic correction', source_ref=ref, anchor=OTHER),
-                      'owner/attestations.jsonl')
-    with pytest.raises(RebuildRequired):
-        engine.apply()
-    assert engine.state() == before
-    project([engine.root], engine.oracle)
-    with closing(sqlite3.connect(engine.oracle)) as conn:
-        assert conn.execute("SELECT sender_contact_id, sender_identifier FROM messages WHERE native_message_id='SEED'").fetchone() == (corrected, PN)
-        actor, native, eid, refs = conn.execute('SELECT actor_contact_id, actor_identifier, event_id, source_refs FROM message_events').fetchone()
-        assert (actor, native) == (corrected, PN) and eid != old_event
+@pytest.mark.asyncio
+async def test_incremental_late_author_after_restart_removes_obsolete_event_ids(tmp_path):
+    from test_hist_live import oracle_parity, start_ready
+    from yeoman_gateway.history.live import HistoryProjector
+    from yeoman_shared.raw_archive.records import append_owner_record
+    from yeoman_shared.raw_archive.writer import RawArchive
+    root, db = tmp_path / 'raw', tmp_path / 'history.db'
+    write_jsonl(root / 'whatsapp/2026-01.jsonl', [observation(native_id='SEED'), observation(native_id='OTHER', sender=OTHER), observation('reaction', native_id='SEED')])
+    project([root], db, publish_lineage_root=root)
+    archive = RawArchive(root, spool=tmp_path / 'spool', status_path=tmp_path / 'status.json')
+    p = HistoryProjector(root, db, archive)
+    await start_ready(p)
+    s = await p.read_turn()
+    old_event = s.connection.execute('SELECT event_id FROM message_events').fetchone()[0]
+    corrected = s.connection.execute("SELECT sender_contact_id FROM messages WHERE native_message_id='OTHER'").fetchone()[0]
+    generation = s.generation
+    s.close()
+    await p.stop()
+    p = HistoryProjector(root, db, archive)
+    await start_ready(p)
+    try:
+        def mutation(fd):
+            for ref in ['whatsapp/2026-01.jsonl#1', 'whatsapp/2026-01.jsonl#3']:
+                append_owner_record(root, make('author', T0 + 1000, 'synthetic correction', source_ref=ref, anchor=OTHER), projection_owner_fd=fd)
+            before = table_digest(db)
+            with pytest.raises(RebuildRequired):
+                apply_committed(p._connection, p._index, root, enumerate_committed(root))
+            assert table_digest(db) == before
+            assert p.health()['status'] == 'rebuilding'
+        await p.rebuild(reason='identity', mutation=mutation)
+        s = await p.read_turn()
+        assert s.generation > generation
+        assert s.connection.execute("SELECT sender_contact_id, sender_identifier FROM messages WHERE native_message_id='SEED'").fetchone() == (corrected, PN)
+        actor, native, refs = s.connection.execute('SELECT actor_contact_id, actor_identifier, source_refs FROM message_events').fetchone()
+        assert (actor, native) == (corrected, PN)
         assert 'owner/attestations.jsonl#' in refs
-        assert 'owner/attestations.jsonl#' in conn.execute("SELECT source_refs FROM messages WHERE native_message_id='SEED'").fetchone()[0]
-    assert set(table_digest(engine.oracle)) == {'contacts', 'identifier_history', 'messages', 'message_events'}
+        assert 'owner/attestations.jsonl#' in s.connection.execute("SELECT source_refs FROM messages WHERE native_message_id='SEED'").fetchone()[0]
+        assert s.connection.execute('SELECT count(*) FROM message_events WHERE event_id=?', (old_event,)).fetchone() == (0,)
+        s.close()
+        await oracle_parity(p, root, tmp_path)
+    finally:
+        await p.stop()
 
 
+@pytest.mark.asyncio
 @pytest.mark.parametrize('order', [('message', 'edit', 'delete'), ('edit', 'delete', 'message')])
-def test_incremental_edit_delete_matches_full_in_both_arrival_orders(engine, order):
-    for kind in order:
-        if kind == 'message' and order[0] == 'edit':
-            assert engine.conn.execute('SELECT target_message_id FROM message_events ORDER BY kind').fetchall() == [(None,), (None,)]
-            engine.restart()
-        engine.append(observation(kind, text='edited' if kind == 'edit' else 'original',
-                                  ms=T0 + {'message': 0, 'edit': 1000, 'delete': 2000}[kind]))
-        engine.apply()
-        engine.parity()
-    assert engine.conn.execute("SELECT current_text, deleted FROM messages_current WHERE native_message_id='M'").fetchone() == ('edited', 1)
-    assert engine.conn.execute("SELECT count(*) FROM messages WHERE native_message_id='M'").fetchone()[0] == 1
-    assert engine.conn.execute('SELECT kind, target_native_id, target_message_id FROM message_events ORDER BY kind').fetchall() == [
-        ('delete', 'M', f'whatsapp:{G}:M'), ('edit', 'M', f'whatsapp:{G}:M')]
+async def test_incremental_edit_delete_matches_full_in_both_arrival_orders(tmp_path, order):
+    from test_hist_live import oracle_parity, projector_fixture, start_ready
+    from yeoman_gateway.history.live import HistoryPaused, HistoryProjector
+    root, db, archive, p = projector_fixture(tmp_path)
+    await start_ready(p)
+    try:
+        for kind in order:
+            if kind == 'message' and order[0] == 'edit':
+                await p.stop()
+                p = HistoryProjector(root, db, archive)
+                await start_ready(p)
+            append_line(root / 'whatsapp/2026-10.jsonl', canonical_json(observation(kind, text='edited' if kind == 'edit' else 'original', ms=T0 + {'message': 0, 'edit': 1000, 'delete': 2000}[kind])))
+            try:
+                await p.barrier()
+            except HistoryPaused:
+                await p.rebuild(reason='late_evidence')
+            await oracle_parity(p, root, tmp_path)
+        s = await p.read_turn()
+        assert s.connection.execute("SELECT current_text, deleted FROM messages_current WHERE native_message_id='M'").fetchone() == ('edited', 1)
+        assert s.connection.execute('SELECT kind, target_native_id, target_message_id FROM message_events ORDER BY kind').fetchall() == [('delete', 'M', f'whatsapp:{G}:M'), ('edit', 'M', f'whatsapp:{G}:M')]
+        s.close()
+    finally:
+        await p.stop()
 
 
+@pytest.mark.asyncio
 @pytest.mark.parametrize('case', ['frozen_shaped', 'append', 'restart', 'late_evidence', 'window',
                                  'merge', 'unmerge', 'month_rollover', 'wal', 'purge'])
-def test_incremental_matches_full_rebuild_fixture_matrix(engine, case):
+async def test_incremental_matches_full_rebuild_fixture_matrix(engine, case, tmp_path):
     if case in {'window', 'merge', 'unmerge', 'purge'}:
         if case != 'purge':
             engine.append(observation(native_id='BOUND-OTHER', sender=OTHER))
@@ -368,7 +396,19 @@ def test_incremental_matches_full_rebuild_fixture_matrix(engine, case):
         with pytest.raises(RebuildRequired):
             engine.apply()
         assert engine.state() == before
-        return  # Task 7 extends this branch with the real fenced repair.
+        from test_hist_live import oracle_parity, start_ready
+        from yeoman_gateway.history.live import HistoryProjector
+        from yeoman_shared.raw_archive.writer import RawArchive
+        engine.close()
+        archive = RawArchive(engine.root, spool=tmp_path / 'spool', status_path=tmp_path / 'status.json')
+        p = HistoryProjector(engine.root, engine.db, archive)
+        await start_ready(p)
+        try:
+            await p.rebuild(reason='identity_or_purge')
+            await oracle_parity(p, engine.root, tmp_path)
+        finally:
+            await p.stop()
+        return
     if case == 'wal':
         assert engine.conn.execute('PRAGMA journal_mode=WAL').fetchone()[0] == 'wal'
     if case == 'restart':

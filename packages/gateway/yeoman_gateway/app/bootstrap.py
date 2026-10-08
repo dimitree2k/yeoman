@@ -3957,6 +3957,7 @@ def build_gateway_runtime(
         await bus.publish_event(SystemEvent(kind=kind, detail=detail, timestamp=time.time()))
         return {"published": True}
 
+    history_projector = build_history_projector(config, channels)
     gateway_socket = GatewaySocket(
         path=socket_path,
         send_message_handler=ipc_send_message,
@@ -3966,6 +3967,7 @@ def build_gateway_runtime(
         a2a_invoke_handler=ipc_a2a_invoke,
         a2a_capabilities_handler=ipc_a2a_capabilities,
         publish_event_handler=ipc_publish_event,
+        history_control_handler=history_projector.control if history_projector is not None else None,
         rate_limit=ipc_config.command_rate_limit,
     )
 
@@ -4297,7 +4299,7 @@ def build_gateway_runtime(
     return GatewayRuntime(
         orchestrator=orchestrator_service,
         channels=channels,
-        history_projector=build_history_projector(config, channels),
+        history_projector=history_projector,
         cron=cron,
         heartbeat=heartbeat,
         inbound_archive=inbound_archive,

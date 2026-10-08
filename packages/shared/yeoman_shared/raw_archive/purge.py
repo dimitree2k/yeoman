@@ -99,10 +99,14 @@ class _PurgePredicate:
     chat_id: str | None
     identities: frozenset[str]
     correlations: frozenset[str]
+    erased_source_refs: frozenset[str] = frozenset()
 
     def matches(self, record: dict[str, Any]) -> bool:
         if record == TOMBSTONE:
             return False
+        if record.get('kind') == 'contact_id':
+            return (record.get('channel') == safe_channel(self.selector.channel) and
+                    bool(self.erased_source_refs.intersection(record.get('source_refs', []))))
         parts = record_parts(record)
         if parts != [record]:
             return any(self.matches(part) for part in parts)
@@ -142,7 +146,28 @@ def _build_predicate(root: Path, selector: PurgeSelector) -> _PurgePredicate:
     for record in matched:
         identities.update(record_identities(record))
         correlations.update(record_correlations(record))
-    return _PurgePredicate(selector, chat_id, frozenset(identities), frozenset(correlations))
+    predicate = _PurgePredicate(selector, chat_id, frozenset(identities), frozenset(correlations))
+    erased_refs: set[str] = set()
+    for path in _channel_files(root, safe_channel(selector.channel)):
+        for number, record, _ in iter_records(path):
+            if record is None or record.get('kind') == 'contact_id' or not predicate.matches(record):
+                continue
+            base = f'{path.relative_to(root).as_posix()}#{number}'
+            segments = (record.get('payload') or {}).get('segments') if isinstance(record.get('payload'), dict) else None
+            if isinstance(segments, list):
+                parts = iter(record_parts(record))
+                surviving = False
+                for index, segment in enumerate(segments):
+                    if isinstance(segment, dict) and segment != TOMBSTONE:
+                        if predicate.matches(next(parts)):
+                            erased_refs.add(f'{base}/{index}')
+                        else:
+                            surviving = True
+                if not surviving:
+                    erased_refs.add(base)
+            else:
+                erased_refs.add(base)
+    return _PurgePredicate(selector, chat_id, frozenset(identities), frozenset(correlations), frozenset(erased_refs))
 
 
 def plan_purge(root: Path, selector: PurgeSelector) -> PurgeResult:
@@ -503,6 +528,8 @@ def _purge(
         identities = set(predicate.identities)
         correlations = set(predicate.correlations)
         for record in selected_records:
+            if record.get('kind') == 'contact_id':
+                continue  # A lineage seed is not a purged native-message identity.
             for part in record_parts(record):
                 if not predicate.matches(part):
                     continue

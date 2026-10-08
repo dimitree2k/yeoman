@@ -56,7 +56,10 @@ def history_project(
 ) -> None:
     from yeoman_gateway.history.project import project
 
-    _emit(project([path.expanduser() for path in layer1], db.expanduser()))
+    try:
+        _emit(project([path.expanduser() for path in layer1], db.expanduser()))
+    except (PermissionError, BlockingIOError):
+        raise typer.BadParameter("history is owned; use history rebuild --confirm through Gateway") from None
 
 
 @history_app.command("verify")
@@ -101,12 +104,26 @@ def history_attest(
 
     _owner_mode(dry_run, confirm)
     try:
-        records = [json.loads(line) for line in file.expanduser().read_text().splitlines()]
+        import hashlib
+
+        from yeoman_gateway.history.control import (
+            _parse_owner_package,
+            _read_package_bytes,
+            cli_control,
+            projection_owned,
+        )
+        path = file.expanduser().absolute()
+        data = _read_package_bytes(path)
+        digest = hashlib.sha256(data).hexdigest()
+        records = _parse_owner_package(data)
         if not records:
             raise ValueError('empty owner package')
         root = raw_root()
         preflight_owner_paths(root)
         validate_owner_package(root, records)
+        if confirm and projection_owned(root):
+            _emit(cli_control("attest", {"confirm": True, "package_path": str(path), "package_sha256": digest}))
+            return
         if dry_run:
             _emit({'validated': len(records), 'committed': 0, 'suppressed': 0})
             return
@@ -139,13 +156,48 @@ def history_import_backfill(
 
     _owner_mode(dry_run, confirm)
     try:
-        package = json.loads(manifest.expanduser().read_text())
+        import hashlib
+
+        from yeoman_gateway.history.control import (
+            _load_pinned_bytes,
+            _read_package_bytes,
+            cli_control,
+            projection_owned,
+        )
+        path = manifest.expanduser().absolute()
+        data = _read_package_bytes(path)
+        digest = hashlib.sha256(data).hexdigest()
+        package = json.loads(_load_pinned_bytes(path, digest))
         source = staged.expanduser()
         if package != prepare_import_manifest(source):
             raise ValueError('manifest does not bind the validated staged records')
+        if confirm and projection_owned(raw_root()):
+            _emit(cli_control("import-backfill", {"confirm": True, "package_path": str(path), "package_sha256": digest, "staged_path": str(source.absolute())}))
+            return
         result = (preview_import if dry_run else import_backfill)(raw_root(), source, package)
         _emit({'status': 'dry-run' if dry_run else result['status'], 'files': len(result['files']),
                'records': sum(f['lines'] for f in package['files'].values()),
                'suppressed': sum(f['suppressed'] for f in result['files'].values())})
     except (OSError, ValueError, TypeError, KeyError):
         raise typer.BadParameter('import package validation or publication failed') from None
+
+
+@history_app.command('rebuild')
+def history_rebuild(confirm: bool = typer.Option(False, '--confirm')) -> None:
+    from yeoman_gateway.history.control import cli_control
+    if not confirm:
+        raise typer.BadParameter('--confirm required')
+    _emit(cli_control('rebuild', {'confirm': True}))
+
+
+@history_app.command('projection-status')
+def history_projection_status() -> None:
+    import asyncio
+
+    from yeoman_shared.config.loader import load_config
+
+    from yeoman_gateway.history.control import request_history_control
+    try:
+        _emit(asyncio.run(request_history_control(Path(load_config().ipc.gateway_socket_path).expanduser(), 'status', {})))
+    except (OSError, ValueError, TimeoutError):
+        raise typer.BadParameter('Gateway history control unavailable') from None

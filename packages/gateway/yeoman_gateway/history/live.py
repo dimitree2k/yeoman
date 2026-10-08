@@ -5,9 +5,10 @@ import asyncio
 import json
 import os
 import sqlite3
+import tempfile
 import threading
 import time
-from collections.abc import Callable, Sequence
+from collections.abc import Callable, Mapping, Sequence
 from concurrent.futures import ThreadPoolExecutor
 from contextlib import closing
 from dataclasses import dataclass
@@ -21,13 +22,16 @@ from yeoman_shared.raw_archive.records import (
     _import_receipt,
     _no_symlinks,
     acquire_projection_owner,
+    copy_committed,
     enumerate_committed,
 )
 from yeoman_shared.raw_archive.writer import RawArchive
 from yeoman_shared.utils.helpers import get_operational_data_path
 
 from .incremental import ProjectionIndex, RebuildRequired, apply_committed
+from .project import project
 from .schema import PROJECTOR_VERSION, SCHEMA_VERSION
+from .verify import verify_rebuild_candidate
 
 if TYPE_CHECKING:
     from .reader import HistoryReader, HistorySnapshot
@@ -150,6 +154,10 @@ class HistoryProjector:
         runtime = [row for row in states if row[0] == '@runtime']
         if len(runtime) != 1:
             raise RebuildRequired('missing runtime checkpoint')
+        runtime_state = json.loads(runtime[0][5])
+        self._generation = int(runtime_state['generation'])
+        if runtime_state.get('admission', runtime_state.get('status')) != 'ready':
+            raise RebuildRequired('interrupted rebuild requires repair')
         boundaries = tuple(SourceBoundary(*row[:4]) for row in states if row[0] != '@runtime')
         self._index = ProjectionIndex.from_prefix(self.raw_root, boundaries)
         if any(item.contact_id not in self._index._reserved_ids
@@ -298,6 +306,153 @@ class HistoryProjector:
                     'lag_lines': max(self._lag_lines, notified_lines), 'lag_bytes': max(self._lag_bytes, notified_bytes),
                     'retry_policy': 'none',
                     'oldest_wait_age_ms': int((time.monotonic() - self._oldest_wait) * 1000) if self._oldest_wait is not None else 0}
+
+    async def rebuild(self, *, reason: str,
+                      mutation: Callable[[int], None] | None = None) -> dict[str, Any]:
+        # Accepted repair outlives a disconnected/cancelled control client.
+        task = asyncio.create_task(self._rebuild(reason, mutation))
+        try:
+            return await asyncio.shield(task)
+        except asyncio.CancelledError:
+            await asyncio.shield(task)
+            raise
+
+    async def _rebuild(self, reason: str, mutation: Callable[[int], None] | None) -> dict[str, Any]:
+        async with self._operation_lock:
+            if self._executor is None or self._projection_owner_fd is None or self._stopping:
+                raise HistoryPaused('disabled')
+            self._status, self._reason = 'rebuilding', reason
+            try:
+                if self._reader is not None:
+                    await self._reader._wait_for_snapshots()
+                await self._submit(self._persist_fence)
+                if mutation is not None:
+                    if self._connection is None:
+                        raise HistoryPaused('repair_database_before_mutation')
+                    await self._submit(mutation, self._projection_owner_fd)
+                result = await self._submit(self._build_replace_release)
+                if self._reader is None:
+                    from .reader import HistoryReader
+                    self._reader = HistoryReader(self.db_path)
+                self._status, self._reason = 'ready', None
+                if self._worker is None:
+                    self._worker = asyncio.create_task(self._run_notifications())
+                return result
+            except BaseException:
+                self._status, self._reason = 'failed', 'rebuild_failed'
+                raise
+
+    def _open_writer(self) -> None:
+        if self._connection is None:
+            self._connection = sqlite3.connect(self.db_path)
+            self._connection.execute('PRAGMA foreign_keys=ON')
+            self._connection.execute('PRAGMA journal_mode=WAL')
+            self._connection.execute('PRAGMA synchronous=FULL')
+
+    def _runtime_status(self, status: str) -> None:
+        if self._connection is None:
+            return
+        row = self._connection.execute("SELECT state_json FROM projector_state WHERE file='@runtime'").fetchone()
+        state = json.loads(row[0])
+        state['status'] = status
+        state['admission'] = status
+        self._connection.execute("UPDATE projector_state SET state_json=? WHERE file='@runtime'", (json.dumps(state, sort_keys=True),))
+        self._connection.commit()
+
+    def _persist_fence(self) -> None:
+        if self.db_path.exists():
+            # A compatible installed DB retains the interrupted admission state across restart.
+            with closing(sqlite3.connect(f'{self.db_path.as_uri()}?mode=ro', uri=True)) as conn:
+                compatible = conn.execute('PRAGMA user_version').fetchone()[0] == SCHEMA_VERSION
+            if compatible:
+                self._open_writer()
+                self._runtime_status('rebuilding')
+
+    def _checkpoint_close(self) -> None:
+        if self._connection is not None:
+            if self._connection.execute('PRAGMA wal_checkpoint(TRUNCATE)').fetchone()[0] != 0:
+                raise ValueError('writer_checkpoint_busy')
+            self._close_writer()
+        # Closed SQLite handles retire their own sidecars; never unlink a possibly live WAL.
+        if any(self.db_path.with_name(self.db_path.name + suffix).exists() for suffix in ('-wal', '-shm')):
+            raise ValueError('writer_sidecars_remain')
+
+    def _replace_candidate(self, candidate: Path) -> None:
+        os.replace(candidate, self.db_path)
+
+    def _sync_directory(self) -> None:
+        fd = os.open(self.db_path.parent, os.O_RDONLY | os.O_DIRECTORY)
+        try:
+            os.fsync(fd)
+        finally:
+            os.close(fd)
+
+    def _publish_generation(self, generation: int) -> None:
+        self._generation = generation
+
+    def _release_tail(self) -> None:
+        self._runtime_status('ready')
+
+    def _build_replace_release(self) -> dict[str, Any]:
+        self.db_path.parent.mkdir(mode=0o700, parents=True, exist_ok=True)
+        while True:
+            with tempfile.TemporaryDirectory(prefix='.history-rebuild-', dir=self.db_path.parent) as stage:
+                directory = Path(stage)
+                # A lineage reservation can advance the source; rebuild the refreshed prefix.
+                iteration = 0
+                while True:
+                    boundaries = enumerate_committed(self.raw_root)
+                    prefix = directory / f'prefix-{iteration}'
+                    copy_committed(self.raw_root, boundaries, prefix)
+                    candidate = directory / 'candidate.db'
+                    project([prefix], candidate, publish_lineage_root=self.raw_root)
+                    refreshed = enumerate_committed(self.raw_root)
+                    old_lineage = [b for b in boundaries if b.relative_path == 'derived/contact-ids.jsonl']
+                    new_lineage = [b for b in refreshed if b.relative_path == 'derived/contact-ids.jsonl']
+                    if old_lineage == new_lineage:
+                        break
+                    iteration += 1
+                result = verify_rebuild_candidate([prefix], candidate, boundaries=boundaries)
+                generation = self._generation + 1
+                with closing(sqlite3.connect(candidate)) as conn:
+                    row = conn.execute("SELECT state_json FROM projector_state WHERE file='@runtime'").fetchone()
+                    state = json.loads(row[0])
+                    state.update(generation=generation, status='rebuilding', admission='rebuilding')
+                    conn.execute("UPDATE projector_state SET state_json=? WHERE file='@runtime'", (json.dumps(state, sort_keys=True),))
+                    conn.commit()
+                    if conn.execute('PRAGMA wal_checkpoint(TRUNCATE)').fetchone()[0] not in (0,):
+                        raise ValueError('candidate_checkpoint_busy')
+                fd = os.open(candidate, os.O_RDONLY | os.O_NOFOLLOW)
+                try:
+                    os.fsync(fd)
+                finally:
+                    os.close(fd)
+                self._checkpoint_close()
+                self._replace_candidate(candidate)
+                self._sync_directory()
+                self._publish_generation(generation)
+                self._open_writer()
+                try:
+                    self._index = ProjectionIndex.from_prefix(self.raw_root, boundaries)
+                    while True:
+                        self.archive.drain_spool()
+                        status = self.archive.status()
+                        if status.spooled or status.pending_in_memory:
+                            raise HistoryPaused('retained_backlog')
+                        _import_receipt(self.raw_root, '')
+                        target = self._index.target(self.raw_root)
+                        self._catch_up(target)
+                        self._runtime_status('rebuilding')
+                        if self._index.target(self.raw_root) == self._index._boundaries:
+                            self._release_tail()
+                            return result
+                except RebuildRequired:
+                    self._runtime_status('rebuilding')
+                    continue  # Identity/prefix changes in the tail need another verified prefix.
+
+    async def control(self, operation: str, args: Mapping[str, Any]) -> dict[str, Any]:
+        from .control import control_projector
+        return await control_projector(self, operation, args)
 
     def _close_writer(self) -> None:
         if self._connection is not None:

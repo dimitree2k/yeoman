@@ -1,5 +1,7 @@
 import json
+import sqlite3
 
+import pytest
 from hist_fixtures import _bf, sample_layer1, write_jsonl
 from typer.testing import CliRunner
 from yeoman_gateway.cli.commands import app
@@ -154,3 +156,82 @@ def test_project_failure_preserves_existing_database(tmp_path, monkeypatch):
         project([live, dev], db)
     assert db.read_bytes() == before
     assert not db.with_name(db.name + ".building").exists()
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize('damage', ['offset', 'missing', 'extra', 'hash', 'fk', 'corrupt', 'columns', 'runtime', 'input'])
+async def test_rebuild_candidate_checkpoint_and_integrity_mismatch_refuses_replace(tmp_path, damage, monkeypatch):
+    from test_hist_live import projector_fixture, start_ready
+    from yeoman_gateway.history import live
+    root, db, archive, p = projector_fixture(tmp_path)
+    await start_ready(p)
+    before, generation = db.read_bytes(), p.health()['generation']
+    original = live.verify_rebuild_candidate
+    replacements = []
+    replace = p._replace_candidate
+    def spy(candidate):
+        replacements.append(candidate)
+        return replace(candidate)
+    monkeypatch.setattr(p, '_replace_candidate', spy)
+    def corrupt(roots, candidate, **kwargs):
+        if damage == 'corrupt':
+            candidate.write_bytes(b'not sqlite')
+        elif damage == 'input':
+            with (roots[0] / 'whatsapp/2026-10.jsonl').open('ab') as out:
+                out.write(b'\n')
+        else:
+            with sqlite3.connect(candidate) as conn:
+                sql = {'offset': "UPDATE projector_state SET end_offset=end_offset+1 WHERE file!='@runtime'",
+                       'missing': "DELETE FROM projector_state WHERE file='whatsapp/2026-10.jsonl'",
+                       'extra': "INSERT INTO projector_state VALUES ('whatsapp/extra.jsonl',0,0,'',3,'{}')",
+                       'hash': "UPDATE projector_state SET sha256='bad' WHERE file!='@runtime'",
+                       'fk': "UPDATE messages SET sender_contact_id='absent'",
+                       'columns': 'ALTER TABLE messages ADD COLUMN unexpected TEXT',
+                       'runtime': "UPDATE projector_state SET state_json='{}' WHERE file='@runtime'"}[damage]
+                conn.execute(sql)
+        return original(roots, candidate, **kwargs)
+    monkeypatch.setattr(live, 'verify_rebuild_candidate', corrupt)
+    try:
+        with pytest.raises((ValueError, sqlite3.Error)):
+            await p.rebuild(reason='owner_request')
+        assert not replacements
+        assert db.read_bytes() == before and p.health()['generation'] == generation
+        assert p.health()['status'] == 'failed'
+        with pytest.raises(live.HistoryPaused):
+            await p.read_turn()
+    finally:
+        await p.stop()
+
+
+def test_rebuild_candidate_expected_digests_are_independent(tmp_path):
+    from test_hist_live import fixture
+    from yeoman_gateway.history.verify import verify_rebuild_candidate
+    from yeoman_shared.raw_archive.records import enumerate_committed
+    root, db, _ = fixture(tmp_path, 2)
+    report = verify_rebuild_candidate([root], db, boundaries=enumerate_committed(root))
+    assert report['verified'] and report['accounting_ok']
+    assert report['expected_digests'] == report['candidate_digests'] == table_digest(db)
+    with sqlite3.connect(db) as conn:
+        conn.execute('DELETE FROM messages WHERE message_id=(SELECT message_id FROM messages LIMIT 1)')
+    with pytest.raises(ValueError, match='semantic_digest_mismatch'):
+        verify_rebuild_candidate([root], db, boundaries=enumerate_committed(root))
+
+
+@pytest.mark.parametrize('damage', ['outcomes', 'schema_version', 'admission'])
+def test_rebuild_candidate_rejects_invalid_runtime_accounting(tmp_path, damage):
+    from test_hist_live import fixture
+    from yeoman_gateway.history.verify import verify_rebuild_candidate
+    from yeoman_shared.raw_archive.records import enumerate_committed
+    root, db, _ = fixture(tmp_path)
+    with sqlite3.connect(db) as conn:
+        if damage == 'schema_version':
+            conn.execute('PRAGMA user_version=2')
+        else:
+            state = json.loads(conn.execute("SELECT state_json FROM projector_state WHERE file='@runtime'").fetchone()[0])
+            if damage == 'outcomes':
+                state['outcomes'] = {}
+            else:
+                state['admission'] = 'unknown'
+            conn.execute("UPDATE projector_state SET state_json=? WHERE file='@runtime'", (json.dumps(state),))
+    with pytest.raises(ValueError):
+        verify_rebuild_candidate([root], db, boundaries=enumerate_committed(root))

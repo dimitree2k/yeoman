@@ -385,8 +385,10 @@ def test_real_bootstrap_keeps_existing_consumers_and_raw_instance(tmp_path, monk
     try:
         if enabled:
             assert runtime.history_projector.archive is runtime.channels.raw_archive
+            assert runtime.gateway_socket.history_control_handler.__self__ is runtime.history_projector
         else:
             assert runtime.history_projector is None
+            assert runtime.gateway_socket.history_control_handler is None
         assert not (tmp_path / 'data/history').exists()
         assert not list(tmp_path.rglob('*writer.lock'))
         assert not list(tmp_path.rglob('.history-projection-owner.lock'))
@@ -707,5 +709,339 @@ async def test_projector_startup_exception_pauses_without_retry(tmp_path, monkey
             await p.read_turn()
         assert archive.append_durable(RawEvent(channel='whatsapp', kind='message', direction='in', native=observation(native_id='AFTER_STARTUP_FAILURE')['native'], received_ms=T0))
         assert db.read_bytes() == before
+    finally:
+        await p.stop()
+
+
+async def oracle_parity(p, root, tmp_path):
+    oracle = tmp_path / 'oracle.db'
+    project([root], oracle)
+    snapshot = await p.read_turn()
+    try:
+        from yeoman_gateway.history.verify import _table_digest
+        assert _table_digest(snapshot.connection) == table_digest(oracle)
+        with sqlite3.connect(oracle) as conn:
+            assert snapshot.connection.execute('SELECT * FROM messages_current ORDER BY message_id').fetchall() == conn.execute('SELECT * FROM messages_current ORDER BY message_id').fetchall()
+        assert snapshot.sources == enumerate_committed(root)
+    finally:
+        snapshot.close()
+
+
+@pytest.mark.asyncio
+async def test_rebuild_fence_catches_tail_before_release(tmp_path, monkeypatch):
+    from yeoman_gateway.history import live
+    root, db, archive, p = projector_fixture(tmp_path)
+    await start_ready(p)
+    old = await p.read_turn()
+    generation = old.generation
+    copied, release = threading.Event(), threading.Event()
+    original = live.copy_committed
+    def block(*args):
+        original(*args)
+        copied.set()
+        assert release.wait(20)
+    monkeypatch.setattr(live, 'copy_committed', block)
+    task = asyncio.create_task(p.rebuild(reason='owner_request'))
+    try:
+        await asyncio.sleep(.02)
+        assert p.health()['status'] == 'rebuilding'
+        assert not copied.is_set()  # Existing lease must drain before any candidate work.
+        from yeoman_gateway.history.live import HistoryPaused
+        with pytest.raises(HistoryPaused):
+            await p.read_turn()
+        old.close()
+        assert await asyncio.to_thread(copied.wait, 10)
+        # Native/derived appends remain available while build has no raw lock.
+        from test_hist_incremental import paired
+        tail_time = T0 + 31 * 86400000
+        assert archive.append_durable(RawEvent(channel='whatsapp', kind='message', direction='in', chat_id=G, account='default', native=observation(native_id='TAIL')['native'], received_ms=tail_time))
+        assert archive.append_media_transcript({'kind': 'media_transcript', 'channel': 'whatsapp', 'native_message_id': 'TAIL', 'chat_id': G, 'text': 'synthetic transcript', 'generated_ms': tail_time})
+        append_line(root / 'whatsapp/2026-10.jsonl', dumps(paired('outbound_request')))
+        append_line(root / 'whatsapp/2026-11.jsonl', dumps(paired('outbound_result')))
+        release.set()
+        await task
+        assert p.health()['generation'] > generation
+        snapshot = await p.read_turn()
+        try:
+            assert json.loads(snapshot.connection.execute("SELECT media_json FROM messages WHERE native_message_id='TAIL'").fetchone()[0])['transcript']['text'] == 'synthetic transcript'
+            assert snapshot.connection.execute("SELECT count(*) FROM messages WHERE native_message_id='S' AND direction='out'").fetchone() == (1,)
+        finally:
+            snapshot.close()
+        await oracle_parity(p, root, tmp_path)
+    finally:
+        old.close()
+        release.set()
+        await p.stop()
+
+
+@pytest.mark.asyncio
+async def test_rebuild_missing_candidate_row_blocks_replace_and_reply_release(tmp_path, monkeypatch):
+    from yeoman_gateway.history import live
+    from yeoman_gateway.history.live import HistoryPaused, HistoryProjector
+    root, db, archive = fixture(tmp_path, 2)
+    p = HistoryProjector(root, db, archive)
+    await start_ready(p)
+    before, generation = db.read_bytes(), p.health()['generation']
+    original = live.verify_rebuild_candidate
+    def corrupt(roots, candidate, **kwargs):
+        with sqlite3.connect(candidate) as conn:
+            conn.execute('DELETE FROM messages WHERE message_id=(SELECT message_id FROM messages LIMIT 1)')
+            assert conn.execute('PRAGMA integrity_check').fetchall() == [('ok',)]
+            assert conn.execute('PRAGMA foreign_key_check').fetchall() == []
+        return original(roots, candidate, **kwargs)
+    monkeypatch.setattr(live, 'verify_rebuild_candidate', corrupt)
+    try:
+        with pytest.raises(ValueError, match='semantic_digest_mismatch'):
+            await p.rebuild(reason='owner_request')
+        assert db.read_bytes() == before
+        assert p.health()['generation'] == generation
+        assert p.health()['status'] == 'failed'
+        with pytest.raises(HistoryPaused):
+            await p.read_turn()
+    finally:
+        await p.stop()
+
+
+@pytest.mark.asyncio
+async def test_purge_fence_failure_never_serves_erased_projection(tmp_path, monkeypatch):
+    from yeoman_gateway.history import live
+    from yeoman_gateway.history.live import HistoryPaused
+    from yeoman_shared.raw_archive.purge import PurgeSelector, purge
+    root, db, archive, p = projector_fixture(tmp_path)
+    row = observation(native_id='M0')
+    row['chat_id'] = G
+    write_jsonl(root / 'whatsapp/2026-10.jsonl', [row])
+    from test_hist_incremental import OTHER, PN
+    write_jsonl(root / 'backfill/mixed.jsonl', [_bf('memory', 'message', {'messageId': 'KEEP', 'segments': [
+        {'senderId': PN, 'text': 'erase synthetic', 'messageId': 'M0'},
+        {'senderId': OTHER, 'text': 'keep synthetic', 'messageId': 'KEEP'}]}, chat=G)])
+    project([root], db, publish_lineage_root=root)
+    await start_ready(p)
+    original = live.verify_rebuild_candidate
+    def fail(*args, **kwargs):
+        raise ValueError('synthetic_verify_failure')
+    monkeypatch.setattr(live, 'verify_rebuild_candidate', fail)
+    try:
+        with pytest.raises(ValueError):
+            await p.rebuild(reason='purge', mutation=lambda fd: purge(root, PurgeSelector(channel='whatsapp', native_id='M0'), operator='synthetic', projection_owner_fd=fd))
+        with pytest.raises(HistoryPaused):
+            await p.read_turn()
+        append_line(root / 'whatsapp/2026-11.jsonl', dumps(observation(native_id='AFTER')))
+        monkeypatch.setattr(live, 'verify_rebuild_candidate', original)
+        await p.rebuild(reason='recovery')
+        s = await p.read_turn()
+        try:
+            assert s.connection.execute('SELECT native_message_id FROM messages').fetchall() == [('AFTER',), ('KEEP',)]
+        finally:
+            s.close()
+        batch = json.loads((root / 'backfill/mixed.jsonl').read_text())
+        assert batch['payload']['segments'][0] == {'purged_version': 1}
+        assert any(json.loads(line) == {'purged_version': 1} for line in (root / 'derived/contact-ids.jsonl').read_text().splitlines())
+        await oracle_parity(p, root, tmp_path)
+    finally:
+        await p.stop()
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize('stage', ['before_close', 'after_close', 'after_replace', 'after_directory_fsync', 'after_generation_publish', 'after_tail_commit'])
+async def test_rebuild_wal_replace_crash_and_verify_failure(tmp_path, monkeypatch, stage):
+    from yeoman_gateway.history.live import HistoryPaused, HistoryProjector
+    root, db, archive = fixture(tmp_path)
+    script = tmp_path / 'crash.py'
+    script.write_text("""
+import asyncio, os, sys
+from pathlib import Path
+from yeoman_gateway.history.live import HistoryProjector
+from yeoman_shared.raw_archive.writer import RawArchive
+from yeoman_shared.raw_archive.records import append_line
+root, db, stage = Path(sys.argv[1]), Path(sys.argv[2]), sys.argv[3]
+archive = RawArchive(root, spool=root.parent / 'child-spool', status_path=root.parent / 'child-status.json')
+async def crash():
+    p = HistoryProjector(root, db, archive)
+    await p.start()
+    await p._startup_task
+    assert p.health()['status'] == 'ready'
+    method = {'before_close': '_checkpoint_close', 'after_close': '_checkpoint_close',
+              'after_replace': '_replace_candidate', 'after_directory_fsync': '_sync_directory',
+              'after_generation_publish': '_publish_generation', 'after_tail_commit': '_release_tail'}[stage]
+    original = getattr(p, method)
+    def exit_at_stage(*args):
+        if stage not in ('before_close', 'after_tail_commit'):
+            original(*args)
+        os._exit(70)
+    setattr(p, method, exit_at_stage)
+    if stage == 'after_tail_commit':
+        replace = p._replace_candidate
+        def tail(candidate):
+            replace(candidate)
+            append_line(root / 'whatsapp/2026-11.jsonl', sys.argv[4])
+        p._replace_candidate = tail
+    await p.rebuild(reason='owner_request')
+    raise AssertionError('crash point was not reached')
+asyncio.run(crash())
+""")
+    result = await asyncio.to_thread(subprocess.run, [os.sys.executable, str(script), str(root), str(db), stage, dumps(observation(native_id='CRASH-TAIL'))], capture_output=True, timeout=330)
+    assert result.returncode == 70, result.stderr.decode()
+    p = HistoryProjector(root, db, archive)
+    await start_ready(p)
+    try:
+        # No orderly shutdown: persisted admission and WAL recovery must carry the fence.
+        assert p.health()['status'] != 'ready'
+        with pytest.raises(HistoryPaused):
+            await p.read_turn()
+        other = HistoryProjector(root, db, archive)
+        await start_ready(other)
+        assert other.health()['status'] == 'failed'
+        await other.stop()
+        await p.rebuild(reason='recovery')
+        assert p.health()['generation'] > 2
+        await oracle_parity(p, root, tmp_path)
+    finally:
+        await p.stop()
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize('case', ['window', 'merge', 'unmerge'])
+async def test_identity_fence_window_merge_unmerge_matches_full(tmp_path, case):
+    from test_hist_incremental import OTHER, PN
+    from yeoman_gateway.history.attestations import make
+    from yeoman_shared.raw_archive.records import append_owner_record
+    root, db, archive, p = projector_fixture(tmp_path)
+    append_line(root / 'whatsapp/2026-10.jsonl', dumps(observation(native_id='OTHER', sender=OTHER)))
+    await start_ready(p)
+    generation = p.health()['generation']
+    try:
+        row = (make('identifier', T0, 'synthetic', anchor=PN, identifier=OTHER, valid_from_ms=T0, valid_until_ms=T0 + 1000)
+               if case == 'window' else make(case, T0, 'synthetic', a=PN, b=OTHER))
+        await p.rebuild(reason='identity', mutation=lambda fd: append_owner_record(root, row, projection_owner_fd=fd, on_committed=p.notify_committed))
+        assert p.health()['generation'] > generation
+        await oracle_parity(p, root, tmp_path)
+    finally:
+        await p.stop()
+
+
+@pytest.mark.asyncio
+async def test_rebuild_release_reselects_after_tail_commit(tmp_path, monkeypatch):
+    root, db, archive, p = projector_fixture(tmp_path)
+    await start_ready(p)
+    original = p._catch_up
+    appended = []
+    def append_after_commit(target):
+        original(target)
+        if not appended:
+            appended.append(True)
+            append_line(root / 'whatsapp/2026-11.jsonl', dumps(observation(native_id='LATE-TAIL')))
+    monkeypatch.setattr(p, '_catch_up', append_after_commit)
+    try:
+        await p.rebuild(reason='owner_request')
+        await oracle_parity(p, root, tmp_path)
+        assert p.health()['lag_lines'] == 0
+    finally:
+        await p.stop()
+
+
+@pytest.mark.asyncio
+async def test_rebuild_mutation_is_not_repeated_after_verify_failure(tmp_path, monkeypatch):
+    from yeoman_gateway.history import live
+    root, db, archive, p = projector_fixture(tmp_path)
+    await start_ready(p)
+    calls = []
+    original = live.verify_rebuild_candidate
+    def fail(*args, **kwargs):
+        raise ValueError('synthetic failure')
+    monkeypatch.setattr(live, 'verify_rebuild_candidate', fail)
+    try:
+        with pytest.raises(ValueError):
+            await p.rebuild(reason='owner_request', mutation=lambda fd: calls.append(fd))
+        assert len(calls) == 1
+        monkeypatch.setattr(live, 'verify_rebuild_candidate', original)
+        await p.rebuild(reason='recovery')
+        assert len(calls) == 1
+    finally:
+        await p.stop()
+
+
+@pytest.mark.asyncio
+async def test_purge_pending_recovery_append_forces_live_repair(tmp_path, monkeypatch):
+    from yeoman_gateway.history.live import HistoryPaused
+    from yeoman_shared.raw_archive import purge as purge_module
+    from yeoman_shared.raw_archive.purge import PurgeSelector, purge
+    root, db, archive, p = projector_fixture(tmp_path)
+    row = observation(native_id='M0')
+    row['chat_id'] = G
+    write_jsonl(root / 'whatsapp/2026-10.jsonl', [row])
+    project([root], db, publish_lineage_root=root)
+    await start_ready(p)
+    original = purge_module._fsync_directory
+    replaced = []
+    original_replace = purge_module.os.replace
+    def replace(source, target):
+        original_replace(source, target)
+        if target == root / 'whatsapp/2026-10.jsonl':
+            replaced.append(True)
+    def fail(directory):
+        if replaced:
+            raise OSError('synthetic purge interruption')
+        return original(directory)
+    monkeypatch.setattr(purge_module.os, 'replace', replace)
+    monkeypatch.setattr(purge_module, '_fsync_directory', fail)
+    try:
+        with pytest.raises(OSError):
+            await p.rebuild(reason='purge', mutation=lambda fd: purge(root, PurgeSelector(channel='whatsapp', native_id='M0'), operator='synthetic', projection_owner_fd=fd))
+        monkeypatch.setattr(purge_module, '_fsync_directory', original)
+        assert archive.append_durable(RawEvent(channel='whatsapp', kind='message', direction='in', chat_id=G, account='default', native=observation(native_id='RECOVERED')['native'], received_ms=T0))
+        with pytest.raises(HistoryPaused):
+            await p.read_turn()
+        await p.rebuild(reason='recovery')
+        s = await p.read_turn()
+        try:
+            assert s.connection.execute('SELECT native_message_id FROM messages').fetchall() == [('RECOVERED',)]
+        finally:
+            s.close()
+        await oracle_parity(p, root, tmp_path)
+    finally:
+        await p.stop()
+
+
+@pytest.mark.asyncio
+async def test_rebuild_repairs_absent_database_without_enabling_consumers(tmp_path):
+    from yeoman_gateway.history.live import HistoryPaused, HistoryProjector
+    root, db, archive = fixture(tmp_path)
+    db.unlink()
+    p = HistoryProjector(root, db, archive)
+    await start_ready(p)
+    try:
+        with pytest.raises(HistoryPaused):
+            await p.read_turn()
+        await p.rebuild(reason='owner_request')
+        assert p.health()['status'] == 'ready'
+        await oracle_parity(p, root, tmp_path)
+    finally:
+        await p.stop()
+
+
+@pytest.mark.asyncio
+async def test_rebuild_identity_tail_stays_in_one_fence_until_second_verified_prefix(tmp_path, monkeypatch):
+    from test_hist_incremental import PN
+    from yeoman_gateway.history import live
+    from yeoman_gateway.history.attestations import make
+    root, db, archive, p = projector_fixture(tmp_path)
+    await start_ready(p)
+    original = live.project
+    builds = []
+    def owner_tail(roots, candidate, **kwargs):
+        result = original(roots, candidate, **kwargs)
+        builds.append(True)
+        assert p.health()['status'] == 'rebuilding'
+        if len(builds) == 1:
+            append_line(root / 'owner/attestations.jsonl', dumps(make('name', T0, 'synthetic tail', anchor=PN, name='Tail identity')))
+        return result
+    monkeypatch.setattr(live, 'project', owner_tail)
+    generation = p.health()['generation']
+    try:
+        await p.rebuild(reason='owner_request')
+        assert len(builds) == 2
+        assert p.health()['generation'] == generation + 2
+        await oracle_parity(p, root, tmp_path)
     finally:
         await p.stop()

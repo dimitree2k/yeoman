@@ -4,13 +4,18 @@ from __future__ import annotations
 
 import asyncio
 import json
+import os
+import socket
+import struct
 import time
-from collections.abc import Awaitable, Callable
+from collections.abc import Awaitable, Callable, Mapping
 from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any
 
 from loguru import logger
+
+from yeoman_gateway.history.control import MAX_IPC_REQUEST_BYTES, validate_control
 
 
 @dataclass
@@ -30,6 +35,7 @@ class GatewaySocket:
     a2a_capabilities_handler: Callable[[], Awaitable[dict[str, Any]]] | None = None
     publish_event_handler: Callable[..., Awaitable[dict]] | None = None
     get_session_state_handler: Callable[..., Awaitable[dict]] | None = None
+    history_control_handler: Callable[[str, Mapping[str, Any]], Awaitable[dict[str, Any]]] | None = None
     rate_limit: int = 10  # commands per second
     _server: asyncio.Server | None = field(default=None, init=False)
     _request_timestamps: list[float] = field(default_factory=list, init=False)
@@ -38,7 +44,7 @@ class GatewaySocket:
         if self.path.exists():
             self.path.unlink()
         self.path.parent.mkdir(parents=True, exist_ok=True)
-        self._server = await asyncio.start_unix_server(self._handle_client, path=str(self.path))
+        self._server = await asyncio.start_unix_server(self._handle_client, path=str(self.path), limit=MAX_IPC_REQUEST_BYTES)
         self.path.chmod(0o600)
         logger.info("Gateway IPC socket listening on {}", self.path)
 
@@ -58,33 +64,74 @@ class GatewaySocket:
         self._request_timestamps.append(now)
         return True
 
+    def _peer_is_owner(self, writer: asyncio.StreamWriter) -> bool:
+        try:
+            peer = writer.get_extra_info('socket')
+            credentials = peer.getsockopt(socket.SOL_SOCKET, socket.SO_PEERCRED, struct.calcsize('3i'))
+            return struct.unpack('3i', credentials)[1] == os.getuid()
+        except (AttributeError, OSError, struct.error):
+            return False
+
     async def _handle_client(
         self, reader: asyncio.StreamReader, writer: asyncio.StreamWriter
     ) -> None:
         try:
             while True:
-                line = await reader.readline()
-                if not line:
+                oversized = False
+                try:
+                    line = await reader.readline()
+                    if not line:
+                        break
+                    oversized = len(line) > MAX_IPC_REQUEST_BYTES
+                except ValueError:
+                    oversized = True
+                if oversized:
+                    writer.write(b'{"status":"error","code":"REQUEST_TOO_LARGE"}\n')
+                    await writer.drain()
                     break
                 try:
                     request = json.loads(line)
-                    if not self._check_rate_limit():
+                    if (not isinstance(request, dict) or not isinstance(request.get('cmd'), str) or
+                            not isinstance(request.get('args', {}), dict)):
+                        raise ValueError('invalid frame')
+                    if request['cmd'] == 'history_control' and not self._peer_is_owner(writer):
+                        response = {'status': 'error', 'code': 'OWNER_REQUIRED'}
+                    elif not self._check_rate_limit():
                         response = {"status": "error", "message": "Rate limit exceeded"}
                     else:
                         response = await self._dispatch(request)
-                except json.JSONDecodeError:
-                    response = {"status": "error", "message": "Invalid JSON"}
+                except (ValueError, UnicodeError):
+                    response = {"status": "error", "code": "INVALID_REQUEST", "message": "Invalid JSON"}
                 writer.write(json.dumps(response).encode() + b"\n")
                 await writer.drain()
-        except ConnectionResetError:
+        except (ConnectionError, OSError):
             pass
         finally:
             writer.close()
-            await writer.wait_closed()
+            try:
+                await writer.wait_closed()
+            except (ConnectionError, OSError):
+                pass
 
     async def _dispatch(self, request: dict[str, Any]) -> dict[str, Any]:
         cmd = request.get("cmd", "")
         args = request.get("args", {})
+
+        if cmd == 'history_control':
+            try:
+                if set(request) != {'cmd', 'args'} or 'operation' not in args:
+                    raise ValueError('INVALID_OPERATION')
+                operation = args['operation']
+                arguments = {key: value for key, value in args.items() if key != 'operation'}
+                validate_control(operation, arguments)
+                if self.history_control_handler is None:
+                    return {'status': 'disabled'}
+                task: asyncio.Future[dict[str, Any]] = asyncio.ensure_future(self.history_control_handler(operation, arguments))
+                return await asyncio.shield(task)
+            except ValueError:
+                return {'status': 'error', 'code': 'INVALID_OPERATION'}
+            except Exception:
+                return {'status': 'error', 'code': 'HISTORY_CONTROL_FAILED'}
 
         if cmd == "ping":
             return {"status": "ok", "response": "pong"}

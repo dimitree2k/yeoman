@@ -212,9 +212,17 @@ def test_lineage_never_overwrites_existing_contact_or_purged_ref(witness, tmp_pa
         publish_lineage(other.root, [generated], first_published_ms=200)
     other.append(_raw('message', 'message', {'messageId': 'fresh', 'senderId': L, 'text': 'synthetic'}, received=300))
     fresh = build_rows(extract(iter_layer1([other.root]))).resolution.generated_ids
+    # Task 7 physically tombstones the old receipt; fresh evidence gets a new reservation.
+    receipts = publish_lineage(other.root, fresh, first_published_ms=300)
+    assert len(receipts) == 1 and receipts[0].line_number == 2
+    rows = [json.loads(line) for line in (other.root / 'derived/contact-ids.jsonl').read_text().splitlines()]
+    assert rows[0] == {'purged_version': 1}
+    assert rows[1]['source_refs'] == list(fresh[0].source_refs)
+    assert not set(rows[1]['source_refs']).intersection(reserved['source_refs'])
     with pytest.raises(ValueError, match='disposed'):
-        publish_lineage(other.root, fresh, first_published_ms=300)
-    assert other.contact_row(reserved['contact_id']) is None
+        publish_lineage(other.root, [generated], first_published_ms=400)
+    other.rebuild_into_fresh_database_without_previous_db()
+    assert other.contact_row(reserved['contact_id']) is not None
 
 
 def test_lineage_incremental_publication_and_external_reservation(witness, monkeypatch):
