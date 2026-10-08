@@ -371,8 +371,25 @@ def _event_complete(copy: EventCopy) -> bool:
     return True
 
 
+def _payload_json(payload: dict[str, Any], cache: dict[int, str]) -> str:
+    ident = id(payload)
+    if ident not in cache:
+        cache[ident] = canonical_json(payload)
+    return cache[ident]
+
+
+def _event_payload(copy: EventCopy, cache: dict[int, str]) -> str:
+    payload = copy.payload
+    if copy.kind in ("group_subject", "group_description") and not payload["snapshot"] and "occurredMs" in payload:
+        # Keep the stored observation time, but exclude it from the deduplication key.
+        return canonical_json({k: v for k, v in payload.items() if k != "observedAtMs"})
+    return _payload_json(payload, cache)
+
+
 def _events(ex: Extracted, res: Resolution, arvid: str | None, message_ids: set[str],
-            review: dict[str, Any], authors: dict[str, AuthorCorrection]) -> list[dict[str, Any]]:
+            review: dict[str, Any], authors: dict[str, AuthorCorrection],
+            payload_cache: dict[int, str] | None = None) -> list[dict[str, Any]]:
+    payload_cache = {} if payload_cache is None else payload_cache
     groups: dict[tuple[str, ...], list[tuple[EventCopy, str | None, str]]] = defaultdict(list)
     purged: list[tuple[tuple[str, ...], tuple[EventCopy, str | None, str]]] = []
     for copy in ex.events:
@@ -381,10 +398,7 @@ def _events(ex: Extracted, res: Resolution, arvid: str | None, message_ids: set[
         base = (copy.kind, copy.channel, copy.chat_id, copy.target_native_id or "", actor_key)
         item = (copy, actor, basis)
         if _event_complete(copy):
-            payload = copy.payload
-            if copy.kind in ("group_subject", "group_description") and not payload["snapshot"] and "occurredMs" in payload:
-                payload = {k: v for k, v in payload.items() if k != "observedAtMs"}
-            groups[(*base, canonical_json(payload))].append(item)
+            groups[(*base, _event_payload(copy, payload_cache))].append(item)
         else:
             purged.append((base, item))
 
@@ -429,18 +443,19 @@ def _events(ex: Extracted, res: Resolution, arvid: str | None, message_ids: set[
 
     rows: list[dict[str, Any]] = []
     for key, members in clusters:
-        rows.append(_event_row(key, members, message_ids, authors))
+        rows.append(_event_row(key, members, message_ids, authors, payload_cache))
     for copy, actor, basis in unmatched:
         key = (copy.kind, copy.channel, copy.chat_id, copy.target_native_id or "",
-               actor or (copy.actor.value if copy.actor is not None else ""), canonical_json(copy.payload))
-        rows.append(_event_row(key, [(copy, actor, basis)], message_ids, authors))
+               actor or (copy.actor.value if copy.actor is not None else ""), _payload_json(copy.payload, payload_cache))
+        rows.append(_event_row(key, [(copy, actor, basis)], message_ids, authors, payload_cache))
     _mark_current_reactions(rows)
     rows.sort(key=lambda r: r["event_id"])
     return rows
 
 
 def _event_row(key: tuple[str, ...], members: list[tuple[EventCopy, str | None, str]],
-               message_ids: set[str], authors: dict[str, AuthorCorrection]) -> dict[str, Any]:
+               message_ids: set[str], authors: dict[str, AuthorCorrection],
+               payload_cache: dict[int, str]) -> dict[str, Any]:
     kind, channel, chat, target, _, payload_json = key
     copies = [c for c, _, _ in members]
     actor_item = min((item for item in members if item[0].actor_raw), default=min(members, key=lambda x: _order(x[0])),
@@ -461,6 +476,7 @@ def _event_row(key: tuple[str, ...], members: list[tuple[EventCopy, str | None, 
         "actor_identifier": actor_item[0].actor_raw, "actor_basis": basis,
         "occurred_ms": occurred_ms, "time_certainty": certainty,
         "payload": first.payload if kind in ("group_subject", "group_description") else json.loads(payload_json),
+        "_payload_json": _payload_json(first.payload, payload_cache) if kind in ("group_subject", "group_description") else payload_json,
         "provenance": min((c.provenance for c in copies), key=lambda p: _PROVENANCE.get(p, 3)),
         "source_refs": sorted({r for c in copies for r in (c.ref, *c.extra_refs)}
                               | {authors[c.ref].attestation.ref for c in copies if c.ref in authors}),
@@ -556,7 +572,7 @@ def write_rows(conn: sqlite3.Connection, rows: ProjectionRows, *,
                       "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)", [
         (e["event_id"], e["kind"], e["channel"], e["chat_id"], e["target_message_id"],
          e["target_native_id"], e["actor_contact_id"], e["actor_identifier"], e["actor_basis"],
-         e["occurred_ms"], e["time_certainty"], canonical_json(e["payload"]), e["provenance"],
+         e["occurred_ms"], e["time_certainty"], (e["_payload_json"] if e["kind"] != "reaction" else canonical_json(e["payload"])), e["provenance"],
          json.dumps(e["source_refs"]), e["native_event_id"]) for e in rows.events])
 
 

@@ -29,7 +29,6 @@ from yeoman_shared.raw_archive.writer import RawArchive
 from yeoman_shared.utils.helpers import get_operational_data_path
 
 from .incremental import ProjectionIndex, RebuildRequired, apply_committed
-from .project import project
 from .schema import PROJECTOR_VERSION, SCHEMA_VERSION
 from .verify import verify_rebuild_candidate
 
@@ -430,9 +429,11 @@ class HistoryProjector:
                 while True:
                     boundaries = enumerate_committed(self.raw_root)
                     prefix = directory / f'prefix-{iteration}'
+                    expected = {b.relative_path: (self.raw_root / b.relative_path).stat() for b in boundaries}
                     copy_committed(self.raw_root, boundaries, prefix)
+                    index = ProjectionIndex.from_prefix(prefix, boundaries)
                     candidate = directory / 'candidate.db'
-                    project([prefix], candidate, publish_lineage_root=self.raw_root)
+                    index.write_candidate(prefix, candidate, self.raw_root)
                     refreshed = enumerate_committed(self.raw_root)
                     old_lineage = [b for b in boundaries if b.relative_path == 'derived/contact-ids.jsonl']
                     new_lineage = [b for b in refreshed if b.relative_path == 'derived/contact-ids.jsonl']
@@ -460,7 +461,8 @@ class HistoryProjector:
                 self._publish_generation(generation)
                 self._open_writer()
                 try:
-                    self._index = ProjectionIndex.from_prefix(self.raw_root, boundaries)
+                    index.rebind(self.raw_root, expected)
+                    self._index = index
                     while True:
                         self.archive.drain_spool()
                         status = self.archive.status()

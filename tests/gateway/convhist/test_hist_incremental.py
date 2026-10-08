@@ -373,6 +373,34 @@ async def test_incremental_edit_delete_matches_full_in_both_arrival_orders(tmp_p
         await p.stop()
 
 
+def assert_candidate_matches_project(root, out):
+    from yeoman_gateway.history.verify import verify_rebuild_candidate
+    from yeoman_shared.raw_archive.records import copy_committed
+
+    out.mkdir()
+    iteration = 0
+    while True:
+        boundaries = enumerate_committed(root)
+        prefix = out / f'prefix-{iteration}'
+        copy_committed(root, boundaries, prefix)
+        index = ProjectionIndex.from_prefix(prefix, boundaries)
+        candidate = out / 'candidate.db'
+        index.write_candidate(prefix, candidate, root)
+        if enumerate_committed(root) == boundaries:
+            break
+        iteration += 1
+        assert iteration <= 1
+    oracle = out / 'project.db'
+    project([prefix], oracle)
+    assert table_digest(candidate) == table_digest(oracle)
+    with closing(sqlite3.connect(candidate)) as actual, closing(sqlite3.connect(oracle)) as expected:
+        assert actual.execute('SELECT * FROM projector_state ORDER BY file').fetchall() == expected.execute(
+            'SELECT * FROM projector_state ORDER BY file').fetchall()
+    assert verify_rebuild_candidate([prefix], candidate, boundaries=boundaries)['verified']
+    assert verify_rebuild_candidate([prefix], oracle, boundaries=boundaries)['verified']
+    return iteration
+
+
 @pytest.mark.asyncio
 @pytest.mark.parametrize('case', ['frozen_shaped', 'append', 'restart', 'late_evidence', 'window',
                                  'merge', 'unmerge', 'month_rollover', 'wal', 'purge'])
@@ -408,6 +436,7 @@ async def test_incremental_matches_full_rebuild_fixture_matrix(engine, case, tmp
             await oracle_parity(p, engine.root, tmp_path)
         finally:
             await p.stop()
+        assert_candidate_matches_project(engine.root, tmp_path / 'candidate-parity')
         return
     if case == 'wal':
         assert engine.conn.execute('PRAGMA journal_mode=WAL').fetchone()[0] == 'wal'
@@ -425,6 +454,7 @@ async def test_incremental_matches_full_rebuild_fixture_matrix(engine, case, tmp
     report = engine.apply()
     assert report['accounting_ok']
     engine.parity()
+    assert_candidate_matches_project(engine.root, tmp_path / 'candidate-parity')
 
 
 @pytest.mark.parametrize('mutation', ['truncate', 'equal_size', 'tombstone', 'missing', 'inode'])
@@ -970,3 +1000,53 @@ async def test_benchmark_first_seen_pair_commits_original_vector_then_arriving_t
             snapshot.close()
     finally:
         await p.stop()
+
+
+@pytest.mark.parametrize('purged', [False, True])
+def test_candidate_lineage_publishing_prefix(tmp_path, purged):
+    e = EngineFixture(tmp_path)
+    try:
+        e.append(observation(native_id='NEW-LINEAGE', sender='4915558888888@s.whatsapp.net'))
+        if purged:
+            path = e.root / 'whatsapp/2026-01.jsonl'
+            rows = path.read_text().splitlines()
+            rows[0] = canonical_json({'purged_version': 1})
+            path.write_text('\n'.join(rows) + '\n')
+        assert assert_candidate_matches_project(e.root, tmp_path / 'candidate-parity') == 1
+    finally:
+        e.close()
+
+
+@pytest.mark.parametrize('segment', [False, True])
+def test_candidate_purged_prefix_runtime(tmp_path, segment):
+    e = EngineFixture(tmp_path)
+    try:
+        if segment:
+            row = _bf('memory', 'message', {'segments': [
+                {'senderId': '4915558888888@s.whatsapp.net', 'text': 'purged segment'},
+                {'senderId': PN, 'text': 'retained segment'}]}, chat=G)
+            e.append(row, 'backfill/memory.jsonl')
+            project([e.root], tmp_path / 'issued.db', publish_lineage_root=e.root)
+            issued = [json.loads(line) for line in (e.root / 'derived/contact-ids.jsonl').read_text().splitlines()]
+            assert any('backfill/memory.jsonl#1/0' in line['source_refs'] for line in issued)
+            row['payload']['segments'][0] = {'purged_version': 1}
+            (e.root / 'backfill/memory.jsonl').write_text(canonical_json(row) + '\n')
+        else:
+            (e.root / 'whatsapp/2026-01.jsonl').write_text(canonical_json({'purged_version': 1}) + '\n')
+        assert_candidate_matches_project(e.root, tmp_path / 'candidate-parity')
+    finally:
+        e.close()
+
+
+def test_current_reactions_match_with_opposite_event_insertion_order(engine):
+    for sender, ms in [(PN, T0), ('4915551000001@s.whatsapp.net', T0 + 1000)]:
+        engine.append(observation('reaction', native_id='SEED', sender=sender, ms=ms))
+        engine.apply()
+    project([engine.root], engine.oracle)
+    with closing(sqlite3.connect(engine.oracle)) as full:
+        incremental_order = engine.conn.execute("SELECT event_id FROM message_events WHERE kind='reaction' ORDER BY rowid").fetchall()
+        full_order = full.execute("SELECT event_id FROM message_events WHERE kind='reaction' ORDER BY rowid").fetchall()
+        assert len(incremental_order) == 2 and incremental_order == list(reversed(full_order))
+        query = "SELECT reactions FROM messages_current WHERE native_message_id='SEED'"
+        assert engine.conn.execute(query).fetchone() == full.execute(query).fetchone()
+    engine.parity()

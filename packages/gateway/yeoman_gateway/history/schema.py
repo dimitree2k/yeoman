@@ -111,9 +111,14 @@ SELECT m.*,
            WHERE e.target_message_id = m.message_id AND e.kind = 'delete') AS deleted,
   (SELECT json_group_array(json_object('actor', r.actor_contact_id,
                                        'emoji', json_extract(r.payload_json, '$.emoji')))
-     FROM message_events r
-    WHERE r.target_message_id = m.message_id AND r.kind = 'reaction'
-      AND json_extract(r.payload_json, '$.current') = 1) AS reactions
+     FROM (
+       SELECT r.actor_contact_id, r.payload_json
+         FROM message_events r
+        WHERE r.target_message_id = m.message_id AND r.kind = 'reaction'
+          AND json_extract(r.payload_json, '$.current') = 1
+        -- NULL times sort first; event_id breaks time ties independently of insertion order.
+        ORDER BY r.occurred_ms, r.event_id
+     ) r) AS reactions
 FROM messages m;
 """
 

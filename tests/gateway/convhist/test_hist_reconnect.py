@@ -27,10 +27,10 @@ def membership(number, *, new=False, ms=T0):
 def burst(new=False):
     rows = [membership(i, new=new and i < 3, ms=T0 + 60000) for i in range(18)]
     rows += [_raw('group_subject', 'group_subject', {'chatJid': f'reconnect-{i}@g.us',
-              'subject': f'Synthetic group {i}', 'snapshot': True, 'timestamp': T0 + 60000}, received=T0 + 60000)
+              'value': f'Synthetic group {i}', 'snapshot': True, 'observedAtMs': T0 + 60000}, received=T0 + 60000)
              for i in range(18)]
     rows += [_raw('group_description', 'group_description', {'chatJid': f'reconnect-{i}@g.us',
-              'description': f'Synthetic description {i}', 'snapshot': True, 'timestamp': T0 + 60000}, received=T0 + 60000)
+              'value': f'Synthetic description {i}', 'snapshot': True, 'observedAtMs': T0 + 60000}, received=T0 + 60000)
              for i in range(5)]
     rows += [observation(native_id=f'RECONNECT-{i}', sender='4915552000000@s.whatsapp.net',
                          chat='reconnect-0@g.us', ms=T0 + 60000 + i) for i in range(2)]
@@ -201,6 +201,8 @@ def test_reconnect_burst_cost_at_30k(tmp_path, monkeypatch, new, per_line):
     rows = [observation(native_id=f'M{i}', sender=f'{4915554000000 + i % 1500}@s.whatsapp.net',
                         chat='large@g.us' if i < 10000 else f'chat-{i % 200}@g.us',
                         text=f'Synthetic body {i}', ms=T0 + i) for i in range(30000)]
+    for n in range(8):
+        rows += with_double_bound_member([membership(i, ms=T0 - (n + 1) * 300000) for i in range(18)])
     rows += with_double_bound_member([membership(i) for i in range(18)])
     path = write_jsonl(root / 'whatsapp/2026-01.jsonl', rows)
     write_jsonl(root / 'backfill/journal.jsonl', legacy_numerics())
@@ -461,6 +463,121 @@ def test_reconnect_numeric_ambiguity_between_existing_owners_uses_global_path(tm
         e.append(row)
         e.apply()
         assert len(calls) == 1
+        e.parity()
+    finally:
+        e.close()
+
+
+@pytest.mark.parametrize('kind', ['membership', 'group_subject', 'group_description'])
+@pytest.mark.parametrize('offset', [60000, 120000, 120001, -60000])
+def test_snapshot_cluster_closure_parity(tmp_path, monkeypatch, kind, offset):
+    import yeoman_gateway.history.incremental as incremental
+
+    def snapshot(ms):
+        if kind == 'membership':
+            return membership(0, ms=ms)
+        return _raw(kind, kind, {'chatJid': 'reconnect-0@g.us', 'value': 'Same value',
+                    'snapshot': True, 'observedAtMs': ms}, received=ms)
+
+    e = EngineFixture(tmp_path)
+    try:
+        for ms in [T0, T0 + 100000, T0 + 200000, T0 + 310000, T0 + 1000000]:
+            e.append(snapshot(ms))
+        e.apply()
+        far = {c.ref for ex in e.index._extracted.values() for c in ex.events
+               if c.chat_id == 'reconnect-0@g.us' and c.occurred_ms == T0 + 1000000}
+        assert far
+        normalized = []
+        original = incremental._events
+        def measured(ex, *args, **kwargs):
+            normalized.extend(c.ref for c in ex.events)
+            return original(ex, *args, **kwargs)
+        monkeypatch.setattr(incremental, '_events', measured)
+        statements = []
+        e.conn.set_trace_callback(statements.append)
+        for delta in [0, 1]:
+            e.append(snapshot(T0 + offset + delta))
+        e.apply()
+        assert not far.intersection(normalized)
+        far_ids = {eid for eid, row in e.index._events_rows.items() if far.intersection(row['source_refs'])}
+        assert not any(eid in sql for eid in far_ids for sql in statements
+                       if sql.startswith(('DELETE FROM message_events', 'INSERT INTO message_events')))
+        e.parity()
+        e.restart()
+        e.parity()
+    finally:
+        e.close()
+
+
+def test_snapshot_unchanged_event_rows_survive_broad_closure(tmp_path, monkeypatch):
+    e = EngineFixture(tmp_path)
+    try:
+        for ms in [T0, T0 + 300000, T0 + 600000]:
+            e.append(membership(0, ms=ms))
+        e.apply()
+        all_units = {key for key, ex in e.index._extracted.items() if ex.events}
+        original = e.index._closure
+        monkeypatch.setattr(e.index, '_closure', lambda changes: original(changes) | all_units)
+        e.append(membership(0, ms=T0 + 60000))
+        statements = []
+        e.conn.set_trace_callback(statements.append)
+        e.apply()
+        assert len([sql for sql in statements if sql.startswith('DELETE FROM message_events WHERE event_id=')]) == 1
+        assert len([sql for sql in statements if sql.startswith('INSERT INTO message_events')]) == 1
+        e.parity()
+    finally:
+        e.close()
+
+
+def test_snapshot_payload_serialized_once_per_apply(tmp_path, monkeypatch):
+    from collections import Counter
+
+    import yeoman_gateway.history.project as projection
+
+    e = EngineFixture(tmp_path)
+    try:
+        e.append(membership(0))
+        e.apply()
+        calls = Counter()
+        original = projection.canonical_json
+        def measured(value):
+            if isinstance(value, dict) and 'participants' in value:
+                calls[id(value)] += 1
+            return original(value)
+        e.append(membership(0, ms=T0 + 60000))
+        with monkeypatch.context() as patch:
+            patch.setattr(projection, 'canonical_json', measured)
+            e.apply()
+        assert calls and max(calls.values()) == 1
+        e.parity()
+    finally:
+        e.close()
+
+
+def test_snapshot_closure_excludes_other_group_event_bases(tmp_path, monkeypatch):
+    import yeoman_gateway.history.incremental as incremental
+
+    e = EngineFixture(tmp_path)
+    try:
+        for ms in [T0, T0 + 300000, T0 + 1000000]:
+            e.append(membership(0, ms=ms))
+        actor_snapshot = membership(0, ms=T0 + 10000)
+        actor_snapshot['native']['payload']['actor'] = '4915552000000@s.whatsapp.net'
+        e.append(actor_snapshot)
+        e.append(_raw('group_subject', 'group_subject', {'chatJid': 'reconnect-0@g.us',
+                 'value': 'Update', 'snapshot': False, 'observedAtMs': T0 + 20000}, received=T0 + 20000))
+        e.apply()
+        normalized = []
+        original = incremental._events
+        def measured(ex, *args, **kwargs):
+            normalized.extend(c for c in ex.events)
+            return original(ex, *args, **kwargs)
+        monkeypatch.setattr(incremental, '_events', measured)
+        e.append(membership(0, ms=T0 + 60000))
+        e.apply()
+        assert normalized
+        assert all(c.kind == 'member_snapshot' and c.actor is None
+                   and c.occurred_ms <= T0 + 120000 for c in normalized)
         e.parity()
     finally:
         e.close()

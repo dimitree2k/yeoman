@@ -1203,21 +1203,114 @@ async def test_rebuild_identity_tail_stays_in_one_fence_until_second_verified_pr
     from yeoman_gateway.history.attestations import make
     root, db, archive, p = projector_fixture(tmp_path)
     await start_ready(p)
-    original = live.project
+    original = live.ProjectionIndex.write_candidate
     builds = []
-    def owner_tail(roots, candidate, **kwargs):
-        result = original(roots, candidate, **kwargs)
+    def owner_tail(index, prefix, candidate, raw_root):
+        result = original(index, prefix, candidate, raw_root)
         builds.append(True)
         assert p.health()['status'] == 'rebuilding'
         if len(builds) == 1:
             append_line(root / 'owner/attestations.jsonl', dumps(make('name', T0, 'synthetic tail', anchor=PN, name='Tail identity')))
         return result
-    monkeypatch.setattr(live, 'project', owner_tail)
+    monkeypatch.setattr(live.ProjectionIndex, 'write_candidate', owner_tail)
     generation = p.health()['generation']
     try:
         await p.rebuild(reason='owner_request')
         assert len(builds) == 2
         assert p.health()['generation'] == generation + 2
+        await oracle_parity(p, root, tmp_path)
+    finally:
+        await p.stop()
+
+
+@pytest.mark.asyncio
+async def test_rebuild_reuses_candidate_index_after_replace(tmp_path, monkeypatch):
+    from yeoman_gateway.history import live
+    root, db, archive, p = projector_fixture(tmp_path)
+    await start_ready(p)
+    original_build = live.ProjectionIndex.from_prefix
+    original_replace = p._replace_candidate
+    replaced, builds = [], []
+    def build(source, boundaries):
+        assert not replaced, 'full index build after replace'
+        builds.append(source)
+        return original_build(source, boundaries)
+    def replace(candidate):
+        original_replace(candidate)
+        replaced.append(True)
+    monkeypatch.setattr(live.ProjectionIndex, 'from_prefix', build)
+    monkeypatch.setattr(p, '_replace_candidate', replace)
+    try:
+        await p.rebuild(reason='synthetic')
+        assert len(builds) == 1 and builds[0] != root
+        await oracle_parity(p, root, tmp_path)
+    finally:
+        await p.stop()
+
+
+@pytest.mark.parametrize('mutation', ['rewrite', 'replace', 'truncate', 'rewrite_grow'])
+def test_index_rebind_refuses_changed_prefix(tmp_path, mutation):
+    from yeoman_gateway.history.incremental import ProjectionIndex, RebuildRequired
+    from yeoman_shared.raw_archive.records import copy_committed
+    root, db, archive = fixture(tmp_path)
+    boundaries = enumerate_committed(root)
+    expected = {b.relative_path: (root / b.relative_path).stat() for b in boundaries}
+    prefix = tmp_path / 'prefix'
+    copy_committed(root, boundaries, prefix)
+    index = ProjectionIndex.from_prefix(prefix, boundaries)
+    path = root / next(b.relative_path for b in boundaries if b.relative_path.startswith('whatsapp/'))
+    data = path.read_bytes()
+    assert b'M0' in data
+    if mutation == 'replace':
+        replacement = path.with_suffix('.replacement')
+        replacement.write_bytes(data)
+        os.replace(replacement, path)
+    elif mutation == 'truncate':
+        path.write_bytes(data[:10])
+    else:
+        path.write_bytes(data.replace(b'M0', b'M9') + (b'{}\n' if mutation == 'rewrite_grow' else b''))
+    with pytest.raises(RebuildRequired, match='changed'):
+        index.rebind(root, expected)
+
+
+@pytest.mark.perf
+@pytest.mark.asyncio
+async def test_rebuild_two_build_cost_at_30k(tmp_path, monkeypatch):
+    from yeoman_gateway.history import live
+    root, db = tmp_path / 'raw', tmp_path / 'history.db'
+    write_jsonl(root / 'whatsapp/2026-10.jsonl', [
+        observation(native_id=f'M{i}', sender=f'{4915554000000 + i % 1500}@s.whatsapp.net',
+                    chat=f'chat-{i % 200}@g.us', text=f'Synthetic body {i}', ms=T0 + i)
+        for i in range(30000)])
+    started = time.perf_counter()
+    project([root], db, publish_lineage_root=root)
+    full_build = time.perf_counter() - started
+    boundaries = enumerate_committed(root)
+    started = time.perf_counter()
+    live.verify_rebuild_candidate([root], db, boundaries=boundaries)
+    independent_verify = time.perf_counter() - started
+    original = live.ProjectionIndex.from_prefix
+    index_times = []
+    def measured(source, pinned):
+        started = time.perf_counter()
+        result = original(source, pinned)
+        index_times.append(time.perf_counter() - started)
+        return result
+    monkeypatch.setattr(live.ProjectionIndex, 'from_prefix', measured)
+    archive = RawArchive(root, spool=tmp_path / 'spool', status_path=tmp_path / 'status.json')
+    p = live.HistoryProjector(root, db, archive)
+    await start_ready(p)
+    try:
+        baseline = full_build + independent_verify + index_times[0]
+        started = time.perf_counter()
+        await p.rebuild(reason='synthetic perf')
+        elapsed = time.perf_counter() - started
+        print(f'rebuild full_build={full_build:.3f} independent_verify={independent_verify:.3f} '
+              f'full_index={index_times[0]:.3f} three_build_seconds={baseline:.3f} '
+              f'two_build_seconds={elapsed:.3f} saved_fraction={1 - elapsed / baseline:.3f}', flush=True)
+        assert len(index_times) == 2
+        # Regression guard: synthetic saving measured 13 %; real-volume rebuild 110.6 s -> 85.8 s (-22 %).
+        assert elapsed <= baseline * 0.90
         await oracle_parity(p, root, tmp_path)
     finally:
         await p.stop()

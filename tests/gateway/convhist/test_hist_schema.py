@@ -1,3 +1,4 @@
+import json
 import sqlite3
 
 import pytest
@@ -145,3 +146,23 @@ def test_history_v2_requires_rebuild(tmp_path):
         table_digest(path)
     assert path.read_bytes() == before
     assert not path.with_name(path.name + ".building").exists()
+
+
+@pytest.mark.parametrize('times, actors', [
+    ((None, 1000), ['c1', 'c2']),
+    ((1000, None), ['c2', 'c1']),
+    ((1000, 1000), ['c2', 'c1']),
+    ((None, None), ['c2', 'c1']),
+])
+def test_current_reactions_order_null_times_and_ties(db, times, actors):
+    _contact(db, 'c1')
+    _contact(db, 'c2')
+    _message(db)
+    for eid, cid, ms in [('z', 'c1', times[0]), ('a', 'c2', times[1])]:
+        db.execute(
+            "INSERT INTO message_events (event_id, kind, channel, chat_id, target_message_id, "
+            "actor_contact_id, actor_basis, occurred_ms, time_certainty, payload_json, provenance, source_refs) "
+            "VALUES (?, 'reaction', 'whatsapp', 'g@g.us', 'whatsapp:g@g.us:M1', ?, 'native_identifier', "
+            "?, 'unknown', '{\"emoji\":\"same\",\"current\":true}', 'native', '[]')", (eid, cid, ms))
+    reactions = db.execute('SELECT reactions FROM messages_current').fetchone()[0]
+    assert [reaction['actor'] for reaction in json.loads(reactions)] == actors

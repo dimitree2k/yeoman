@@ -26,15 +26,18 @@ from yeoman_shared.raw_archive.records import (
 
 from .extract import Description, EventCopy, Extracted, MediaRecord, MessageCopy, extract
 from .ids import Ident, classify, numeric_part
-from .layer1 import SUBDIRS, Layer1Line, canonical_json
+from .layer1 import SUBDIRS, Layer1Line, canonical_json, is_tombstone, layer1_files
 from .lineage import apply_lineage, publish_lineage
 from .project import (
     WINDOW_MS,
     ProjectionRows,
     _authors,
     _direction,
+    _event_complete,
+    _event_payload,
     _events,
     _messages,
+    _write,
     build_rows,
     write_rows,
 )
@@ -272,6 +275,9 @@ class _Plan:
 
 
 class ProjectionIndex:
+    _snapshot_times: dict[tuple[str, ...], list[tuple[bool, int, int, str, str]]]
+    _payload_cache: dict[int, str]
+    _accepted_payloads: dict[int, str]
     _lineage_records: list[Layer1Line]
     _reserved_ids: set[str]
     _blanks: dict[str, int]
@@ -316,6 +322,25 @@ class ProjectionIndex:
                                                        (info.st_dev, info.st_ino), info.st_size, info.st_mtime_ns)
         self._groups = _units(lines)
         self._extracted = {key: extract(group) for key, group in self._groups.items()}
+        # Lineage suppression depends on purged sources outside its extraction unit.
+        purged_refs = {line.ref for line in lines if is_tombstone(line.record or {})}
+        for line in lines:
+            payload = (line.record or {}).get('payload')
+            segments = payload.get('segments') if isinstance(payload, dict) else None
+            if isinstance(segments, list):
+                purged_refs.update(f'{line.ref}/{i}' for i, part in enumerate(segments)
+                                   if part == {'purged_version': 1})
+        for unit in self._extracted.values():
+            for line in list(unit.contact_id_records):
+                refs = (line.record or {})['source_refs']
+                if any(ref in purged_refs or ref.split('#')[0] + '#' + ref.split('#')[1].split('/')[0]
+                       in purged_refs for ref in refs):
+                    unit.contact_id_records.remove(line)
+                    outcome = (line.ref.split('#')[0], 'contact_id_lineage')
+                    unit.outcomes[outcome] -= 1
+                    if not unit.outcomes[outcome]:
+                        del unit.outcomes[outcome]
+                    unit.count(line.ref, 'skipped:purged')
         combined = _combine(self._extracted)
         rows = build_rows(combined)
         self._lineage_records = combined.contact_id_records
@@ -327,6 +352,9 @@ class ProjectionIndex:
         self._outcomes = {file: dict(counts) for file, counts in rows.report['outcomes'].items()}
         self._messages_rows = {m['message_id']: m for m in rows.messages}
         self._events_rows = {e['event_id']: e for e in rows.events}
+        self._snapshot_times = defaultdict(list)
+        self._payload_cache = {}
+        self._accepted_payloads = {}
         self._by_key = defaultdict(set)
         self._by_target = defaultdict(set)
         self._by_chat = defaultdict(set)
@@ -355,6 +383,51 @@ class ProjectionIndex:
             self._index_row(row, True, True)
         self._identity_indexes()
         return self
+
+    def write_candidate(self, prefix: Path, candidate: Path, raw_root: Path) -> None:
+        from yeoman_shared.raw_archive.records import enumerate_committed
+
+        missing = [item for item in self._resolution.generated_ids if item.contact_id not in self._reserved_ids]
+        if missing:
+            publish_lineage(raw_root, missing, first_published_ms=int(time.time() * 1000))
+        if self._lineage_records or missing:
+            enumerate_committed(raw_root)
+        self._report['unpublished_generated_ids'] = 0
+        rows = ProjectionRows(self._resolution, list(self._messages_rows.values()),
+                              list(self._events_rows.values()), self._report)
+        _write(candidate, rows, layer1_files([prefix]), self._pending)
+
+    def rebind(self, raw_root: Path, expected: dict[str, os.stat_result]) -> None:
+        files = {}
+        for boundary in self._boundaries:
+            path = raw_root / boundary.relative_path
+            _no_symlinks(path)
+            try:
+                fd = lock_file(path)
+                try:
+                    info = os.fstat(fd)
+                    prior = expected[boundary.relative_path]
+                    if ((info.st_dev, info.st_ino) != (prior.st_dev, prior.st_ino)
+                            or info.st_size < boundary.end_offset
+                            or (info.st_size == prior.st_size and info.st_mtime_ns != prior.st_mtime_ns)):
+                        raise RebuildRequired('source changed before index rebind')
+                    digest, offset = hashlib.sha256(), 0
+                    while offset < boundary.end_offset:
+                        data = os.pread(fd, min(1024 * 1024, boundary.end_offset - offset), offset)
+                        if not data:
+                            raise RebuildRequired('source changed before index rebind')
+                        digest.update(data)
+                        offset += len(data)
+                    if digest.hexdigest() != boundary.prefix_sha256:
+                        raise RebuildRequired('committed prefix changed before index rebind')
+                    state = self._files[boundary.relative_path]
+                    files[boundary.relative_path] = _File(boundary, state.digest, (info.st_dev, info.st_ino),
+                                                          info.st_size, info.st_mtime_ns)
+                finally:
+                    os.close(fd)
+            except OSError as exc:
+                raise RebuildRequired('source changed before index rebind') from exc
+        self._files = files
 
     def _identity_indexes(self) -> None:
         self._contact_positions = {row.contact_id: i for i, row in enumerate(self._resolution.contacts)}
@@ -418,6 +491,15 @@ class ProjectionIndex:
                 if not c.native_id:
                     self._loose_texts[slot[:3]].add(c.text)
         for c in ex.events:
+            snapshot_slot = self._snapshot_key(c, self._payload_cache)
+            if snapshot_slot is not None:
+                snapshot_item = (c.occurred_ms is None, c.occurred_ms or 0, c.rank, c.ref, key)
+                if add:
+                    insort(self._snapshot_times[snapshot_slot], snapshot_item)
+                    self._accepted_payloads[id(c.payload)] = self._payload_cache[id(c.payload)]
+                else:
+                    self._snapshot_times[snapshot_slot].remove(snapshot_item)
+                    self._accepted_payloads.pop(id(c.payload), None)
             update(self._by_target, _target_key(c))
             if c.kind == 'reaction' and c.occurred_ms is not None:
                 items = self._reaction_times[(c.channel, c.chat_id)]
@@ -496,8 +578,52 @@ class ProjectionIndex:
             result.update(key for _, _, key in items[low:high])
         return result
 
+    @staticmethod
+    def _snapshot_key(event: EventCopy, cache: dict[int, str]) -> tuple[str, ...] | None:
+        if (event.kind not in ('member_snapshot', 'group_subject', 'group_description')
+                or event.actor is not None or not _event_complete(event)
+                or (event.kind != 'member_snapshot' and not event.payload.get('snapshot'))):
+            return None
+        return event.kind, event.channel, event.chat_id, _event_payload(event, cache)
+
+    def _snapshot_closure(self, changes: dict[str, Extracted]) -> set[str]:
+        additions: dict[tuple[str, ...], list[Any]] = defaultdict(list)
+        for key, ex in changes.items():
+            for event in ex.events:
+                slot = self._snapshot_key(event, self._payload_cache)
+                if slot is not None:
+                    additions[slot].append((event.occurred_ms is None, event.occurred_ms or 0,
+                                            event.rank, event.ref, key))
+
+        def clusters(items: list[Any]) -> dict[tuple[str, ...], set[str]]:
+            result: dict[tuple[str, ...], set[str]] = {}
+            current: list[Any] = []
+            first: int | None = None
+            for item in items:
+                moment = None if item[0] else item[1]
+                if current and (moment is None or first is None or moment - first > WINDOW_MS):
+                    result[tuple(c[3] for c in current)] = {c[4] for c in current}
+                    current, first = [], None
+                current.append(item)
+                if first is None and moment is not None:
+                    first = moment
+            if current:
+                result[tuple(c[3] for c in current)] = {c[4] for c in current}
+            return result
+
+        selected = set()
+        for slot, added in additions.items():
+            old = self._snapshot_times.get(slot, [])
+            before = clusters(old)
+            after = clusters(sorted([item for item in old if item[4] not in changes] + added))
+            # A late first item can shift several following first-item anchored clusters.
+            for refs in before.keys() ^ after.keys():
+                selected.update(before.get(refs, set()))
+                selected.update(after.get(refs, set()))
+        return selected
+
     def _closure(self, changes: dict[str, Extracted]) -> set[str]:
-        selected = set(changes)
+        selected = set(changes) | self._snapshot_closure(changes)
         todo = list(selected)
         while todo:
             key = todo.pop()
@@ -521,7 +647,8 @@ class ProjectionIndex:
                 for attachment in attachments:
                     related.update(self._by_key.get((attachment.channel, attachment.chat_id, attachment.native_id), ()))
                 for event in ex.events:
-                    related.update(self._by_target.get(_target_key(event), ()))
+                    if self._snapshot_key(event, self._payload_cache) is None:
+                        related.update(self._by_target.get(_target_key(event), ()))
                     if event.target_native_id:
                         related.update(self._by_key.get(_target_key(event), ()))
                     # Purged assistant echoes may attach across native targets in this chat.
@@ -875,11 +1002,12 @@ class ProjectionIndex:
             key = f'{c.channel}:{c.chat_id}:{c.target_native_id}'
             if key in self._messages_rows and key not in removed:
                 mids.add(key)
-        events = _events(ex, res, res.role_contact.get('assistant'), mids, res.review, authors)
+        events = _events(ex, res, res.role_contact.get('assistant'), mids, res.review, authors, self._payload_cache)
         return messages, events, unattached, res.review
 
     def plan(self, lines: Sequence[Layer1Line]) -> ProjectionDelta:
         self._staged = None
+        self._payload_cache = dict(self._accepted_payloads)
         groups, changes = {}, {}
         for key, additions in _units(lines).items():
             prior = {line.ref: line for line in self._groups.get(key, ())}
@@ -958,7 +1086,14 @@ class ProjectionIndex:
             report['contacts'] += sum(row.merged_into is None for row in added)
             report['provisional_contacts'] += sum(row.merged_into is None and row.status == 'provisional' for row in added)
             report['merged_contacts'] += sum(row.merged_into is not None for row in added)
-        delta = ProjectionDelta(rows, old_mids, old_eids, False, None, pending)
+        unchanged_messages = {row['message_id'] for row in messages
+                              if self._messages_rows.get(row['message_id']) == row}
+        unchanged_events = {row['event_id'] for row in events
+                            if self._events_rows.get(row['event_id']) == row
+                            and row['target_message_id'] not in old_mids - unchanged_messages}
+        rows.messages = [row for row in messages if row['message_id'] not in unchanged_messages]
+        rows.events = [row for row in events if row['event_id'] not in unchanged_events]
+        delta = ProjectionDelta(rows, old_mids - unchanged_messages, old_eids - unchanged_events, False, None, pending)
         self._staged = _Plan(delta, groups, changes, identity, sightings, replacements, contact_replacements, local)
         return delta
 
