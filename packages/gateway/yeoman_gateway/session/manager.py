@@ -6,11 +6,18 @@ import uuid
 from dataclasses import dataclass, field
 from datetime import datetime
 from pathlib import Path
-from typing import Any
+from typing import TYPE_CHECKING, Any
 
 from loguru import logger
 from yeoman_shared.raw_archive.paths import is_protected
-from yeoman_shared.utils.helpers import get_sessions_path, safe_filename
+from yeoman_shared.utils.helpers import get_operational_store_path, get_sessions_path, safe_filename
+
+from yeoman_gateway.history.live import HistoryPaused
+from yeoman_gateway.history.queries import HistoryQueries
+from yeoman_gateway.history.reader import HistorySnapshot
+
+if TYPE_CHECKING:
+    from .operational import OperationalSessions
 
 _LLM_HISTORY_METADATA_KEYS = frozenset(
     {
@@ -23,6 +30,10 @@ _LLM_HISTORY_METADATA_KEYS = frozenset(
         "reply_to_text",
     }
 )
+
+LEGACY_CONTEXT_MARKER = "[legacy chat context - not thread-bound]"
+LEGACY_CONTEXT_TURNS = 20
+LEGACY_CONTEXT_MAX_CHARS = 6000
 
 
 @dataclass
@@ -38,6 +49,13 @@ class Session:
     created_at: datetime = field(default_factory=datetime.now)
     updated_at: datetime = field(default_factory=datetime.now)
     metadata: dict[str, Any] = field(default_factory=dict)
+    operational_store: "OperationalSessions | None" = field(default=None, repr=False)
+    channel: str = ""
+    chat_id: str = ""
+    thread_id: str | None = None
+    history_snapshot: HistorySnapshot | None = field(default=None, repr=False)
+    current_message_id: str | None = None
+    turn_id: str = field(default_factory=lambda: uuid.uuid4().hex)
 
     def add_message(self, role: str, content: str, **kwargs: Any) -> None:
         """Add a message to the session."""
@@ -58,6 +76,12 @@ class Session:
         result: str,
     ) -> None:
         """Record a tool call trace (excluded from LLM context, kept for debugging)."""
+        if self.operational_store is not None:
+            self.operational_store.record_tool_trace(
+                session_key=self.key, turn_id=self.turn_id, tool_call_id=tool_call_id,
+                tool_name=tool_name, arguments=json.dumps(arguments, sort_keys=True),
+                result=result, at_ms=int(datetime.now().timestamp() * 1000))
+            return
         msg = {
             "role": "tool_trace",
             "tool_name": tool_name,
@@ -71,6 +95,11 @@ class Session:
 
     def add_boundary(self) -> None:
         """Insert a session boundary marker. get_history() will not look past this."""
+        if self.operational_store is not None:
+            self.operational_store.set_boundary(channel=self.channel, chat_id=self.chat_id,
+                                                at_ms=int(datetime.now().timestamp() * 1000))
+            self.messages.clear()
+            return
         self.messages.append({
             "role": "session_boundary",
             "timestamp": datetime.now().isoformat(),
@@ -92,11 +121,23 @@ class Session:
                 break
 
         start = boundary_idx + 1 if boundary_idx >= 0 else 0
+        operational_boundary = (self.operational_store.boundary(channel=self.channel, chat_id=self.chat_id)
+                                if self.operational_store is not None else None)
         candidates = [
             message
             for message in self.messages[start:]
             if message.get("hidden") is not True
         ]
+        if operational_boundary is not None:
+            dated = []
+            for message in candidates:
+                try:
+                    at_ms = int(datetime.fromisoformat(message["timestamp"]).timestamp() * 1000)
+                except (KeyError, TypeError, ValueError):
+                    continue
+                if at_ms > operational_boundary:
+                    dated.append(message)
+            candidates = dated
 
         # Apply max_messages limit.
         if len(candidates) > max_messages:
@@ -123,6 +164,52 @@ class Session:
                 if key in message and message[key] is not None:
                     row[key] = message[key]
             history.append(row)
+        if self.operational_store is not None:
+            if self.history_snapshot is None:
+                raise HistoryPaused("session_snapshot_required")
+            queries = HistoryQueries(self.history_snapshot)
+            rows = queries.recent(
+                chat_id=self.chat_id,
+                limit=min(max_messages, LEGACY_CONTEXT_TURNS) if self.thread_id and not self.chat_id.endswith("@g.us") else max_messages,
+                after_ms=operational_boundary)
+            projected = {("assistant" if row["direction"] == "out" else "user", row["native_message_id"])
+                         for row in rows if row["native_message_id"]}
+            rows = [row for row in rows if not (row["direction"] == "in" and self.current_message_id
+                                                and row["native_message_id"] == self.current_message_id)]
+            local = []
+            seen = set(projected)
+            for row in history:
+                native_id = row.get("message_id")
+                if row["role"] == "user" and self.current_message_id and native_id == self.current_message_id:
+                    continue
+                if native_id:
+                    key = (row["role"], native_id)
+                    if key in seen:
+                        continue
+                    message = queries.native_message(chat_id=self.chat_id, native_id=native_id)
+                    if message is not None and row["role"] == ("assistant" if message["direction"] == "out" else "user"):
+                        continue
+                    seen.add(key)
+                local.append(row)
+            history = local
+            preceding = [{"role": "assistant" if row["direction"] == "out" else "user",
+                          "content": row["current_text"] or "", "message_id": row["native_message_id"],
+                          "timestamp": row["sent_ms"], "sender_id": row["sender_identifier"]}
+                         for row in rows]
+            if self.thread_id and not self.chat_id.endswith("@g.us"):
+                bounded = []
+                total = 0
+                for row in reversed(preceding):
+                    row["content"] = " ".join(str(row["content"]).split())[:400]
+                    size = len(f"{row['role']}: {row['content']}")
+                    if total + size > LEGACY_CONTEXT_MAX_CHARS:
+                        break
+                    if row["content"]:
+                        bounded.append(row)
+                        total += size
+                preceding = [{"role": "system", "content": LEGACY_CONTEXT_MARKER + "\n" +
+                              "\n".join(f"{row['role']}: {row['content']}" for row in reversed(bounded))}] if bounded else []
+            return (preceding + history)[-max_messages:]
         return history
 
     def get_full_history(self) -> list[dict[str, Any]]:
@@ -142,18 +229,45 @@ class SessionManager:
     Sessions are stored as JSONL files in the sessions directory.
     """
 
-    def __init__(self, workspace: Path, sessions_dir: Path | None = None):
+    def __init__(self, workspace: Path, sessions_dir: Path | None = None, *,
+                 operational_store: "OperationalSessions | None" = None,
+                 history_selected: bool = False, legacy_history_disabled: bool = False):
         self.workspace = workspace
-        self.sessions_dir = sessions_dir if sessions_dir is not None else get_sessions_path()
-        self.sessions_dir.mkdir(parents=True, exist_ok=True)
+        self.operational_store = operational_store
+        self.history_selected = history_selected
+        self.legacy_history_disabled = legacy_history_disabled
+        if (history_selected or legacy_history_disabled) and operational_store is None:
+            from .operational import OperationalSessions
+            self.operational_store = OperationalSessions(get_operational_store_path("session_metadata"))
+        if history_selected or legacy_history_disabled:
+            # Resolve legacy location without creating a retired inbound directory.
+            self.sessions_dir = sessions_dir if sessions_dir is not None else get_sessions_path(create=False)
+        else:
+            self.sessions_dir = sessions_dir if sessions_dir is not None else get_sessions_path()
+            self.sessions_dir.mkdir(parents=True, exist_ok=True)
         self._cache: dict[str, Session] = {}
+
+    def uses_history(self, channel: str) -> bool:
+        if channel != "whatsapp":
+            return False
+        if self.legacy_history_disabled and not self.history_selected:
+            raise HistoryPaused("session_reader_unselected")
+        return self.history_selected
+
+    def recent_history(self, *, channel: str, chat_id: str, snapshot: HistorySnapshot,
+                       limit: int) -> list[dict[str, Any]]:
+        session = self.get_or_create(f"{channel}:{chat_id}", channel=channel, chat_id=chat_id,
+                                     history_snapshot=snapshot)
+        return session.get_history(max_messages=limit)
 
     def _get_session_path(self, key: str) -> Path:
         """Get the file path for a session."""
         safe_key = safe_filename(key.replace(":", "_"))
         return self.sessions_dir / f"{safe_key}.jsonl"
 
-    def get_or_create(self, key: str) -> Session:
+    def get_or_create(self, key: str, *, channel: str | None = None, chat_id: str | None = None,
+                      thread_id: str | None = None, history_snapshot: HistorySnapshot | None = None,
+                      turn_id: str | None = None, current_message_id: str | None = None) -> Session:
         """
         Get an existing session or create a new one.
 
@@ -163,6 +277,20 @@ class SessionManager:
         Returns:
             The session.
         """
+        if self.history_selected or self.legacy_history_disabled:
+            if channel is None and key.startswith("whatsapp:"):
+                raise ValueError("selected session routing requires explicit channel/chat")
+            # Legacy non-WhatsApp keys retain their callers; never decode a new-store route.
+            if channel is not None and self.uses_history(channel):
+                if chat_id is None:
+                    raise ValueError("selected session routing requires explicit channel/chat")
+                assert self.operational_store is not None
+                self.operational_store.set_route(session_key=key, channel=channel, chat_id=chat_id,
+                                                 thread_id=thread_id)
+                return Session(key=key, operational_store=self.operational_store,
+                               channel=channel, chat_id=chat_id, thread_id=thread_id,
+                               history_snapshot=history_snapshot, current_message_id=current_message_id,
+                               turn_id=turn_id or uuid.uuid4().hex)
         # Check cache
         if key in self._cache:
             return self._cache[key]
@@ -213,6 +341,10 @@ class SessionManager:
 
     def save(self, session: Session) -> None:
         """Save a session to disk."""
+        if session.operational_store is not None:
+            return
+        if self.legacy_history_disabled and session.key.startswith("whatsapp:"):
+            raise HistoryPaused("session_writer_retired")
         path = self._get_session_path(session.key)
         path.parent.mkdir(parents=True, exist_ok=True)
         temporary = path.with_name(f".{path.name}.{uuid.uuid4().hex}.tmp")

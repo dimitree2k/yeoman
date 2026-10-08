@@ -54,6 +54,7 @@ from yeoman_gateway.bus.events import OutboundMessage
 from yeoman_gateway.bus.queue import MessageBus
 from yeoman_gateway.core.models import InboundEvent, PolicyDecision
 from yeoman_gateway.core.ports import ResponderPort, SecurityPort, TelemetryPort
+from yeoman_gateway.history.reader import HistorySnapshot
 from yeoman_gateway.media.tts import (
     strip_markdown_for_tts,
     truncate_for_voice,
@@ -2448,6 +2449,7 @@ class LLMResponder(ResponderPort):
         session_history_limit: int | None = None,
         private_handoff_id: str | None = None,
         draft_only: bool = False,
+        history_snapshot: HistorySnapshot | None = None,
     ) -> str | None:
         # Serialize concurrent calls for the same session to prevent session
         # state corruption (lost messages, overwritten saves).
@@ -2474,6 +2476,7 @@ class LLMResponder(ResponderPort):
                 session_history_limit=session_history_limit,
                 private_handoff_id=private_handoff_id,
                 draft_only=draft_only,
+                history_snapshot=history_snapshot,
             )
 
     async def _generate_draft_only(
@@ -2620,6 +2623,7 @@ class LLMResponder(ResponderPort):
         session_history_limit: int | None = None,
         private_handoff_id: str | None = None,
         draft_only: bool = False,
+        history_snapshot: HistorySnapshot | None = None,
     ) -> str | None:
         if draft_only:
             return await self._generate_draft_only(
@@ -2659,10 +2663,24 @@ class LLMResponder(ResponderPort):
 
         canonical_id = resolve_canonical_user_id(channel, str(sender_id or ""), metadata)
 
-        session = self.sessions.get_or_create(session_key)
+        if self.sessions.history_selected or self.sessions.legacy_history_disabled:
+            from yeoman_gateway.processing.dispatch import CURRENT_TURN
+
+            binding = CURRENT_TURN.get(None)
+            turn = getattr(binding, "turn", None)
+            session = self.sessions.get_or_create(
+                session_key, channel=channel, chat_id=chat_id,
+                thread_id=getattr(turn, "thread_id", None),
+                turn_id=getattr(turn, "turn_id", None), history_snapshot=history_snapshot,
+                current_message_id=str(metadata.get("message_id") or "") or None)
+        else:
+            session = self.sessions.get_or_create(session_key)
 
         # Save session immediately on first message (even if no response yet)
-        if not session.messages:
+        if session.operational_store is not None:
+            # The triggering inbound is supplied once as current_message, outside history.
+            _user_message_already_added = True
+        elif not session.messages:
             session.add_message("user", content, **self._session_user_metadata(sender_id, metadata))
             self.sessions.save(session)
             # Track that we've already added the user message to avoid duplication
@@ -3313,6 +3331,7 @@ class LLMResponder(ResponderPort):
         decision: PolicyDecision,
         *,
         session_key: str | None = None,
+        history_snapshot: HistorySnapshot | None = None,
     ) -> str | None:
         route_channel, route_chat_id = self._route_for_event(event)
         # A caller that knows the thread passes a thread-scoped key; without one the
@@ -3370,6 +3389,7 @@ class LLMResponder(ResponderPort):
                 metadata["_contacts_roster_text"] = roster_text
         return await self._generate(
             session_key=session_key,
+            history_snapshot=history_snapshot,
             channel=route_channel,
             chat_id=route_chat_id,
             content=event.content,

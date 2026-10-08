@@ -16,6 +16,7 @@ from typing import Any
 
 from loguru import logger
 
+from yeoman_gateway.history.reader import HistorySnapshot
 from yeoman_gateway.processing.actor import (
     MAX_ADDITIONAL_GENERATIONS,
     ThreadActorRegistry,
@@ -25,12 +26,12 @@ from yeoman_gateway.processing.dispatch import CURRENT_TURN, EffectNotDeliveredE
 from yeoman_gateway.processing.models import TurnBinding
 from yeoman_gateway.processing.models import now_ms as _now_ms
 from yeoman_gateway.processing.threads import TurnAuthority
-
-#: Marked, bounded carry-over of the chat-scoped DM history into a thread session.
-#: The chat session itself is never modified, so the change is reversible by key only.
-LEGACY_CONTEXT_MARKER = "[legacy chat context - not thread-bound]"
-LEGACY_CONTEXT_TURNS = 20
-LEGACY_CONTEXT_MAX_CHARS = 6000
+from yeoman_gateway.session.manager import (
+    LEGACY_CONTEXT_MARKER,
+    LEGACY_CONTEXT_MAX_CHARS,
+    LEGACY_CONTEXT_TURNS,
+    SessionManager,
+)
 
 
 class ThreadActorResponder:
@@ -342,8 +343,9 @@ class ThreadActorResponder:
         return thread_session_key(channel, chat_id, thread_id)
 
     def _ensure_legacy_context(
-        self, *, channel: str, chat_id: str, session_key: str
-    ) -> None:
+        self, *, channel: str, chat_id: str, session_key: str,
+        history_snapshot: HistorySnapshot | None = None,
+    ) -> str | None:
         """Copy the chat-scoped history once into a thread session, clearly marked.
 
         The old chat session stays untouched, the copy is bounded in turns and characters,
@@ -356,6 +358,24 @@ class ThreadActorResponder:
         chat_key = f"{channel}:{chat_id}"
         if chat_key == session_key or str(chat_id).endswith("@g.us"):
             return
+        if isinstance(sessions, SessionManager) and sessions.uses_history(channel):
+            # The final reply supplies its snapshot later; never persist a history copy.
+            if history_snapshot is None:
+                return None
+            history = sessions.recent_history(channel=channel, chat_id=chat_id,
+                                               snapshot=history_snapshot, limit=LEGACY_CONTEXT_TURNS)
+            lines: list[str] = []
+            total = 0
+            for message in reversed(history):
+                text = " ".join(str(message.get("content") or "").split())[:400]
+                if not text:
+                    continue
+                line = f"{message.get('role')}: {text}"
+                if total + len(line) > LEGACY_CONTEXT_MAX_CHARS:
+                    break
+                lines.append(line)
+                total += len(line)
+            return LEGACY_CONTEXT_MARKER + "\n" + "\n".join(reversed(lines)) if lines else None
         try:
             thread_session = sessions.get_or_create(session_key)
             if any(
@@ -390,6 +410,7 @@ class ThreadActorResponder:
                 chat_id,
                 type(exc).__name__,
             )
+        return None
 
     def _event_id(self, event: Any) -> str:
         return str(getattr(event, "message_id", "") or "")

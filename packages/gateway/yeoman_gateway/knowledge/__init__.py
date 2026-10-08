@@ -12,8 +12,10 @@ from yeoman_gateway.knowledge.api import (
     open_knowledge_store,
     workspace_id_for,
 )
+from yeoman_gateway.knowledge.authority import EvidenceAudience
 
 __all__ = [
+    "EvidenceAudience",
     "KnowledgeService",
     "KnowledgeStartupError",
     "open_knowledge_store",

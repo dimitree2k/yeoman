@@ -6,6 +6,7 @@ from datetime import datetime
 from pathlib import Path
 
 OPERATIONAL_STORE_PATHS = {
+    "session_metadata": "ops/session-metadata.db",
     "processing": "ops/processing.db",
     "speakups": "ops/speakups.db",
     "burst_state": "ops/burst-state.json",
@@ -127,9 +128,13 @@ def get_workspace_path(workspace: str | None = None) -> Path:
     return ensure_dir(path)
 
 
-def get_sessions_path() -> Path:
+def get_sessions_path(*, create: bool = True) -> Path:
     """Get the session history directory (~/.yeoman/data/inbound)."""
-    return ensure_dir(get_operational_data_path() / "inbound")
+    if create:
+        return ensure_dir(get_operational_data_path() / "inbound")
+    yeoman_home = os.environ.get("YEOMAN_HOME", "").strip()
+    root = Path(yeoman_home) if yeoman_home else Path.home() / ".yeoman"
+    return root / "data" / "inbound"
 
 
 def get_memory_path(workspace: Path | None = None) -> Path:

@@ -1456,9 +1456,16 @@ class EnginePolicyAdapter(PolicyPort):
 
         session_key = f"{ctx.channel}:{ctx.chat_id}"
         try:
-            session = self._session_manager.get_or_create(session_key)
-            session.add_boundary()
-            self._session_manager.save(session)
+            if self._session_manager.uses_history(ctx.channel):
+                session = self._session_manager.get_or_create(
+                    session_key, channel=ctx.channel, chat_id=ctx.chat_id)
+                assert self._session_manager.operational_store is not None
+                self._session_manager.operational_store.set_boundary(
+                    channel=ctx.channel, chat_id=ctx.chat_id, at_ms=self._now_ms())
+            else:
+                session = self._session_manager.get_or_create(session_key)
+                session.add_boundary()
+                self._session_manager.save(session)
         except Exception as e:
             return AdminCommandResult(status="handled", response=f"Session boundary failed: {e}")
 

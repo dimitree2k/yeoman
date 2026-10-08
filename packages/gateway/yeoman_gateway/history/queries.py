@@ -5,7 +5,7 @@ from __future__ import annotations
 import json
 from typing import Any
 
-from yeoman_gateway.knowledge.authority import EvidenceAudience
+from yeoman_gateway.knowledge import EvidenceAudience
 from yeoman_gateway.policy.identity import canonical_user_id
 
 from .ids import classify
