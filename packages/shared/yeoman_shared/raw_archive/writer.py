@@ -32,6 +32,8 @@ from yeoman_shared.raw_archive.records import (
     CLOSED_FILE_MODE,
     OPEN_FILE_MODE,
     PURGE_DISPOSITION_LOCK,
+    CommitCallback,
+    CommittedLine,
     _fsync_directory,
     append_is_disposed,
     append_line,
@@ -258,6 +260,7 @@ class RawArchive:
         self._media_enabled = bool(media_enabled)
         self._max_video_bytes = max(0, int(max_video_bytes))
         self._lock = threading.Lock()
+        self._commit_callback: CommitCallback | None = None
         self._media_guard = _media_guard_for(self.root)
         self._registered_spool_path: str | None = None
         self._pending: list[tuple[str, int, str, str | None, _MediaGuardLease | None]] = []
@@ -268,6 +271,11 @@ class RawArchive:
         self._register_spool()
 
     # -- public API -------------------------------------------------------------------
+
+    def set_commit_callback(self, callback: CommitCallback | None) -> None:
+        """Install a bounded wakeup callback; it runs under raw locks after durability."""
+        with self._lock:
+            self._commit_callback = callback
 
     def append(self, event: RawEvent) -> bool:
         """Archive one event. ``True`` when it reached its month file, ``False`` when deferred."""
@@ -473,11 +481,16 @@ class RawArchive:
         destination: str | None = None,
     ) -> bool:
         # ponytail: AUDIT is scanned per append; compact only if archive size makes latency measurable.
+        path = self.root / destination if destination else self._month_file(channel, received_ms)
+        callback = self._commit_callback
         return append_line(
-            self.root / destination if destination else self._month_file(channel, received_ms),
+            path,
             line,
             coordination_lock=self.root / PURGE_DISPOSITION_LOCK,
             should_append=lambda: not append_is_disposed(self.root / "AUDIT", record, line),
+            on_committed=(lambda number, end:
+                          callback(CommittedLine(path.relative_to(self.root).as_posix(), number, end)))
+            if callback is not None else None,
         )
 
     def _append_locked(

@@ -11,10 +11,11 @@ import base64
 import fcntl
 import hashlib
 import json
+import logging
 import os
 import re
 import time
-from collections.abc import Callable, Iterator, Mapping
+from collections.abc import Callable, Iterator, Mapping, Sequence
 from dataclasses import dataclass
 from datetime import date, datetime
 from pathlib import Path
@@ -33,6 +34,127 @@ class CommittedLine:
     relative_path: str
     line_number: int
     end_offset: int
+
+
+# Callbacks run under raw locks: bounded wakeups only, never SQLite or IPC.
+CommitCallback = Callable[[CommittedLine], None]
+logger = logging.getLogger(__name__)
+
+
+@dataclass(frozen=True, slots=True)
+class SourceBoundary:
+    relative_path: str
+    line_number: int
+    end_offset: int
+    prefix_sha256: str
+
+
+def _notify_committed(callback: CommitCallback | None, receipt: CommittedLine) -> None:
+    if callback is not None:
+        try:
+            callback(receipt)
+        except Exception:
+            logger.exception("raw commit callback failed after durable publication")
+
+
+def enumerate_committed(raw_root: Path) -> tuple[SourceBoundary, ...]:
+    """Synchronize all complete history destinations; physical rows include invalid JSON."""
+    _no_symlinks(raw_root / PURGE_DISPOSITION_LOCK)
+    coordinator = lock_file(raw_root / PURGE_DISPOSITION_LOCK, create=True)
+    try:
+        from .purge import _recover_pending
+
+        _recover_pending(raw_root, now_ms=int(time.time() * 1000))
+        result = []
+        for sub in ('whatsapp', 'backfill', 'derived', 'owner'):
+            _no_symlinks(raw_root / sub)
+            for path in sorted((raw_root / sub).glob('*.jsonl')):
+                _no_symlinks(path)
+                fd = lock_file(path)
+                try:
+                    end = os.fstat(fd).st_size
+                    if end and os.pread(fd, 1, end - 1) != b'\n':
+                        raise ValueError('incomplete raw committed prefix')
+                    os.fsync(fd)
+                    _fsync_directory(path.parent)
+                    digest = hashlib.sha256()
+                    lines = 0
+                    for offset in range(0, end, 1024 * 1024):
+                        chunk = os.pread(fd, min(1024 * 1024, end - offset), offset)
+                        digest.update(chunk)
+                        lines += chunk.count(b'\n')
+                    result.append(SourceBoundary(path.relative_to(raw_root).as_posix(),
+                                                 lines, end, digest.hexdigest()))
+                finally:
+                    os.close(fd)
+        return tuple(sorted(result, key=lambda item: item.relative_path))
+    finally:
+        os.close(coordinator)
+
+
+def copy_committed(raw_root: Path, boundaries: Sequence[SourceBoundary], out: Path) -> None:
+    """Pin inodes under short locks, then stream and validate exactly the requested prefixes."""
+    from .paths import contains_protected
+
+    _no_symlinks(out)
+    source, destination = raw_root.resolve(), out.resolve()
+    if (contains_protected(out) or source == destination or source in destination.parents
+            or destination in source.parents or out.exists()):
+        raise ValueError('prefix copy requires a new isolated destination')
+    seen = set()
+    for boundary in boundaries:
+        parts = Path(boundary.relative_path).parts
+        if (len(parts) != 2 or parts[0] not in ('whatsapp', 'backfill', 'derived', 'owner')
+                or not parts[1].endswith('.jsonl') or boundary.relative_path != '/'.join(parts)
+                or boundary.relative_path in seen or boundary.end_offset < 0
+                or boundary.line_number < 0):
+            raise ValueError('invalid committed prefix boundary')
+        seen.add(boundary.relative_path)
+    pinned: list[tuple[SourceBoundary, int]] = []
+    _no_symlinks(raw_root / PURGE_DISPOSITION_LOCK)
+    coordinator = lock_file(raw_root / PURGE_DISPOSITION_LOCK, create=True)
+    try:
+        try:
+            for boundary in boundaries:
+                path = raw_root / boundary.relative_path
+                _no_symlinks(path)
+                fd = lock_file(path)
+                pinned.append((boundary, fd))
+                if os.fstat(fd).st_size < boundary.end_offset:
+                    raise ValueError('committed prefix shortened')
+                fcntl.flock(fd, fcntl.LOCK_UN)
+        finally:
+            os.close(coordinator)
+        ensure_private_dir(out)
+        for boundary, fd in pinned:
+            path = out / boundary.relative_path
+            ensure_private_dir(path.parent)
+            digest = hashlib.sha256()
+            lines, offset, last = 0, 0, b''
+            try:
+                with path.open('xb') as handle:
+                    os.chmod(path, OPEN_FILE_MODE)
+                    while offset < boundary.end_offset:
+                        chunk = os.pread(fd, min(1024 * 1024, boundary.end_offset - offset), offset)
+                        if not chunk:
+                            raise ValueError('committed prefix shortened while copying')
+                        handle.write(chunk)
+                        digest.update(chunk)
+                        lines += chunk.count(b'\n')
+                        offset += len(chunk)
+                        last = chunk[-1:]
+                    if (digest.hexdigest() != boundary.prefix_sha256 or lines != boundary.line_number
+                            or (offset and last != b'\n')):
+                        raise ValueError('committed prefix changed')
+                    handle.flush()
+                    os.fsync(handle.fileno())
+                _fsync_directory(path.parent)
+            except BaseException:
+                path.unlink(missing_ok=True)
+                raise
+    finally:
+        for _, fd in pinned:
+            os.close(fd)
 
 
 def _fsync_directory(path: Path) -> None:
@@ -134,7 +256,10 @@ def append_line(
                     lines = 0
                     for offset in range(0, end, 1024 * 1024):
                         lines += os.pread(fd, min(1024 * 1024, end - offset), offset).count(b"\n")
-                    on_committed(lines, end)
+                    try:
+                        on_committed(lines, end)
+                    except Exception:
+                        logger.exception("raw commit callback failed after durable publication")
                 return True
             finally:
                 os.close(fd)
@@ -166,7 +291,8 @@ def preflight_owner_paths(raw_root: Path) -> None:
         _no_symlinks(raw_root / relative)
 
 
-def append_owner_record_locked(raw_root: Path, record: Mapping[str, Any]) -> CommittedLine | None:
+def append_owner_record_locked(raw_root: Path, record: Mapping[str, Any], *,
+                               on_committed: CommitCallback | None = None) -> CommittedLine | None:
     """Publish a gateway-validated owner envelope to its fixed destination, without a queue."""
     validate_owner_envelope(record)
     preflight_owner_paths(raw_root)
@@ -178,6 +304,7 @@ def append_owner_record_locked(raw_root: Path, record: Mapping[str, Any]) -> Com
     def committed(number: int, end: int) -> None:
         nonlocal receipt
         receipt = CommittedLine(relative, number, end)
+        _notify_committed(on_committed, receipt)
 
     recover_pending_append(raw_root, path)
     append_line(path, line,
@@ -186,13 +313,14 @@ def append_owner_record_locked(raw_root: Path, record: Mapping[str, Any]) -> Com
     return receipt
 
 
-def append_owner_record(raw_root: Path, record: Mapping[str, Any]) -> CommittedLine | None:
+def append_owner_record(raw_root: Path, record: Mapping[str, Any], *,
+                        on_committed: CommitCallback | None = None) -> CommittedLine | None:
     """Publish one owner record while sharing the purge/import root lock."""
     validate_owner_envelope(record)
     preflight_owner_paths(raw_root)
     fd = lock_file(raw_root / PURGE_DISPOSITION_LOCK, create=True)
     try:
-        return append_owner_record_locked(raw_root, record)
+        return append_owner_record_locked(raw_root, record, on_committed=on_committed)
     finally:
         os.close(fd)
 
@@ -760,7 +888,8 @@ def preview_import(raw_root: Path, staged_root: Path, manifest: Mapping[str, Any
     return result
 
 
-def _publish_import_file(path: Path, addition: bytes, *, write_once: bool) -> None:
+def _publish_import_file(path: Path, addition: bytes, *, write_once: bool,
+                         on_committed: Callable[[int, int], None] | None = None) -> None:
     """Durable write-once link for backfill; derived lines reuse locked append_line."""
     if not write_once:
         if not path.exists() and not addition:
@@ -770,7 +899,7 @@ def _publish_import_file(path: Path, addition: bytes, *, write_once: bool) -> No
             os.close(fd)
             _fsync_directory(path.parent)
         for line in addition.splitlines(keepends=True):
-            append_line(path, line[:-1].decode('utf-8'))
+            append_line(path, line[:-1].decode('utf-8'), on_committed=on_committed)
         return
     ensure_private_dir(path.parent)
     if path.exists():
@@ -811,9 +940,18 @@ def _publish_import_file(path: Path, addition: bytes, *, write_once: bool) -> No
     _fsync_directory(path.parent)
     pending.unlink()
     _fsync_directory(path.parent)
+    if on_committed is not None:
+        end = 0
+        for number, line in enumerate(addition.splitlines(keepends=True), 1):
+            end += len(line)
+            try:
+                on_committed(number, end)
+            except Exception:
+                logger.exception("raw commit callback failed after durable publication")
 
 
-def import_backfill(raw_root: Path, staged_root: Path, manifest: Mapping[str, Any]) -> dict[str, Any]:
+def import_backfill(raw_root: Path, staged_root: Path, manifest: Mapping[str, Any], *,
+                    on_committed: CommitCallback | None = None) -> dict[str, Any]:
     """Prevalidate, pin a durable partial receipt, and resume exact publications; not atomic."""
     # ponytail: holds one staged package in memory; stream pinned descriptors if package size warrants it.
     blobs = validate_import_manifest(staged_root, manifest)
@@ -830,7 +968,12 @@ def import_backfill(raw_root: Path, staged_root: Path, manifest: Mapping[str, An
             append_line(raw_root / IMPORT_RECEIPTS, dumps(result))
         for relative, addition in additions.items():
             path = raw_root / relative
-            _publish_import_file(path, addition, write_once=relative.startswith('backfill/'))
+
+            def committed(number: int, end: int, rel: str = relative) -> None:
+                _notify_committed(on_committed, CommittedLine(rel, number, end))
+
+            _publish_import_file(path, addition, write_once=relative.startswith('backfill/'),
+                                 on_committed=committed if on_committed is not None else None)
         result['status'] = 'complete'
         append_line(raw_root / IMPORT_RECEIPTS, dumps(result))
         return result
