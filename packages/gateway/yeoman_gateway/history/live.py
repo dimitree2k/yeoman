@@ -311,6 +311,44 @@ class HistoryProjector:
                 self._status, self._reason = 'failed', 'reader_unavailable'
                 raise
 
+    async def worker_snapshot(self, callback: Callable[[HistorySnapshot], T]) -> T:
+        """Fence and run bounded work with an independent thread-owned reader."""
+        from .reader import HistoryReader
+
+        self._require_ready()
+        async with self._operation_lock:
+            async def admitted() -> T:
+                boundary = await self._admit()
+
+                def run() -> T:
+                    reader = HistoryReader(self.db_path)
+                    snapshot = None
+                    try:
+                        snapshot = reader.open_snapshot(boundary)
+                        return callback(snapshot)
+                    finally:
+                        if snapshot is not None:
+                            snapshot.close()
+                        reader.close()
+
+                return await self._submit(run)
+
+            task = asyncio.create_task(admitted())
+            try:
+                return await asyncio.shield(task)
+            except asyncio.CancelledError:
+                # Repeated cancellation cannot release ownership before thread cleanup.
+                while not task.done():
+                    try:
+                        await asyncio.shield(task)
+                    except asyncio.CancelledError:
+                        continue
+                    except Exception:
+                        break
+                if not task.cancelled():
+                    task.exception()
+                raise
+
     def health(self) -> dict[str, Any]:
         with self._notification_lock:
             index = self._index

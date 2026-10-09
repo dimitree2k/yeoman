@@ -41,10 +41,47 @@ class RuntimeKnowledgePolicy:
     capture_actors: frozenset[str] = frozenset()
     now_ms: Callable[[], int] = lambda: int(time.time() * 1000)
 
+    capture_policy_provider: Callable[[], Any] | None = None
+
     # ── PolicyAuthority ──────────────────────────────────────────────────────
 
     def current_policy_revision(self) -> int:
         return int(self.policy_revision)
+
+    def _capture_policy(self) -> tuple[str, Any]:
+        from yeoman_gateway.policy.engine import PolicyEngine
+        from yeoman_gateway.processing.models import canonical_hash
+        if self.capture_policy_provider is not None:
+            snapshot = self.capture_policy_provider()
+            if not snapshot.healthy or snapshot.policy is None:
+                from yeoman_gateway.history.live import HistoryPaused
+                raise HistoryPaused("policy_unavailable")
+            return snapshot.version, snapshot.policy
+        policy = self.engine.policy if isinstance(self.engine, PolicyEngine) else self.engine
+        if policy is None:
+            from yeoman_gateway.history.live import HistoryPaused
+            raise HistoryPaused("policy_unavailable")
+        return f"{self.policy_revision}:{canonical_hash(policy.model_dump(mode='json'))}", policy
+
+    def capture_policy_state(self) -> tuple[str, tuple[str, ...]]:
+        revision, policy = self._capture_policy()
+        channel = policy.channels.get("whatsapp")
+        return revision, tuple(sorted(channel.chats)) if channel is not None else ()
+
+    def capture_allowed(self, *, channel: str, chat_id: str, principal: str) -> bool:
+        from pathlib import Path
+
+        from yeoman_gateway.policy.engine import ActorContext, PolicyEngine
+        _, policy = self._capture_policy()
+        group = chat_id.endswith("@g.us")
+        configured = policy.channels.get(channel)
+        if group:
+            # Group capture opt-in is the chat entry; sender admission defaults govern DMs.
+            return configured is not None and chat_id in configured.chats
+        sender = principal.removeprefix(f"{channel}:")
+        actor = ActorContext(channel, chat_id, sender, [sender + "@s.whatsapp.net"],
+                             group, False, False)
+        return PolicyEngine(policy, Path(".")).evaluate(actor, set()).accept_message
 
     def admin_actor(self) -> str:
         """The principal the runtime accepts as an owner actor, if Policy names one."""

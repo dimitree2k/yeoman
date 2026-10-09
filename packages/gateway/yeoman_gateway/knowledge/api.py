@@ -1168,6 +1168,13 @@ class KnowledgeService:
 
     # ── jobs ─────────────────────────────────────────────────────────────────
 
+    def capture_policy_state(self) -> tuple[str, tuple[str, ...]]:
+        """Loaded policy revision and explicit WhatsApp groups, through its authority."""
+        return self._policy.capture_policy_state()
+
+    def capture_allowed(self, *, channel: str, chat_id: str, principal: str) -> bool:
+        return self._policy.capture_allowed(channel=channel, chat_id=chat_id, principal=principal)
+
     def enqueue_capture(
         self,
         sources: tuple[SourceRef, ...],

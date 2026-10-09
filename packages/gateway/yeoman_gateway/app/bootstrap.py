@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import asyncio
 import hashlib
+import inspect
 import os
 import random
 import time
@@ -11,7 +12,7 @@ from collections.abc import Awaitable, Callable, Mapping
 from dataclasses import dataclass
 from datetime import UTC, datetime
 from pathlib import Path
-from typing import TYPE_CHECKING, Any, assert_never
+from typing import TYPE_CHECKING, Any, assert_never, cast
 from uuid import uuid4 as _uuid4
 
 from loguru import logger
@@ -494,7 +495,9 @@ class GatewayRuntime:
             if self.shared_facts is not None and hasattr(self.shared_facts, "start"):
                 self.shared_facts.start()
             if self.statement_capture is not None and hasattr(self.statement_capture, "start"):
-                self.statement_capture.start()
+                result = self.statement_capture.start()
+                if inspect.isawaitable(result):
+                    await result
             tasks = [
                 self.orchestrator.run(),
                 self.channels.start_all(),
@@ -559,7 +562,10 @@ class GatewayRuntime:
             if self.shared_facts is not None and hasattr(self.shared_facts, "stop"):
                 attempt_sync(self.shared_facts.stop)
             if self.statement_capture is not None and hasattr(self.statement_capture, "stop"):
-                attempt_sync(self.statement_capture.stop)
+                if inspect.iscoroutinefunction(self.statement_capture.stop):
+                    await attempt_async(self.statement_capture.stop)
+                else:
+                    attempt_sync(self.statement_capture.stop)
             if self.contacts is not None:
                 attempt_sync(self.contacts.close)
             attempt_sync(self.memory.close)
@@ -776,6 +782,7 @@ def build_statement_capture(
     *,
     knowledge: object | None,
     processing: "ProcessingStore | None",
+    projector: HistoryProjector | None = None,
 ) -> "object | None":
     """The forward statement-promotion worker, or ``None`` when promotion is off.
 
@@ -784,7 +791,10 @@ def build_statement_capture(
     returns ``None``: no worker, no job, and no boundary.  Observation is untouched: the
     canonical journal keeps recording every event either way.
     """
-    if knowledge is None or processing is None:
+    if knowledge is None:
+        return None
+    selected = config.history.live_projection_enabled and config.history.readers.knowledge
+    if not selected and processing is None:
         return None
     if not bool(getattr(config.knowledge, "capture_enabled", False)):
         return None
@@ -797,22 +807,33 @@ def build_statement_capture(
     )
 
     knowledge_cfg = config.knowledge
-    producer = StatementCaptureProducer(
-        knowledge=knowledge,
-        processing=processing,
+    settings = dict(
         idle_ms=int(getattr(knowledge_cfg, "capture_idle_seconds", 60)) * 1000,
         max_delay_ms=int(getattr(knowledge_cfg, "capture_max_delay_seconds", 300)) * 1000,
         batch_max=int(getattr(knowledge_cfg, "capture_batch_max", 8)),
         max_waiting=int(getattr(knowledge_cfg, "capture_max_waiting", 64)),
-        extractor_version=STATEMENT_EXTRACTOR_VERSION,
     )
     try:
         extractor = StatementExtractor(config=config)
     except Exception:
-        # A route that cannot be built must not silently promote nothing forever: the
-        # worker is absent and the reason is visible in the log.
         logger.exception("statement capture extractor unavailable; promotion stays off")
         return None
+    if selected:
+        from yeoman_gateway.history.live import HistoryPaused
+        from yeoman_gateway.knowledge._history_capture import (
+            HistoryCaptureProducer,
+            HistoryCaptureWorker,
+        )
+        if projector is None:
+            raise HistoryPaused("capture_projector_required")
+        from yeoman_gateway.knowledge.api import KnowledgeService
+        history_knowledge = cast(KnowledgeService, knowledge)
+        history_producer = HistoryCaptureProducer(history_knowledge, **settings)
+        return HistoryCaptureWorker(projector=projector, knowledge=history_knowledge,
+            producer=history_producer, extractor=extractor,
+            poll_seconds=float(getattr(knowledge_cfg, "capture_poll_seconds", 5.0)))
+    producer = StatementCaptureProducer(knowledge=knowledge, processing=processing,
+        extractor_version=STATEMENT_EXTRACTOR_VERSION, **settings)
     return StatementCaptureWorker(
         knowledge=knowledge,
         processing=processing,
@@ -4289,10 +4310,14 @@ def build_gateway_runtime(
     if shared_fact_runtime is not None:
         responder.shared_facts = shared_fact_runtime
 
+    if knowledge_service is not None:
+        knowledge_policy.capture_policy_provider = policy_adapter.current_policy_snapshot
+
     statement_capture = build_statement_capture(
         config,
         knowledge=knowledge_service,
         processing=processing_store,
+        projector=history_projector,
     )
     # One startup line the owner can check: observation and proof are wired whenever the
     # knowledge store is open, promotion only when the switch is on.

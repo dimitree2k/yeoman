@@ -1314,3 +1314,70 @@ async def test_rebuild_two_build_cost_at_30k(tmp_path, monkeypatch):
         await oracle_parity(p, root, tmp_path)
     finally:
         await p.stop()
+
+
+@pytest.mark.asyncio
+async def test_worker_snapshot_owns_thread_connection_and_reopens_after_rebuild(tmp_path):
+    root, db, archive, p = projector_fixture(tmp_path)
+    await start_ready(p)
+    main_thread = threading.get_ident()
+    snapshots = []
+    def read(snapshot):
+        assert threading.get_ident() != main_thread
+        assert p._operation_lock.locked()
+        assert not p._reader._snapshots
+        snapshots.append(snapshot)
+        return snapshot.generation, snapshot.connection.execute(
+            "SELECT count(*) FROM messages").fetchone()[0]
+    try:
+        generation, count = await p.worker_snapshot(read)
+        assert count == 1 and snapshots[-1]._closed
+        await p.rebuild(reason="synthetic worker replacement")
+        newer, count = await p.worker_snapshot(read)
+        assert newer > generation and count == 1 and snapshots[-1]._closed
+        def fail(snapshot):
+            snapshots.append(snapshot)
+            raise RuntimeError("bounded callback failure")
+        with pytest.raises(RuntimeError, match="bounded callback"):
+            await p.worker_snapshot(fail)
+        assert snapshots[-1]._closed and not p._operation_lock.locked()
+        p._status = "failed"
+        with pytest.raises(Exception, match="failed"):
+            await p.worker_snapshot(read)
+    finally:
+        await p.stop()
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("cancel_count", [1, 2])
+async def test_worker_snapshot_cancellation_waits_for_callback_cleanup_and_repair(tmp_path, cancel_count):
+    _, _, _, p = projector_fixture(tmp_path)
+    await start_ready(p)
+    entered, release = threading.Event(), threading.Event()
+    snapshots = []
+    def blocked(snapshot):
+        snapshots.append(snapshot)
+        entered.set()
+        assert release.wait(30)
+        return snapshot.generation
+    try:
+        task = asyncio.create_task(p.worker_snapshot(blocked))
+        assert await asyncio.to_thread(entered.wait, 30)
+        task.cancel()
+        # Repair cannot replace while a worker callback owns its independent lease.
+        repair = asyncio.create_task(p.rebuild(reason="synthetic worker cancellation"))
+        await asyncio.sleep(0)
+        assert p._operation_lock.locked() and not task.done() and not repair.done()
+        if cancel_count == 2:
+            task.cancel()
+            await asyncio.sleep(0)
+            assert p._operation_lock.locked() and not task.done() and not repair.done()
+        release.set()
+        with pytest.raises(asyncio.CancelledError):
+            await task
+        await asyncio.wait_for(repair, 30)
+        assert snapshots[0]._closed
+        assert not p._reader._snapshots and not p._operation_lock.locked()
+    finally:
+        release.set()
+        await p.stop()

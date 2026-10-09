@@ -107,6 +107,10 @@ class PolicyAuthority(Protocol):
 
     def current_policy_revision(self) -> int: ...
 
+    def capture_policy_state(self) -> tuple[str, tuple[str, ...]]: ...
+
+    def capture_allowed(self, *, channel: str, chat_id: str, principal: str) -> bool: ...
+
     def require_admin(self, context: TrustedAdminContext) -> str: ...
 
     def require_capture(self, context: TrustedCaptureContext) -> str: ...
@@ -220,6 +224,14 @@ class FakePolicyAuthority:
 
     def current_policy_revision(self) -> int:
         return int(self.revision)
+
+    def capture_policy_state(self) -> tuple[str, tuple[str, ...]]:
+        from yeoman_gateway.history.live import HistoryPaused
+        raise HistoryPaused("policy_unavailable")
+
+    def capture_allowed(self, *, channel: str, chat_id: str, principal: str) -> bool:
+        from yeoman_gateway.history.live import HistoryPaused
+        raise HistoryPaused("policy_unavailable")
 
     def require_admin(self, context: TrustedAdminContext) -> str:
         if context.actor_principal not in self.admins:
