@@ -153,8 +153,10 @@ def prepare(args: argparse.Namespace) -> dict[str, Any]:
             if boundary is None:
                 raise ValueError("missing_legacy_boundary")
             capture_summary = {}
+            producer = HistoryCaptureProducer(knowledge)
             inputs = prepare_capture_inputs(queries=q, legacy_boundary=boundary,
-                legacy_rows=[*rows, *bundle["capture_rows"]], jobs=jobs, summary=capture_summary)
+                legacy_rows=[*rows, *bundle["capture_rows"]], jobs=jobs, summary=capture_summary,
+                permanent_reason=producer._permanent_reason)
             counts["no_legacy_row_pending"] = capture_summary["no_legacy_row_pending"]
             counts["duplicate_observations"] = capture_summary["duplicate_observations"]
             counts["unmapped_terminal_job_refs"] = capture_summary["unmapped_terminal_job_refs"]
@@ -162,7 +164,7 @@ def prepare(args: argparse.Namespace) -> dict[str, Any]:
                 counts[label] = dict(sorted(Counter(row['cutover_reason'] for row in rows
                     if row['cutover_status'] != 'mapped'
                     and (((row['event_id'],row['revision']) in required) == cited)).items()))
-            handover = HistoryCaptureProducer(knowledge).prepare_handover(
+            handover = producer.prepare_handover(
                 snapshot, legacy_boundary=boundary, **inputs)
         entries = []
         for row in rows:

@@ -612,3 +612,81 @@ def test_legacy_node_cannot_be_aliased_even_with_a_native_locator(case):
     row = legacy(note, content_fingerprint=q.content_fingerprint('m'))
     aliases, counts = build_history_source_aliases(queries=q, legacy_rows=[row], locators={note.key: ('m',)})
     assert not aliases and counts['legacy_node']==1
+
+
+@pytest.mark.parametrize(('left_author','right_author','expected'), [
+    ('whatsapp:10001','10001@s.whatsapp.net','mapped'),
+    ('+10001','whatsapp:10001','mapped'),
+    ('whatsapp:10001','10002@s.whatsapp.net','ambiguous'),
+    ('unknown-a','unknown-b','ambiguous'),
+])
+def test_cross_store_author_comparison_is_canonical(case, left_author, right_author, expected):
+    from yeoman_gateway.knowledge._history_cutover import prepare_legacy_alias_inputs
+    _,q,_,_ = case
+    source = SourceRef('authors',1,'whatsapp',q.message('m')['chat_id'],'whatsapp:10001',100)
+    copies = [proof(q,'m',source),proof(q,'m',source)]
+    for item,author in zip(copies,(left_author,right_author),strict=True):
+        item['original']['state']['author_principal'] = author
+        item['original']['issued']['author_principal'] = author
+        item['origin']['row_sha256'] = row_sha256(item['original'])
+    rows,_,counts = prepare_legacy_alias_inputs(queries=q,legacy_rows=[legacy(source)],preserved_rows=copies)
+    assert rows[0]['cutover_status']==expected and counts[expected]==1
+    assert copies[1]['original']['state']['author_principal']==right_author
+
+
+@pytest.mark.parametrize(('first_reply','second_reply','text_conflict','expected'), [
+    (None,'absent',False,'mapped'),('', 'absent',False,'mapped'),
+    (None,'parent',False,'mapped'),('', 'parent',False,'mapped'),
+    ('parent','different',False,'ambiguous'),(None,'absent',True,'ambiguous'),
+])
+def test_cross_store_reply_absence_and_strict_text(case, first_reply, second_reply, text_conflict, expected):
+    from yeoman_gateway.knowledge._history_cutover import prepare_legacy_alias_inputs
+    _,q,_,db = case
+    if second_reply=='parent':
+        db.execute("UPDATE messages SET reply_to_native_id='parent' WHERE message_id='m'")
+    source = SourceRef('replies',1,'whatsapp',q.message('m')['chat_id'],'whatsapp:10001',100)
+    copies = [proof(q,'m',source),proof(q,'m',source)]
+    copies[0]['original']['state']['reply_to_native_id'] = first_reply
+    if second_reply=='absent':
+        copies[1]['original']['state'].pop('reply_to_native_id')
+    else:
+        copies[1]['original']['state']['reply_to_native_id'] = second_reply
+    if text_conflict:
+        copies[1]['original']['state']['text'] += ' '
+    for item in copies:
+        item['origin']['row_sha256'] = row_sha256(item['original'])
+    result = prepare_legacy_alias_inputs(queries=q,legacy_rows=[legacy(source)],preserved_rows=copies)
+    assert result[0][0]['cutover_status']==expected and result[2][expected]==1
+    if expected=='mapped':
+        assert ('reply_to_native_id' in result[0][0]['proven_fields'])==(second_reply=='parent')
+    assert prepare_legacy_alias_inputs(queries=q,legacy_rows=[legacy(source)],preserved_rows=list(reversed(copies)))==result
+
+
+@pytest.mark.parametrize('direction',['in','out'])
+def test_cutover_uses_loaded_producer_policy_precedence(capture_case, direction):
+    from yeoman_gateway.knowledge._history_cutover import prepare_capture_inputs
+    h,k,_,_ = capture_case
+    h.add('denied-chat',line=1,chat='not-configured@g.us',direction=direction)
+    p = producer(k)
+    with h.snapshot() as snap:
+        inputs = prepare_capture_inputs(queries=HistoryQueries(snap),legacy_boundary=(10,'b'),
+            legacy_rows=[],jobs=[],permanent_reason=p._permanent_reason)
+        assert inputs['classifications']=={'denied-chat':'not_policy_chat'}
+        assert inputs['pending']==inputs['processed']==()
+        receipt = p.prepare_handover(snap,legacy_boundary=(10,'b'),**inputs)
+        assert receipt['classifications']==inputs['classifications']
+
+
+def test_canonical_author_comparison_retains_raw_issued_ref(case):
+    from yeoman_gateway.knowledge._history_cutover import prepare_legacy_alias_inputs
+    _,q,authority,_ = case
+    source = SourceRef('raw-issued',1,'whatsapp',q.message('m')['chat_id'],'10001@s.whatsapp.net',100)
+    original = proof(q,'m',source)
+    rows,locators,counts = prepare_legacy_alias_inputs(queries=q,legacy_rows=[legacy(source)],preserved_rows=[original])
+    assert counts['mapped']==1 and rows[0]['author_principal']==source.author_principal
+    aliases,_ = build_history_source_aliases(queries=q,legacy_rows=rows,locators=locators)
+    assert aliases[source.key].issued==source
+    authority.ledger.persist_aliases(aliases)
+    assert authority.verify_source_ref(*source.key)==source
+    assert authority.permits_principal(source,'whatsapp:10001',now_ms=101)
+    assert original['original']['issued']['author_principal']==source.author_principal

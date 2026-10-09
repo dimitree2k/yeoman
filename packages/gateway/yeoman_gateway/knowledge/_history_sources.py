@@ -133,6 +133,16 @@ def _principal(value: str) -> str | None:
     return f'whatsapp:{ident.value}'
 
 
+def _canonical_author(value: Any) -> Any:
+    if not isinstance(value, str):
+        return value
+    identifier = value.removeprefix('whatsapp:')
+    # Only hash-bound author fields use bare phones; runtime native-ID checks remain typed.
+    if '@' in identifier:
+        return _principal(identifier) or value
+    return canonical_user_id('whatsapp', metadata={'sender_phone_jid': identifier}) or value
+
+
 def principal_identifier(principal: str) -> str | None:
     channel, _, value = principal.partition(':')
     if channel != 'whatsapp' or not value:
@@ -242,7 +252,7 @@ class HistoryKnowledgeSources:
         if proof is None or fingerprint != self.queries.content_fingerprint(message_id):
             return None
         row, principal, contact, historical = proof
-        if (source.author_principal != principal or source.occurred_at_ms != row['sent_ms']
+        if (_canonical_author(source.author_principal) != principal or source.occurred_at_ms != row['sent_ms']
                 or source.chat_id != row['chat_id'] or self.queries.terminal(owner) != contact):
             return None
         if audience.status == 'unknown':
@@ -347,7 +357,7 @@ class HistoryKnowledgeSources:
         audience = self.evidence_audience(source, basis='')
         if audience is None or (audience.status == 'known' and principal not in audience.members):
             return False
-        if principal == source.author_principal:
+        if principal == _canonical_author(source.author_principal):
             return before == self.author_contact(source)
         return audience.status == 'known' and principal in audience.members
 
@@ -389,7 +399,7 @@ def build_history_source_aliases(*, queries: HistoryQueries, legacy_rows: Iterab
         fingerprint = queries.content_fingerprint(targets[0])
         owner = row.get('author_contact_id')
         if (proof is None or not owner or queries.terminal(str(owner)) != proof[2]
-                or fingerprint != row.get('content_fingerprint') or source.author_principal != proof[1]
+                or fingerprint != row.get('content_fingerprint') or _canonical_author(source.author_principal) != proof[1]
                 or source.chat_id != proof[0]['chat_id'] or source.occurred_at_ms != proof[0]['sent_ms']):
             counts['missing'] += 1
             continue

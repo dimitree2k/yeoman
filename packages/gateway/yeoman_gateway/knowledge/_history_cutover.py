@@ -3,13 +3,14 @@ from __future__ import annotations
 
 import json
 from collections import Counter, defaultdict
-from collections.abc import Iterable, Mapping
+from collections.abc import Callable, Iterable, Mapping
 from dataclasses import asdict
 from typing import Any
 
 from yeoman_gateway.history.layer1 import row_sha256
 from yeoman_gateway.history.queries import HistoryQueries
 from yeoman_gateway.knowledge._history_sources import (
+    _canonical_author,
     _principal,
     build_history_source_aliases,
     is_legacy_node,
@@ -112,6 +113,16 @@ def prepare_legacy_alias_inputs(*, queries: HistoryQueries,
                 if not isinstance(state, dict) or (issued is not None and not isinstance(issued, dict)):
                     invalid = True
                     continue
+                # Comparison views never alter the hash-bound originals or issued refs.
+                state = dict(state)
+                if 'author_principal' in state:
+                    state['author_principal'] = _canonical_author(state['author_principal'])
+                if state.get('reply_to_native_id') in (None, ''):
+                    state.pop('reply_to_native_id', None)
+                if issued is not None:
+                    issued = dict(issued)
+                    if 'author_principal' in issued:
+                        issued['author_principal'] = _canonical_author(issued['author_principal'])
                 states.append((issued, state))
                 if all(state.get(k) for k in ("channel", "chat_id", "native_message_id")):
                     matches = queries._rows(
@@ -150,8 +161,8 @@ def prepare_legacy_alias_inputs(*, queries: HistoryQueries,
                     status, reason = "purged_revoked", "purged_revoked"
                 elif not issued_proofs or not complete:
                     reason = "no_author_or_text_proof"
-                elif issued_proofs[0] != asdict(source):
-                    status, reason = "changed", ("author_mismatch" if issued_proofs[0].get("author_principal") != source.author_principal
+                elif issued_proofs[0] != dict(asdict(source), author_principal=_canonical_author(source.author_principal)):
+                    status, reason = "changed", ("author_mismatch" if issued_proofs[0].get("author_principal") != _canonical_author(source.author_principal)
                         else "time_mismatch" if issued_proofs[0].get("occurred_at_ms") != source.occurred_at_ms
                         else "issued_source_mismatch")
                 elif recorded["text"] != expected["text"]:
@@ -173,7 +184,7 @@ def prepare_legacy_alias_inputs(*, queries: HistoryQueries,
                             row["created_ms"] = next(iter(order_values))
                     else:
                         principal = "whatsapp:" + (current["sender_identifier"] or "").split("@")[0]
-                        reason = ("author_mismatch" if source.author_principal != principal else
+                        reason = ("author_mismatch" if _canonical_author(source.author_principal) != principal else
                                   "time_mismatch" if source.occurred_at_ms != current["sent_ms"] else
                                   "no_author_or_audience_proof")
         if status != "mapped":
@@ -210,7 +221,8 @@ def native_prefix(queries: HistoryQueries) -> dict[str, dict[str, Any]]:
 
 def prepare_capture_inputs(*, queries: HistoryQueries,
     legacy_boundary: tuple[int, str], legacy_rows: Iterable[Mapping[str, Any]],
-    jobs: Iterable[Mapping[str, Any]], summary: dict[str, Any] | None = None) -> dict[str, Any]:
+    jobs: Iterable[Mapping[str, Any]], summary: dict[str, Any] | None = None,
+    permanent_reason: Callable[[dict[str, Any]], str] | None = None) -> dict[str, Any]:
     """Accept proven completion or preserved created/event ordering, never provider time.
 
     Ordering proof pins progress as 'boundary' and the separately preserved
@@ -287,7 +299,9 @@ def prepare_capture_inputs(*, queries: HistoryQueries,
                   "derived_only" if current["provenance"] == "derived_only" else
                   "source_revoked" if current["deleted"] else
                   "empty_text" if not (current["current_text"] or "").strip() else "")
-        if row.get("classification") == "not_policy_chat":
+        if permanent_reason is not None:
+            reason = permanent_reason(current)
+        elif row.get("classification") == "not_policy_chat":
             reason = "not_policy_chat"
         if reason:
             classifications[mid] = reason
