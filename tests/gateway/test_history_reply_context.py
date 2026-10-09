@@ -10,7 +10,11 @@ from tests.gateway.convhist.consumer_fixtures import reply_case  # noqa: F401
 
 
 async def test_final_reply_snapshot_includes_enrichment_and_is_shared_by_tools(reply_case):
+    reply_case.db.execute("INSERT INTO contacts VALUES ('person','person',NULL,'synthetic','confirmed',NULL,'[]')")
+    reply_case.db.execute("INSERT INTO identifier_history(contact_id,channel,kind,value,strength,evidence,source_refs) VALUES ('person','whatsapp','pn_jid','491000000001@s.whatsapp.net','strong','owner_attested','[]')")
+    reply_case.db.commit()
     await reply_case.run_voice_reply()
+    assert reply_case.resolved_contact_id == 'person'
     assert reply_case.prompt_transcript == 'synthetic transcript'
     assert len(set(reply_case.reply_snapshot_ids)) == 1
     assert reply_case.responder_acquisitions == 0

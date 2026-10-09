@@ -150,7 +150,8 @@ class ContactsMiddleware:
                 value, at_ms=int(event.timestamp.timestamp() * 1000), time_basis='native')) is not None}
             raw = {key: value for key, value in event.raw_metadata.items() if key not in {'contact_id','identity_status','identity_reason','mentioned_person_candidates'}}
             if len(owners) == 1:
-                raw.update(contact_id=next(iter(owners)), identity_status='resolved', identity_reason='history')
+                (owner,) = owners
+                raw.update(contact_id=owner, identity_status='resolved', identity_reason='history')
             event = replace(event, raw_metadata=raw)
             ctx.event = event
         if event.channel not in _IDENTITY_CHANNELS or self._knowledge is None:

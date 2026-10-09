@@ -81,7 +81,7 @@ async def reply_case(tmp_path, monkeypatch):
             self.db.execute("UPDATE messages SET media_json=? WHERE message_id='voice'", ('{"transcript":{"text":"synthetic transcript"}}',))
             self.db.commit()
             self.add('prior', text='prior synthetic text')
-            event = InboundEvent(channel='whatsapp', chat_id='a@g.us', sender_id='sender',
+            event = InboundEvent(channel='whatsapp', chat_id='a@g.us', sender_id='491000000001@s.whatsapp.net',
                 content='synthetic transcript', message_id='voice', is_group=True)
             await self.service._process_message(event)
             assert self.bus.publish_outbound.call_count == 1
@@ -121,6 +121,7 @@ async def reply_case(tmp_path, monkeypatch):
     monkeypatch.setattr(responder.context, 'build_messages', build_messages)
 
     async def generate(ctx, next):
+        case.resolved_contact_id = ctx.event.raw_metadata.get('contact_id')
         before = case.acquisitions
         reply = await responder._generate(session_key='opaque', channel='whatsapp', chat_id=ctx.event.chat_id,
             content=ctx.event.content, sender_id=ctx.event.sender_id, media=(),

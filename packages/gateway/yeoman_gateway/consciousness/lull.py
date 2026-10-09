@@ -63,7 +63,6 @@ class LullObserver:
         self._task: asyncio.Task[None] | None = None
         self._tick_lock = asyncio.Lock()
 
-    @secondary_consumer
     async def handle(self, event: GatewayEvent) -> None:
         """Track inbound activity timestamps. Does not fire by itself."""
 
@@ -80,6 +79,17 @@ class LullObserver:
         chat_id = str(event.chat_id or "").strip()
         if not channel or not chat_id:
             return
+        history = getattr(self._config, 'history', None)
+        selected = bool(channel == 'whatsapp' and history is not None
+                        and history.live_projection_enabled and history.readers.secondary)
+        if selected and not await self._eligible(channel, chat_id):
+            return
+        await self._handle_activity(event)
+
+    @secondary_consumer
+    async def _handle_activity(self, event: InboundObservedEvent) -> None:
+        channel = str(event.channel or "").strip()
+        chat_id = str(event.chat_id or "").strip()
         key = (channel, chat_id)
         ts = float(event.timestamp)
         if self._is_direct_bot_interaction(event):

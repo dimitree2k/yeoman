@@ -18,14 +18,15 @@ _PROJECTOR: ContextVar[HistoryProjector | None] = ContextVar('history_projector'
 
 
 def current_history_snapshot() -> HistorySnapshot | None:
-    return _HISTORY.get()
+    snapshot = _HISTORY.get()
+    return snapshot if snapshot is not None and not snapshot._closed else None
 
 
 @asynccontextmanager
 async def history_turn(projector: HistoryProjector) -> AsyncIterator[HistorySnapshot]:
     """A nested consumer borrows the root lease; only its owner closes it."""
     current = current_history_snapshot()
-    if current is not None and not current._closed:
+    if current is not None:
         if _PROJECTOR.get() is not projector:
             raise HistoryPaused('history_scope_mismatch')
         require_history_effect(projector, current)
@@ -54,9 +55,10 @@ def require_history_effect(projector: HistoryProjector, snapshot: HistorySnapsho
 
 
 def history_effect_metadata() -> dict[str, int]:
-    snapshot, projector = current_history_snapshot(), _PROJECTOR.get()
+    snapshot = current_history_snapshot()
     if snapshot is None:
         return {}
+    projector = _PROJECTOR.get()
     if projector is None:
         raise HistoryPaused('history_scope_required')
     require_history_effect(projector, snapshot)
