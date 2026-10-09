@@ -4,7 +4,7 @@ import json
 import sqlite3
 import threading
 from concurrent.futures import ThreadPoolExecutor
-from contextlib import contextmanager
+from contextlib import closing, contextmanager
 from dataclasses import asdict
 
 import pytest
@@ -38,7 +38,7 @@ class History:
         self.lines = 10
         self.extra_files = {}
         self.status = "ready"
-        with sqlite3.connect(path) as db:
+        with closing(sqlite3.connect(path)) as db, db:
             create(db)
             contact(db, "a")
             identifier(db, "a", PHONE, start=1)
@@ -76,7 +76,7 @@ class History:
             path, _, number = ref.rpartition("#")
             if path.startswith("whatsapp/") and path != "whatsapp/2026-10.jsonl":
                 self.extra_files[path] = max(self.extra_files.get(path, 0), int(number))
-        with sqlite3.connect(self.path) as db:
+        with closing(sqlite3.connect(self.path)) as db, db:
             message(db, mid, chat=chat, ms=MS, text=f"Synthetic source {mid}",
                     identifier=PHONE if known else None, sender="a" if known else None,
                     provenance=provenance)
@@ -97,7 +97,7 @@ class History:
     def replace(self):
         self.generation += 1
         replacement = self.path.with_suffix(".replacement")
-        with sqlite3.connect(self.path) as old, sqlite3.connect(replacement) as new:
+        with closing(sqlite3.connect(self.path)) as old, closing(sqlite3.connect(replacement)) as new, old, new:
             old.backup(new)
             self.runtime(new)
         replacement.replace(self.path)
@@ -202,7 +202,7 @@ async def test_capture_no_gap_across_switch_pause_rebuild_and_late_pair(case):
     # This is a synthetic inbound projection; real bot outbound pairs are refused separately.
     h.add("late-pair", refs=["whatsapp/2026-10.jsonl#4", "whatsapp/2026-11.jsonl#1"])
     h.add("during-rebuild")
-    with sqlite3.connect(h.path) as db:
+    with closing(sqlite3.connect(h.path)) as db, db:
         db.execute("UPDATE messages SET sent_ms=?,time_certainty='provider_timestamp' WHERE message_id='late-pair'",
                    (MS-5000,))
     h.replace()
@@ -293,7 +293,7 @@ async def test_capture_pause_during_model_call_requeues_without_publishing(case,
         for row in k._store.query("SELECT job_id FROM knowledge_jobs"):
             k.mark_capture_job(row["job_id"], "cancelled")
     else:
-        with sqlite3.connect(h.path) as db:
+        with closing(sqlite3.connect(h.path)) as db, db:
             if change == "purge":
                 db.execute("DELETE FROM messages WHERE message_id='m'")
             else:
@@ -404,7 +404,7 @@ async def test_capture_skips_non_policy_groups_and_starts_forward_when_added(cas
     p = producer(k)
     handover(h, p)
     outside = "outside@g.us"
-    with sqlite3.connect(h.path) as db:
+    with closing(sqlite3.connect(h.path)) as db, db:
         event(db, "outside-roster", "member_snapshot", MS-1,
               {"complete": True, "participants": [[PHONE]]}, chat=outside)
     h.add("old-outside", chat=outside)
@@ -441,7 +441,7 @@ async def test_single_candidate_window_alternates_discovery_and_pending_retry(ca
     handover(h, p)
     h.add("a-unknown", known=False)
     await worker(h, k, p).run_due(now_ms=MS+1000)
-    with sqlite3.connect(h.path) as db:
+    with closing(sqlite3.connect(h.path)) as db, db:
         db.execute("UPDATE messages SET sender_contact_id='a',sender_identifier=?,sender_basis='native_identifier'"
                    " WHERE message_id='a-unknown'", (PHONE,))
     h.add("z-new")
@@ -482,7 +482,7 @@ async def test_unprocessed_edit_queues_current_revision_once_and_preserves_job_i
     h.add("m")
     with h.snapshot() as snap:
         p.run_due(snap, now_ms=MS+1000)
-    with sqlite3.connect(h.path) as db:
+    with closing(sqlite3.connect(h.path)) as db, db:
         event(db, "edit", "edit", MS+1, {"text": "Current synthetic content"}, target="m", chat=PHONE)
     with h.snapshot() as snap:
         p.run_due(snap, now_ms=MS+2000)
@@ -663,7 +663,7 @@ async def test_backdated_source_uses_author_at_source_time_after_identifier_reus
     p = producer(k)
     handover(h, p)
     h.add("historical-author")
-    with sqlite3.connect(h.path) as db:
+    with closing(sqlite3.connect(h.path)) as db, db:
         db.execute("UPDATE identifier_history SET valid_until_ms=? WHERE contact_id='a'", (MS+1,))
         contact(db, "new-owner")
         identifier(db, "new-owner", PHONE, start=MS+1)
