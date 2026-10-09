@@ -29,9 +29,29 @@
         "forward_start_evidence_member": {"type": "string", "minLength": 1},
         "reader_smoke": {"type": "object", "required": ["workspace_id", "channel", "chat_id", "principal", "phone", "message_id", "source_event_id", "statement_id", "query", "text", "curated_text", "at_ms", "owner_scope", "rights"], "additionalProperties": false, "properties": {"workspace_id": {"type": "string"}, "channel": {"const": "whatsapp"}, "chat_id": {"type": "string"}, "principal": {"type": "string"}, "phone": {"type": "string"}, "message_id": {"type": "string"}, "source_event_id": {"type": "string"}, "statement_id": {"type": "string"}, "query": {"type": "string"}, "text": {"type": "string"}, "curated_text": {"type": "string"}, "at_ms": {"type": "integer"}, "owner_scope": {"type": "boolean"}, "rights": {"type": "object", "required": ["knowledge_read", "tools_read", "owner_export"], "additionalProperties": false, "properties": {"knowledge_read": {"type": "boolean"}, "tools_read": {"type": "boolean"}, "owner_export": {"type": "boolean"}}}}},
         "optional_conversion_stores": {"type": "array", "uniqueItems": true, "items": {"type": "string", "pattern": "^[a-z][a-z0-9_-]*$"}},
-        "bridge_package_dir": {"type": "string", "pattern": "^/"}
+        "bridge_package_dir": {"type": "string", "pattern": "^/"},
+        "config_path": {"type": "string", "pattern": "^/"},
+        "pause_path": {"type": "string", "pattern": "^/"},
+        "knowledge_db": {"type": "string", "pattern": "^/"},
+        "processing_db": {"type": "string", "pattern": "^/"},
+        "prepared_text_manifest": {"type": "string", "pattern": "^/"},
+        "original_home": {"type": "string", "pattern": "^/"},
+        "source_dir": {"type": "string", "pattern": "^/"},
+        "prior_source_dir": {"type": "string", "pattern": "^/"},
+        "tool_python": {"type": "string", "pattern": "^/"},
+        "yeoman": {"type": "string", "pattern": "^/"},
+        "prior_yeoman": {"type": "string", "pattern": "^/"},
+        "gateway_socket": {"type": "string", "pattern": "^/"},
+        "raw_status_path": {"type": "string", "minLength": 1},
+        "bridge_status_path": {"type": "string", "minLength": 1},
+        "prepared_text_manifest_sha256": {"type": "string", "pattern": "^[a-f0-9]{64}$"},
+        "frozen_files": {"type": "array", "items": {"type": "string", "pattern": "^/"}},
+        "frozen_watermarks": {"type": "object", "propertyNames": {"pattern": "^/"}, "additionalProperties": {"type": "string", "pattern": "^[a-f0-9]{64}$"}},
+        "pinned_files": {"type": "object", "propertyNames": {"pattern": "^/"}, "additionalProperties": {"type": "string", "pattern": "^[a-f0-9]{64}$"}},
+        "prior_pinned_files": {"type": "object", "propertyNames": {"pattern": "^/"}, "additionalProperties": {"type": "string", "pattern": "^[a-f0-9]{64}$"}}
       }
     },
     "rehearsal_root": {"type": "string", "pattern": "^/"}
-  }
+  },
+  "$defs": {"rehearsal": {"type": "object", "required": ["members", "raw_path", "bridge", "gateway_jobs", "units", "timers", "manual_routes", "host_crontab", "overseer_jobs", "external_text_targets", "forward_start_evidence_member", "reader_smoke", "bridge_package_dir", "config_path", "pause_path", "knowledge_db", "processing_db", "frozen_files", "frozen_watermarks", "prepared_text_manifest", "prepared_text_manifest_sha256", "original_home", "raw_status_path", "bridge_status_path"], "allOf": [{"$ref": "#/properties/inventory"}]}, "live": {"type": "object", "required": ["members", "raw_path", "bridge", "gateway_jobs", "units", "timers", "manual_routes", "host_crontab", "overseer_jobs", "external_text_targets", "forward_start_evidence_member", "reader_smoke", "bridge_package_dir", "config_path", "pause_path", "knowledge_db", "processing_db", "frozen_files", "frozen_watermarks", "prepared_text_manifest", "prepared_text_manifest_sha256", "original_home", "pinned_files", "prior_pinned_files", "source_dir", "prior_source_dir", "tool_python", "yeoman", "prior_yeoman", "gateway_socket"], "allOf": [{"$ref": "#/properties/inventory"}]}}
 }

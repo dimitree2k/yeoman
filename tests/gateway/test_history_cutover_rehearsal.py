@@ -69,7 +69,7 @@ def test_builder_accepts_only_executable_interpreter_symlink(tmp_path):
     example = json.loads((Path(__file__).parents[2]/'scripts/history_cutover_inventory.example.json').read_text())
     example.update(home=str(home),output=value['output'],receipts=value['receipts'],rehearsal_root=str(tmp_path))
     package = bridge_package(tmp_path)
-    example['inventory']['bridge_package_dir'] = str(package)
+    example['inventory'].update(value['inventory'],bridge_package_dir=str(package))
     interpreter = tmp_path/'python'
     interpreter.symlink_to(sys.executable)
     example['python'] = str(interpreter)
@@ -124,7 +124,8 @@ def test_cli_refuses_unusable_decoder_before_any_phase(tmp_path, monkeypatch, ca
     assert json.loads(capsys.readouterr().out)['ok'] is False
     assert not Path(value['receipts']).exists()
 
-def test_cli_operator_contract_real_sequence(tmp_path,monkeypatch,capsys):
+@pytest.mark.parametrize('file_invocation',[False,True])
+def test_cli_operator_contract_real_sequence(tmp_path,monkeypatch,capsys,file_invocation):
     from yeoman_gateway.history.convert import bridge_refs
 
     from scripts import history_cutover, history_cutover_inputs
@@ -219,7 +220,7 @@ def test_cli_operator_contract_real_sequence(tmp_path,monkeypatch,capsys):
         knowledge_target=str(work/'v3.db'),knowledge_live=str(knowledge),policy_snapshot=str(policy),alias_output=str(work/'aliases'))
     inv = json.loads((Path(__file__).parents[2]/'scripts/history_cutover_inventory.example.json').read_text())
     inv.update(home=str(home),output=str(acquisition),receipts=str(root/'receipts'),python=sys.executable,rehearsal_root=str(root))
-    inv['inventory'].update(bridge_package_dir=str(package),raw_path='data/raw',forward_start_evidence_member='inputs/forward.json',
+    inv['inventory'].update(original_home=str(home),bridge_package_dir=str(package),raw_path='data/raw',forward_start_evidence_member='inputs/forward.json',
         members=[dict(path=path,kind=kind,restore=restore) for path,kind,restore in (
             ('data/knowledge/knowledge.db','sqlite',True),('data/ops/processing.db','sqlite',True),('data/raw','tree',False),
             ('data/ops/bridge-message-references','tree',False),('inputs/forward.json','file',False),('cron.json','file',True))],
@@ -247,12 +248,62 @@ def test_cli_operator_contract_real_sequence(tmp_path,monkeypatch,capsys):
     receipts.mkdir()
     (receipts/'functional-smoke.owner_ack.json').write_text(dumps(dict(action='functional-smoke',record_digest=value['digest'],owner_ack=True,proof={})))
     monkeypatch.setattr(sys,'argv',['cutover','cutover','--record',str(record_file),'--home',str(home),'--controls','rehearsal','--apply'])
-    assert history_cutover.main()==0, (receipts/'cutover.json').read_text() if (receipts/'cutover.json').exists() else capsys.readouterr().out
+    if file_invocation:
+        import os
+        import subprocess
+        stub = tmp_path/'subprocess-stub'
+        stub.mkdir()
+        (stub/'sitecustomize.py').write_text(
+            'from yeoman_gateway.history.convert import bridge_refs\n'
+            'import subprocess\n'
+            'original_run = subprocess.run\n'
+            'def guarded_run(argv, **kwargs):\n'
+            '    assert argv[0] != "systemctl" and "deploy" not in argv\n'
+            '    return original_run(argv, **kwargs)\n'
+            'subprocess.run = guarded_run\n'
+            'bridge_refs.node_batch_decoder = lambda path: lambda items: '
+            + ' {name:{"value":'+repr(dict(key=dict(id='source',remoteJid=chat,participant=phone,fromMe=False),
+                messageTimestamp=ts//1000,message=dict(conversation='Synthetic original')))
+            + '} for name,_ in items}\n')
+        env = dict(os.environ,PYTHONPATH=os.pathsep.join([str(stub),*[str(Path(history_cutover.__file__).parents[1]/'packages'/p) for p in ('gateway','shared','overseer')]]))
+        completed = subprocess.run([sys.executable,str(Path(history_cutover.__file__)),*sys.argv[1:]],
+            cwd=work,env=env,capture_output=True,text=True,timeout=180)
+        assert completed.returncode==0, completed.stdout+completed.stderr
+    else:
+        assert history_cutover.main()==0, (receipts/'cutover.json').read_text() if (receipts/'cutover.json').exists() else capsys.readouterr().out
     journal = json.loads((receipts/'cutover.json').read_text())
     assert journal['ok'] and 'error_code' not in journal
     actions = [p['action'] for p in journal['phases']]
     assert actions == history_cutover._sequence(value)
     assert all(p['receipt']['complete'] for p in journal['phases'] if p['action'] in ('prepare-v3','publish-v3'))
     assert sum(a.startswith('smoke-reader-') for a in actions)==6
-    assert any(items==[('synthetic.json','c3ludGhldGlj')] for items in decoded)
+    if not file_invocation:
+        assert any(items==[('synthetic.json','c3ludGhldGlj')] for items in decoded)
     assert not any('decoder_not_supplied' in p.read_text() for p in (work/'staged').rglob('*.jsonl'))
+
+
+@pytest.mark.parametrize('mode',['rehearsal','live'])
+@pytest.mark.parametrize('key','config_path pause_path knowledge_db processing_db frozen_files frozen_watermarks prepared_text_manifest prepared_text_manifest_sha256 original_home'.split())
+def test_missing_host_inputs_refused_before_first_phase(tmp_path,mode,key):
+    from scripts import history_cutover as m
+    path,home,value = record(tmp_path)
+    value['mode'] = mode
+    value['inventory'].pop(key,None)
+    value['digest'] = m.record_digest(value)
+    path.write_text(json.dumps(value))
+    with pytest.raises(ValueError,match=f'missing_inventory_key:{key}'):
+        m._load(path,home,apply=False)
+    assert not Path(value['receipts']).exists()
+
+
+@pytest.mark.parametrize('key','pinned_files prior_pinned_files source_dir prior_source_dir tool_python yeoman prior_yeoman gateway_socket'.split())
+def test_missing_live_host_inputs_refused_before_first_phase(tmp_path,key):
+    from scripts import history_cutover as m
+    path,home,value = record(tmp_path)
+    value['mode'] = 'live'
+    value['inventory'].pop(key)
+    value['digest'] = m.record_digest(value)
+    path.write_text(json.dumps(value))
+    with pytest.raises(ValueError,match=f'missing_inventory_key:{key}'):
+        m._load(path,home,apply=False)
+    assert not Path(value['receipts']).exists()

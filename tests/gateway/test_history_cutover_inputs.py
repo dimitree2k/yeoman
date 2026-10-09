@@ -5,6 +5,7 @@ import json
 import sqlite3
 from contextlib import closing
 from dataclasses import asdict
+from pathlib import Path
 
 import pytest
 from yeoman_gateway.history.attestations import make
@@ -252,7 +253,6 @@ def test_record_builder_loads_and_refuses_drift(tmp_path,mode):
     path,home,value = record(tmp_path)
     inventory = tmp_path/'inventory.json'
     value['inventory']['units'] = [dict(name='synthetic.service',restart='always',executable='/synthetic/writer')]
-    from pathlib import Path
     example = json.loads((Path(__file__).parents[2]/'scripts/history_cutover_inventory.example.json').read_text())
     value['inventory'].update(overseer_jobs=[],external_text_targets=[],gateway_jobs=0,manual_routes=[],
         forward_start_evidence_member='inputs/forward-start.json',reader_smoke=example['inventory']['reader_smoke'])
@@ -758,3 +758,51 @@ def test_supplemental_capture_time_is_not_native_send_time():
         payload={'messageId':'native'}, original={'content':'Synthetic preserved text'})
     state = _original_state(record, set())
     assert state==dict(channel='whatsapp', chat_id='synthetic', native_message_id='native', text='Synthetic preserved text')
+
+
+@pytest.mark.parametrize('mode',['rehearsal','live'])
+def test_record_derives_control_paths_hashes_and_config_socket(tmp_path,mode):
+    from scripts.history_cutover_inputs import build_cutover_record
+    _,home,value = record(tmp_path)
+    inv = value['inventory']
+    for key in ('config_path','pause_path','knowledge_db','processing_db','gateway_socket',
+            'frozen_watermarks','prepared_text_manifest_sha256'):
+        inv.pop(key)
+    (home/'config.json').write_text(dumps({'ipc':{'gateway_socket_path':str(home/'run/custom.sock')}}))
+    inv['frozen_files'] = [str(home/'cron.json')]
+    source = {k:value[k] for k in ('home','output','receipts','candidate','prior','inventory','rehearsal_root')}
+    source.update(version=1,python=__import__('sys').executable)
+    path = tmp_path/'inventory.json'
+    path.write_text(dumps(source))
+    result = build_cutover_record(inventory=path,layout={},mode=mode,
+        window=(1791532800000,1791534600000),expected_gateway_jobs=0)['inventory']
+    assert result['config_path']==str(home/'config.json')
+    assert result['knowledge_db']==str(home/'data/knowledge/knowledge.db')
+    assert result['processing_db']==str(home/'data/ops/processing.db')
+    assert result['pause_path']==str(home/'data/ops/response-pauses.json')
+    assert result['frozen_watermarks']=={str(home/'cron.json'):__import__('hashlib').sha256((home/'cron.json').read_bytes()).hexdigest()}
+    assert result['prepared_text_manifest_sha256']==__import__('hashlib').sha256(Path(inv['prepared_text_manifest']).read_bytes()).hexdigest()
+    if mode=='live':
+        assert result['gateway_socket']==str(home/'run/custom.sock')
+    del source['inventory']['prepared_text_manifest']
+    path.write_text(dumps(source))
+    with pytest.raises(ValueError,match='missing_inventory_key:prepared_text_manifest'):
+        build_cutover_record(inventory=path,layout={},mode=mode,
+            window=(1791532800000,1791534600000),expected_gateway_jobs=0)
+
+
+@pytest.mark.parametrize('mode',['rehearsal','live'])
+def test_record_cli_reports_only_safe_missing_control_key(tmp_path,mode,capsys):
+    from scripts.history_cutover_inputs import main
+    _,_,value = record(tmp_path)
+    source = {k:value[k] for k in ('home','output','receipts','candidate','prior','inventory','rehearsal_root')}
+    source.update(version=1,python=__import__('sys').executable)
+    del source['inventory']['prepared_text_manifest']
+    inventory,layout,output = tmp_path/'inventory.json',tmp_path/'layout.json',tmp_path/'generated.json'
+    inventory.write_text(dumps(source))
+    layout.write_text('{}')
+    assert main(['record','--inventory',str(inventory),'--layout',str(layout),'--mode',mode,
+        '--window-start-ms','1791532800000','--window-end-ms','1791534600000',
+        '--expected-gateway-jobs','0','--output',str(output)])==1
+    assert json.loads(capsys.readouterr().out)==dict(ok=False,error='missing_inventory_key:prepared_text_manifest')
+    assert not output.exists() and not Path(value['receipts']).exists()

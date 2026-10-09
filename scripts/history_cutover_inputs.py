@@ -33,6 +33,7 @@ try:
         _rehearsal_paths,
         check_window_timing,
         record_digest,
+        validate_host_inventory,
     )
     from scripts.history_maintenance_guard import preflight_isolated_paths
 except ModuleNotFoundError:
@@ -45,6 +46,7 @@ except ModuleNotFoundError:
         _rehearsal_paths,
         check_window_timing,
         record_digest,
+        validate_host_inventory,
     )
     from history_maintenance_guard import preflight_isolated_paths
 
@@ -469,6 +471,29 @@ def build_cutover_record(*, inventory: Path, layout: Mapping[str,str],
     if source.get('version') != 1 or mode not in ('live','rehearsal'):
         raise ValueError('invalid_inventory')
     inv = source['inventory']
+    home = Path(source['home'])
+    for key,relative in dict(config_path='config.json',pause_path='data/ops/response-pauses.json',
+            knowledge_db='data/knowledge/knowledge.db',processing_db='data/ops/processing.db').items():
+        inv.setdefault(key,layout.get('knowledge_live') if key=='knowledge_db' and layout.get('knowledge_live') else str(home/relative))
+    if 'frozen_files' not in inv:
+        raise ValueError('missing_inventory_key:frozen_files')
+    _paths(*(Path(path) for path in inv['frozen_files']))
+    inv['frozen_watermarks'] = {str(Path(path)): _hash(Path(path)) for path in inv['frozen_files']}
+    if 'prepared_text_manifest' not in inv:
+        raise ValueError('missing_inventory_key:prepared_text_manifest')
+    _paths(Path(inv['prepared_text_manifest']))
+    inv['prepared_text_manifest_sha256'] = _hash(Path(inv['prepared_text_manifest']))
+    if mode=='live' and 'gateway_socket' not in inv:
+        _paths(Path(inv['config_path']))
+        config = json.loads(Path(inv['config_path']).read_bytes())
+        from yeoman_shared.config.schema import Config
+        socket = Config.model_validate(config).ipc.gateway_socket_path
+        if socket is None or socket=='~/.yeoman/run/gateway.sock':
+            socket = str(home/'run/gateway.sock')
+        if not Path(socket).is_absolute():
+            raise ValueError('invalid_gateway_socket_path')
+        inv['gateway_socket'] = socket
+    validate_host_inventory(inv, mode=mode)
     if type(expected_gateway_jobs) is not int or expected_gateway_jobs < 0 or inv['gateway_jobs'] != expected_gateway_jobs:
         raise ValueError('cron_inventory_drift')
     if any(not isinstance(u,dict) or not all(k in u for k in ('name','restart','executable')) for u in inv['units']):
@@ -526,8 +551,9 @@ def main(argv=None) -> int:
     except InputProofError as error:
         print(json.dumps(dict(ok=False,error=str(error),origin_proof_errors=error.store_counts),sort_keys=True))
         return 1
-    except Exception:
-        print('{"ok":false,"error":"cutover_inputs_refused"}')
+    except Exception as exc:
+        code = str(exc) if isinstance(exc, ValueError) and re.fullmatch(r'missing_inventory_key:[a-z_]+',str(exc)) else 'cutover_inputs_refused'
+        print(json.dumps(dict(ok=False,error=code),sort_keys=True))
         return 1
 
 

@@ -86,7 +86,25 @@
       }
     },
     "bridge_package_dir": "/synthetic/bridge-package",
-    "optional_conversion_stores": []
+    "optional_conversion_stores": [],
+    "original_home": "/synthetic/original-home",
+    "prepared_text_manifest": "/synthetic/work/texts.json",
+    "frozen_files": [
+      "/synthetic/copy/cron.json"
+    ],
+    "raw_status_path": "raw-status.json",
+    "bridge_status_path": "bridge-status.json",
+    "source_dir": "/synthetic/source",
+    "prior_source_dir": "/synthetic/prior-source",
+    "tool_python": "/synthetic/tools/python",
+    "yeoman": "/synthetic/tools/yeoman",
+    "prior_yeoman": "/synthetic/prior-tools/yeoman",
+    "pinned_files": {
+      "/synthetic/source/pyproject.toml": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"
+    },
+    "prior_pinned_files": {
+      "/synthetic/prior-source/pyproject.toml": "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb"
+    }
   },
   "rehearsal_root": "/synthetic"
 }

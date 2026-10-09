@@ -43,7 +43,7 @@ _ARGUMENTS = ("snapshot_home", "history_db", "knowledge_source", "knowledge_targ
 _COUNTS = ("total", "mapped", "missing", "ambiguous", "changed", "purged_revoked",
            "other_channel", "legacy_node", "no_legacy_row_pending", "candidate_copies", "statements", "jobs", "withheld_statements",
            "affected_jobs", "duplicate_observations", "unmapped_terminal_job_refs",
-           "cited_reason_counts", "uncited_reason_counts")
+           "cited_reason_counts", "uncited_reason_counts", "author_unresolved", "author_different_contact")
 
 
 def _affected_counts(rows, statements, jobs, aliases):
@@ -179,6 +179,8 @@ def prepare(args: argparse.Namespace) -> dict[str, Any]:
                 value["audience"]["allowed"] = sorted(alias.audience.allowed)
                 entry["alias"] = value
                 entry["proven_fields"] = row["proven_fields"]
+            if 'author_reason' in row:
+                entry['author_reason'] = row['author_reason']
             entries.append(entry)
         manifest = {"version": 1, "inputs": {
             "snapshot_digest": bundle["snapshot_digest"], "conversion_digest": bundle["conversion_digest"],
@@ -188,7 +190,8 @@ def prepare(args: argparse.Namespace) -> dict[str, Any]:
             "schema_digest": row_sha256({"history": 4, "knowledge": upgrade["schema_version"],
                                          "knowledge_source": upgrade["source_digest"]})},
             "entries": entries, "handover": handover, "capture_summary": capture_summary,
-            "cited_reason_counts": counts["cited_reason_counts"], "uncited_reason_counts": counts["uncited_reason_counts"]}
+            "cited_reason_counts": counts["cited_reason_counts"], "uncited_reason_counts": counts["uncited_reason_counts"],
+            "author_reason_counts": {k: counts[k] for k in ("author_unresolved", "author_different_contact")}}
         manifest["digest"] = row_sha256(manifest)
         args.output_root.mkdir(mode=0o700)
         _private_json(manifest_path, manifest)

@@ -48,9 +48,23 @@ def record(tmp_path):
     value = dict(rehearsal_root=str(tmp_path), bridge_package_dir=str(package), version=1, mode='rehearsal', approved=True, approval='synthetic-owner-gate', home=str(home),
                  candidate='synthetic-candidate', prior='synthetic-prior', inventory=dict(
                      bridge_package_dir=str(package), members=items, raw_path='raw', bridge=dict(mode='stopped'),
-                     gateway_jobs=0, expected_gateway_jobs=0, units=['overseer', 'gateway', 'bridge', 'a2a'], timers=['watch'],
+                     gateway_jobs=0, expected_gateway_jobs=0, units=[dict(name=f'yeoman-{name}.service',restart='always',executable=f'/synthetic/{name}') for name in ('overseer','gateway','bridge','a2a')], timers=['watch'],
                      host_crontab=dict(window_safe=True,timezone='UTC',window_start_ms=1791532800000,window_end_ms=1791534600000,danger_minutes=[240])), output=str(tmp_path / 'acquisition'),
                  receipts=str(tmp_path / 'receipts'), commands={})
+    texts = tmp_path/'texts.json'
+    texts.write_text('{"actions":[]}')
+    (home/'config.json').write_text('{}')
+    example = json.loads((Path(__file__).parents[2]/'scripts/history_cutover_inventory.example.json').read_text())
+    value['inventory'].update(config_path=str(home/'config.json'),pause_path=str(home/'pauses.json'),
+        knowledge_db=str(home/'knowledge.db'),processing_db=str(home/'processing.db'),
+        frozen_files=[],frozen_watermarks={},prepared_text_manifest=str(texts),
+        prepared_text_manifest_sha256=__import__('hashlib').sha256(texts.read_bytes()).hexdigest(),original_home=str(home),
+        raw_status_path='raw-status.json',bridge_status_path='bridge-status.json',manual_routes=[],
+        overseer_jobs=[],external_text_targets=[],reader_smoke=example['inventory']['reader_smoke'],
+        forward_start_evidence_member='inputs/forward.json',source_dir=str(tmp_path/'source'),
+        prior_source_dir=str(tmp_path/'prior-source'),tool_python=__import__('sys').executable,
+        yeoman=str(tmp_path/'yeoman'),prior_yeoman=str(tmp_path/'prior-yeoman'),
+        pinned_files={},prior_pinned_files={},gateway_socket=str(home/'run/gateway.sock'))
     value['digest'] = procedure().record_digest(value)
     path = tmp_path / 'record.json'
     path.write_text(json.dumps(value))

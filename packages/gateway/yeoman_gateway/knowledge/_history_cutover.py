@@ -10,6 +10,7 @@ from typing import Any
 from yeoman_gateway.history.layer1 import row_sha256
 from yeoman_gateway.history.queries import HistoryQueries
 from yeoman_gateway.knowledge._history_sources import (
+    _author_contact,
     _canonical_author,
     _principal,
     build_history_source_aliases,
@@ -70,7 +71,8 @@ def prepare_legacy_alias_inputs(*, queries: HistoryQueries,
             raise ValueError("conflicting_legacy_key")
         distinct[key] = row
     counts = Counter({key: 0 for key in (
-        "mapped", "missing", "ambiguous", "changed", "purged_revoked", "other_channel", "legacy_node")})
+        "mapped", "missing", "ambiguous", "changed", "purged_revoked", "other_channel", "legacy_node",
+        "author_unresolved", "author_different_contact")})
     prepared, locators = [], {}
     for key, row in sorted(distinct.items(), key=lambda item: (str(item[0][0]),
             (0, item[0][1]) if type(item[0][1]) is int else (1, str(item[0][1])))):
@@ -80,6 +82,17 @@ def prepare_legacy_alias_inputs(*, queries: HistoryQueries,
         targets: set[str] = set()
         proofs = []
         states = []
+        contacts = {}
+        def author(value):
+            canonical = _canonical_author(value)
+            if not isinstance(canonical, str):
+                return ('unresolved', row_sha256(canonical))
+            if canonical not in contacts:
+                contacts[canonical] = _author_contact(queries, canonical, at_ms=source.occurred_at_ms)
+            return ('contact', contacts[canonical]) if contacts[canonical] is not None else ('unresolved', canonical)
+        def author_reason(values):
+            return 'author_unresolved' if any(v[0]=='unresolved' for v in values) else 'author_different_contact'
+
         if is_legacy_node(row.get("event_id", "")):
             status = reason = "legacy_node"
         elif source is None:
@@ -116,13 +129,13 @@ def prepare_legacy_alias_inputs(*, queries: HistoryQueries,
                 # Comparison views never alter the hash-bound originals or issued refs.
                 state = dict(state)
                 if 'author_principal' in state:
-                    state['author_principal'] = _canonical_author(state['author_principal'])
+                    state['author_principal'] = author(state['author_principal'])
                 if state.get('reply_to_native_id') in (None, ''):
                     state.pop('reply_to_native_id', None)
                 if issued is not None:
                     issued = dict(issued)
                     if 'author_principal' in issued:
-                        issued['author_principal'] = _canonical_author(issued['author_principal'])
+                        issued['author_principal'] = author(issued['author_principal'])
                 states.append((issued, state))
                 if all(state.get(k) for k in ("channel", "chat_id", "native_message_id")):
                     matches = queries._rows(
@@ -134,6 +147,10 @@ def prepare_legacy_alias_inputs(*, queries: HistoryQueries,
             conflicts = any((left_issued is not None and right_issued is not None and left_issued != right_issued) or any(
                 left[k] != right[k] for k in left.keys() & right.keys())
                 for i,(left_issued,left) in enumerate(states) for right_issued,right in states[i+1:])
+            author_values = {state['author_principal'] for _,state in states if 'author_principal' in state}
+            author_values.update(issued['author_principal'] for issued,_ in states if issued is not None and 'author_principal' in issued)
+            if len(author_values)>1:
+                row['author_reason'] = author_reason(author_values)
             recorded = {k: v for _, state in states for k, v in state.items()}
             if not conflicts and all(recorded.get(k) for k in ("channel", "chat_id", "native_message_id")) and not targets:
                 matches = queries._rows(
@@ -150,7 +167,7 @@ def prepare_legacy_alias_inputs(*, queries: HistoryQueries,
                 mid = next(iter(targets))
                 current = queries._rows("SELECT * FROM messages_current WHERE message_id=?", (mid,))[0]
                 expected = _state(queries, current)
-                expected["author_principal"] = _principal(current["sender_identifier"] or "")
+                expected["author_principal"] = author(_principal(current["sender_identifier"] or ""))
                 # An original observation with no mutations proves pre-edit text.
                 if not recorded.get("events"):
                     expected["events"] = []
@@ -161,8 +178,10 @@ def prepare_legacy_alias_inputs(*, queries: HistoryQueries,
                     status, reason = "purged_revoked", "purged_revoked"
                 elif not issued_proofs or not complete:
                     reason = "no_author_or_text_proof"
-                elif issued_proofs[0] != dict(asdict(source), author_principal=_canonical_author(source.author_principal)):
-                    status, reason = "changed", ("author_mismatch" if issued_proofs[0].get("author_principal") != _canonical_author(source.author_principal)
+                elif any(value[0]=='unresolved' for value in [*author_values, author(source.author_principal), expected['author_principal']]):
+                    status, reason = 'changed', 'author_mismatch'
+                elif issued_proofs[0] != dict(asdict(source), author_principal=author(source.author_principal)):
+                    status, reason = "changed", ("author_mismatch" if issued_proofs[0].get("author_principal") != author(source.author_principal)
                         else "time_mismatch" if issued_proofs[0].get("occurred_at_ms") != source.occurred_at_ms
                         else "issued_source_mismatch")
                 elif recorded["text"] != expected["text"]:
@@ -183,10 +202,14 @@ def prepare_legacy_alias_inputs(*, queries: HistoryQueries,
                         if len(order_values) == 1 and type(next(iter(order_values))) is int:
                             row["created_ms"] = next(iter(order_values))
                     else:
-                        principal = "whatsapp:" + (current["sender_identifier"] or "").split("@")[0]
-                        reason = ("author_mismatch" if _canonical_author(source.author_principal) != principal else
+                        principal = author(_principal(current["sender_identifier"] or ""))
+                        reason = ("author_mismatch" if author(source.author_principal) != principal else
                                   "time_mismatch" if source.occurred_at_ms != current["sent_ms"] else
                                   "no_author_or_audience_proof")
+        if reason == 'author_mismatch':
+            row['author_reason'] = author_reason([*author_values,author(source.author_principal),expected['author_principal']])
+        if 'author_reason' in row:
+            counts[row['author_reason']] += 1
         if status != "mapped":
             locators.pop(key, None)
             row.pop("content_fingerprint", None)

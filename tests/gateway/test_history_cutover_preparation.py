@@ -690,3 +690,48 @@ def test_canonical_author_comparison_retains_raw_issued_ref(case):
     assert authority.verify_source_ref(*source.key)==source
     assert authority.permits_principal(source,'whatsapp:10001',now_ms=101)
     assert original['original']['issued']['author_principal']==source.author_principal
+
+
+@pytest.mark.parametrize(('contact','start','expected','reason'), [
+    ('a',1,'mapped','mapped'),
+    ('b',1,'ambiguous','author_different_contact'),
+    ('a',101,'ambiguous','author_unresolved'),
+])
+def test_cross_store_author_identity_at_message_time(case, contact, start, expected, reason):
+    from yeoman_gateway.knowledge._history_cutover import prepare_legacy_alias_inputs
+
+    from tests.gateway.convhist.test_hist_queries import identifier
+    _,q,sources,db = case
+    identifier(db,contact,'90001@lid',start=start)
+    source = SourceRef('identity',1,'whatsapp',q.message('m')['chat_id'],'whatsapp:90001@lid',100)
+    left,right = proof(q,'m',source),proof(q,'m',source)
+    for item,author in ((left,'whatsapp:90001@lid'),(right,'10001@s.whatsapp.net')):
+        item['original']['state']['author_principal'] = author
+        item['original']['issued']['author_principal'] = author
+        item['origin']['row_sha256'] = row_sha256(item['original'])
+    rows,locators,counts = prepare_legacy_alias_inputs(queries=q,legacy_rows=[legacy(source)],preserved_rows=[left,right])
+    assert rows[0]['cutover_status']==expected
+    assert rows[0].get('author_reason',rows[0]['cutover_reason'])==reason
+    assert counts[expected]==1
+    if expected=='mapped':
+        aliases,_ = build_history_source_aliases(queries=q,legacy_rows=rows,locators=locators)
+        assert aliases[source.key].issued==source
+        sources.ledger.persist_aliases(aliases)
+        assert sources.verify_source_ref(*source.key)==source
+        assert sources.permits_principal(source,'whatsapp:10001',now_ms=100)
+        assert not sources.permits_principal(source,'whatsapp:10002',now_ms=100)
+    else:
+        assert counts[reason]==1
+
+
+def test_identical_unresolved_authors_are_withheld_with_identity_reason(case):
+    from yeoman_gateway.knowledge._history_cutover import prepare_legacy_alias_inputs
+    _,q,_,db = case
+    source = SourceRef('unresolved',1,'whatsapp',q.message('m')['chat_id'],'whatsapp:10001',100)
+    item = proof(q,'m',source)
+    db.execute("DELETE FROM identifier_history WHERE contact_id='a'")
+    rows,_,counts = prepare_legacy_alias_inputs(queries=q,legacy_rows=[legacy(source)],preserved_rows=[item])
+    assert rows[0]['cutover_status']=='changed'
+    assert rows[0]['cutover_reason']=='author_mismatch'
+    assert rows[0]['author_reason']=='author_unresolved'
+    assert counts['author_unresolved']==1 and counts['mapped']==0

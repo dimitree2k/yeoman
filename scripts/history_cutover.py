@@ -456,6 +456,19 @@ def check_window_timing(inventory: Mapping[str, Any]) -> None:
             raise ValueError('unsafe_host_crontab_window')
         day += timedelta(days=1)
 
+def validate_host_inventory(inventory: Mapping[str, Any], *, mode: str) -> None:
+    """Validate the complete mode-specific control inputs before any phase."""
+    from jsonschema import Draft202012Validator
+    document = json.loads(Path(__file__).with_name('history_cutover_inventory.schema.json').read_bytes())
+    schema = document['$defs'][mode]
+    # Missing controls are operator errors, never late KeyErrors inside the fence.
+    for key in schema['required']:
+        if key not in inventory:
+            raise ValueError(f'missing_inventory_key:{key}')
+    if not Draft202012Validator({'$ref': f'#/$defs/{mode}', '$defs': document['$defs'], 'properties': document['properties']}).is_valid(inventory):
+        raise ValueError('invalid_host_inventory')
+
+
 def _load(record: Path, home: Path, *, apply: bool) -> dict[str, Any]:
     _paths(record, home)
     value = json.loads(record.read_bytes())
@@ -466,6 +479,7 @@ def _load(record: Path, home: Path, *, apply: bool) -> dict[str, Any]:
     mode = value.get('mode')
     if mode not in ('live', 'rehearsal'):
         raise ValueError('explicit_record_mode_required')
+    validate_host_inventory(value.get('inventory', {}), mode=mode)
     if mode == 'rehearsal':
         isolated = [home, Path(value['output']), Path(value['receipts'])]
         isolated.extend(Path(v) for v in value.get('layout', {}).values())
@@ -752,8 +766,9 @@ def main() -> int:
             result = _cli_run(args)
         print(canonical_json(dict(ok=result['ok'], planned=result.get('planned', False), fenced=result.get('fenced', False), fence_verified=result.get('fence_verified', False), phases=len(result.get('actions', [])))))
         return 0 if result['ok'] else 1
-    except Exception:
-        print('{"ok":false,"error":"cutover_refused"}')
+    except Exception as exc:
+        error = str(exc) if isinstance(exc, ValueError) and re.fullmatch(r'missing_inventory_key:[a-z_]+',str(exc)) else 'cutover_refused'
+        print(canonical_json(dict(ok=False,error=error)))
         return 1
 
 
@@ -766,4 +781,7 @@ def _cli_run(args):
 
 
 if __name__ == '__main__':
-    raise SystemExit(main())
+    import sys
+    sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
+    from scripts.history_cutover import main as canonical_main
+    raise SystemExit(canonical_main())

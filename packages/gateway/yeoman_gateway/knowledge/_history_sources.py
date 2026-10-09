@@ -143,6 +143,16 @@ def _canonical_author(value: Any) -> Any:
     return canonical_user_id('whatsapp', metadata={'sender_phone_jid': identifier}) or value
 
 
+def _author_contact(queries: HistoryQueries, value: Any, *, at_ms: int, time_basis: str = 'native') -> str | None:
+    canonical = _canonical_author(value)
+    if not isinstance(canonical, str) or not canonical.startswith('whatsapp:'):
+        return None
+    identifier = canonical.removeprefix('whatsapp:')
+    if '@' not in identifier:
+        identifier += '@s.whatsapp.net'
+    return queries.resolve_identifier(identifier, at_ms=at_ms, time_basis=time_basis)
+
+
 def principal_identifier(principal: str) -> str | None:
     channel, _, value = principal.partition(':')
     if channel != 'whatsapp' or not value:
@@ -252,7 +262,7 @@ class HistoryKnowledgeSources:
         if proof is None or fingerprint != self.queries.content_fingerprint(message_id):
             return None
         row, principal, contact, historical = proof
-        if (_canonical_author(source.author_principal) != principal or source.occurred_at_ms != row['sent_ms']
+        if (_author_contact(self.queries, source.author_principal, at_ms=row['sent_ms'], time_basis=row['time_certainty']) != contact or source.occurred_at_ms != row['sent_ms']
                 or source.chat_id != row['chat_id'] or self.queries.terminal(owner) != contact):
             return None
         if audience.status == 'unknown':
@@ -357,7 +367,7 @@ class HistoryKnowledgeSources:
         audience = self.evidence_audience(source, basis='')
         if audience is None or (audience.status == 'known' and principal not in audience.members):
             return False
-        if principal == _canonical_author(source.author_principal):
+        if before == self.author_contact(source):
             return before == self.author_contact(source)
         return audience.status == 'known' and principal in audience.members
 
@@ -399,7 +409,7 @@ def build_history_source_aliases(*, queries: HistoryQueries, legacy_rows: Iterab
         fingerprint = queries.content_fingerprint(targets[0])
         owner = row.get('author_contact_id')
         if (proof is None or not owner or queries.terminal(str(owner)) != proof[2]
-                or fingerprint != row.get('content_fingerprint') or _canonical_author(source.author_principal) != proof[1]
+                or fingerprint != row.get('content_fingerprint') or _author_contact(queries, source.author_principal, at_ms=proof[0]['sent_ms'], time_basis=proof[0]['time_certainty']) != proof[2]
                 or source.chat_id != proof[0]['chat_id'] or source.occurred_at_ms != proof[0]['sent_ms']):
             counts['missing'] += 1
             continue
