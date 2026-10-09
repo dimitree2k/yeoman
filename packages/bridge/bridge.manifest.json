@@ -1,5 +1,5 @@
 {
   "bridgeVersion": "0.2.0",
-  "protocolVersion": 5,
-  "buildId": "20260920-v5-outbox"
+  "protocolVersion": 6,
+  "buildId": "20261009-v6-history-mentions"
 }
