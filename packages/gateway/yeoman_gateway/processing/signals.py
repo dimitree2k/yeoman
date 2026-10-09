@@ -28,6 +28,9 @@ from yeoman_shared.whatsapp_protocol import (
     valid_group_metadata,
 )
 
+from yeoman_gateway.history.writer_guard import (
+    legacy_history_writers_disabled,
+)
 from yeoman_gateway.knowledge.models import Identifier, TrustedIdentityObservation
 from yeoman_gateway.processing.models import (
     CANONICAL_WHATSAPP_ORIGIN,
@@ -705,7 +708,9 @@ class SignalJournalSink:
         sources: Any | None = None,
         statements: Any | None = None,
         identity_observation_issuer: Any | None = None,
+        legacy_history_disabled: bool = False,
     ) -> None:
+        self.legacy_history_disabled = legacy_history_writers_disabled(legacy_history_disabled)
         self._store = store
         self._mapper = mapper or WhatsAppSignalMapper()
         self._clock = clock
@@ -797,7 +802,7 @@ class SignalJournalSink:
             and signal.payload.get("observation_only") is True
             and signal.payload.get("observation_type") == "encrypted_message_edit_undecoded"
         )
-        if signal.kind == "message" and self._memory is not None and not opaque_edit:
+        if signal.kind == "message" and self._memory is not None and not opaque_edit and self.legacy_history_disabled is not True:
             get_event = getattr(self._store, "get_event", None)
             get_authority = getattr(self._store, "get_event_source_authority", None)
             index_event = getattr(self._memory, "index_canonical_event", None)
@@ -879,7 +884,7 @@ class SignalJournalSink:
         self, signal: Any, source_event_ids: Iterable[str], *, now_ms: int | None
     ) -> None:
         """Apply strict source tombstones to memory without changing turn semantics."""
-        if self._memory is None:
+        if self._memory is None or self.legacy_history_disabled is True:
             return
         invalidate = getattr(self._memory, "invalidate_sources", None)
         direct_soft_delete = False
@@ -964,7 +969,7 @@ class SignalJournalSink:
         self, source_message_id: str, enrichments: Iterable[Mapping[str, Any] | object]
     ) -> tuple[Any, ...]:
         """Index approved text derived from an already-journaled message."""
-        if self._memory is None:
+        if self._memory is None or self.legacy_history_disabled is True:
             return ()
         get_event = getattr(self._store, "get_event", None)
         events_by_source = getattr(self._store, "events_by_source_message", None)

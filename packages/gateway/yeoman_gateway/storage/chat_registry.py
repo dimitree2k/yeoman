@@ -13,6 +13,11 @@ from typing import Any
 from loguru import logger
 from yeoman_shared.utils.helpers import ensure_dir, get_operational_data_path
 
+from yeoman_gateway.history.writer_guard import (
+    legacy_history_writers_disabled,
+    require_legacy_history_writer,
+)
+
 PURGE_INTERVAL_SECONDS = 3600
 
 
@@ -32,7 +37,10 @@ class ChatRegistry:
     def __init__(
         self,
         db_path: Path | None = None,
+        *, legacy_history_disabled: bool = False,
     ) -> None:
+        self.legacy_history_disabled = legacy_history_writers_disabled(legacy_history_disabled)
+        require_legacy_history_writer(disabled=self.legacy_history_disabled, channel="whatsapp")
         if db_path is not None:
             self.db_path = db_path
         else:
@@ -48,6 +56,7 @@ class ChatRegistry:
         self._last_purge_at = 0.0
 
     def _create_schema(self) -> None:
+        require_legacy_history_writer(disabled=self.legacy_history_disabled, channel='whatsapp')
         with self._lock:
             self._conn.execute(
                 """
@@ -112,6 +121,7 @@ class ChatRegistry:
         metadata: dict[str, Any] | None = None,
     ) -> bool:
         """Register or update a chat. Returns True if newly registered, False if updated."""
+        require_legacy_history_writer(disabled=self.legacy_history_disabled, channel='whatsapp')
         if not channel or not chat_id:
             logger.warning("register_chat: missing required fields")
             return False
@@ -294,6 +304,7 @@ class ChatRegistry:
 
     def mark_seen(self, channel: str, chat_id: str) -> None:
         """Update last_seen_at timestamp."""
+        require_legacy_history_writer(disabled=self.legacy_history_disabled, channel='whatsapp')
         if not channel or not chat_id:
             return
 
@@ -386,6 +397,7 @@ class ChatRegistry:
         Returns:
             Dict mapping chat_id to whether it was newly registered (True) or updated (False)
         """
+        require_legacy_history_writer(disabled=self.legacy_history_disabled, channel='whatsapp')
         results: dict[str, bool] = {}
 
         for meta in bridge_metadata_list:

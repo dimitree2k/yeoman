@@ -194,7 +194,14 @@ def test_purge_without_chat_or_message_is_refused(home: Path) -> None:
 
 
 def test_seed_dry_run_and_import_use_only_home_stores(home: Path) -> None:
-    processing_db = get_operational_store_path("processing", data_dir=home / "data")
+    before = sorted(str(p.relative_to(home)) for p in home.rglob("*"))
+    refused = runner.invoke(app, ["raw", "seed"])
+    assert refused.exit_code == 2
+    assert sorted(str(p.relative_to(home)) for p in home.rglob("*")) == before
+
+    snapshot = home / "isolated-seed-inputs"
+    destination = home / "isolated-seed-output"
+    processing_db = snapshot / "processing.db"
     processing_db.parent.mkdir(parents=True)
     with sqlite3.connect(processing_db) as connection:
         connection.execute(
@@ -216,15 +223,21 @@ def test_seed_dry_run_and_import_use_only_home_stores(home: Path) -> None:
             ),
         )
 
-    dry_run = runner.invoke(app, ["raw", "seed", "--dry-run"])
+    args = ["raw", "seed", "--processing-db", str(processing_db),
+            "--reply-context-db", str(snapshot / "reply_context.db"),
+            "--inbound-dir", str(snapshot / "inbound"),
+            "--knowledge-db", str(snapshot / "knowledge.db"),
+            "--destination", str(destination)]
+    dry_run = runner.invoke(app, [*args, "--dry-run"])
     assert dry_run.exit_code == 0, dry_run.output
     dry_report = json.loads(dry_run.output)
     assert dry_report["per_source"]["journal"]["written"] == 1
+    assert not destination.exists()
     assert not (home / "data" / "raw" / "whatsapp" / "seed-journal.jsonl").exists()
 
-    seeded = runner.invoke(app, ["raw", "seed"])
+    seeded = runner.invoke(app, args)
     assert seeded.exit_code == 0, seeded.output
-    seed_file = home / "data" / "raw" / "whatsapp" / "seed-journal.jsonl"
+    seed_file = destination / "whatsapp" / "seed-journal.jsonl"
     assert seed_file.is_file()
     assert json.loads(seed_file.read_text().splitlines()[0])["native_id"] == "history-event"
 

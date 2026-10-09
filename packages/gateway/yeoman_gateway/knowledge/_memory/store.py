@@ -16,6 +16,10 @@ from typing import Any, Final
 
 from yeoman_shared.utils.helpers import ensure_dir
 
+from yeoman_gateway.history.writer_guard import (
+    legacy_history_writers_disabled,
+    require_legacy_history_writer,
+)
 from yeoman_gateway.knowledge._memory.models import MemoryEntry, MemoryHit, MemorySector
 from yeoman_gateway.knowledge._memory.read_gate import FactAclPredicate
 from yeoman_gateway.knowledge._memory.shared_facts import (
@@ -182,12 +186,15 @@ class MemoryStore:
         self,
         db_path: Path | None = None,
         *,
-        owner: object | None = None,
+        owner: object | None = None, legacy_history_disabled: bool = False,
         source_authority: object | None = None,
     ) -> None:
         #: Optional live source authority.  When present, vector search re-checks
         #: revocation and provenance immediately before a candidate is returned.
         self.source_authority = source_authority
+        self.legacy_history_disabled = legacy_history_writers_disabled(legacy_history_disabled)
+        if owner is None:
+            require_legacy_history_writer(disabled=self.legacy_history_disabled, channel="whatsapp")
         if owner is not None:
             self._owner = owner
             self._owns_connection = False
@@ -195,8 +202,9 @@ class MemoryStore:
             self._lock = getattr(owner, "lock")
             self._conn = getattr(owner, "connection")
             self._conn.row_factory = sqlite3.Row
-            self._migrate_shared_facts()
-            self._commit_owned()
+            if not self.legacy_history_disabled and getattr(owner, "history_identity_frozen", False) is not True:
+                self._migrate_shared_facts()
+                self._commit_owned()
             return
         if db_path is None:
             raise ValueError("MemoryStore needs either db_path or owner")
@@ -246,6 +254,7 @@ class MemoryStore:
             self._conn.close()
 
     def _create_schema(self) -> None:
+        require_legacy_history_writer(disabled=self.legacy_history_disabled, channel='whatsapp')
         with self._lock:
             self._conn.execute(
                 """
@@ -360,6 +369,7 @@ class MemoryStore:
         No column is added to ``memory2_nodes``: an existing row therefore has no fact
         row and can never acquire shared-fact read rights by accident.
         """
+        require_legacy_history_writer(disabled=self.legacy_history_disabled, channel='whatsapp')
         with self._lock:
             for statement in _SHARED_FACT_SCHEMA:
                 self._conn.execute(statement)
@@ -391,6 +401,7 @@ class MemoryStore:
         return None if row is None else str(row["value"])
 
     def set_meta(self, key: str, value: str) -> None:
+        require_legacy_history_writer(disabled=self.legacy_history_disabled, channel='whatsapp')
         with self._lock:
             self._conn.execute(
                 """
@@ -469,6 +480,7 @@ class MemoryStore:
         return [str(row["fact_id"]) for row in rows]
 
     def delete_fact_sources(self, fact_id: str, *, source_event_ids: list[str]) -> int:
+        require_legacy_history_writer(disabled=self.legacy_history_disabled, channel='whatsapp')
         if not source_event_ids:
             return 0
         placeholders = ",".join(["?"] * len(source_event_ids))
@@ -497,6 +509,7 @@ class MemoryStore:
         last_activity_ms: int | None = None,
         attempts: int | None = None,
     ) -> None:
+        require_legacy_history_writer(disabled=self.legacy_history_disabled, channel='whatsapp')
         with self._lock:
             self._conn.execute(
                 """
@@ -574,6 +587,7 @@ class MemoryStore:
         self, fact_id: str, *, workspace_id: str, model: str, vector: list[float]
     ) -> None:
         """Store a fact's vector so semantic retrieval can find it."""
+        require_legacy_history_writer(disabled=self.legacy_history_disabled, channel='whatsapp')
         with self._lock:
             self._upsert_embedding(str(fact_id), str(workspace_id), str(model), vector)
             self._commit_owned()
@@ -600,6 +614,7 @@ class MemoryStore:
             return 0
 
     def remember_embedding_dimension(self, model_id: str, dimension: int) -> None:
+        require_legacy_history_writer(disabled=self.legacy_history_disabled, channel='whatsapp')
         if int(dimension) <= 0:
             return
         self.set_meta(f"embedding_dimension:{str(model_id)}", str(int(dimension)))
@@ -613,6 +628,7 @@ class MemoryStore:
 
     def bump_acl_epoch(self) -> int:
         """Invalidate every cached permission decision after a rights change."""
+        require_legacy_history_writer(disabled=self.legacy_history_disabled, channel='whatsapp')
         with self._lock:
             next_epoch = self.acl_epoch() + 1
             self._conn.execute(
@@ -629,6 +645,7 @@ class MemoryStore:
 
     def upsert_fact(self, fact: SharedFact) -> SharedFact:
         """Write node, fact row, sources and principals; idempotent per fact id."""
+        require_legacy_history_writer(disabled=self.legacy_history_disabled, channel='whatsapp')
         now_ms = int(fact.updated_ms or fact.created_ms or 0)
         entry = MemoryEntry(
             id=fact.fact_id,
@@ -829,6 +846,7 @@ class MemoryStore:
         now_ms: int,
         superseded_by: str | None = None,
     ) -> bool:
+        require_legacy_history_writer(disabled=self.legacy_history_disabled, channel='whatsapp')
         if status not in ASSERTION_STATUSES:
             raise ValueError(f"unknown assertion status: {status}")
         with self._lock:
@@ -858,6 +876,7 @@ class MemoryStore:
 
     def redact_fact(self, fact_id: str, *, now_ms: int) -> bool:
         """Drop content and audience of a fact, keeping the tombstone and its sources."""
+        require_legacy_history_writer(disabled=self.legacy_history_disabled, channel='whatsapp')
         with self._lock:
             cursor = self._conn.execute(
                 """
@@ -1032,6 +1051,7 @@ class MemoryStore:
         rows are only a searchable projection and carry enough source/audience metadata
         for a later tombstone to remove them without adding another schema.
         """
+        require_legacy_history_writer(disabled=self.legacy_history_disabled, channel='whatsapp')
         event_id = str(self._event_value(event, "event_id", "") or "").strip()
         channel = str(self._event_value(event, "channel", "") or "").strip()
         chat_id = str(self._event_value(event, "chat_id", "") or "").strip()
@@ -1159,6 +1179,7 @@ class MemoryStore:
         contact_id: str | None = None,
     ) -> tuple[MemoryEntry, bool]:
         """Insert or merge one entry. Returns (entry, inserted_new)."""
+        require_legacy_history_writer(disabled=self.legacy_history_disabled, channel='whatsapp')
         now_iso = datetime.now(UTC).isoformat()
         with self._lock:
             existing_by_id = None
@@ -1285,6 +1306,7 @@ class MemoryStore:
         model: str,
         vector: list[float],
     ) -> None:
+        require_legacy_history_writer(disabled=self.legacy_history_disabled, channel='whatsapp')
         payload = self._serialize_vector(vector)
         now_iso = datetime.now(UTC).isoformat()
         self._conn.execute(
@@ -1332,6 +1354,7 @@ class MemoryStore:
         attempts: int | None = None,
     ) -> str:
         """Insert or update one durable embedding job, unioning conversation relations."""
+        require_legacy_history_writer(disabled=self.legacy_history_disabled, channel='whatsapp')
         merged_ids: list[str] = []
         existing = self.get_embedding_job(job_key)
         if existing is not None:
@@ -1474,6 +1497,7 @@ class MemoryStore:
         conversation_ids: Iterable[str] = (),
     ) -> None:
         """Publish one section under its full document key."""
+        require_legacy_history_writer(disabled=self.legacy_history_disabled, channel='whatsapp')
         with self._lock:
             self._conn.execute(
                 """
@@ -1531,6 +1555,7 @@ class MemoryStore:
         the sections of one document survive together while an older model, dimension,
         preprocessing version or source revision is retired.
         """
+        require_legacy_history_writer(disabled=self.legacy_history_disabled, channel='whatsapp')
         keep = {
             (
                 str(document_id),
@@ -1909,6 +1934,7 @@ class MemoryStore:
 
     def soft_delete(self, ids: list[str]) -> int:
         """Mark entries as deleted. Returns count of rows affected."""
+        require_legacy_history_writer(disabled=self.legacy_history_disabled, channel='whatsapp')
         if not ids:
             return 0
         now_iso = datetime.now(UTC).isoformat()
@@ -1928,6 +1954,7 @@ class MemoryStore:
 
     def soft_delete_sources(self, source_event_ids: Iterable[str]) -> int:
         """Soft-delete canonical projections for the supplied source event IDs."""
+        require_legacy_history_writer(disabled=self.legacy_history_disabled, channel='whatsapp')
         wanted = {str(item) for item in source_event_ids if str(item)}
         if not wanted:
             return 0
@@ -1968,6 +1995,7 @@ class MemoryStore:
         meta_json: str,
     ) -> MemoryEntry | None:
         """Update metadata for one active entry and return the updated row."""
+        require_legacy_history_writer(disabled=self.legacy_history_disabled, channel='whatsapp')
         now_iso = datetime.now(UTC).isoformat()
         with self._lock:
             cursor = self._conn.execute(
@@ -2056,6 +2084,7 @@ class MemoryStore:
         carries the knowledge tables the lock is applied; on a bare memory database the
         legacy behaviour is unchanged.
         """
+        require_legacy_history_writer(disabled=self.legacy_history_disabled, channel='whatsapp')
         with self._lock:
             self._conn.execute("DELETE FROM memory2_nodes_fts")
             has_knowledge = bool(
@@ -2094,6 +2123,7 @@ class MemoryStore:
 
     def link_nodes_to_contact(self, sender_id: str, contact_id: str) -> int:
         """Link existing memory nodes to a contact by sender_id."""
+        require_legacy_history_writer(disabled=self.legacy_history_disabled, channel='whatsapp')
         with self._lock:
             cursor = self._conn.execute(
                 "UPDATE memory2_nodes SET contact_id = ?"
@@ -2110,6 +2140,7 @@ class MemoryStore:
         title: str,
         source: str,
     ) -> int:
+        require_legacy_history_writer(disabled=self.legacy_history_disabled, channel='whatsapp')
         now_iso = datetime.now(UTC).isoformat()
         promoted_at = now_iso if stage == "backlog" else None
         with self._lock:

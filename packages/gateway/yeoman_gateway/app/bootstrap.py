@@ -458,9 +458,9 @@ class GatewayRuntime:
     channels: ChannelManager
     cron: CronService
     heartbeat: HeartbeatService
-    inbound_archive: InboundArchive
+    inbound_archive: InboundArchive | None
     responder: LLMResponder
-    memory: MemoryService
+    memory: MemoryService | None
     contacts: ContactsService | None
     chat_registry: object
     bus: MessageBus | None = None
@@ -585,7 +585,8 @@ class GatewayRuntime:
                     # cleanup (including the store fence) still runs below.
                     retention_error = exc
             await attempt_async(self.responder.aclose)
-            attempt_sync(self.inbound_archive.close)
+            if self.inbound_archive is not None:
+                attempt_sync(self.inbound_archive.close)
             if self.speakup_log is not None and hasattr(self.speakup_log, "close"):
                 attempt_sync(self.speakup_log.close)
             if hasattr(self.chat_registry, "close"):
@@ -599,7 +600,8 @@ class GatewayRuntime:
                     attempt_sync(self.statement_capture.stop)
             if self.contacts is not None:
                 attempt_sync(self.contacts.close)
-            attempt_sync(self.memory.close)
+            if self.memory is not None:
+                attempt_sync(self.memory.close)
             if self.processing is not None:
                 attempt_sync(self.processing.close)
             if self.history_projector is not None:
@@ -735,6 +737,7 @@ def build_shared_fact_runtime(
     chat_registry: object | None = None,
     policy: object | None = None,
     memory: "MemoryService | None" = None,
+    legacy_history_disabled: bool = False,
 ) -> SharedFactRuntime | None:
     """Shared-fact runtime (Plan 05), or ``None`` when any switch is off.
 
@@ -742,6 +745,9 @@ def build_shared_fact_runtime(
     the new processing mode. Disabled mode therefore has no worker thread, no job row and
     no gate object - the same fail-closed shape as :func:`build_processing_store`.
     """
+    from yeoman_gateway.history.writer_guard import legacy_history_writers_disabled
+    if legacy_history_writers_disabled(legacy_history_disabled) or getattr(getattr(config, "history", None), "legacy_writers_disabled", False) is True:
+        return None
     if not getattr(getattr(config, "memory", None), "enabled", False):
         return None
     shared = getattr(config.memory, "shared", None)
@@ -786,6 +792,7 @@ def build_shared_fact_runtime(
             extractor = None
     queue = SharedFactExtractionQueue(
         store=memory.store,
+        legacy_history_disabled=legacy_history_disabled,
         journal=store,
         extractor=extractor,
         embedder=getattr(memory, "embedding", None),
@@ -825,6 +832,8 @@ def build_statement_capture(
     if knowledge is None:
         return None
     selected = config.history.live_projection_enabled and config.history.readers.knowledge
+    if config.history.legacy_writers_disabled is True and not selected:
+        return None
     if not selected and processing is None:
         return None
     if not bool(getattr(config.knowledge, "capture_enabled", False)):
@@ -2726,6 +2735,49 @@ def build_effect_router(
     )
 
 
+def _validate_legacy_writer_retirement(config: "Config") -> None:
+    """Validate the prepared replacement set and durable handover before writers exist."""
+    if config.history.legacy_writers_disabled is not True:
+        return
+    import json
+    import sqlite3
+
+    from yeoman_gateway.adapters.reply_archive_history import HistoryReplyArchiveAdapter
+    from yeoman_gateway.agent.tools.history_read import HistoryReadTool
+    from yeoman_gateway.history.export import SecondaryArchive
+    from yeoman_gateway.history.live import HistoryPaused
+    from yeoman_gateway.history.queries import HistoryQueries
+    from yeoman_gateway.knowledge._history_capture import (
+        HistoryCaptureProducer,
+        HistoryCaptureWorker,
+    )
+    from yeoman_gateway.knowledge._history_identity import HistoryIdentityEngine
+
+    adapters = (HistoryReplyArchiveAdapter, HistoryQueries, HistoryReadTool, SecondaryArchive,
+                HistoryIdentityEngine, HistoryCaptureProducer, HistoryCaptureWorker)
+    if config.history.live_projection_enabled is not True or not all(callable(a) for a in adapters):
+        raise HistoryPaused("writer_retirement_replacements_required")
+    if config.knowledge.enabled is not True:
+        raise HistoryPaused("writer_retirement_knowledge_required")
+    path = Path(config.knowledge.db_path).expanduser().resolve()
+    connection = None
+    try:
+        connection = sqlite3.connect(path.as_uri() + "?mode=ro", uri=True)
+        version = connection.execute("SELECT value FROM knowledge_meta WHERE key='schema_version'").fetchone()
+        row = connection.execute("SELECT value_json FROM knowledge_history_capture_state WHERE key='handover'").fetchone()
+        receipt = json.loads(row[0]) if row else None
+        if (version != ('3',) or not isinstance(receipt, dict) or receipt.get('version') != 1
+                or type(receipt.get('generation')) is not int or receipt['generation'] < 1
+                or not all(isinstance(receipt.get(key), list) for key in ('sources', 'pending', 'processed', 'legacy_boundary'))
+                or len(receipt['legacy_boundary']) != 2):
+            raise HistoryPaused("writer_retirement_handover_required")
+    except (OSError, sqlite3.Error, ValueError, TypeError) as exc:
+        raise HistoryPaused("writer_retirement_handover_required") from exc
+    finally:
+        if connection is not None:
+            connection.close()
+
+
 def build_gateway_runtime(
     *,
     config: "Config",
@@ -2736,6 +2788,9 @@ def build_gateway_runtime(
     bus: MessageBus,
 ) -> GatewayRuntime:
     """Compose full gateway runtime around vNext orchestrator."""
+
+    _validate_legacy_writer_retirement(config)
+    legacy_history_disabled = config.history.legacy_writers_disabled is True
 
     from yeoman_shared.utils.helpers import get_operational_data_path, get_operational_store_path
 
@@ -2779,9 +2834,10 @@ def build_gateway_runtime(
         history_selected=config.history.live_projection_enabled and config.history.readers.responder,
         legacy_history_disabled=config.history.legacy_writers_disabled)
     # The owner wants a complete inbound record: keep every message, purge nothing.
-    inbound_archive = InboundArchive(
+    inbound_archive = None if legacy_history_disabled else InboundArchive(
         db_path=get_operational_data_path() / "inbound" / "reply_context.db",
         retention_days=None,
+        legacy_history_disabled=legacy_history_disabled,
     )
     model_router = ModelRouter(config.models)
     media_storage = MediaStorage(
@@ -2834,8 +2890,9 @@ def build_gateway_runtime(
 
     from yeoman_gateway.storage.chat_registry import ChatRegistry
 
-    chat_registry = ChatRegistry(
+    chat_registry = None if legacy_history_disabled else ChatRegistry(
         db_path=get_operational_data_path() / "inbound" / "chat_registry.db",
+        legacy_history_disabled=legacy_history_disabled,
     )
 
     # ── knowledge storage ownership ──────────────────────────────────────────
@@ -2868,7 +2925,8 @@ def build_gateway_runtime(
         try:
             knowledge_service = open_knowledge_store(
                 Path(config.knowledge.db_path).expanduser(),
-                history_mode=history_identity_selected,
+                history_mode=history_identity_selected or legacy_history_disabled,
+                legacy_history_disabled=legacy_history_disabled,
                 workspace_id=workspace_id_for(workspace),
                 source_authority=knowledge_sources,
                 policy_authority=knowledge_policy,
@@ -2885,28 +2943,33 @@ def build_gateway_runtime(
             logger.error("person knowledge unavailable: {}", exc)
             raise
 
-    if knowledge_service is not None:
+    if legacy_history_disabled:
+        memory_service = None
+        contacts_service = None
+    elif knowledge_service is not None:
         memory_service = MemoryService(
             workspace=workspace,
             config=config.memory,
             root_config=config,
             store=knowledge_service.memory_store(),
             owns_store=False,
+            legacy_history_disabled=legacy_history_disabled,
         )
         if history_identity_selected:
             contacts_service = None
         else:
-            contacts_service = ContactsService(store=knowledge_service.contacts_store())
+            contacts_service = ContactsService(store=knowledge_service.contacts_store(), legacy_history_disabled=legacy_history_disabled)
             contacts_service.mark_owner_from_policy(
                 policy_engine.policy.owners if policy_engine else {},
             )
             memory_service.set_contacts(contacts_service)
     else:
         memory_service = MemoryService(
-            workspace=workspace, config=config.memory, root_config=config
+            workspace=workspace, config=config.memory, root_config=config, legacy_history_disabled=legacy_history_disabled
         )
         contacts_service = None if history_identity_selected else ContactsService(
             db_path=get_operational_data_path() / "contacts" / "contacts.db",
+            legacy_history_disabled=legacy_history_disabled,
         )
         if contacts_service is not None:
             contacts_service.mark_owner_from_policy(policy_engine.policy.owners if policy_engine else {})
@@ -2926,7 +2989,7 @@ def build_gateway_runtime(
     consumer_contacts = None if knowledge_service is not None else contacts_service
 
     try:
-        imported = memory_service.backfill_from_workspace_files(force=False)
+        imported = memory_service.backfill_from_workspace_files(force=False) if memory_service is not None else 0
         if imported > 0:
             logger.info("memory backfill imported {} entries", imported)
     except Exception as e:
@@ -3187,6 +3250,7 @@ def build_gateway_runtime(
             SignalJournalSink(
                 processing_store,
                 memory=memory_service,
+                legacy_history_disabled=legacy_history_disabled,
                 sources=observed_sources,
                 statements=knowledge_service,
                 identity_observation_issuer=knowledge_sources,
@@ -3292,7 +3356,7 @@ def build_gateway_runtime(
         if next_job.payload.next_job_id and response and not is_chain_failure(response):
             await _handle_chain(next_job, response, run_id)
 
-    archive_adapter = SqliteReplyArchiveAdapter(inbound_archive)
+    archive_adapter = SqliteReplyArchiveAdapter(inbound_archive, legacy_history_disabled=legacy_history_disabled)
     opportunity_scheduler: object | None = None
 
     def _release_participation_chat(channel: str, chat_id: str) -> None:
@@ -4565,6 +4629,7 @@ def build_gateway_runtime(
 
     shared_fact_runtime = build_shared_fact_runtime(
         config,
+        legacy_history_disabled=legacy_history_disabled,
         store=processing_store,
         processing=processing_store,
         chat_registry=chat_registry,
@@ -4597,7 +4662,8 @@ def build_gateway_runtime(
             observer._history_knowledge = knowledge_service
             if config.history.live_projection_enabled and config.history.readers.secondary:
                 observer._session_manager = SessionManager(workspace=responder.sessions.workspace, sessions_dir=responder.sessions.sessions_dir,
-                    history_selected=True, operational_store=responder.sessions.operational_store)
+                    history_selected=True, operational_store=responder.sessions.operational_store,
+                    legacy_history_disabled=legacy_history_disabled)
     return GatewayRuntime(
         orchestrator=orchestrator_service,
         channels=channels,

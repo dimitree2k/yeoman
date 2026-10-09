@@ -6,6 +6,10 @@ from pathlib import Path
 
 from loguru import logger
 
+from yeoman_gateway.history.writer_guard import (
+    legacy_history_writers_disabled,
+    require_legacy_history_writer,
+)
 from yeoman_gateway.knowledge._contacts.store import ContactsStore
 
 
@@ -17,12 +21,14 @@ class ContactsService:
         known_jids: Mapping of identifier -> contact_id, loaded on boot.
     """
 
-    def __init__(self, db_path: Path | None = None, *, store: ContactsStore | None = None) -> None:
+    def __init__(self, db_path: Path | None = None, *, store: ContactsStore | None = None, legacy_history_disabled: bool = False) -> None:
+        self.legacy_history_disabled = legacy_history_writers_disabled(legacy_history_disabled)
+        require_legacy_history_writer(disabled=self.legacy_history_disabled, channel="whatsapp")
         self.owns_store = store is None
         if store is not None:
             self.store = store
         elif db_path is not None:
-            self.store = ContactsStore(db_path=db_path)
+            self.store = ContactsStore(db_path=db_path, legacy_history_disabled=self.legacy_history_disabled)
         else:
             raise ValueError("ContactsService needs either db_path or store")
         self.known_jids: dict[str, str] = {}
@@ -33,6 +39,7 @@ class ContactsService:
 
     def reload_cache(self) -> None:
         """(Re)load the in-memory JID cache from the store."""
+        require_legacy_history_writer(disabled=self.legacy_history_disabled, channel='whatsapp')
         self.known_jids = self.store.load_all_identifiers()
         self._display_names.clear()
         logger.debug("contacts cache reloaded — {} known JIDs", len(self.known_jids))
@@ -51,6 +58,7 @@ class ContactsService:
 
         If *push_name* is provided it is tracked as an alias (source="push_name").
         """
+        require_legacy_history_writer(disabled=self.legacy_history_disabled, channel='whatsapp')
         # Fast path: already in cache
         if identifier in self.known_jids:
             contact_id = self.known_jids[identifier]
@@ -88,6 +96,7 @@ class ContactsService:
 
     def _track_alias(self, contact_id: str, push_name: str) -> None:
         """Upsert a push_name alias for the given contact."""
+        require_legacy_history_writer(disabled=self.legacy_history_disabled, channel='whatsapp')
         self.store.upsert_alias(
             contact_id=contact_id,
             alias=push_name,
@@ -98,6 +107,7 @@ class ContactsService:
 
     def update_display_name(self, contact_id: str, display_name: str) -> None:
         """Update display name in the store and invalidate the cache entry."""
+        require_legacy_history_writer(disabled=self.legacy_history_disabled, channel='whatsapp')
         self.store.update_display_name(contact_id, display_name)
         self._display_names.pop(contact_id, None)
 
@@ -187,6 +197,7 @@ class ContactsService:
         The flag mirrors policy: a contact that policy no longer names loses it.  An
         empty map is treated as a missing policy, never as a decision to demote everyone.
         """
+        require_legacy_history_writer(disabled=self.legacy_history_disabled, channel='whatsapp')
         marked: set[str] = set()
         for channel, jids in owner_map.items():
             for jid in jids:
@@ -219,12 +230,14 @@ class ContactsService:
         value: str,
         label: str | None = None,
     ) -> None:
+        require_legacy_history_writer(disabled=self.legacy_history_disabled, channel='whatsapp')
         self.store.upsert_field(contact_id=contact_id, kind=kind, value=value, label=label)
 
     # ── memory backfill ────────────────────────────────────────────────────
 
     def backfill_memory(self, memory_store: object) -> int:
         """One-time backfill: link existing memory nodes to contacts by sender_id."""
+        require_legacy_history_writer(disabled=self.legacy_history_disabled, channel='whatsapp')
         linked = 0
         for identifier, contact_id in self.known_jids.items():
             count = memory_store.link_nodes_to_contact(identifier, contact_id)  # type: ignore[attr-defined]

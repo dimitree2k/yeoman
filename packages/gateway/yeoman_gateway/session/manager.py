@@ -15,6 +15,10 @@ from yeoman_shared.utils.helpers import get_operational_store_path, get_sessions
 from yeoman_gateway.history.live import HistoryPaused
 from yeoman_gateway.history.queries import HistoryQueries
 from yeoman_gateway.history.reader import HistorySnapshot
+from yeoman_gateway.history.writer_guard import (
+    legacy_history_writers_disabled,
+    require_legacy_history_writer,
+)
 
 if TYPE_CHECKING:
     from .operational import OperationalSessions
@@ -235,8 +239,10 @@ class SessionManager:
                  history_selected: bool = False, legacy_history_disabled: bool = False):
         self.workspace = workspace
         self.operational_store = operational_store
-        self.history_selected = history_selected
-        self.legacy_history_disabled = legacy_history_disabled
+        self.history_selected = history_selected is True
+        self.legacy_history_disabled = legacy_history_writers_disabled(legacy_history_disabled)
+        history_selected = self.history_selected
+        legacy_history_disabled = self.legacy_history_disabled
         if (history_selected or legacy_history_disabled) and operational_store is None:
             from .operational import OperationalSessions
             self.operational_store = OperationalSessions(get_operational_store_path("session_metadata"))
@@ -292,6 +298,7 @@ class SessionManager:
                                channel=channel, chat_id=chat_id, thread_id=thread_id,
                                history_snapshot=history_snapshot, current_message_id=current_message_id,
                                turn_id=turn_id or uuid.uuid4().hex)
+        require_legacy_history_writer(disabled=self.legacy_history_disabled, channel=channel or key.split(":", 1)[0])
         # Check cache
         if key in self._cache:
             return self._cache[key]
@@ -306,6 +313,7 @@ class SessionManager:
 
     def _load(self, key: str) -> Session | None:
         """Load a session from disk."""
+        require_legacy_history_writer(disabled=self.legacy_history_disabled, channel=key.split(":", 1)[0])
         path = self._get_session_path(key)
 
         if not path.exists():
@@ -344,8 +352,7 @@ class SessionManager:
         """Save a session to disk."""
         if session.operational_store is not None:
             return
-        if self.legacy_history_disabled and session.key.startswith("whatsapp:"):
-            raise HistoryPaused("session_writer_retired")
+        require_legacy_history_writer(disabled=self.legacy_history_disabled, channel=session.key.split(":", 1)[0])
         path = self._get_session_path(session.key)
         path.parent.mkdir(parents=True, exist_ok=True)
         temporary = path.with_name(f".{path.name}.{uuid.uuid4().hex}.tmp")
@@ -385,6 +392,7 @@ class SessionManager:
         Returns:
             True if deleted, False if not found.
         """
+        require_legacy_history_writer(disabled=self.legacy_history_disabled, channel=key.split(":", 1)[0])
         # Remove from cache
         self._cache.pop(key, None)
 

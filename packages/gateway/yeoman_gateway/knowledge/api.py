@@ -15,6 +15,11 @@ from collections.abc import Iterator
 from contextlib import contextmanager
 from typing import TYPE_CHECKING
 
+from yeoman_gateway.history.writer_guard import (
+    legacy_history_writers_disabled,
+    require_legacy_history_writer,
+)
+
 if TYPE_CHECKING:
     from yeoman_gateway.history.queries import HistoryQueries
     from yeoman_gateway.knowledge._history_sources import (
@@ -199,6 +204,7 @@ def open_knowledge_store(
     retention_ms: int | None = None,
     legacy_sources: Iterable[Path] = (),
     history_mode: bool = False,
+    legacy_history_disabled: bool = False,
 ) -> "KnowledgeService":
     """Open (or create) the knowledge store and return the public service.
 
@@ -212,6 +218,10 @@ def open_knowledge_store(
     meta rows, no WAL side file.  Only a file that does not exist at all is created as a
     fresh v2 store; the normal start never migrates, and it never upgrades in place.
     """
+    legacy_history_disabled = legacy_history_writers_disabled(legacy_history_disabled)
+    if legacy_history_disabled and history_mode is not True:
+        from yeoman_gateway.history.live import HistoryPaused
+        raise HistoryPaused("retired_knowledge_requires_history_schema")
     path = Path(db_path).expanduser()
     legacy = [Path(item).expanduser() for item in legacy_sources]
     probe = _probe_schema(path)
@@ -273,6 +283,7 @@ def open_knowledge_store(
         clock=clock,
         retention_ms=retention_ms,
         history_mode=history_mode,
+        legacy_history_disabled=legacy_history_disabled,
     )
 
 
@@ -367,7 +378,12 @@ class KnowledgeService:
         clock: Any | None = None,
         retention_ms: int | None = None,
         history_mode: bool = False,
+        legacy_history_disabled: bool = False,
     ) -> None:
+        self.legacy_history_disabled = legacy_history_writers_disabled(legacy_history_disabled)
+        if self.legacy_history_disabled is True and store.schema_version != 3:
+            from yeoman_gateway.history.live import HistoryPaused
+            raise HistoryPaused("retired_knowledge_requires_history_schema")
         self._store = store
         # One wrapper so administrative sources registered later are visible to the
         # statement engine through the very same object.
@@ -379,7 +395,7 @@ class KnowledgeService:
         self.workspace_id = str(workspace_id)
         self._clock = clock
         self._identity = ScopedKnowledgeAdapter(store,
-            IdentityEngine(store, authority=self._authority, policy=policy_authority),
+            IdentityEngine(store, authority=self._authority, policy=policy_authority, legacy_history_disabled=self.legacy_history_disabled),
             'identity', selected=history_mode)
         self._identity_candidates = IdentityCandidateEngine(store, identity=self._identity)
         self._statements = StatementEngine(
@@ -428,6 +444,7 @@ class KnowledgeService:
             _scopes.reset(token)
 
     def _require_legacy_identity(self) -> None:
+        require_legacy_history_writer(disabled=self.legacy_history_disabled, channel="whatsapp")
         from yeoman_gateway.knowledge._history_identity import current_history_scope
         if self._history_mode or current_history_scope(self._store) is not None:
             raise KnowledgeError('history_identity_read_only', 'use the local owner-attestation CLI')
@@ -677,6 +694,7 @@ class KnowledgeService:
         visibility: str = "public",
         observed_name: str | None = None,
     ) -> ChangeReceipt:
+        require_legacy_history_writer(disabled=self.legacy_history_disabled, channel="whatsapp")
         with self._store.transaction():
             receipt = self._identity.set_preferred_name(
                 person_id,
@@ -697,6 +715,7 @@ class KnowledgeService:
         mapping_verified: bool,
         context: TrustedAdminContext,
     ) -> ChangeReceipt:
+        require_legacy_history_writer(disabled=self.legacy_history_disabled, channel="whatsapp")
         with self._store.transaction():
             return self._identity.add_binding(
                 person_id=person_id,
@@ -825,6 +844,7 @@ class KnowledgeService:
         expected_revision: int,
         context: TrustedAdminContext,
     ) -> ChangeReceipt:
+        require_legacy_history_writer(disabled=self.legacy_history_disabled, channel="whatsapp")
         with self._store.transaction():
             return self._identity.merge_people(
                 target_id,
@@ -836,6 +856,7 @@ class KnowledgeService:
     def undo_merge(
         self, operation_id: str, *, expected_revision: int, context: TrustedAdminContext
     ) -> ChangeReceipt:
+        require_legacy_history_writer(disabled=self.legacy_history_disabled, channel="whatsapp")
         with self._store.transaction():
             return self._identity.undo_merge(
                 operation_id, expected_revision=expected_revision, context=context
@@ -857,6 +878,7 @@ class KnowledgeService:
         merge.  A verified unknown platform identity may create a stub; model text never
         reaches this method.
         """
+        require_legacy_history_writer(disabled=self.legacy_history_disabled, channel="whatsapp")
         with self._store.transaction():
             return self._identity.resolve_observation(
                 observation, context=context, create_stub=create_stub
@@ -867,6 +889,7 @@ class KnowledgeService:
         observation: TrustedIdentityObservation,
     ) -> PersonResolution:
         """Persist and resolve one issuer-verified WhatsApp phone/LID pairing."""
+        require_legacy_history_writer(disabled=self.legacy_history_disabled, channel="whatsapp")
         if not isinstance(observation, TrustedIdentityObservation):
             raise ValidationError("observation must be a TrustedIdentityObservation")
         with self._store.transaction():
@@ -957,6 +980,7 @@ class KnowledgeService:
         change_kind: str = "binding",
     ) -> ChangeReceipt:
         """Claim, extend or hand over one temporal identifier binding."""
+        require_legacy_history_writer(disabled=self.legacy_history_disabled, channel="whatsapp")
         with self._store.transaction():
             return self._identity.add_or_end_binding(
                 change_kind=change_kind,
@@ -984,6 +1008,7 @@ class KnowledgeService:
         end_at_ms: int | None = None,
     ) -> ChangeReceipt:
         """End exactly one binding; its proven period stays as history."""
+        require_legacy_history_writer(disabled=self.legacy_history_disabled, channel="whatsapp")
         with self._store.transaction():
             return self._identity.end_binding(
                 binding_id=binding_id,
@@ -1012,6 +1037,7 @@ class KnowledgeService:
         source: str = "observed",
     ) -> NameObservation:
         """Record one alias with an explicit kind, context and evidence."""
+        require_legacy_history_writer(disabled=self.legacy_history_disabled, channel="whatsapp")
         with self._store.transaction():
             return self._identity.observe_alias(
                 person_id=person_id,
@@ -1036,6 +1062,7 @@ class KnowledgeService:
         address_allowed: bool = True,
     ) -> ChangeReceipt:
         """Make one alias the preferred address in its own context."""
+        require_legacy_history_writer(disabled=self.legacy_history_disabled, channel="whatsapp")
         with self._store.transaction():
             return self._identity.set_alias_preference(
                 alias_id=int(alias_id),
@@ -1058,6 +1085,7 @@ class KnowledgeService:
         correct_mapping: bool = False,
     ) -> ChangeReceipt:
         """Withdraw the addressing permission, or retract the mapping itself."""
+        require_legacy_history_writer(disabled=self.legacy_history_disabled, channel="whatsapp")
         with self._store.transaction():
             return self._identity.retire_alias(
                 alias_id=int(alias_id),
@@ -1482,6 +1510,7 @@ class KnowledgeService:
         )
 
     def reindex(self, *, context: TrustedAdminContext) -> MaintenanceReport:
+        require_legacy_history_writer(disabled=self.legacy_history_disabled, channel="whatsapp")
         self._require_admin_context(context)
         rows = self._store.query(
             "SELECT id, content FROM memory2_nodes WHERE is_deleted = 0"
@@ -1558,13 +1587,13 @@ class KnowledgeService:
         """The session/notes adapter's view of the shared store.  Internal use only."""
         from yeoman_gateway.knowledge._memory.store import MemoryStore
 
-        return MemoryStore(owner=self._store)
+        return MemoryStore(owner=self._store, legacy_history_disabled=self.legacy_history_disabled)
 
     def contacts_store(self) -> Any:
         """The contacts cache adapter's view of the shared store.  Internal use only."""
         from yeoman_gateway.knowledge._contacts.store import ContactsStore
 
-        return ContactsStore(owner=self._store)
+        return ContactsStore(owner=self._store, legacy_history_disabled=self.legacy_history_disabled)
 
     # ── internal helpers used by the runtime adapters ────────────────────────
 
@@ -1789,6 +1818,7 @@ class KnowledgeService:
         never mints an active authority, because no channel adapter proved the mapping.
         A later audited admin operation or a real platform observation promotes it.
         """
+        require_legacy_history_writer(disabled=self.legacy_history_disabled, channel="whatsapp")
         self._require_legacy_identity()
         identifier = Identifier(
             channel=str(channel), kind=str(kind), value=str(value), namespace=namespace
@@ -2124,6 +2154,7 @@ class KnowledgeService:
         self, target_id: str, source_id: str, *, reason: str = "admin"
     ) -> ChangeReceipt:
         """Reversible merge with a Policy-issued admin context."""
+        require_legacy_history_writer(disabled=self.legacy_history_disabled, channel="whatsapp")
         context = self.admin_context_for(reason=reason)
         with self._store.transaction():
             return self._identity.merge_people(
@@ -2137,6 +2168,7 @@ class KnowledgeService:
         self, operation_id: str, *, reason: str = "admin"
     ) -> ChangeReceipt:
         """Undo one reversible merge with a Policy-issued admin context."""
+        require_legacy_history_writer(disabled=self.legacy_history_disabled, channel="whatsapp")
         context = self.admin_context_for(reason=reason)
         with self._store.transaction():
             return self._identity.undo_merge(
@@ -2149,6 +2181,7 @@ class KnowledgeService:
         self, alias_id: int, *, correct_mapping: bool, reason: str = "admin"
     ) -> ChangeReceipt:
         """Retire one alias with a Policy-issued admin context."""
+        require_legacy_history_writer(disabled=self.legacy_history_disabled, channel="whatsapp")
         return self.retire_alias(
             alias_id=int(alias_id),
             context=self.admin_context_for(reason=reason),
@@ -2160,6 +2193,7 @@ class KnowledgeService:
         self, operation_id: str, *, reason: str = "admin"
     ) -> ChangeReceipt:
         """Reverse one alias retirement with a Policy-issued admin context."""
+        require_legacy_history_writer(disabled=self.legacy_history_disabled, channel="whatsapp")
         context = self.admin_context_for(reason=reason)
         with self._store.transaction():
             return self._identity.undo_alias_retire(

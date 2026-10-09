@@ -14,6 +14,9 @@ import time
 from dataclasses import dataclass
 from typing import Any, Final, Iterable
 
+from yeoman_gateway.history.writer_guard import (
+    require_legacy_history_writer,
+)
 from yeoman_gateway.knowledge._store import KnowledgeStore
 from yeoman_gateway.knowledge.models import (
     ALIAS_STATUSES,
@@ -65,7 +68,8 @@ class PersonRow:
 class IdentityEngine:
     """Person lookup, identifier binding, name priority and reversible merges."""
 
-    def __init__(self, store: KnowledgeStore, *, authority: Any, policy: Any) -> None:
+    def __init__(self, store: KnowledgeStore, *, authority: Any, policy: Any, legacy_history_disabled: bool = False) -> None:
+        self.legacy_history_disabled = legacy_history_disabled is True
         self._store = store
         self._authority = authority
         self._policy = policy
@@ -296,6 +300,7 @@ class IdentityEngine:
         wins); a caller that wants to end it must go through ``add_or_end_binding`` so
         the previous period survives as history instead of being overwritten.
         """
+        require_legacy_history_writer(disabled=self.legacy_history_disabled, channel='whatsapp')
         ts = now_ms()
         from_ms = int(valid_from_ms or 0)
         if status == "withheld":
@@ -374,6 +379,7 @@ class IdentityEngine:
         mapping_verified: bool,
         observed_at_ms: int = 0,
     ) -> str:
+        require_legacy_history_writer(disabled=self.legacy_history_disabled, channel='whatsapp')
         person_id = self._store.new_id()
         ts = now_ms()
         iso = _iso(ts)
@@ -455,6 +461,7 @@ class IdentityEngine:
         Detection is not permission: an observed or confirmed alias is searchable but is
         only usable as an address once ``address_allowed`` was deliberately granted.
         """
+        require_legacy_history_writer(disabled=self.legacy_history_disabled, channel='whatsapp')
         clean = validate_name(name)
         if status not in ALIAS_STATUSES:
             raise ValidationError(f"alias status must be one of {ALIAS_STATUSES}")
@@ -708,6 +715,7 @@ class IdentityEngine:
         channel input may create a stub for a genuinely unknown identifier; model text
         never reaches this method.
         """
+        require_legacy_history_writer(disabled=self.legacy_history_disabled, channel='whatsapp')
         evidence_ref = self._authority.verify_observation(observation)
         pair = self._provider_pair_identifiers(observation)
         if pair is not None and observation.mapping_verified:
@@ -742,6 +750,7 @@ class IdentityEngine:
         observation: TrustedIdentityObservation,
     ) -> PersonResolution:
         """Record and resolve one issuer-verified WhatsApp phone/LID observation."""
+        require_legacy_history_writer(disabled=self.legacy_history_disabled, channel='whatsapp')
         evidence_ref = self._authority.verify_observation(observation)
         pair = self._provider_pair_identifiers(observation)
         if pair is None:
@@ -864,6 +873,7 @@ class IdentityEngine:
         context: TrustedReadContext | None,
         create_stub: bool,
     ) -> PersonResolution:
+        require_legacy_history_writer(disabled=self.legacy_history_disabled, channel="whatsapp")
         phone, lid = pair
         observed_at_ms = int(observation.observed_at_ms or now_ms())
         self._store.execute(
@@ -1003,6 +1013,7 @@ class IdentityEngine:
         reason: str,
         evidence_ref: str,
     ) -> None:
+        require_legacy_history_writer(disabled=self.legacy_history_disabled, channel='whatsapp')
         ts = self._store.now_ms()
         self._store.execute(
             """
@@ -1202,6 +1213,7 @@ class IdentityEngine:
         ``address_allowed`` was granted deliberately - and a scope key is required, because
         a name released in one chat is not a global fact.
         """
+        require_legacy_history_writer(disabled=self.legacy_history_disabled, channel='whatsapp')
         canonical = self.canonical_id(person_id)
         self.require_person(canonical)
         clean = validate_name(name)
@@ -1258,6 +1270,7 @@ class IdentityEngine:
         holder of that slot is demoted in the same transaction, so a reader never has to
         choose between two "preferred" names.
         """
+        require_legacy_history_writer(disabled=self.legacy_history_disabled, channel='whatsapp')
         self._require_owner(context)
         self._policy.require_admin(context)
         alias = self.alias_by_id(alias_id)
@@ -1311,6 +1324,7 @@ class IdentityEngine:
         old messages remain findable.  ``correct_mapping=True`` ("so habe ich nie
         geheissen") retracts the association itself, which also removes it from search.
         """
+        require_legacy_history_writer(disabled=self.legacy_history_disabled, channel='whatsapp')
         self._require_owner(context)
         self._policy.require_admin(context)
         alias = self.alias_by_id(alias_id)
@@ -1372,6 +1386,7 @@ class IdentityEngine:
         without it returns to the neutral ``observed`` state, which never grants
         addressing: detection is not permission.
         """
+        require_legacy_history_writer(disabled=self.legacy_history_disabled, channel='whatsapp')
         self._require_owner(context)
         self._policy.require_admin(context)
         if int(expected_revision) != self._store.identity_revision:
@@ -1610,6 +1625,7 @@ class IdentityEngine:
         must not mint an active v2 binding: an unproven import stays ``withheld`` until a
         channel adapter or an audited admin operation proves it.
         """
+        require_legacy_history_writer(disabled=self.legacy_history_disabled, channel='whatsapp')
         self._store.execute(
             "INSERT INTO contact_identifiers (channel, identifier, contact_id, kind)"
             " VALUES (?, ?, ?, ?) ON CONFLICT(channel, identifier) DO NOTHING",
@@ -1626,6 +1642,7 @@ class IdentityEngine:
         steal a live identity.  The candidate row is still written, so the case stays
         visible in the cutover ledger.
         """
+        require_legacy_history_writer(disabled=self.legacy_history_disabled, channel='whatsapp')
         ts = now_ms()
         binding_id = self._store.new_id()
         taken = self._store.query_one(
@@ -1954,6 +1971,7 @@ class IdentityEngine:
         evidence_ref: str = "",
     ) -> ChangeReceipt:
         """Set the released address preference.  This changes no rights at all."""
+        require_legacy_history_writer(disabled=self.legacy_history_disabled, channel='whatsapp')
         self._require_owner(context)
         self._policy.require_admin(context)
         canonical = self.canonical_id(person_id)
@@ -2015,6 +2033,7 @@ class IdentityEngine:
         mapping_verified: bool,
         context: TrustedAdminContext,
     ) -> ChangeReceipt:
+        require_legacy_history_writer(disabled=self.legacy_history_disabled, channel='whatsapp')
         self._require_owner(context)
         self._policy.require_admin(context)
         canonical = self.canonical_id(person_id)
@@ -2075,6 +2094,7 @@ class IdentityEngine:
         acting on stale knowledge changes nothing.  An overlapping proven period for two
         different people is refused rather than silently preferred.
         """
+        require_legacy_history_writer(disabled=self.legacy_history_disabled, channel='whatsapp')
         self._require_owner(context)
         self._policy.require_admin(context)
         if int(expected_revision) != self._store.identity_revision:
@@ -2168,6 +2188,7 @@ class IdentityEngine:
         reason: str = "reassigned",
     ) -> ChangeReceipt:
         """End exactly one binding and keep its proven period as history."""
+        require_legacy_history_writer(disabled=self.legacy_history_disabled, channel='whatsapp')
         self._require_owner(context)
         self._policy.require_admin(context)
         if int(expected_revision) != self._store.identity_revision:
@@ -2252,6 +2273,7 @@ class IdentityEngine:
         authorization_ref: str,
         payload: dict[str, Any],
     ) -> str:
+        require_legacy_history_writer(disabled=self.legacy_history_disabled, channel='whatsapp')
         operation_id = self._store.new_id()
         self._store.execute(
             "INSERT INTO knowledge_identity_ops (operation_id, kind, actor_principal,"
@@ -2302,6 +2324,7 @@ class IdentityEngine:
         original person ids and are only canonicalised on read.  No principal, quota,
         audience or owner flag is touched.
         """
+        require_legacy_history_writer(disabled=self.legacy_history_disabled, channel='whatsapp')
         self._require_owner(context)
         self._policy.require_admin(context)
         if int(expected_revision) != self._store.identity_revision:
@@ -2372,6 +2395,7 @@ class IdentityEngine:
         self, operation_id: str, *, expected_revision: int, context: TrustedAdminContext
     ) -> ChangeReceipt:
         """Remove exactly this redirect.  Refuses while dependents exist."""
+        require_legacy_history_writer(disabled=self.legacy_history_disabled, channel='whatsapp')
         self._require_owner(context)
         self._policy.require_admin(context)
         if int(expected_revision) != self._store.identity_revision:

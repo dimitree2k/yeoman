@@ -6,17 +6,26 @@ from typing import override
 
 from yeoman_gateway.core.models import ArchivedMessage, InboundEvent
 from yeoman_gateway.core.ports import ReplyArchivePort
+from yeoman_gateway.history.live import HistoryPaused
+from yeoman_gateway.history.writer_guard import (
+    legacy_history_writers_disabled,
+    require_legacy_history_writer,
+)
 from yeoman_gateway.storage.inbound_archive import InboundArchive
 
 
 class SqliteReplyArchiveAdapter(ReplyArchivePort):
     """Adapter around legacy `InboundArchive` with typed return models."""
 
-    def __init__(self, archive: InboundArchive) -> None:
+    def __init__(self, archive: InboundArchive | None, *, legacy_history_disabled: bool = False) -> None:
+        self.legacy_history_disabled = legacy_history_writers_disabled(legacy_history_disabled)
         self._archive = archive
 
     @override
     def record_inbound(self, event: InboundEvent) -> None:
+        require_legacy_history_writer(disabled=self.legacy_history_disabled, channel=event.channel)
+        if self._archive is None:
+            return
         if not event.message_id:
             return
         self._archive.record_inbound(
@@ -32,6 +41,10 @@ class SqliteReplyArchiveAdapter(ReplyArchivePort):
 
     @override
     def lookup_message(self, channel: str, chat_id: str, message_id: str) -> ArchivedMessage | None:
+        if channel == "whatsapp" and self.legacy_history_disabled is True:
+            raise HistoryPaused("reply_archive_reader_unselected")
+        if self._archive is None:
+            return None
         row = self._archive.lookup_message(channel, chat_id, message_id)
         if row is None:
             return None
@@ -45,6 +58,10 @@ class SqliteReplyArchiveAdapter(ReplyArchivePort):
         *,
         preferred_chat_id: str | None = None,
     ) -> ArchivedMessage | None:
+        if channel == "whatsapp" and self.legacy_history_disabled is True:
+            raise HistoryPaused("reply_archive_reader_unselected")
+        if self._archive is None:
+            return None
         row = self._archive.lookup_message_any_chat(
             channel,
             message_id,
@@ -63,6 +80,10 @@ class SqliteReplyArchiveAdapter(ReplyArchivePort):
         *,
         limit: int,
     ) -> list[ArchivedMessage]:
+        if channel == "whatsapp" and self.legacy_history_disabled is True:
+            raise HistoryPaused("reply_archive_reader_unselected")
+        if self._archive is None:
+            return []
         rows = self._archive.lookup_messages_before(
             channel,
             chat_id,

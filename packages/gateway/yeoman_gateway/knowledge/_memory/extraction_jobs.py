@@ -24,6 +24,10 @@ from typing import TYPE_CHECKING, Any, Callable, Final, Iterable, Mapping
 
 from loguru import logger
 
+from yeoman_gateway.history.writer_guard import (
+    legacy_history_writers_disabled,
+    require_legacy_history_writer,
+)
 from yeoman_gateway.knowledge._memory.shared_facts import (
     SharedFact,
     effective_audience,
@@ -622,7 +626,10 @@ class SharedFactExtractionQueue:
         clock: Callable[[], int] | None = None,
         poll_seconds: float = 5.0,
         stale_ms: int = 600_000,
+        legacy_history_disabled: bool = False,
     ) -> None:
+        self.legacy_history_disabled = legacy_history_writers_disabled(legacy_history_disabled)
+        require_legacy_history_writer(disabled=self.legacy_history_disabled, channel="whatsapp")
         self._store = store
         self._extractor = extractor
         self._journal = journal
@@ -656,6 +663,7 @@ class SharedFactExtractionQueue:
     # -- lifecycle --------------------------------------------------------------
 
     def start(self) -> None:
+        require_legacy_history_writer(disabled=self.legacy_history_disabled, channel='whatsapp')
         if self._thread is not None and self._thread.is_alive():
             return
         self._stop.clear()
@@ -697,6 +705,7 @@ class SharedFactExtractionQueue:
         chat_scope_key: str,
     ) -> str:
         """Queue one extraction. Returns the job key, or "" when the queue is full."""
+        require_legacy_history_writer(disabled=self.legacy_history_disabled, channel='whatsapp')
         refs = tuple(sorted((str(event_id), int(revision)) for event_id, revision in source_refs))
         job_key = extraction_job_key(refs, self._extractor_version)
         existing = self._store.get_fact_job(job_key)
@@ -733,6 +742,7 @@ class SharedFactExtractionQueue:
 
     def cancel_sources(self, source_event_ids: Iterable[str], *, now_ms: int) -> int:
         """Cancel queued or running jobs that rest on the given sources."""
+        require_legacy_history_writer(disabled=self.legacy_history_disabled, channel='whatsapp')
         wanted = {str(item) for item in source_event_ids}
         if not wanted:
             return 0
@@ -758,6 +768,7 @@ class SharedFactExtractionQueue:
 
     def recover_stale(self, *, now_ms: int, stale_ms: int | None = None) -> int:
         """Re-queue jobs a crash left ``running``, so a killed run resumes."""
+        require_legacy_history_writer(disabled=self.legacy_history_disabled, channel='whatsapp')
         threshold = int(stale_ms if stale_ms is not None else self._stale_ms)
         requeued = 0
         for job in self._store.list_fact_jobs(state="running", limit=200):
@@ -770,6 +781,7 @@ class SharedFactExtractionQueue:
 
     def run_due(self, *, now_ms: int, limit: int | None = None) -> ExtractionReport:
         """Process due jobs synchronously. The worker thread simply calls this."""
+        require_legacy_history_writer(disabled=self.legacy_history_disabled, channel='whatsapp')
         report = ExtractionReport()
         self.recover_stale(now_ms=int(now_ms))
         jobs = self._store.list_fact_jobs(state="queued", due_before_ms=int(now_ms), limit=limit or 20)
@@ -789,6 +801,7 @@ class SharedFactExtractionQueue:
     # -- one job ----------------------------------------------------------------
 
     def _run_job(self, job: Mapping[str, Any], *, now_ms: int, report: ExtractionReport) -> None:
+        require_legacy_history_writer(disabled=self.legacy_history_disabled, channel='whatsapp')
         refs = _job_refs(job)
         state = str(job.get("state"))
         if state != "queued":
@@ -856,6 +869,7 @@ class SharedFactExtractionQueue:
     def _publish(
         self, candidate: SharedFactCandidate, *, job: Mapping[str, Any], now_ms: int
     ) -> bool:
+        require_legacy_history_writer(disabled=self.legacy_history_disabled, channel='whatsapp')
         refs = candidate.source_refs or _job_refs(job)
         if not refs:
             return False
@@ -908,6 +922,7 @@ class SharedFactExtractionQueue:
         therefore never loses, delays or hides the fact: it stays stored and retrievable
         lexically, and the failed job stays durable so it can be retried.
         """
+        require_legacy_history_writer(disabled=self.legacy_history_disabled, channel='whatsapp')
         if self._embedding_queue is None or not fact.content.strip():
             return
         try:
@@ -986,6 +1001,7 @@ class SharedFactExtractionQueue:
         A cancellation that arrived during the model call keeps its state; the run simply
         stops touching the job.
         """
+        require_legacy_history_writer(disabled=self.legacy_history_disabled, channel='whatsapp')
         try:
             current = self._store.get_fact_job(str(job.get("job_key") or ""))
         except Exception:  # pragma: no cover - defensive
@@ -1003,6 +1019,7 @@ class SharedFactExtractionQueue:
         reason: str | None,
         now_ms: int,
     ) -> None:
+        require_legacy_history_writer(disabled=self.legacy_history_disabled, channel='whatsapp')
         self._store.upsert_fact_job(
             job_key=str(job["job_key"]),
             workspace_id=str(job["workspace_id"]),

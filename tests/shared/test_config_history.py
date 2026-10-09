@@ -86,3 +86,26 @@ def test_history_selectors_off_and_environment_cannot_activate(tmp_path, monkeyp
                 assert build_history_projector(config, object()) is None
     assert Config(history={"legacyWritersDisabled": True}).history.legacy_writers_disabled
     assert not (tmp_path / "data" / "operational" / "history").exists()
+
+
+def test_direct_writer_flag_is_file_only_and_does_not_normalize_config(tmp_path, monkeypatch):
+    from yeoman_gateway.history.writer_guard import (
+        LegacyHistoryWriterDisabled,
+        legacy_history_writers_disabled,
+        require_legacy_history_writer,
+    )
+
+    root = tmp_path / 'not-created'
+    monkeypatch.setenv('YEOMAN_HOME', str(root))
+    monkeypatch.setenv('YEOMAN_HISTORY__legacyWritersDisabled', 'true')
+    require_legacy_history_writer(disabled=legacy_history_writers_disabled(), channel='whatsapp')
+    assert not root.exists()
+    root.mkdir()
+    path = root / 'config.json'
+    text = '{"history":{"legacyWritersDisabled":true}}'
+    path.write_text(text)
+    with pytest.raises(LegacyHistoryWriterDisabled):
+        require_legacy_history_writer(disabled=legacy_history_writers_disabled(), channel='whatsapp')
+    require_legacy_history_writer(disabled=True, channel='telegram')
+    assert path.read_text() == text
+    assert sorted(p.name for p in root.iterdir()) == ['config.json']

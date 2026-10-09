@@ -16,6 +16,10 @@ from typing import TYPE_CHECKING, Iterable, Literal
 
 from loguru import logger
 
+from yeoman_gateway.history.writer_guard import (
+    legacy_history_writers_disabled,
+    require_legacy_history_writer,
+)
 from yeoman_gateway.knowledge._memory.disclosure import (
     classify_disclosure_for_content,
     disclosure_decision,
@@ -97,7 +101,11 @@ class MemoryService:
         root_config: "Config | None" = None,
         store: "MemoryStore | None" = None,
         owns_store: bool = True,
+        legacy_history_disabled: bool = False,
     ) -> None:
+        legacy_history_disabled = legacy_history_disabled is True or getattr(getattr(root_config, "history", None), "legacy_writers_disabled", False) is True
+        self.legacy_history_disabled = legacy_history_writers_disabled(legacy_history_disabled)
+        require_legacy_history_writer(disabled=self.legacy_history_disabled, channel="whatsapp")
         self.workspace = workspace
         self.config = config
         self.workspace_id = hashlib.sha1(
@@ -109,7 +117,7 @@ class MemoryService:
             db_path = (Path.home() / ".yeoman" / db_path).resolve()
         self.db_path = db_path
         self.owns_store = bool(owns_store) and store is None
-        self.store = store if store is not None else MemoryStore(db_path)
+        self.store = store if store is not None else MemoryStore(db_path, legacy_history_disabled=self.legacy_history_disabled)
         self._owner_ids = _load_owner_ids()
 
         self.embedding: MemoryEmbeddingService | None = None
@@ -253,6 +261,7 @@ class MemoryService:
         batch_max_messages: int = 100,
     ) -> None:
         """Queue one inbound message for batched background notes capture."""
+        require_legacy_history_writer(disabled=self.legacy_history_disabled, channel='whatsapp')
         if not self.config.enabled or not self.config.capture.enabled:
             return
         compact = self._normalize_content(content)
@@ -297,6 +306,7 @@ class MemoryService:
 
     def flush_background_notes(self, now: float | None = None) -> int:
         """Flush expired background note buffers. Returns flushed chat-buffer count."""
+        require_legacy_history_writer(disabled=self.legacy_history_disabled, channel='whatsapp')
         now_ts = time.monotonic() if now is None else float(now)
         to_flush: list[tuple[str, _BackgroundNoteBuffer]] = []
         with self._background_notes_lock:
@@ -324,6 +334,7 @@ class MemoryService:
     """Messages per extraction window. Each chunk gets its own 4-memory budget."""
 
     def _flush_background_buffer(self, buf: _BackgroundNoteBuffer) -> None:
+        require_legacy_history_writer(disabled=self.legacy_history_disabled, channel='whatsapp')
         if not buf.events:
             return
         self._background_notes_flushed_total += 1
@@ -344,6 +355,7 @@ class MemoryService:
         self._background_notes_saved_total += total_accepted
 
     def _flush_single_chunk(self, buf: _BackgroundNoteBuffer) -> int:
+        require_legacy_history_writer(disabled=self.legacy_history_disabled, channel='whatsapp')
         payload = self._build_background_payload(buf)
         if not payload:
             return 0
@@ -674,6 +686,7 @@ class MemoryService:
         source supersedes them, so the older revision becomes unreadable while the
         tombstone points at the replacement. A second call changes nothing.
         """
+        require_legacy_history_writer(disabled=self.legacy_history_disabled, channel='whatsapp')
         ids = [str(item) for item in source_event_ids if str(item)]
         if not ids:
             return InvalidationReport()
@@ -726,6 +739,7 @@ class MemoryService:
         enrichments: Iterable[object] = (),
     ) -> tuple[MemoryEntry, ...]:
         """Project one canonical WhatsApp message into the existing FTS store."""
+        require_legacy_history_writer(disabled=self.legacy_history_disabled, channel='whatsapp')
         return self.store.index_canonical_event(
             event,
             audience=audience,
@@ -1138,6 +1152,7 @@ class MemoryService:
         assistant_reply: str | None = None,
         mode_override: Literal["heuristic", "llm", "hybrid"] | None = None,
     ) -> MemoryCaptureResult:
+        require_legacy_history_writer(disabled=self.legacy_history_disabled, channel='whatsapp')
         result = MemoryCaptureResult()
         if not self.config.enabled or not self.config.capture.enabled:
             return result
@@ -1189,6 +1204,7 @@ class MemoryService:
                 self._capture_queue.task_done()
 
     def _process_capture_task(self, task: dict[str, object]) -> None:
+        require_legacy_history_writer(disabled=self.legacy_history_disabled, channel='whatsapp')
         channel = str(task.get("channel") or "")
         chat_id = str(task.get("chat_id") or "")
         sender_id = str(task.get("sender_id") or "").strip() or None
@@ -1234,6 +1250,7 @@ class MemoryService:
         source_message_id: str | None,
         mode_override: Literal["heuristic", "llm", "hybrid"] | None = None,
     ) -> int:
+        require_legacy_history_writer(disabled=self.legacy_history_disabled, channel='whatsapp')
         compact = self._normalize_content(text)
         if not compact:
             return 0
@@ -1275,6 +1292,7 @@ class MemoryService:
         source_message_id: str | None,
         candidate: ExtractedCandidate,
     ) -> bool:
+        require_legacy_history_writer(disabled=self.legacy_history_disabled, channel='whatsapp')
         compact = self._normalize_content(candidate.content)
         if not compact or self._looks_like_injection(compact):
             return False
@@ -1422,6 +1440,7 @@ class MemoryService:
         subjects: list[str] | str | None = None,
         extra_meta: dict[str, object] | None = None,
     ) -> tuple[MemoryEntry, bool]:
+        require_legacy_history_writer(disabled=self.legacy_history_disabled, channel='whatsapp')
         sector_map = {
             "preference": "semantic",
             "fact": "semantic",
@@ -1485,6 +1504,7 @@ class MemoryService:
         disclosure_mode: str | None = None,
         subjects: list[str] | str | None = None,
     ) -> MemoryEntry | None:
+        require_legacy_history_writer(disabled=self.legacy_history_disabled, channel='whatsapp')
         existing = self.store.get_node(entry_id, workspace_id=self.workspace_id)
         if existing is None:
             return None
@@ -1523,6 +1543,7 @@ class MemoryService:
         source: str = "manual_capture",
     ) -> int | None:
         """Mirror explicit idea/backlog captures into structured queue table."""
+        require_legacy_history_writer(disabled=self.legacy_history_disabled, channel='whatsapp')
         title = self._strip_manual_capture_marker(content)
         if not title:
             return None
@@ -1541,6 +1562,7 @@ class MemoryService:
         scope_keys: list[str] | None = None,
         dry_run: bool = False,
     ) -> int:
+        require_legacy_history_writer(disabled=self.legacy_history_disabled, channel='whatsapp')
         del older_than_days, kinds, scope_keys, dry_run
         return 0
 
@@ -1580,12 +1602,15 @@ class MemoryService:
 
     def forget_confirm(self, ids: list[str]) -> int:
         """Soft-delete memory entries by ID. Returns count deleted."""
+        require_legacy_history_writer(disabled=self.legacy_history_disabled, channel='whatsapp')
         return self.store.soft_delete(ids)
 
     def reindex(self) -> None:
+        require_legacy_history_writer(disabled=self.legacy_history_disabled, channel='whatsapp')
         self.store.reindex()
 
     def backfill_from_workspace_files(self, *, force: bool = False) -> int:
+        require_legacy_history_writer(disabled=self.legacy_history_disabled, channel='whatsapp')
         del force
         return 0
 

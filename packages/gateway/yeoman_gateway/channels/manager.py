@@ -119,6 +119,7 @@ class ChannelManager:
                     openai_api_key=openai_compat.api_key if openai_compat else None,
                     openai_api_base=openai_compat.api_base if openai_compat else None,
                     openai_extra_headers=openai_compat.extra_headers if openai_compat else None,
+                    legacy_history_disabled=self.config.history.legacy_writers_disabled,
                 )
                 self.channels["whatsapp"].set_raw_archive(self.raw_archive)
                 if self.processing_gate is not None:

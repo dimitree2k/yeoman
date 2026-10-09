@@ -12,6 +12,11 @@ from typing import Any
 from loguru import logger
 from yeoman_shared.utils.helpers import ensure_dir, get_operational_data_path
 
+from yeoman_gateway.history.writer_guard import (
+    legacy_history_writers_disabled,
+    require_legacy_history_writer,
+)
+
 DEFAULT_RETENTION_DAYS = 30
 PURGE_INTERVAL_SECONDS = 3600
 
@@ -23,6 +28,7 @@ class InboundArchive:
         self,
         db_path: Path | None = None,
         retention_days: int | None = DEFAULT_RETENTION_DAYS,
+        *, legacy_history_disabled: bool = False,
     ) -> None:
         """``retention_days=None`` (or 0) keeps every archived message forever.
 
@@ -30,6 +36,8 @@ class InboundArchive:
         keep-forever mode and no longer purges on start; the timed mode stays available
         for callers that want it.
         """
+        self.legacy_history_disabled = legacy_history_writers_disabled(legacy_history_disabled)
+        require_legacy_history_writer(disabled=self.legacy_history_disabled, channel="whatsapp")
         # The canonical location is the operational data directory; deriving it from the
         # home path instead silently creates a second, empty archive.
         self.db_path = db_path or (get_operational_data_path() / "inbound" / "reply_context.db")
@@ -48,6 +56,7 @@ class InboundArchive:
         self._last_purge_at = 0.0
 
     def _create_schema(self) -> None:
+        require_legacy_history_writer(disabled=self.legacy_history_disabled, channel='whatsapp')
         with self._lock:
             self._conn.execute(
                 """
@@ -107,6 +116,7 @@ class InboundArchive:
         reply_to_message_id: str | None = None,
     ) -> None:
         """Record one inbound message if it has not been archived yet."""
+        require_legacy_history_writer(disabled=self.legacy_history_disabled, channel='whatsapp')
         if not channel or not chat_id or not message_id or text is None:
             return
 
@@ -416,6 +426,7 @@ class InboundArchive:
         Refuses to delete anything when the archive is in keep-forever mode, so an
         operator command cannot silently shorten a deliberately complete record.
         """
+        require_legacy_history_writer(disabled=self.legacy_history_disabled, channel='whatsapp')
         if self.retention_days is None:
             return 0
         effective_days = max(1, int(days))
@@ -442,6 +453,7 @@ class InboundArchive:
             pass
 
     def _maybe_purge_locked(self) -> None:
+        require_legacy_history_writer(disabled=self.legacy_history_disabled, channel='whatsapp')
         if self.retention_days is None:
             return  # keep-forever mode: nothing is ever deleted automatically
         now = time.monotonic()

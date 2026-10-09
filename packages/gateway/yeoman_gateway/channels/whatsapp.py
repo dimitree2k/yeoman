@@ -42,6 +42,9 @@ from yeoman_gateway.channels.base import BaseChannel
 from yeoman_gateway.channels.whatsapp_runtime import WhatsAppRuntimeManager
 from yeoman_gateway.core.models import InboundEvent as CoreInboundEvent
 from yeoman_gateway.history.live import HistoryPaused
+from yeoman_gateway.history.writer_guard import (
+    legacy_history_writers_disabled,
+)
 from yeoman_gateway.implicit_addressing import (
     DEFAULT_BOT_NAME_ALIASES,
     contains_bot_name,
@@ -335,7 +338,9 @@ class WhatsAppChannel(BaseChannel):
         openai_api_key: str | None = None,
         openai_api_base: str | None = None,
         openai_extra_headers: dict[str, str] | None = None,
+        legacy_history_disabled: bool = False,
     ):
+        self.legacy_history_disabled = legacy_history_writers_disabled(legacy_history_disabled)
         super().__init__(config, bus)
         self.config: WhatsAppConfig = config
         self._history_projector: Any = None
@@ -421,7 +426,8 @@ class WhatsAppChannel(BaseChannel):
         try:
             from yeoman_gateway.storage.chat_registry import ChatRegistry
 
-            self._chat_registry = ChatRegistry()
+            if not self.legacy_history_disabled:
+                self._chat_registry = ChatRegistry(legacy_history_disabled=self.legacy_history_disabled)
         except Exception as e:
             logger.warning(f"Failed to initialize chat registry: {e}")
 

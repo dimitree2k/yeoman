@@ -10,6 +10,10 @@ from pathlib import Path
 
 from yeoman_shared.utils.helpers import ensure_dir
 
+from yeoman_gateway.history.writer_guard import (
+    legacy_history_writers_disabled,
+    require_legacy_history_writer,
+)
 from yeoman_gateway.knowledge._contacts.models import (
     Contact,
     ContactAlias,
@@ -31,9 +35,11 @@ class ContactsStore:
     closes the shared connection: the knowledge transaction owner is in charge.
     """
 
-    def __init__(self, db_path: Path | None = None, *, owner: object | None = None) -> None:
+    def __init__(self, db_path: Path | None = None, *, owner: object | None = None, legacy_history_disabled: bool = False) -> None:
+        self.legacy_history_disabled = legacy_history_writers_disabled(legacy_history_disabled)
+        require_legacy_history_writer(disabled=self.legacy_history_disabled, channel="whatsapp")
         if owner is not None:
-            if getattr(owner, 'history_identity_frozen', False):
+            if getattr(owner, 'history_identity_frozen', False) is True:
                 from yeoman_gateway.knowledge.models import KnowledgeError
                 raise KnowledgeError('history_identity_read_only', 'history identity does not use a ContactsStore cache')
             self._owner = owner
@@ -81,6 +87,7 @@ class ContactsStore:
     # ── schema ───────────────────────────────────────────────────────────
 
     def _create_schema(self) -> None:
+        require_legacy_history_writer(disabled=self.legacy_history_disabled, channel='whatsapp')
         with self._lock:
             self._conn.executescript(
                 """
@@ -204,6 +211,7 @@ class ContactsStore:
         phone_number: str | None = None,
         is_owner: bool = False,
     ) -> Contact:
+        require_legacy_history_writer(disabled=self.legacy_history_disabled, channel='whatsapp')
         contact_id = str(uuid.uuid4())
         now = _now_iso()
         with self._lock:
@@ -230,6 +238,7 @@ class ContactsStore:
         return self._row_to_contact(row)
 
     def update_display_name(self, contact_id: str, display_name: str) -> None:
+        require_legacy_history_writer(disabled=self.legacy_history_disabled, channel='whatsapp')
         now = _now_iso()
         with self._lock:
             self._conn.execute(
@@ -239,6 +248,7 @@ class ContactsStore:
             self._commit_owned()
 
     def set_owner(self, contact_id: str, is_owner: bool = True) -> None:
+        require_legacy_history_writer(disabled=self.legacy_history_disabled, channel='whatsapp')
         now = _now_iso()
         with self._lock:
             self._conn.execute(
@@ -270,6 +280,7 @@ class ContactsStore:
         identifier: str,
         kind: str,
     ) -> ContactIdentifier:
+        require_legacy_history_writer(disabled=self.legacy_history_disabled, channel='whatsapp')
         with self._lock:
             self._conn.execute(
                 """
@@ -327,6 +338,7 @@ class ContactsStore:
         alias: str,
         source: str,
     ) -> None:
+        require_legacy_history_writer(disabled=self.legacy_history_disabled, channel='whatsapp')
         now = _now_iso()
         with self._lock:
             if self._has_normalized_alias:
@@ -384,6 +396,7 @@ class ContactsStore:
         value: str,
         label: str | None = None,
     ) -> ContactField:
+        require_legacy_history_writer(disabled=self.legacy_history_disabled, channel='whatsapp')
         now = _now_iso()
         with self._lock:
             self._conn.execute(
@@ -411,6 +424,7 @@ class ContactsStore:
         value: str,
         label: str | None = None,
     ) -> None:
+        require_legacy_history_writer(disabled=self.legacy_history_disabled, channel='whatsapp')
         now = _now_iso()
         with self._lock:
             self._conn.execute(
@@ -432,6 +446,7 @@ class ContactsStore:
         return [self._row_to_field(r) for r in rows]
 
     def delete_field(self, contact_id: str, kind: str, value: str) -> None:
+        require_legacy_history_writer(disabled=self.legacy_history_disabled, channel='whatsapp')
         with self._lock:
             self._conn.execute(
                 "DELETE FROM contact_fields WHERE contact_id = ? AND kind = ? AND value = ?",
@@ -443,6 +458,7 @@ class ContactsStore:
 
     def merge_contacts(self, *, target_id: str, source_id: str) -> None:
         """Move all identifiers, aliases, and fields from source to target, then delete source."""
+        require_legacy_history_writer(disabled=self.legacy_history_disabled, channel='whatsapp')
         with self._lock:
             # Move identifiers
             self._conn.execute(
