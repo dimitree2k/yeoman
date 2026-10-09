@@ -5,7 +5,7 @@ import asyncio
 import json
 import threading
 import time
-from collections.abc import Callable, Iterable, Sequence
+from collections.abc import Callable, Iterable, Mapping, Sequence
 from contextlib import contextmanager
 from dataclasses import asdict
 from typing import Any
@@ -107,13 +107,16 @@ class HistoryCaptureProducer:
 
     def prepare_handover(self, snapshot: HistorySnapshot, *, pending: tuple[SourceRef, ...],
                          processed: tuple[SourceRef, ...],
-                         legacy_boundary: tuple[int, str]) -> dict[str, Any]:
+                         legacy_boundary: tuple[int, str],
+                         classifications: Mapping[str, str] | None = None) -> dict[str, Any]:
         snapshot.assert_current(snapshot.generation)
         receipt = {"version": 1, "generation": snapshot.generation,
                    "sources": [asdict(s) for s in snapshot.sources],
                    "pending": [asdict(s) for s in sorted(pending, key=lambda s: s.key)],
                    "processed": [asdict(s) for s in sorted(processed, key=lambda s: s.key)],
                    "legacy_boundary": list(legacy_boundary)}
+        if classifications is not None:
+            receipt["classifications"] = dict(sorted(classifications.items()))
         with self.store.transaction(), self.scope(snapshot) as (_, authority):
             existing = self._state("handover")
             if existing is not None:
@@ -141,15 +144,45 @@ class HistoryCaptureProducer:
                     state = "published" if job["state"] == "done" else (
                         "queued" if job["state"] in ("queued", "running", "failed") else (
                             "pending" if job["state"] == "skipped" and job["reason"] == "queue_full" else "cancelled"))
-                    if mid in assignments and assignments[mid][1] == "processed" and state != "published":
-                        raise ValueError("ambiguous_handover_job")
+                    previous = assignments.get(mid)
+                    if previous is not None:
+                        old_source, old_state, old_job = previous
+                        if (old_source != source or (old_job is not None and old_job != job["job_id"])
+                                or (old_state == "processed" and state != "published")
+                                or (old_state == "pending" and state not in ("queued", "pending"))
+                                or (old_job is not None and old_state != state)):
+                            raise ValueError("ambiguous_handover_job")
                     assignments[mid] = (source, state, job["job_id"])
             cursor = snapshot.connection.execute(
                 "SELECT m.* FROM messages_current m WHERE channel='whatsapp'")
             rows = [dict(zip([c[0] for c in cursor.description], row, strict=True)) for row in cursor]
+            explicit = dict(classifications or {})
+            permanent = {"not_policy_chat", "not_inbound", "derived_only", "source_revoked", "empty_text"}
+            if any(outcome not in permanent | {"pending", "historical_not_selected"}
+                   for outcome in explicit.values()):
+                raise ValueError("unknown_handover_classification")
+            prefix = set()
+            vector = _vector(snapshot)
+            for row in rows:
+                for ref in json.loads(row["source_refs"]):
+                    path, _, number = ref.rpartition("#")
+                    if (path.startswith("whatsapp/") and number.isdecimal()
+                            and 0 < int(number) <= vector.get(path, 0)):
+                        prefix.add(row["message_id"])
+            if set(explicit) - prefix:
+                raise ValueError("out_of_prefix_handover_classification")
+            if set(explicit) & assignments.keys():
+                raise ValueError("ambiguous_handover_source")
             for row in rows:
                 mid = row["message_id"]
-                if mid not in assignments:
+                if mid in explicit:
+                    outcome = explicit.pop(mid)
+                    reason = self._permanent_reason(row)
+                    if ((outcome in permanent and outcome != reason)
+                            or (outcome not in permanent and reason)):
+                        raise ValueError("classification_refusal_mismatch")
+                    self._outcome(mid, 0, outcome)
+                elif mid not in assignments:
                     if not self._beyond(snapshot, mid, {}):
                         continue
                     reason = self._permanent_reason(row)
