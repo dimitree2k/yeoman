@@ -1,0 +1,39 @@
+{
+  "version": 1,
+  "home": "/synthetic/copy",
+  "output": "/synthetic/acquisition",
+  "receipts": "/synthetic/receipts",
+  "python": "/synthetic/tools/python",
+  "candidate": "synthetic-candidate",
+  "prior": "synthetic-prior",
+  "inventory": {
+    "members": [
+      {"path": "data/knowledge/knowledge.db", "kind": "sqlite", "restore": true},
+      {"path": "data/ops/processing.db", "kind": "sqlite", "restore": true},
+      {"path": "data/raw", "kind": "tree", "restore": false, "role": "raw"},
+      {"path": "inputs/forward-start.json", "kind": "file", "restore": false}
+    ],
+    "raw_path": "data/raw",
+    "bridge": {"mode": "stopped"},
+    "gateway_jobs": 0,
+    "units": [
+      {"name": "yeoman-overseer.service", "restart": "always", "executable": "/synthetic/tools/yeoman-overseer"},
+      {"name": "yeoman-gateway.service", "restart": "always", "executable": "/synthetic/tools/yeoman"},
+      {"name": "yeoman-bridge.service", "restart": "always", "executable": "/synthetic/bridge/index.js"}
+    ],
+    "timers": ["synthetic-watch.timer"],
+    "manual_routes": [],
+    "host_crontab": {"timezone": "UTC", "danger_minutes": [240]},
+    "overseer_jobs": [],
+    "external_text_targets": [],
+    "forward_start_evidence_member": "inputs/forward-start.json",
+    "reader_smoke": {
+      "workspace_id": "synthetic", "channel": "whatsapp", "chat_id": "10001@s.whatsapp.net",
+      "principal": "whatsapp:10001", "phone": "10001@s.whatsapp.net", "message_id": "whatsapp:10001@s.whatsapp.net:synthetic-message",
+      "source_event_id": "synthetic-message", "statement_id": "synthetic-statement",
+      "query": "Curated", "text": "Synthetic", "curated_text": "Curated synthetic statement",
+      "at_ms": 100, "owner_scope": true,
+      "rights": {"knowledge_read": true, "tools_read": true, "owner_export": true}
+    }
+  }
+}

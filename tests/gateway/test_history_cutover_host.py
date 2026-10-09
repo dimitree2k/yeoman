@@ -365,9 +365,11 @@ def test_cli_installs_explicit_factory_and_refuses_unselected_apply(tmp_path, mo
     assert m.main() == 1
     assert json.loads(capsys.readouterr().out)['error'] == 'cutover_refused'
     seen = []
-    def compose(*, host):
+    def compose(*, host, probes):
         seen.append(host.mode)
         return Controls(m)
+    from scripts import history_cutover_probes
+    monkeypatch.setattr(history_cutover_probes,'build_probes',lambda **_: {})
     monkeypatch.setattr(m, 'preparation_controls', compose)
     monkeypatch.setattr(sys, 'argv', ['history_cutover.py', 'cutover', '--record', str(path), '--home', str(home), '--apply', '--controls', 'rehearsal'])
     assert m.main() == 0

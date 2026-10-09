@@ -681,14 +681,16 @@ def main() -> int:
         if args.controls:
             try:
                 from scripts.history_cutover_host import live_host_controls, rehearsal_host_controls
+                from scripts.history_cutover_probes import build_probes
             except ModuleNotFoundError:
                 from history_cutover_host import live_host_controls, rehearsal_host_controls
+                from history_cutover_probes import build_probes
             value = _load(args.record, args.home, apply=False)
             if value['mode'] != args.controls:
                 raise ValueError('control_record_mode_mismatch')
             host = (live_host_controls(inventory=value['inventory']) if args.controls == 'live'
                     else rehearsal_host_controls(copy_home=args.home, inventory=value['inventory']))
-            controls = preparation_controls(host=host)
+            controls = preparation_controls(host=host,probes=build_probes(record=value,home=args.home))
         else:
             controls = None
         with injected_controls(controls):

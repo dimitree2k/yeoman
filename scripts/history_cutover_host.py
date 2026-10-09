@@ -48,7 +48,6 @@ SERVICE_ACTIONS = {
 }
 READER_FAMILIES = ('knowledge', 'whatsapp', 'responder', 'tools', 'participation', 'secondary')
 SELECT_ACTIONS = {f'select-{f}' for f in READER_FAMILIES}
-SMOKE_ACTIONS = {f'smoke-reader-{f}' for f in READER_FAMILIES}
 ACK_ACTIONS = {'functional-smoke'}
 COMMAND_ACTIONS = {'import-preview', 'import', 'owner-preview', 'owner-append'}
 
@@ -242,22 +241,25 @@ def _configure(payload: dict, inventory: Mapping) -> dict:
 
 
 def _prepare_inputs(payload: dict, inventory: Mapping) -> dict:
+    try:
+        from scripts.history_cutover_inputs import build_cutover_inputs
+    except ModuleNotFoundError:
+        from history_cutover_inputs import build_cutover_inputs
     layout = payload['record']['layout']
     snapshot = _path(payload['record']['output'])
-    template = _path(str(snapshot / inventory['normalization_member']))
-    if snapshot not in template.parents or _hash(template) != inventory['normalization_sha256']:
-        raise ValueError('normalization_acquisition_pin_mismatch')
-    bundle = json.loads(template.read_bytes())
-    bundle['snapshot_digest'] = next(p['receipt']['digest'] for p in payload['receipts'] if p['action'] == 'acquire')
-    bundle['conversion_digest'] = next(p['receipt']['manifest_digest'] for p in payload['receipts'] if p['action'] == 'convert')
     home = _path(layout['preparation_home'])
     preflight_isolated_paths(home)
     require_isolated_paths(home)
     home.mkdir(mode=0o700, parents=True, exist_ok=False)
     vector = enumerate_committed(_path(layout['raw']))
     copy_committed(_path(layout['raw']), vector, home / 'raw')
-    _write(home / 'cutover-inputs.json', json.dumps(bundle).encode(), exclusive=True)
-    return dict(ok=True, complete=True, snapshot_digest=bundle['snapshot_digest'], conversion_digest=bundle['conversion_digest'])
+    evidence = snapshot / inventory['forward_start_evidence_member']
+    if snapshot not in evidence.parents:
+        raise ValueError('forward_evidence_not_acquired')
+    summary = build_cutover_inputs(acquisition_home=snapshot,
+        conversion_manifest=_path(layout['conversion_manifest']),staged_raw=_path(layout['staged']),
+        forward_start_evidence=evidence,output=home/'cutover-inputs.json')
+    return dict(ok=True,complete=True,**summary)
 
 
 def _import_proof(payload: dict, report: dict) -> dict:
@@ -476,7 +478,7 @@ def live_host_controls(*, inventory: Mapping[str, Any],
             result['ok'] &= response.returncode == 0
         elif action == 'prepare-input-bundle':
             result = _prepare_inputs(payload, inventory)
-        elif action in ACK_ACTIONS or action in SMOKE_ACTIONS:
+        elif action in ACK_ACTIONS:
             result = _ack(action, payload)
         elif action in ('capture-suppression-delta', 'reapply-suppression-delta', 'verify-current-denials'):
             result = _suppression_delta(action, payload, inventory)
@@ -664,7 +666,7 @@ def rehearsal_host_controls(*, copy_home: Path, inventory: Mapping[str, Any], ru
             result = dict(ok=True, complete=True, validated=len(records))
         elif action == 'prepare-input-bundle':
             result = _prepare_inputs(payload, local)
-        elif action in ACK_ACTIONS or action in SMOKE_ACTIONS:
+        elif action in ACK_ACTIONS:
             result = _ack(action, payload)
         else:
             raise ValueError('unknown_host_action')

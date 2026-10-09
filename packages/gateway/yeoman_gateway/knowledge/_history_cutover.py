@@ -79,9 +79,13 @@ def prepare_legacy_alias_inputs(*, queries: HistoryQueries,
             invalid = False
             for preserved in originals.get(key, ()):
                 original, origin = preserved.get("original"), preserved.get("origin")
+                proof_bytes = preserved.get("preserved_original", original)
+                envelope_valid = ("preserved_original" not in preserved or
+                    preserved.get("envelope_sha256") == row_sha256(original))
                 if (not isinstance(original, dict) or not isinstance(origin, dict)
                         or not all(origin.get(k) for k in ("store", "path", "table", "row_key"))
-                        or origin.get("row_sha256") != row_sha256(original)
+                        or origin.get("row_sha256") != row_sha256(proof_bytes)
+                        or not envelope_valid
                         or not preserved.get("source_ref")):
                     invalid = True
                     continue
@@ -223,9 +227,14 @@ def prepare_capture_inputs(*, queries: HistoryQueries,
             if order <= legacy_boundary:
                 if (not isinstance(start, list) or len(start) != 2
                         or type(start[0]) is not int or not isinstance(start[1], str)
-                        or not order <= tuple(start) <= legacy_boundary):
+                        or not tuple(start) <= legacy_boundary):
                     raise ValueError("unclassified_handover_message")
-                classifications[mid] = "historical_not_selected"
+                if order <= tuple(start):
+                    classifications[mid] = "historical_not_selected"
+                elif source is not None:
+                    pending.append(source)
+                else:
+                    classifications[mid] = "pending"
             elif source is not None:
                 pending.append(source)
             else:
