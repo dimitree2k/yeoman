@@ -171,7 +171,7 @@ def test_capture_input_requires_preserved_order_and_rejects_conflicts(capture_ca
         with pytest.raises(ValueError, match="conflicting_capture_proof"):
             prepare_capture_inputs(queries=q, legacy_boundary=(10, "b"), legacy_rows=[
                 {"message_id": "old", "created_ms": 1, "event_id": "a", "boundary": [10, "b"], "forward_start": [5, "start"]},
-                {"message_id": "old", "created_ms": 11, "event_id": "z", "boundary": [10, "b"]}], jobs=[])
+                {"message_id": "old", "created_ms": 11, "event_id": "z", "boundary": [10, "b"], "forward_start": [7, "start"]}], jobs=[])
 
 
 def script():
@@ -200,7 +200,8 @@ def test_operator_refuses_paths_before_access(tmp_path, monkeypatch, capsys):
     assert json.loads(capsys.readouterr().out)["error"] == "unsafe_paths"
 
 
-def test_operator_prepares_private_manifest_and_handover(tmp_path, capsys):
+@pytest.mark.parametrize("duplicate",[False,True])
+def test_operator_prepares_private_manifest_and_handover(tmp_path, capsys,duplicate):
     from yeoman_gateway.history.attestations import make
     from yeoman_gateway.history.project import project
     from yeoman_gateway.knowledge._store import KnowledgeStore
@@ -237,6 +238,8 @@ def test_operator_prepares_private_manifest_and_handover(tmp_path, capsys):
     bundle = {"version": 1, "snapshot_digest": "a" * 64, "conversion_digest": "b" * 64,
               "legacy_rows": [], "preserved_rows": [], "capture_rows": [
                   {"message_id": mid, "created_ms": 1, "event_id": "old", "boundary": [10, "b"], "forward_start": [5, "start"]}]}
+    if duplicate:
+        bundle["capture_rows"].append(dict(bundle["capture_rows"][0],event_id="redelivery",created_ms=11))
     (home / "cutover-inputs.json").write_text(json.dumps(bundle))
     source = tmp_path / "v2.db"
     store = KnowledgeStore(source)
@@ -254,10 +257,14 @@ def test_operator_prepares_private_manifest_and_handover(tmp_path, capsys):
     assert module.main(argv) == 0
     summary = json.loads(capsys.readouterr().out)
     assert summary["ok"] and summary["handover"] and summary["total"] == 0
+    assert summary["duplicate_observations"]==int(duplicate)
     assert set(summary) == {"ok", "handover", *module._COUNTS}
     manifest_path = output / "legacy-alias-manifest.json"
     manifest = json.loads(manifest_path.read_text())
     assert manifest["version"] == 1 and manifest["entries"] == []
+    assert manifest["capture_summary"]["duplicate_observations"]==int(duplicate)
+    if duplicate:
+        assert manifest["capture_summary"]["observations"][mid]==[dict(created_ms=1,event_id="old"),dict(created_ms=11,event_id="redelivery")]
     digest = manifest.pop("digest")
     assert row_sha256(manifest) == digest
     assert manifest["handover"]["classifications"] == {mid: "historical_not_selected"}
@@ -384,3 +391,72 @@ async def test_unissued_source_pending_zero_does_not_rescue_active_job(capture_c
         p.prepare_handover(snap,legacy_boundary=(10,'b'),**inputs)
     row = k._store.query_one("SELECT revision,outcome FROM knowledge_history_capture WHERE message_id='unissued'")
     assert tuple(row)==(0,'pending')
+
+
+@pytest.mark.parametrize(('early','completed','outcome'),[(4,False,'historical_not_selected'),(6,False,'pending'),(6,True,'processed')])
+@pytest.mark.parametrize('reverse',[False,True])
+def test_duplicate_observation_uses_earliest_order(capture_case,early,completed,outcome,reverse):
+    from yeoman_gateway.knowledge._history_cutover import prepare_capture_inputs
+    h,k,_,_ = capture_case
+    h.add('duplicate',line=1)
+    source = issue(h,k,('duplicate',))[0]
+    observations = [dict(message_id='duplicate',event_id=event,created_ms=created,source=asdict(source),
+        completed=completed,boundary=[10,'b'],forward_start=[5,'start']) for event,created in (('early',early),('late',12))]
+    observations.append(dict(observations[0]))
+    if reverse:
+        observations.reverse()
+    summary = {}
+    with h.snapshot() as snap:
+        inputs = prepare_capture_inputs(queries=HistoryQueries(snap),legacy_boundary=(10,'b'),legacy_rows=observations,jobs=[],summary=summary)
+        assert summary['duplicate_observations']==1
+        assert summary['observations']['duplicate']==[dict(created_ms=early,event_id='early'),dict(created_ms=12,event_id='late')]
+        if outcome=='historical_not_selected':
+            assert inputs['classifications']=={'duplicate':outcome} and inputs['pending']==inputs['processed']==()
+        else:
+            assert inputs[outcome]==(source,) and inputs['classifications']=={}
+        producer(k).prepare_handover(snap,legacy_boundary=(10,'b'),**inputs)
+
+
+@pytest.mark.parametrize('field',['completed','status','source','author_principal','source_audience_json','boundary','forward_start'])
+def test_duplicate_observation_still_refuses_other_conflicts(capture_case,field):
+    from yeoman_gateway.knowledge._history_cutover import prepare_capture_inputs
+    h,k,_,_ = capture_case
+    h.add('duplicate',line=1)
+    source = issue(h,k,('duplicate',))[0]
+    first = dict(message_id='duplicate',event_id='early',created_ms=6,source=asdict(source),completed=False,
+        status='active',author_principal=source.author_principal,source_audience_json=None,boundary=[10,'b'],forward_start=[5,'start'])
+    second = dict(first,event_id='late',created_ms=12)
+    second[field] = {'completed':True,'status':'revoked','source':asdict(replace(source,event_id='different')),
+        'author_principal':'whatsapp:10002','source_audience_json':'[]','boundary':[11,'b'],'forward_start':[7,'start']}[field]
+    with h.snapshot() as snap,pytest.raises(ValueError,match='conflicting_capture_proof'):
+        prepare_capture_inputs(queries=HistoryQueries(snap),legacy_boundary=(10,'b'),legacy_rows=[first,second],jobs=[])
+
+
+def test_duplicate_observation_cannot_reassign_source_identity(capture_case):
+    from yeoman_gateway.knowledge._history_cutover import prepare_capture_inputs
+    h,k,_,_ = capture_case
+    h.add('duplicate',line=1)
+    source = issue(h,k,('duplicate',))[0]
+    first = dict(asdict(source),message_id='duplicate',cutover_status='mapped',created_ms=6,
+        boundary=[10,'b'],forward_start=[5,'start'])
+    with h.snapshot() as snap:
+        q = HistoryQueries(snap)
+        summary = {}
+        inputs = prepare_capture_inputs(queries=q,legacy_boundary=(10,'b'),legacy_rows=[first,dict(first,created_ms=12)],jobs=[],summary=summary)
+        assert inputs['pending']==(source,) and summary['duplicate_observations']==1
+        with pytest.raises(ValueError,match='conflicting_capture_proof'):
+            prepare_capture_inputs(queries=q,legacy_boundary=(10,'b'),legacy_rows=[first,dict(first,event_id='other',created_ms=12)],jobs=[])
+        with pytest.raises(ValueError,match='conflicting_capture_proof'):
+            prepare_capture_inputs(queries=q,legacy_boundary=(10,'b'),legacy_rows=[first,dict(first,message_id='other')],jobs=[])
+
+
+def test_duplicate_observation_tie_breaks_by_event_id(capture_case):
+    from yeoman_gateway.knowledge._history_cutover import prepare_capture_inputs
+    h,_,_,_ = capture_case
+    h.add('duplicate',line=1,known=False)
+    rows = [dict(message_id='duplicate',created_ms=5,event_id=event,boundary=[10,'b'],forward_start=[5,'m']) for event in ('z','a')]
+    summary = {}
+    with h.snapshot() as snap:
+        result = prepare_capture_inputs(queries=HistoryQueries(snap),legacy_boundary=(10,'b'),legacy_rows=rows,jobs=[],summary=summary)
+    assert result['classifications']=={'duplicate':'historical_not_selected'}
+    assert summary['observations']['duplicate'][0]==dict(created_ms=5,event_id='a')

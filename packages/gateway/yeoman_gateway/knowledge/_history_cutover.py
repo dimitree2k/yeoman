@@ -168,7 +168,7 @@ def native_prefix(queries: HistoryQueries) -> dict[str, dict[str, Any]]:
 
 def prepare_capture_inputs(*, queries: HistoryQueries,
     legacy_boundary: tuple[int, str], legacy_rows: Iterable[Mapping[str, Any]],
-    jobs: Iterable[Mapping[str, Any]]) -> dict[str, Any]:
+    jobs: Iterable[Mapping[str, Any]], summary: dict[str, Any] | None = None) -> dict[str, Any]:
     """Accept proven completion or preserved created/event ordering, never provider time.
 
     Ordering proof pins progress as 'boundary' and the separately preserved
@@ -179,26 +179,39 @@ def prepare_capture_inputs(*, queries: HistoryQueries,
     """
     rows: dict[str, Mapping[str, Any]] = {}
     refs: dict[tuple[str, int], tuple[str, SourceRef]] = {}
+    sources_by_mid: dict[str, SourceRef] = {}
+    observations: dict[str, set[tuple[int, str]]] = defaultdict(set)
     for row in legacy_rows:
         mid = row.get("message_id")
         if not mid and row.get("cutover_status") == "other_channel":
             mid = row["event_id"]
         if not mid:
             continue
+        # Source identity belongs to the issued row, not its observation ordering.
+        source = (_source(row['source']) if 'source' in row else
+                  _source(row) if row.get('cutover_status') in ('mapped', 'other_channel') else None)
+        order = (row.get('created_ms'), row.get('event_id'))
+        if type(order[0]) is int and isinstance(order[1], str):
+            observations[mid].add(order)
         if mid in rows:
             previous = rows[mid]
-            if any(previous[k] != row[k] for k in previous.keys() & row.keys()):
+            if any(previous[k] != row[k] for k in (previous.keys() & row.keys()) - {'event_id', 'created_ms'}):
                 raise ValueError("conflicting_capture_proof")
+            previous_order = (previous.get('created_ms'), previous.get('event_id'))
+            different_order = any(previous[k] != row[k] for k in (previous.keys() & row.keys()) & {'event_id', 'created_ms'})
+            if different_order and (type(previous_order[0]) is not int or not isinstance(previous_order[1], str)
+                                    or type(order[0]) is not int or not isinstance(order[1], str)):
+                raise ValueError('conflicting_capture_proof')
             row = {**previous, **row}
+            if different_order:
+                created, event = min(previous_order, order)
+                row = dict(row, created_ms=created, event_id=event)
         rows[mid] = row
-        if "source" in row:
-            source = _source(row["source"])
-        elif row.get("cutover_status") in ("mapped", "other_channel"):
-            source = _source(row)
-        else:
-            continue
         if source is None:
             continue
+        if mid in sources_by_mid and sources_by_mid[mid] != source:
+            raise ValueError('conflicting_capture_proof')
+        sources_by_mid[mid] = source
         if source.key in refs and refs[source.key] != (mid, source):
             raise ValueError("conflicting_capture_proof")
         refs[source.key] = mid, source
@@ -212,7 +225,7 @@ def prepare_capture_inputs(*, queries: HistoryQueries,
             elif ref.get("channel", "whatsapp") == "whatsapp":
                 raise ValueError("unmapped_handover_job")
     pending, processed, classifications = [], [], {}
-    sources_by_mid = {mid: source for mid, source in refs.values() if source.channel == "whatsapp"}
+    sources_by_mid = {mid: source for mid, source in sources_by_mid.items() if source.channel == "whatsapp"}
     prefix = native_prefix(queries)
     for mid, current in prefix.items():
         row = rows.get(mid, {})
@@ -263,6 +276,10 @@ def prepare_capture_inputs(*, queries: HistoryQueries,
                 pending.append(source)
             else:
                 raise ValueError("unclassified_handover_message")
+    if summary is not None:
+        summary.update(duplicate_observations=sum(max(0, len(values)-1) for values in observations.values()),
+            observations={mid: [dict(created_ms=created,event_id=event) for created,event in sorted(values)]
+                          for mid,values in sorted(observations.items()) if len(values)>1})
     return {"pending": tuple(sorted(pending, key=lambda s: s.key)),
             "processed": tuple(sorted(processed, key=lambda s: s.key)),
             "classifications": dict(sorted(classifications.items()))}

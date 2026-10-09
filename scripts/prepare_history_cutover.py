@@ -41,7 +41,7 @@ _ARGUMENTS = ("snapshot_home", "history_db", "knowledge_source", "knowledge_targ
               "policy_snapshot", "output_root")
 _COUNTS = ("total", "mapped", "missing", "ambiguous", "changed", "purged_revoked",
            "other_channel", "candidate_copies", "statements", "jobs", "withheld_statements",
-           "affected_jobs")
+           "affected_jobs", "duplicate_observations")
 
 
 def _affected_counts(rows, statements, jobs, aliases):
@@ -150,8 +150,10 @@ def prepare(args: argparse.Namespace) -> dict[str, Any]:
             boundary = knowledge.capture_boundary()
             if boundary is None:
                 raise ValueError("missing_legacy_boundary")
+            capture_summary = {}
             inputs = prepare_capture_inputs(queries=q, legacy_boundary=boundary,
-                legacy_rows=[*rows, *bundle["capture_rows"]], jobs=jobs)
+                legacy_rows=[*rows, *bundle["capture_rows"]], jobs=jobs, summary=capture_summary)
+            counts["duplicate_observations"] = capture_summary["duplicate_observations"]
             handover = HistoryCaptureProducer(knowledge).prepare_handover(
                 snapshot, legacy_boundary=boundary, **inputs)
         entries = []
@@ -174,7 +176,7 @@ def prepare(args: argparse.Namespace) -> dict[str, Any]:
             "raw_boundary_digest": row_sha256([asdict(s) for s in vector]),
             "schema_digest": row_sha256({"history": 4, "knowledge": upgrade["schema_version"],
                                          "knowledge_source": upgrade["source_digest"]})},
-            "entries": entries, "handover": handover}
+            "entries": entries, "handover": handover, "capture_summary": capture_summary}
         manifest["digest"] = row_sha256(manifest)
         args.output_root.mkdir(mode=0o700)
         _private_json(manifest_path, manifest)
