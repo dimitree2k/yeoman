@@ -190,6 +190,28 @@ def history_rebuild(confirm: bool = typer.Option(False, '--confirm')) -> None:
     _emit(cli_control('rebuild', {'confirm': True}))
 
 
+@history_app.command('read')
+def history_read(
+    chat_ids: list[str] = typer.Option(..., '--chat'),
+    after_ms: int = typer.Option(..., '--after-ms', min=0),
+    limit: int = typer.Option(50, '--limit', min=1, max=500),
+    content: bool = typer.Option(False, '--content'),
+) -> None:
+    import asyncio
+    import os
+
+    from yeoman_shared.config.loader import load_config
+
+    from yeoman_gateway.history.export import request_history_read
+    if os.environ.get('YEOMAN_HISTORY_TOOL_TURN') == '1':
+        raise typer.BadParameter('standalone history read forbidden in selected tool turn; use history_read')
+    try:
+        _emit(asyncio.run(request_history_read(Path(load_config().ipc.gateway_socket_path).expanduser(),
+              dict(chat_ids=chat_ids, after_ms=after_ms, limit=limit, aggregate=not content))))
+    except (OSError, ValueError, TimeoutError):
+        raise typer.BadParameter('Gateway history read unavailable') from None
+
+
 @history_app.command('projection-status')
 def history_projection_status() -> None:
     import asyncio

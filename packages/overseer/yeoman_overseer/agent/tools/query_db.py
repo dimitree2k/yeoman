@@ -9,6 +9,16 @@ if TYPE_CHECKING:
     from yeoman_overseer.agent.tools import ToolContext
 
 
+def history_path_refused(db_path: Path, ctx: Any) -> bool:
+    resolved = db_path.resolve()
+    home = ctx.yeoman_home.resolve()
+    if resolved.name.startswith('history.db') or (resolved.is_relative_to(home) and 'history' in resolved.relative_to(home).parts):
+        return True
+    retired = getattr(ctx, 'legacy_history_disabled', False) or getattr(ctx, 'history_selected', False)
+    return retired and any(resolved.name.startswith(name) for name in (
+        'reply_context.db', 'chat_registry.db', 'contacts.db', 'memory.db', 'knowledge.db'))
+
+
 def execute(args: dict[str, Any], ctx: ToolContext) -> str:
     db_path = Path(args["db_path"]).expanduser()
     query = args["query"]
@@ -17,6 +27,8 @@ def execute(args: dict[str, Any], ctx: ToolContext) -> str:
     if not db_path.is_absolute():
         db_path = (ctx.yeoman_home / "data" / db_path).resolve()
 
+    if history_path_refused(db_path, ctx):
+        return '[query_db] refused: use authorized Gateway reads for history and identity'
     if not db_path.exists():
         return f"[query_db] ERROR: database not found: {db_path}"
 

@@ -32,7 +32,6 @@ from yeoman_shared.raw_archive.records import (
 )
 from yeoman_shared.raw_archive.verify import record_closed
 from yeoman_shared.raw_archive.writer import ARCHIVE_VERSION, month_of, read_start_ms, safe_channel
-from yeoman_shared.utils.helpers import get_operational_data_path, get_operational_store_path
 
 SEED_SOURCES: tuple[str, ...] = ("journal", "reply_context", "session_jsonl", "memory2")
 
@@ -47,14 +46,7 @@ class SeedPaths:
 
     @classmethod
     def default(cls) -> SeedPaths:
-        data = get_operational_data_path()
-        return cls(
-            processing_db=get_operational_store_path("processing"),
-            reply_context_db=data / "inbound" / "reply_context.db",
-            inbound_dir=data / "inbound",
-            knowledge_db=data / "knowledge" / "knowledge.db",
-            legacy_memory_db=data / "memory" / "memory.db",
-        )
+        raise ValueError("raw seed requires explicit isolated SeedPaths")
 
 
 @dataclass
@@ -93,7 +85,7 @@ def _iso_ms(value: str, *, naive_is_local: bool = False) -> int | None:
 def _readonly(path: Path) -> sqlite3.Connection | None:
     if not path.is_file():
         return None
-    con = sqlite3.connect(f"file:{path}?mode=ro", uri=True)
+    con = sqlite3.connect(f"{path.resolve().as_uri()}?mode=ro", uri=True)
     con.row_factory = sqlite3.Row
     return con
 
@@ -219,7 +211,16 @@ def seed_raw_archive(
     root: Path, paths: SeedPaths, *, dry_run: bool = False, now_ms: int | None = None
 ) -> SeedReport:
     """Seed history older than START. Refuses to run twice or before the live writer ran."""
+    from yeoman_gateway.history.export import require_isolated_paths
+    require_isolated_paths(root, paths.processing_db, paths.reply_context_db, paths.inbound_dir,
+                           paths.knowledge_db, *(p for p in (paths.legacy_memory_db,) if p is not None))
+    if root.exists():
+        require_isolated_paths(*(path for path in root.rglob('*') if path.is_symlink()))
+    if paths.inbound_dir.exists():
+        require_isolated_paths(*paths.inbound_dir.glob('*.jsonl'))
     start_ms = read_start_ms(root)
+    if start_ms is None and dry_run and not root.exists():
+        start_ms = int(now_ms if now_ms is not None else time.time() * 1000)
     if start_ms is None:
         raise RuntimeError(
             "raw archive has no START marker; run the gateway with the archive first"

@@ -52,6 +52,7 @@ class PolicyAdminService:
         group_subject_resolver: Callable[[list[str]], dict[str, str]] | None = None,
         processing_config: object | None = None,
     ) -> None:
+        self._history_config: Any = None
         self._policy_path = policy_path
         self._processing_config = processing_config
         self._workspace = workspace
@@ -480,6 +481,19 @@ class PolicyAdminService:
                 if tags:
                     rec["tags"] = tags
 
+        history = getattr(self, '_history_config', None)
+        if history is not None and (history.live_projection_enabled and history.readers.secondary or history.legacy_writers_disabled):
+            from yeoman_gateway.history.context import current_history_snapshot
+            from yeoman_gateway.history.live import HistoryPaused
+            from yeoman_gateway.history.queries import HistoryQueries
+            snapshot = current_history_snapshot()
+            if snapshot is None or not (history.live_projection_enabled and history.readers.secondary):
+                raise HistoryPaused('secondary_history_scope_required')
+            for row in HistoryQueries(snapshot).chats():
+                if row['chat_id'].endswith('@g.us'):
+                    rec = ensure(row['chat_id'])
+                    rec['comment'] = row['subject'] or rec['comment']
+            return records
         base_dir = self._policy_path.parent
         sessions_dir = base_dir / "data" / "inbound"
         if sessions_dir.exists():

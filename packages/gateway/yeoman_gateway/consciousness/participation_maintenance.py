@@ -23,6 +23,8 @@ from typing import Any
 
 from loguru import logger
 
+from yeoman_gateway.history.export import secondary_consumer
+
 #: Evidence kinds attached to a classified outcome.
 EVIDENCE_EXPLICIT = "explicit"
 EVIDENCE_INFERRED = "inferred"
@@ -77,6 +79,9 @@ class ParticipationMaintenance:
         taste_distiller: Any | None = None,
         taste_opted_in: Any | None = None,
     ) -> None:
+        self._history_projector: Any = None
+        self._history_knowledge: Any = None
+        self._config: Any = None
         self._ledger = ledger
         self._reconciler = reconciler
         self._archive = archive
@@ -129,6 +134,7 @@ class ParticipationMaintenance:
             except asyncio.CancelledError:
                 raise
 
+    @secondary_consumer
     async def run_once(self, *, now_ms: int | None = None) -> MaintenanceReport:
         moment = int(now_ms if now_ms is not None else self._clock_ms())
         reconciled: dict[str, int] = {}
@@ -303,7 +309,10 @@ class ParticipationMaintenance:
                         limit=50,
                     )
                 )
-            except Exception:
+            except Exception as exc:
+                from yeoman_gateway.history.live import HistoryPaused
+                if isinstance(exc, HistoryPaused):
+                    raise
                 after = []
         return json.dumps(
             {

@@ -49,6 +49,17 @@ def persona_evolution_propose(
 ) -> None:
     """Generate a private persona evolution proposal from runtime evidence."""
     config = load_config()
+    if config.history.live_projection_enabled and config.history.readers.secondary:
+        from yeoman_gateway.history.export import cli_secondary_request
+        result = cli_secondary_request('persona_evolution_read', dict(persona_file=persona_file,
+                                       window_days=window_days, limit=limit))
+        path = output or config.workspace_path / 'persona-evolution' / 'proposals' / (safe_filename(persona_file) + '.md')
+        ensure_dir(path.parent)
+        path.write_text(result['report'], encoding='utf-8')
+        console.print(f'proposal: {path}')
+        return
+    if config.history.legacy_writers_disabled:
+        raise typer.BadParameter('secondary reader unselected')
     policy = load_policy()
     memory = MemoryService(workspace=config.workspace_path, config=config.memory, root_config=config)
     speakup_log = SpeakupLog(get_operational_store_path("speakups"))
@@ -98,6 +109,11 @@ def persona_evolution_status(
     from rich.table import Table
 
     config = load_config()
+    if config.history.legacy_writers_disabled or (config.history.live_projection_enabled and config.history.readers.secondary):
+        from yeoman_gateway.history.export import cli_secondary_request
+        result = cli_secondary_request('persona_evolution_read', dict(persona_file=persona_file, window_days=1, limit=limit))
+        console.print(result['report'])
+        return
     policy = load_policy()
     memory = MemoryService(workspace=config.workspace_path, config=config.memory, root_config=config)
     speakup_log = SpeakupLog(get_operational_store_path("speakups"))

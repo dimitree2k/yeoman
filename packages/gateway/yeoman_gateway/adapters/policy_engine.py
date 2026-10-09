@@ -131,6 +131,7 @@ class EnginePolicyAdapter(PolicyPort):
     ) -> None:
         self._engine = engine
         self._known_tools = policy_known_tools(known_tools)
+        self._history_config: Any = None
         self._policy_path = policy_path
         self._processing_config = processing_config
         self._models_config = models_config
@@ -1070,6 +1071,15 @@ class EnginePolicyAdapter(PolicyPort):
 
     def _get_group_name(self, chat_id: str) -> str | None:
         """Get group name from chat_registry or bridge."""
+        history = getattr(self, '_history_config', None)
+        if history is not None and (history.live_projection_enabled and history.readers.secondary or history.legacy_writers_disabled):
+            from yeoman_gateway.history.context import current_history_snapshot
+            from yeoman_gateway.history.live import HistoryPaused
+            from yeoman_gateway.history.queries import HistoryQueries
+            snapshot = current_history_snapshot()
+            if snapshot is None or not (history.live_projection_enabled and history.readers.secondary):
+                raise HistoryPaused('secondary_history_scope_required')
+            return next((row['subject'] for row in HistoryQueries(snapshot).chats() if row['chat_id'] == chat_id), None)
         # Try chat_registry first
         try:
             from yeoman_gateway.storage.chat_registry import ChatRegistry

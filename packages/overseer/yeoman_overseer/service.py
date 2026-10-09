@@ -169,6 +169,9 @@ class OverseerService:
             data_dir=self.data_dir,
             sandbox=self._create_sandbox(),
             memory_db=yeoman_home / "data" / "memory" / "memory.db",
+            history_selected=raw_config.get('history', {}).get('liveProjectionEnabled') is True and raw_config.get('history', {}).get('readers', {}).get('secondary') is True,
+            legacy_history_disabled=raw_config.get('history', {}).get('legacyWritersDisabled') is True,
+            gateway_socket_path=Path(raw_config.get('ipc', {}).get('gatewaySocketPath', str(yeoman_home / 'run' / 'gateway.sock'))),
             git=self._git,
         )
         _budget = BudgetTracker(

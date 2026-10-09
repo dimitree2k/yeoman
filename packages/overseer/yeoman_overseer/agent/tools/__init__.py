@@ -23,6 +23,9 @@ class ToolContext:
     memory_db: Path | None = None       # used by prune_memory
     runbook_name: str = ""              # current runbook name for audit
     domain: str = ""                    # current runbook domain for audit
+    history_selected: bool = False
+    legacy_history_disabled: bool = False
+    gateway_socket_path: Path | None = None
     git: object | None = None           # InternalGit for write_file/edit_file commits
 
 
@@ -51,10 +54,11 @@ TOOL_DEFINITIONS: list[dict[str, Any]] = [
     },
     {
         "name": "query_memory",
-        "description": "Full-text search on the semantic memory database.",
+        "description": "Authorized Knowledge search via Gateway when history is selected; explicit chat scope required.",
         "input_schema": {
             "type": "object",
             "properties": {
+                "chat_id": {"type": "string"},
                 "query": {"type": "string"},
                 "limit": {"type": "integer", "default": 10},
             },

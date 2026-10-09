@@ -16,17 +16,17 @@ from pathlib import Path
 
 from yeoman_gateway.short_reply import evaluation as ev
 
-RUNTIME = Path(os.environ.get("YEOMAN_HOME", Path.home() / ".yeoman"))
-OUT = RUNTIME / "var" / "eval" / "short-reply"
+OUT: Path
+PROCESSING: Path
 
 
 def _replay(args: argparse.Namespace) -> None:
     since = int(datetime.fromisoformat(args.since).timestamp())
     rows = ev.load_replay_rows(
-        RUNTIME / "data" / "inbound" / "reply_context.db",
-        RUNTIME / "data" / "processing" / "processing.db",
+        Path(args.archive_db),
+        PROCESSING,
         since_ts=since,
-        inbound_jsonl=sorted((RUNTIME / "data" / "inbound").glob("*.jsonl")),
+        inbound_jsonl=[Path(path) for path in args.inbound_jsonl],
         max_chars=args.max_chars,
     )
     ev.rows_to_jsonl(rows, OUT / args.output)
@@ -120,7 +120,7 @@ def _report(args: argparse.Namespace) -> None:
     )
     since_ms = int(datetime.fromisoformat(args.since).timestamp() * 1000)
     coverage = ev.receipt_coverage(
-        RUNTIME / "data" / "processing" / "processing.db", since_ms=since_ms,
+        PROCESSING, since_ms=since_ms,
         chat_id=args.shadow_chat,
     )
     probe_path = OUT / "probe.jsonl"
@@ -139,7 +139,7 @@ def _report(args: argparse.Namespace) -> None:
         shadow, expected, logged, dropped, days = ev.load_shadow_decisions(
             [Path(item) for item in args.shadow_log], shadow_rows, chat_id=args.shadow_chat,
         )
-        processing_db = RUNTIME / "data" / "processing" / "processing.db"
+        processing_db = PROCESSING
         baseline_reactions, text_events = ev.load_effect_sequences(
             processing_db, since_ms=since_ms, chat_id=args.shadow_chat
         )
@@ -182,8 +182,12 @@ def _report(args: argparse.Namespace) -> None:
 
 def main() -> None:
     parser = argparse.ArgumentParser(description=__doc__)
+    parser.add_argument('--output-root', type=Path, required=True)
+    parser.add_argument('--processing-db', type=Path, required=True)
     sub = parser.add_subparsers(dest="command", required=True)
     replay = sub.add_parser("replay")
+    replay.add_argument("--archive-db", type=Path, required=True)
+    replay.add_argument("--inbound-jsonl", type=Path, action="append", default=[])
     replay.add_argument("--since", default="2026-08-01")
     replay.add_argument("--max-chars", type=int, default=80)
     replay.add_argument("--output", default="rows.jsonl")
@@ -211,6 +215,20 @@ def main() -> None:
     report.add_argument("--price-out", type=float)
     report.set_defaults(func=_report)
     args = parser.parse_args()
+    global OUT, PROCESSING
+    OUT, PROCESSING = args.output_root, args.processing_db
+    from yeoman_gateway.history.export import require_isolated_paths
+    paths = [OUT, PROCESSING, *getattr(args, 'inbound_jsonl', []), *[Path(p) for p in getattr(args, 'shadow_log', [])]]
+    for key in ('archive_db', 'synthetic'):
+        if getattr(args, key, None):
+            paths.append(Path(getattr(args, key)))
+    paths.extend(OUT / name for name in ('rows.jsonl', 'labels.csv', 'probe.jsonl', 'report.md'))
+    paths.extend(OUT / getattr(args, key) for key in ('output', 'decisions', 'shadow_rows') if getattr(args, key, None))
+    require_isolated_paths(*paths)
+    for key in ('output', 'decisions', 'shadow_rows'):
+        if getattr(args, key, None) and (Path(getattr(args, key)).is_absolute() or '..' in Path(getattr(args, key)).parts):
+            raise SystemExit('refusing output outside isolated output root')
+    print('frozen/non-live isolated evaluation')
     OUT.mkdir(mode=0o700, parents=True, exist_ok=True)
     os.chmod(OUT, 0o700)
     args.func(args)

@@ -20,6 +20,10 @@ def prune_memory(
     """Delete memory nodes matching criteria after snapshotting the DB first."""
     db_path: Path = ctx.memory_db
 
+    from yeoman_overseer.agent.tools.query_db import history_path_refused
+    if (getattr(ctx, "history_selected", False) is True
+            or getattr(ctx, "legacy_history_disabled", False) is True) and history_path_refused(db_path, ctx):
+        return {'ok': False, 'error': 'legacy history prune refused; use Knowledge maintenance'}
     ts = datetime.now(timezone.utc).strftime("%Y%m%d-%H%M%S")
     snapshot = db_path.with_name(f"{db_path.name}.snapshot-{ts}")
     shutil.copy2(db_path, snapshot)

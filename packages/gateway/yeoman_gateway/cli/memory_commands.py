@@ -305,7 +305,17 @@ def memory_search(
 ) -> None:
     """Search long-term memory with scope filters."""
     scope_value = _normalize_choice(scope, choices=MEMORY_SCOPES, option="--scope")
-
+    from yeoman_shared.config.loader import load_config
+    history = load_config().history
+    if history.live_projection_enabled and history.readers.secondary:
+        from yeoman_gateway.history.export import cli_secondary_request
+        if channel != 'whatsapp' or not chat_id or scope_value != 'chat':
+            raise typer.BadParameter('explicit WhatsApp chat scope required')
+        result = cli_secondary_request('knowledge_read', dict(chat_id=chat_id, query=query, limit=limit))
+        console.print('\n'.join(result['statements']) or 'No memory hits.')
+        return
+    if history.legacy_writers_disabled and channel == 'whatsapp':
+        raise typer.BadParameter('secondary reader unselected')
     with _memory_service_context() as service:
         hits = service.search(
             query=query,
@@ -537,6 +547,7 @@ def memory_disclosure_backfill(
     sample_limit: int = typer.Option(10, "--sample-limit", min=0, max=50),
 ) -> None:
     """Classify existing memories with disclosure metadata using a cheap model."""
+    _refuse_selected_legacy_maintenance()
     from yeoman_shared.config.loader import load_config
 
     from yeoman_gateway.providers.factory import ProviderFactory
@@ -611,6 +622,7 @@ def memory_disclosure_retag_narrow(
     sample_limit: int = typer.Option(10, "--sample-limit", min=0, max=50),
 ) -> None:
     """Retag existing memories with Yeoman's narrow deterministic disclosure policy."""
+    _refuse_selected_legacy_maintenance()
     from yeoman_shared.config.loader import load_config
 
     config = load_config()
@@ -707,6 +719,7 @@ def memory_backfill(
     force: bool = typer.Option(False, "--force", help="Run backfill even if marker exists"),
 ) -> None:
     """Backfill legacy memory files into long-term memory DB."""
+    _refuse_selected_legacy_maintenance()
     with _memory_service_context() as service:
         imported = service.backfill_from_workspace_files(force=force)
 
@@ -745,8 +758,15 @@ def memory_lineage_inventory(
     provider or model call, and never a PDF parse or OCR.  Derived model work is only
     scheduled with --allow-model-jobs, whose eligible count is always reported first.
     """
-    from yeoman_gateway.knowledge.api import import_lineage, inspect_lineage_sources
+    from yeoman_shared.config.loader import load_config
 
+    from yeoman_gateway.history.export import require_isolated_paths
+    from yeoman_gateway.knowledge.api import import_lineage, inspect_lineage_sources
+    history = load_config().history
+    if history.legacy_writers_disabled or (history.live_projection_enabled and history.readers.secondary):
+        if not all((inbound_dir, processing_db, session_state_dir, knowledge_db, media_root)):
+            raise typer.BadParameter('explicit isolated inventory paths required')
+        require_isolated_paths(*(Path(p) for p in (inbound_dir, processing_db, session_state_dir, knowledge_db, media_root)))
     inventory = inspect_lineage_sources(
         inbound_dir=inbound_dir,
         processing_db=processing_db,
@@ -775,9 +795,17 @@ def memory_lineage_inventory(
     )
 
 
+@memory_app.command('source-accounting')
+def memory_source_accounting() -> None:
+    from yeoman_gateway.history.export import cli_secondary_request
+    result = cli_secondary_request('knowledge_accounting', {})
+    console.print(json.dumps(result, sort_keys=True))
+
+
 @memory_app.command("reindex")
 def memory_reindex() -> None:
     """Rebuild memory full-text index."""
+    _refuse_selected_legacy_maintenance()
     with _memory_service_context() as service:
         service.reindex()
 
@@ -793,6 +821,7 @@ def memory_facts_list(
     limit: int = typer.Option(50, "--limit", min=1, max=500),
 ) -> None:
     """List shared facts as metadata: no raw text of other principals is printed."""
+    _refuse_selected_legacy_maintenance()
     with _memory_service_context() as service:
         facts = service.store.list_facts(
             workspace_id=service.workspace_id,
@@ -825,6 +854,7 @@ def memory_facts_show(
     ),
 ) -> None:
     """Show one fact's metadata, its sources and (optionally) its text."""
+    _refuse_selected_legacy_maintenance()
     with _memory_service_context() as service:
         fact = service.store.get_fact(fact_id)
 
@@ -851,6 +881,7 @@ def memory_facts_revoke(
     now_ms: int | None = typer.Option(None, "--now-ms", help="Override the clock (tests)"),
 ) -> None:
     """Revoke facts by hand: tombstone, cleared text and a bumped acl_epoch."""
+    _refuse_selected_legacy_maintenance()
     import time
 
     stamp = int(now_ms) if now_ms is not None else int(time.time() * 1000)
@@ -867,6 +898,7 @@ def memory_facts_supersede(
     now_ms: int | None = typer.Option(None, "--now-ms", help="Override the clock (tests)"),
 ) -> None:
     """Supersede a fact: the older revision becomes unreadable, the tombstone points on."""
+    _refuse_selected_legacy_maintenance()
     import time
 
     stamp = int(now_ms) if now_ms is not None else int(time.time() * 1000)
@@ -921,6 +953,7 @@ def memory_facts_backfill(
     Facts from history reference ``archive:<message_id>`` as their source, so they stay
     distinguishable from facts derived from live turns.
     """
+    _refuse_selected_legacy_maintenance()
     import time
     from datetime import UTC, datetime
 
@@ -1203,3 +1236,32 @@ def memory_media_growth(
             row.media_kind, row.age_bucket, row.state, str(row.count), str(row.bytes)
         )
     console.print(table)
+
+
+def _refuse_selected_legacy_maintenance() -> None:
+    from yeoman_shared.config.loader import load_config
+    history = load_config().history
+    if history.legacy_writers_disabled or (history.live_projection_enabled and history.readers.secondary):
+        raise typer.BadParameter('legacy maintenance is offline only; supply an isolated snapshot runtime')
+
+
+statements_app = typer.Typer(help='Live owner Knowledge statement inspection and curation')
+memory_app.add_typer(statements_app, name='statements')
+
+
+@statements_app.command('list')
+def memory_statements_list(limit: int = typer.Option(50, '--limit', min=1, max=100)) -> None:
+    from yeoman_gateway.history.export import cli_secondary_request
+    console.print(json.dumps(cli_secondary_request('knowledge_statements', dict(action='list', limit=limit))))
+
+
+@statements_app.command('show')
+def memory_statements_show(statement_id: str, content: bool = typer.Option(False, '--content')) -> None:
+    from yeoman_gateway.history.export import cli_secondary_request
+    console.print(json.dumps(cli_secondary_request('knowledge_statements', dict(action='show', statement_id=statement_id, content=content))))
+
+
+@statements_app.command('erase')
+def memory_statements_erase(statement_id: str) -> None:
+    from yeoman_gateway.history.export import cli_secondary_request
+    console.print(json.dumps(cli_secondary_request('knowledge_statements', dict(action='erase', statement_id=statement_id))))

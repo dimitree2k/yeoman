@@ -17,6 +17,7 @@ from yeoman_gateway.bus.events import OutboundMessage
 from yeoman_gateway.bus.queue import MessageBus
 from yeoman_gateway.consciousness.approval import PendingSpeakupApproval, SpeakupApprovalStore
 from yeoman_gateway.consciousness.log import SpeakupLog, deterministic_effect_id
+from yeoman_gateway.history.export import secondary_consumer
 from yeoman_gateway.policy.engine import PolicyEngine
 from yeoman_gateway.policy.persona import load_persona_text
 from yeoman_gateway.storage.inbound_archive import InboundArchive
@@ -169,12 +170,15 @@ class ConsciousnessTools:
         now: Callable[[], datetime] | None = None,
         activation_provider: Callable[[str, str], object | None] | None = None,
     ) -> None:
+        self._history_projector: Any = None
+        self._history_knowledge: Any = None
+        self.knowledge: Any = None
         self.config = config
         self.policy_engine = policy_engine
         self.bus = bus
         self._service_effects = service_effects
         self.log = log
-        self.inbound_archive = inbound_archive
+        self.inbound_archive: Any = inbound_archive
         self.memory = memory
         self.security = security
         self.approval_store = approval_store
@@ -283,6 +287,7 @@ class ConsciousnessTools:
             for chat in self._eligible_chats()
         )
 
+    @secondary_consumer
     async def read_chat_window(
         self,
         chat_id: str,
@@ -308,6 +313,7 @@ class ConsciousnessTools:
         )
         return {"status": "ok", "messages": rows}
 
+    @secondary_consumer
     async def search_memory(
         self,
         query: str,
@@ -321,6 +327,15 @@ class ConsciousnessTools:
             return {"status": "rejected", "reason": "ambiguous_chat_id", "hits": []}
         if eligible is None:
             return {"status": "rejected", "reason": "chat_not_eligible", "hits": []}
+        if self.config.history.live_projection_enabled and self.config.history.readers.secondary and eligible.channel == 'whatsapp':
+            from yeoman_gateway.knowledge.models import RecallQuery
+            knowledge = getattr(self, 'knowledge', None)
+            if knowledge is None:
+                from yeoman_gateway.history.live import HistoryPaused
+                raise HistoryPaused('secondary_knowledge_required')
+            context = knowledge.owner_read_context(channel=eligible.channel, chat_id=eligible.chat_id)
+            result = knowledge.recall(RecallQuery(query, limit=max(1, min(int(limit), 10))), context=context)
+            return {'status': 'ok', 'hits': [{'content': text} for text in result.entry_texts]}
         if self.memory is None or not hasattr(self.memory, "search"):
             return {"status": "ok", "hits": []}
         hits = self.memory.search(
@@ -432,6 +447,7 @@ class ConsciousnessTools:
             "budget_reason": budget["reason"],
         }
 
+    @secondary_consumer
     async def propose_speakup(
         self,
         *,
@@ -514,6 +530,7 @@ class ConsciousnessTools:
         )
         return {"status": "proposed", "proposal_id": proposal_id}
 
+    @secondary_consumer
     async def stage_participation_approval(
         self,
         *,
@@ -728,6 +745,7 @@ class ConsciousnessTools:
         )
         return {"status": "awaiting_approval", "effect_id": str(effect_id)}
 
+    @secondary_consumer
     async def commit_speakup(self, proposal_id: str) -> dict[str, object]:
         """Stage a proposal: preview it to the owner, or submit it through the one
         final validation path. Every submission decision lives in
@@ -856,6 +874,7 @@ class ConsciousnessTools:
 
         return await self.submit_proposal(proposal_id)
 
+    @secondary_consumer
     async def submit_proposal(self, proposal_id: str) -> dict[str, object]:
         """The single final validation and submission path for a proposal.
 

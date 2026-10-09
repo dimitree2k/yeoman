@@ -700,6 +700,7 @@ class LLMResponder(ResponderPort):
         #: protected recall use this instead of reaching into contacts/memory stores.
         self._history_selected = False
         self._history_tools_selected = False
+        self._history_secondary_selected = False
         self._history_projector: Any = None
         self._history_knowledge: Any = None
         self.knowledge = knowledge
@@ -944,6 +945,13 @@ class LLMResponder(ResponderPort):
             ToolInvocationContext,
             set_tool_context,
         )
+        if getattr(self, '_history_secondary_selected', False):
+            if channel == 'system' and not canonical_user_id:
+                binding = self._trusted_turn_binding()
+                canonical_user_id = str(getattr(getattr(binding, 'turn', None), 'principal', '') or '')
+            elif channel == 'cli' and chat_id == 'direct' and (session_key.startswith('cli:') or is_owner):
+                knowledge: Any = getattr(self, 'knowledge', None)
+                canonical_user_id = knowledge._policy.admin_actor() if knowledge is not None else ''
         set_tool_context(
             ToolInvocationContext(
                 channel=channel,
@@ -954,7 +962,7 @@ class LLMResponder(ResponderPort):
                 reply_to_message_id=reply_to_message_id,
                 request_text=request_text,
                 history_snapshot=(current_history_snapshot()
-                    if getattr(self, '_history_tools_selected', False) and channel == 'whatsapp' else None),
+                    if (getattr(self, '_history_tools_selected', False) and channel == 'whatsapp' or getattr(self, '_history_secondary_selected', False) and channel in {'whatsapp', 'cli', 'system'}) else None),
             )
         )
         message_tool = self.tools.get("message")
@@ -3091,7 +3099,7 @@ class LLMResponder(ResponderPort):
         """The opt-in shared-fact runtime, or ``None`` while it is switched off."""
         return getattr(self, "shared_facts", None)
 
-    def _trusted_turn_binding(self):
+    def _trusted_turn_binding(self) -> Any:
         """The frozen turn of this generation - never ``metadata`` or model output."""
         from yeoman_gateway.processing.responder import CURRENT_TURN
 
@@ -3737,7 +3745,7 @@ class LLMResponder(ResponderPort):
             history_knowledge_scope,
             history_turn,
         )
-        if (self._history_selected or self._history_tools_selected) and channel == 'whatsapp' and current_history_snapshot() is None:
+        if ((self._history_selected or self._history_tools_selected) and channel == 'whatsapp' or self._history_secondary_selected and channel in {'whatsapp', 'cli', 'system'}) and current_history_snapshot() is None:
             arguments = dict(locals())
             for key in ('self', 'content', 'current_history_snapshot', 'history_knowledge_scope', 'history_turn'):
                 arguments.pop(key, None)

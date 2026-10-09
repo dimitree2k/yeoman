@@ -5,6 +5,7 @@ from __future__ import annotations
 import asyncio
 import os
 import re
+import signal
 from pathlib import Path
 from typing import TYPE_CHECKING, Any
 
@@ -198,18 +199,30 @@ class ExecTool(Tool):
                 )
 
     async def _execute_local(self, command: str, cwd: str) -> str:
+        from yeoman_gateway.processing.tool_context import current_tool_context
+        context = current_tool_context()
+        child_env = os.environ.copy()
+        if context is not None and context.history_snapshot is not None:
+            child_env['YEOMAN_HISTORY_TOOL_TURN'] = '1'
         try:
             process = await asyncio.create_subprocess_shell(
                 command,
                 stdout=asyncio.subprocess.PIPE,
                 stderr=asyncio.subprocess.PIPE,
                 cwd=cwd,
+                env=child_env,
+                start_new_session=True,
             )
 
             try:
                 stdout, stderr = await asyncio.wait_for(process.communicate(), timeout=self.timeout)
+            except asyncio.CancelledError:
+                os.killpg(process.pid, signal.SIGKILL)
+                await process.wait()
+                raise
             except asyncio.TimeoutError:
-                process.kill()
+                os.killpg(process.pid, signal.SIGKILL)
+                await process.wait()
                 return f"Error: Command timed out after {self.timeout} seconds"
 
             output_parts = []
@@ -241,6 +254,10 @@ class ExecTool(Tool):
         if not self._sandbox_manager:
             return f"Error: Exec isolation unavailable: {self._isolation_error or 'unknown error'}"
 
+        from yeoman_gateway.processing.tool_context import current_tool_context
+        context = current_tool_context()
+        if context is not None and context.history_snapshot is not None:
+            command = '(export YEOMAN_HISTORY_TOOL_TURN=1;\n' + command + '\n)'
         try:
             result = await self._sandbox_manager.execute(
                 session_key=self._session_key,

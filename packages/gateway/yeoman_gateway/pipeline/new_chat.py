@@ -6,6 +6,7 @@ import json
 from collections.abc import Callable
 from datetime import UTC, datetime
 from pathlib import Path
+from typing import TYPE_CHECKING
 
 from yeoman_shared.utils.helpers import get_operational_store_path
 
@@ -94,6 +95,10 @@ def merge_seen_chat_files(sources: list[Path], destination: Path | None = None) 
     return target
 
 
+if TYPE_CHECKING:
+    from yeoman_shared.config.schema import HistoryConfig
+
+
 class NewChatNotifyMiddleware:
     """Send owner notification when yeoman joins a new WhatsApp chat."""
 
@@ -101,7 +106,9 @@ class NewChatNotifyMiddleware:
         self,
         *,
         owner_alert_resolver: Callable[[str], list[str]] | None = None,
+        history_config: HistoryConfig | None = None,
     ) -> None:
+        self._history_config = history_config
         self._owner_resolver = owner_alert_resolver
         self._notified: set[str] = set()
 
@@ -152,26 +159,41 @@ class NewChatNotifyMiddleware:
         except Exception:
             pass
 
-        # Fetch group info.
-        group_name = None
-        group_desc = None
-        try:
-            from yeoman_gateway.storage.chat_registry import ChatRegistry
-
-            registry = ChatRegistry()
+        history = self._history_config
+        if history is not None and history.live_projection_enabled and history.readers.secondary:
+            from yeoman_gateway.history.context import current_history_snapshot
+            from yeoman_gateway.history.live import HistoryPaused
+            from yeoman_gateway.history.queries import HistoryQueries
+            snapshot = current_history_snapshot()
+            if snapshot is None:
+                raise HistoryPaused('secondary_history_scope_required')
+            row = next((row for row in HistoryQueries(snapshot).chats() if row['chat_id'] == event.chat_id), None)
+            group_name = row['subject'] if row else None
+            group_desc = row['description'] if row else None
+        elif history is not None and history.legacy_writers_disabled:
+            from yeoman_gateway.history.live import HistoryPaused
+            raise HistoryPaused('secondary_reader_unselected')
+        else:
+            # Fetch group info.
+            group_name = None
+            group_desc = None
             try:
-                chat_info = registry.get_chat(event.channel, event.chat_id)
-                if chat_info:
-                    group_name = chat_info.get("readable_name")
-                    group_desc = chat_info.get("description")
-            finally:
-                registry.close()
-        except Exception:
-            pass
+                from yeoman_gateway.storage.chat_registry import ChatRegistry
 
-        if not group_name:
+                registry = ChatRegistry()
+                try:
+                    chat_info = registry.get_chat(event.channel, event.chat_id)
+                    if chat_info:
+                        group_name = chat_info.get("readable_name")
+                        group_desc = chat_info.get("description")
+                finally:
+                    registry.close()
+            except Exception:
+                pass
+
+        if not group_name and not (history is not None and history.live_projection_enabled and history.readers.secondary):
             group_name = event.raw_metadata.get("group_name") or event.raw_metadata.get("subject")
-        if not group_desc:
+        if not group_desc and not (history is not None and history.live_projection_enabled and history.readers.secondary):
             group_desc = event.raw_metadata.get("group_desc") or event.raw_metadata.get(
                 "description"
             )

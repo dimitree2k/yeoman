@@ -24,7 +24,8 @@ def chats_list(
     """List chats from the registry."""
     from yeoman_gateway.storage.chat_registry import ChatRegistry, ChatType
 
-    registry = ChatRegistry()
+    selected_chats = _selected_chats()
+    registry = ChatRegistry() if selected_chats is None else None
 
     filters: dict[str, str] = {}
     if channel:
@@ -37,7 +38,9 @@ def chats_list(
             console.print(f"[dim]Valid types: {[t.value for t in ChatType]}[/dim]")
             raise typer.Exit(1)
 
-    chats = registry.list_chats(limit=limit, **filters)
+    chats = registry.list_chats(limit=limit, **filters) if registry is not None else [
+        row for row in selected_chats if (not channel or channel.lower() == row['channel'])
+        and (not chat_type or chat_type.lower() == row['chat_type'])][:limit]
 
     if json_output:
         console.print(json.dumps(chats, indent=2, default=str))
@@ -72,8 +75,9 @@ def chats_show(
     """Show detailed information about a chat."""
     from yeoman_gateway.storage.chat_registry import ChatRegistry
 
-    registry = ChatRegistry()
-    chat = registry.get_chat(channel.lower(), chat_id)
+    selected_chats = _selected_chats()
+    registry = ChatRegistry() if selected_chats is None else None
+    chat = registry.get_chat(channel.lower(), chat_id) if registry is not None else next((row for row in selected_chats if row["channel"] == channel.lower() and row["chat_id"] == chat_id), None)
 
     if not chat:
         console.print(f"[red]Chat not found: {chat_id}[/red]")
@@ -122,6 +126,8 @@ def chats_sync(
     console.print(f"[cyan]Syncing metadata from {channel} bridge...[/cyan]")
 
     config = load_config()
+    if _selected_chats() is not None:
+        raise typer.BadParameter('selected metadata comes from captured group events; no registry sync')
     registry = ChatRegistry()
 
     channel_config = getattr(config.channels, channel, None)
@@ -194,3 +200,19 @@ def chats_sync(
         console.print(f"[green]✓[/green] Synced {len(results)} chats from {channel} bridge")
         console.print(f"  [green]{new_count}[/green] new chats registered")
         console.print(f"  [cyan]{updated_count}[/cyan] existing chats updated")
+
+
+def _selected_chats() -> list[dict] | None:
+    from yeoman_shared.config.loader import load_config
+
+    from yeoman_gateway.history.export import cli_secondary_request
+    from yeoman_gateway.history.live import HistoryPaused
+    history = load_config().history
+    if history.live_projection_enabled and history.readers.secondary:
+        result = cli_secondary_request('history_chats', {})
+        return [dict(row, readable_name=row['subject'], chat_type='group' if row['chat_id'].endswith('@g.us') else 'dm',
+                     participant_count=None, first_seen_at=None, last_seen_at=None, owner_id=None,
+                     is_community=False, invite_code=None) for row in result['chats']]
+    if history.legacy_writers_disabled:
+        raise HistoryPaused('secondary_reader_unselected')
+    return None

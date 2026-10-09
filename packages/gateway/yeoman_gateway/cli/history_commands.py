@@ -40,6 +40,7 @@ def history_build(
     ),
 ) -> None:
     """Reconcile one explicit preservation collection into an isolated journal."""
+    _isolated(collection, target_home, bridge_package_dir, rosters)
     report = rebuild_history(
         collection=collection,
         target_home=target_home,
@@ -57,6 +58,7 @@ def history_verify(
     ),
 ) -> None:
     """Check the isolated journal and exact cited event/revision closure."""
+    _isolated(target_home, knowledge_snapshot)
     report = verify_history(target_home=target_home, knowledge_snapshot=knowledge_snapshot)
     typer.echo(json.dumps(report, ensure_ascii=False, sort_keys=True, indent=2))
 
@@ -67,6 +69,7 @@ def history_coverage(
     target_home: Path = typer.Option(..., "--target-home", help="Explicit isolated history target"),
 ) -> None:
     """Report event-time and audience coverage without rendering message bodies."""
+    _isolated(target_home)
     with HistoricalJournal(target_home, create=True) as journal:
         report = HistoryAudience(journal).coverage(_load_events(records))
     typer.echo(json.dumps(report, ensure_ascii=False, sort_keys=True, indent=2))
@@ -84,6 +87,7 @@ def history_roster_review(
     current = _load_json(current_members) if current_members is not None else None
     if current is not None and not isinstance(current, dict):
         raise typer.BadParameter("current-members must contain a JSON object")
+    _isolated(target_home)
     with HistoricalJournal(target_home, create=True) as journal:
         report = HistoryAudience(journal).roster_review(
             _load_events(records), current_members=current
@@ -101,6 +105,7 @@ def history_roster_attest(
     """Store one exact owner-confirmed roster interval in the isolated target."""
     payload = _load_object(roster, "roster")
     context, policy_authority = _authorization_context(authorization, policy)
+    _isolated(target_home)
     with HistoricalJournal(target_home, create=True) as journal:
         proof_id = HistoryAudience(journal).attest(
             channel=payload.get("channel"),
@@ -125,6 +130,7 @@ def history_roster_revoke(
 ) -> None:
     """Revoke one exact owner-attested proof after rechecking policy authority."""
     context, policy_authority = _authorization_context(authorization, policy)
+    _isolated(target_home)
     with HistoricalJournal(target_home, create=False) as journal:
         HistoryAudience(journal).revoke(proof_id, context=context, policy=policy_authority)
     typer.echo(json.dumps({"status": "revoked", "proof_id": proof_id}, sort_keys=True))
@@ -148,6 +154,7 @@ def history_search(
     context, authority = _read_authorization_context(
         authorization, policy, channel=channel, account=account, chat_id=chat_id
     )
+    _isolated(target_home)
     with HistoricalJournal(target_home, create=False) as journal:
         reader = HistoryReader(journal, policy=authority)
         try:
@@ -194,6 +201,7 @@ def history_recent(
     context, authority = _read_authorization_context(
         authorization, policy, channel=channel, account=account, chat_id=chat_id
     )
+    _isolated(target_home)
     with HistoricalJournal(target_home, create=False) as journal:
         results = HistoryReader(journal, policy=authority).recent(
             context=context,
@@ -229,6 +237,7 @@ def history_excerpt(
     context, authority = _read_authorization_context(
         authorization, policy, channel=channel, account=account, chat_id=chat_id
     )
+    _isolated(target_home)
     with HistoricalJournal(target_home, create=False) as journal:
         result = HistoryReader(journal, policy=authority).excerpt(
             event_id, revision, context=context
@@ -253,6 +262,7 @@ def history_reindex(
     target_home: Path = typer.Option(..., "--target-home", help="Explicit rebuilt history target"),
 ) -> None:
     """Rebuild the private FTS projection from canonical journal rows."""
+    _isolated(target_home)
     with HistoricalJournal(target_home, create=False) as journal:
         report = HistoryReader(
             journal,
@@ -441,3 +451,8 @@ def _emit_history_receipts(metadata: dict[str, Any], results: Any) -> None:
             indent=2,
         )
     )
+
+
+def _isolated(*paths: Path | None) -> None:
+    from yeoman_gateway.history.export import require_isolated_paths
+    require_isolated_paths(*(path for path in paths if path is not None))

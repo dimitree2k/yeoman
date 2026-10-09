@@ -43,6 +43,8 @@ from yeoman_gateway.pipeline.speakup_approval import SpeakupApprovalMiddleware
 if TYPE_CHECKING:
     from collections.abc import Awaitable, Callable, Sequence
 
+    from yeoman_shared.config.schema import HistoryConfig
+
     from yeoman_gateway.bus.queue import MessageBus
     from yeoman_gateway.consciousness.approval import SpeakupApprovalStore
     from yeoman_gateway.consciousness.log import SpeakupLog
@@ -76,6 +78,7 @@ class Orchestrator:
         mention_context_factory: "Callable[[InboundEvent], TrustedReadContext | None] | None" = None,
         reply_context_window_limit: int,
         history_reply_selected: bool = False,
+        history_secondary_config: HistoryConfig | None = None,
         reply_context_line_max_chars: int,
         ambient_window_limit: int = 30,
         dedupe_ttl_seconds: int = 20 * 60,
@@ -175,7 +178,7 @@ class Orchestrator:
         layers.extend([
             IdeaCaptureMiddleware(security=security),
             AccessControlMiddleware(security=security),
-            NewChatNotifyMiddleware(owner_alert_resolver=owner_alert_resolver),
+            NewChatNotifyMiddleware(owner_alert_resolver=owner_alert_resolver, history_config=history_secondary_config),
             NoReplyFilterMiddleware(security=security),
             InputSecurityMiddleware(security=security, classifier=security_classifier, block_message=security_block_message),
             ResponderMiddleware(

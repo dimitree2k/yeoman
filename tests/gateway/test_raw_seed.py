@@ -223,10 +223,16 @@ def test_default_memory2_sources_include_legacy_store_and_deduplicate(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
     monkeypatch.setenv("YEOMAN_HOME", str(tmp_path / "yeoman"))
-    paths = SeedPaths.default()
+    before = set(tmp_path.rglob("*"))
+    with pytest.raises(ValueError, match="explicit isolated SeedPaths"):
+        SeedPaths.default()
+    assert set(tmp_path.rglob("*")) == before
+    isolated = tmp_path / "isolated"
+    paths = SeedPaths(isolated / "processing.db", isolated / "reply_context.db",
+                      isolated / "inbound", isolated / "knowledge.db", isolated / "memory.db")
     legacy = paths.legacy_memory_db
-    assert paths.knowledge_db == tmp_path / "yeoman" / "data" / "knowledge" / "knowledge.db"
-    assert legacy == tmp_path / "yeoman" / "data" / "memory" / "memory.db"
+    assert paths.knowledge_db == isolated / "knowledge.db"
+    assert legacy == isolated / "memory.db"
 
     rows_by_path = (
         (paths.knowledge_db, [("k1", "g4", "X", "primary", "2026-09-01T00:00:00+00:00")]),

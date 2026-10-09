@@ -35,6 +35,12 @@ class GatewaySocket:
     a2a_capabilities_handler: Callable[[], Awaitable[dict[str, Any]]] | None = None
     publish_event_handler: Callable[..., Awaitable[dict]] | None = None
     get_session_state_handler: Callable[..., Awaitable[dict]] | None = None
+    knowledge_statements_handler: Callable[[dict[str, Any]], Awaitable[dict[str, Any]]] | None = None
+    knowledge_accounting_handler: Callable[[], Awaitable[dict[str, Any]]] | None = None
+    persona_evolution_read_handler: Callable[[dict[str, Any]], Awaitable[dict[str, Any]]] | None = None
+    history_chats_handler: Callable[[], Awaitable[dict[str, Any]]] | None = None
+    knowledge_read_handler: Callable[[dict[str, Any]], Awaitable[dict[str, Any]]] | None = None
+    history_read_handler: Callable[[dict[str, Any]], Awaitable[dict[str, Any]]] | None = None
     history_control_handler: Callable[[str, Mapping[str, Any]], Awaitable[dict[str, Any]]] | None = None
     rate_limit: int = 10  # commands per second
     _server: asyncio.Server | None = field(default=None, init=False)
@@ -94,7 +100,7 @@ class GatewaySocket:
                     if (not isinstance(request, dict) or not isinstance(request.get('cmd'), str) or
                             not isinstance(request.get('args', {}), dict)):
                         raise ValueError('invalid frame')
-                    if request['cmd'] == 'history_control' and not self._peer_is_owner(writer):
+                    if request['cmd'] in {'history_control', 'history_read', 'knowledge_read', 'history_chats', 'persona_evolution_read', 'knowledge_accounting', 'knowledge_statements'} and not self._peer_is_owner(writer):
                         response = {'status': 'error', 'code': 'OWNER_REQUIRED'}
                     elif not self._check_rate_limit():
                         response = {"status": "error", "message": "Rate limit exceeded"}
@@ -116,6 +122,74 @@ class GatewaySocket:
     async def _dispatch(self, request: dict[str, Any]) -> dict[str, Any]:
         cmd = request.get("cmd", "")
         args = request.get("args", {})
+
+        if cmd == 'knowledge_statements':
+            fields = {'list': {'action', 'limit'}, 'show': {'action', 'statement_id', 'content'}, 'erase': {'action', 'statement_id'}}
+            action = args.get('action')
+            if set(request) != {'cmd', 'args'} or not isinstance(action, str) or action not in fields or set(args) != fields[action]:
+                return {'status': 'error', 'code': 'INVALID_READ'}
+            if action == 'list' and (type(args['limit']) is not int or not 1 <= args['limit'] <= 100) or action != 'list' and (not isinstance(args['statement_id'], str) or not args['statement_id']) or action == 'show' and type(args['content']) is not bool:
+                return {'status': 'error', 'code': 'INVALID_READ'}
+            if self.knowledge_statements_handler is None:
+                return {'status': 'disabled'}
+            try:
+                return await self.knowledge_statements_handler(args)
+            except Exception:
+                return {'status': 'paused', 'code': 'KNOWLEDGE_READ_UNAVAILABLE'}
+
+        if cmd == 'knowledge_accounting':
+            if set(request) != {'cmd', 'args'} or args:
+                return {'status': 'error', 'code': 'INVALID_READ'}
+            if self.knowledge_accounting_handler is None:
+                return {'status': 'disabled'}
+            try:
+                return await self.knowledge_accounting_handler()
+            except Exception:
+                return {'status': 'paused', 'code': 'KNOWLEDGE_READ_UNAVAILABLE'}
+
+        if cmd == 'persona_evolution_read':
+            if set(request) != {'cmd', 'args'} or set(args) != {'persona_file', 'window_days', 'limit'} or not isinstance(args['persona_file'], str) or type(args['window_days']) is not int or not 1 <= args['window_days'] <= 90 or type(args['limit']) is not int or not 1 <= args['limit'] <= 100:
+                return {'status': 'error', 'code': 'INVALID_READ'}
+            if self.persona_evolution_read_handler is None:
+                return {'status': 'disabled'}
+            try:
+                return await self.persona_evolution_read_handler(args)
+            except Exception:
+                return {'status': 'paused', 'code': 'HISTORY_READ_UNAVAILABLE'}
+
+        if cmd == 'history_chats':
+            if set(request) != {'cmd', 'args'} or args:
+                return {'status': 'error', 'code': 'INVALID_READ'}
+            if self.history_chats_handler is None:
+                return {'status': 'disabled'}
+            try:
+                return await self.history_chats_handler()
+            except Exception:
+                return {'status': 'paused', 'code': 'HISTORY_READ_UNAVAILABLE'}
+
+        if cmd == 'knowledge_read':
+            if set(request) != {'cmd', 'args'} or set(args) != {'chat_id', 'query', 'limit'} or not isinstance(args['chat_id'], str) or not args['chat_id'] or not isinstance(args['query'], str) or type(args['limit']) is not int or not 1 <= args['limit'] <= 500:
+                return {'status': 'error', 'code': 'INVALID_READ'}
+            if self.knowledge_read_handler is None:
+                return {'status': 'disabled'}
+            try:
+                return await self.knowledge_read_handler(args)
+            except Exception:
+                return {'status': 'paused', 'code': 'KNOWLEDGE_READ_UNAVAILABLE'}
+
+        if cmd == 'history_read':
+            from yeoman_gateway.history.export import validate_read_args
+            try:
+                if set(request) != {'cmd', 'args'}:
+                    raise ValueError('invalid request')
+                validate_read_args(args)
+                if self.history_read_handler is None:
+                    return {'status': 'disabled'}
+                return await self.history_read_handler(args)
+            except ValueError:
+                return {'status': 'error', 'code': 'INVALID_READ'}
+            except Exception:
+                return {'status': 'paused', 'code': 'HISTORY_READ_UNAVAILABLE'}
 
         if cmd == 'history_control':
             try:

@@ -210,13 +210,29 @@ def raw_check_capture() -> None:
 
 
 @raw_app.command("seed")
-def raw_seed(dry_run: bool = typer.Option(False, "--dry-run", help="Count only")) -> None:
+def raw_seed(
+    processing_db: Path = typer.Option(..., '--processing-db'),
+    reply_context_db: Path = typer.Option(..., '--reply-context-db'),
+    inbound_dir: Path = typer.Option(..., '--inbound-dir'),
+    knowledge_db: Path = typer.Option(..., '--knowledge-db'),
+    destination: Path = typer.Option(..., '--destination'),
+    legacy_memory_db: Path | None = typer.Option(None, '--legacy-memory-db'),
+    dry_run: bool = typer.Option(False, '--dry-run'),
+) -> None:
     """One-time import of history older than the archive START marker."""
-    from yeoman_shared.raw_archive.paths import raw_root
+    from yeoman_shared.raw_archive.writer import RawArchive
 
+    from yeoman_gateway.history.export import require_isolated_paths
     from yeoman_gateway.storage.raw_seed import SeedPaths, seed_raw_archive
-
-    report = seed_raw_archive(raw_root(), SeedPaths.default(), dry_run=dry_run)
+    paths = SeedPaths(processing_db, reply_context_db, inbound_dir, knowledge_db, legacy_memory_db)
+    require_isolated_paths(destination, processing_db, reply_context_db, inbound_dir, knowledge_db,
+                           *(p for p in (legacy_memory_db,) if p is not None))
+    if destination.exists():
+        raise typer.BadParameter('new isolated destination required')
+    if not dry_run:
+        RawArchive(destination, spool=destination.parent / (destination.name + '-spool'),
+                   status_path=destination.parent / (destination.name + '-status.json'))
+    report = seed_raw_archive(destination, paths, dry_run=dry_run)
     typer.echo(json.dumps(asdict(report), indent=2, sort_keys=True))
 
 

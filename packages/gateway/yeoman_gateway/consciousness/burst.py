@@ -8,12 +8,14 @@ from collections import defaultdict, deque
 from collections.abc import Awaitable, Callable
 from datetime import UTC, datetime
 from pathlib import Path
+from typing import Any
 
 from loguru import logger
 from yeoman_shared.config.schema import Config
 from yeoman_shared.utils.helpers import ensure_dir
 
 from yeoman_gateway.bus.events import GatewayEvent, InboundObservedEvent
+from yeoman_gateway.history.export import secondary_consumer
 from yeoman_gateway.implicit_addressing import (
     SessionManagerLike,
     is_direct_bot_interaction,
@@ -35,6 +37,8 @@ class BurstObserver:
         is_eligible: EligibilityCallback | None = None,
         session_manager: SessionManagerLike | None = None,
     ) -> None:
+        self._history_projector: Any = None
+        self._history_knowledge: Any = None
         self._config = config
         self._state_path = state_path.expanduser()
         self._on_burst = on_burst
@@ -44,6 +48,7 @@ class BurstObserver:
         self._last_direct_bot_interaction: dict[tuple[str, str], float] = {}
         self._fires_today: dict[str, dict[str, object]] = self._load_state()
 
+    @secondary_consumer
     async def handle(self, event: GatewayEvent) -> None:
         if not isinstance(event, InboundObservedEvent):
             return

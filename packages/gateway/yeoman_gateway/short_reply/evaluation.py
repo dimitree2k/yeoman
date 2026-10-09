@@ -196,6 +196,8 @@ def load_replay_rows(
     max_chars: int = 80,
     bot_participants: Collection[str] | None = None,
 ) -> list[ReplayRow]:
+    from yeoman_gateway.history.export import require_isolated_paths
+    require_isolated_paths(archive_db, processing_db, *inbound_jsonl)
     bots = set(bot_participants or derive_bot_participants(archive_db, processing_db))
     media_by_id = _inbound_media_index(inbound_jsonl)
     with closing(_ro(archive_db)) as archive, closing(_ro(processing_db)) as processing:

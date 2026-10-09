@@ -9,6 +9,24 @@ if TYPE_CHECKING:
 
 
 def execute(args: dict[str, Any], ctx: ToolContext) -> str:
+    if getattr(ctx, 'history_selected', False) or getattr(ctx, 'legacy_history_disabled', False):
+        import json
+        import socket
+        chat_id = args.get('chat_id')
+        if not isinstance(chat_id, str) or not chat_id:
+            return '[query_memory] unavailable: explicit authorized chat scope required'
+        gateway = getattr(ctx, 'gateway_socket_path', ctx.yeoman_home / 'run' / 'gateway.sock')
+        try:
+            with socket.socket(socket.AF_UNIX, socket.SOCK_STREAM) as client:
+                client.settimeout(30)
+                client.connect(str(gateway))
+                client.sendall(json.dumps({'cmd': 'knowledge_read', 'args': {
+                    'chat_id': chat_id, 'query': args['query'], 'limit': args.get('limit', 10)}}).encode() + b'\n')
+                with client.makefile('rb') as response:
+                    result = json.loads(response.readline(1024 * 1024))
+            return json.dumps(result)
+        except (OSError, ValueError):
+            return '[query_memory] unavailable: Gateway authorized Knowledge read failed'
     query = args["query"]
     limit = int(args.get("limit", 10))
     db_path = ctx.memory_db or (ctx.yeoman_home / "data" / "memory" / "memory.db")
