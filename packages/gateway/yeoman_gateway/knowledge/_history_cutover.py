@@ -9,7 +9,11 @@ from typing import Any
 
 from yeoman_gateway.history.layer1 import row_sha256
 from yeoman_gateway.history.queries import HistoryQueries
-from yeoman_gateway.knowledge._history_sources import _principal, build_history_source_aliases
+from yeoman_gateway.knowledge._history_sources import (
+    _principal,
+    build_history_source_aliases,
+    is_legacy_node,
+)
 from yeoman_gateway.knowledge.models import KnowledgeError, SourceRef
 
 _STATE_FIELDS = ("channel", "chat_id", "native_message_id", "direction", "sent_ms",
@@ -46,7 +50,7 @@ def prepare_legacy_alias_inputs(*, queries: HistoryQueries,
 
     Preserved envelope: event_id/revision, original {issued, state, created_ms},
     origin {store,path,table,row_key,row_sha256}, source_ref (conversion segment ref).
-    State requires locator and original text; optional fields remain unrecorded.
+    The union of recorded states requires locator and original text; absent fields stay unrecorded.
     Missing identity/proof stays withheld. Neither text nor timestamps match
     locators; only (channel, chat, native ID) does.
     """
@@ -65,7 +69,7 @@ def prepare_legacy_alias_inputs(*, queries: HistoryQueries,
             raise ValueError("conflicting_legacy_key")
         distinct[key] = row
     counts = Counter({key: 0 for key in (
-        "mapped", "missing", "ambiguous", "changed", "purged_revoked", "other_channel")})
+        "mapped", "missing", "ambiguous", "changed", "purged_revoked", "other_channel", "legacy_node")})
     prepared, locators = [], {}
     for key, row in sorted(distinct.items(), key=lambda item: (str(item[0][0]),
             (0, item[0][1]) if type(item[0][1]) is int else (1, str(item[0][1])))):
@@ -75,7 +79,9 @@ def prepare_legacy_alias_inputs(*, queries: HistoryQueries,
         targets: set[str] = set()
         proofs = []
         states = []
-        if source is None:
+        if is_legacy_node(row.get("event_id", "")):
+            status = reason = "legacy_node"
+        elif source is None:
             principal = row.get('author_principal')
             row['cutover_reason'] = ('unissued_principal' if isinstance(principal, str) and not principal.strip()
                                      else 'invalid_source_ref')
@@ -103,21 +109,26 @@ def prepare_legacy_alias_inputs(*, queries: HistoryQueries,
                     continue
                 state = original.get("state")
                 issued = original.get("issued")
-                if (not isinstance(state, dict) or (issued is not None and not isinstance(issued, dict))
-                        or not all(k in state for k in ("channel", "chat_id", "native_message_id"))
-                        or not state["native_message_id"]):
+                if not isinstance(state, dict) or (issued is not None and not isinstance(issued, dict)):
                     invalid = True
                     continue
                 states.append((issued, state))
-                matches = queries._rows(
-                    "SELECT * FROM messages_current WHERE channel=? AND chat_id=? AND native_message_id=?",
-                    (state["channel"], state["chat_id"], state["native_message_id"]))
-                targets.update(match["message_id"] for match in matches)
+                if all(state.get(k) for k in ("channel", "chat_id", "native_message_id")):
+                    matches = queries._rows(
+                        "SELECT * FROM messages_current WHERE channel=? AND chat_id=? AND native_message_id=?",
+                        (state["channel"], state["chat_id"], state["native_message_id"]))
+                    targets.update(match["message_id"] for match in matches)
                 proofs.append({"origin": {k: origin[k] for k in ("store", "path", "table", "row_key", "row_sha256")}, "source_ref": preserved["source_ref"],
-                               "native_locator": [state["channel"], state["chat_id"], state["native_message_id"]]})
+                               "native_locator": [state.get(k) for k in ("channel", "chat_id", "native_message_id")]})
             conflicts = any((left_issued is not None and right_issued is not None and left_issued != right_issued) or any(
                 left[k] != right[k] for k in left.keys() & right.keys())
                 for i,(left_issued,left) in enumerate(states) for right_issued,right in states[i+1:])
+            recorded = {k: v for _, state in states for k, v in state.items()}
+            if not conflicts and all(recorded.get(k) for k in ("channel", "chat_id", "native_message_id")) and not targets:
+                matches = queries._rows(
+                    "SELECT message_id FROM messages_current WHERE channel=? AND chat_id=? AND native_message_id=?",
+                    (recorded["channel"], recorded["chat_id"], recorded["native_message_id"]))
+                targets.update(match["message_id"] for match in matches)
             if len(targets) > 1 or conflicts:
                 status, reason = "ambiguous", "ambiguous_locator"
             elif invalid:
@@ -127,18 +138,17 @@ def prepare_legacy_alias_inputs(*, queries: HistoryQueries,
             elif len(targets) == 1 and states:
                 mid = next(iter(targets))
                 current = queries._rows("SELECT * FROM messages_current WHERE message_id=?", (mid,))[0]
-                recorded = {k:v for _,state in states for k,v in state.items()}
                 expected = _state(queries, current)
                 expected["author_principal"] = _principal(current["sender_identifier"] or "")
                 # An original observation with no mutations proves pre-edit text.
                 if not recorded.get("events"):
                     expected["events"] = []
                     expected["current_text"] = expected["text"]
-                issued_proofs = [issued for issued,state in states if issued is not None
-                    and all(k in state for k in ("text", "sent_ms", "time_certainty"))]
+                issued_proofs = [issued for issued, _ in states if issued is not None]
+                complete = all(k in recorded for k in ("text", "sent_ms", "time_certainty"))
                 if current["deleted"]:
                     status, reason = "purged_revoked", "purged_revoked"
-                elif not issued_proofs:
+                elif not issued_proofs or not complete:
                     reason = "no_author_or_text_proof"
                 elif issued_proofs[0] != asdict(source):
                     status, reason = "changed", ("author_mismatch" if issued_proofs[0].get("author_principal") != source.author_principal
@@ -249,8 +259,11 @@ def prepare_capture_inputs(*, queries: HistoryQueries,
         refs[source.key] = mid, source
     job_mids = set()
     unmapped_terminal = 0
+    no_legacy_row_pending = 0
     for job in jobs:
         for ref in json.loads(job["sources_json"]):
+            if is_legacy_node(ref["event_id"]):
+                continue
             key = ref["event_id"], ref["revision"]
             if key in refs:
                 if refs[key][1].channel == "whatsapp":
@@ -278,6 +291,9 @@ def prepare_capture_inputs(*, queries: HistoryQueries,
             reason = "not_policy_chat"
         if reason:
             classifications[mid] = reason
+        elif mid not in rows:
+            classifications[mid] = "pending"
+            no_legacy_row_pending += 1
         elif row.get("completed") is True and source is not None:
             processed.append(source)
         elif (row.get("boundary") == list(legacy_boundary)
@@ -313,7 +329,7 @@ def prepare_capture_inputs(*, queries: HistoryQueries,
             else:
                 raise ValueError("unclassified_handover_message")
     if summary is not None:
-        summary.update(unmapped_terminal_job_refs=unmapped_terminal, duplicate_observations=sum(max(0, len(values)-1) for values in observations.values()),
+        summary.update(no_legacy_row_pending=no_legacy_row_pending, unmapped_terminal_job_refs=unmapped_terminal, duplicate_observations=sum(max(0, len(values)-1) for values in observations.values()),
             observations={mid: [dict(created_ms=created,event_id=event) for created,event in sorted(values)]
                           for mid,values in sorted(observations.items()) if len(values)>1})
     return {"pending": tuple(sorted(pending, key=lambda s: s.key)),

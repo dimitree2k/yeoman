@@ -167,7 +167,7 @@ def test_capture_input_requires_preserved_order_and_rejects_conflicts(capture_ca
     with h.snapshot() as snap:
         q = HistoryQueries(snap)
         with pytest.raises(ValueError, match="unclassified_handover_message"):
-            prepare_capture_inputs(queries=q, legacy_boundary=(10, "b"), legacy_rows=[], jobs=[])
+            prepare_capture_inputs(queries=q, legacy_boundary=(10, "b"), legacy_rows=[{"message_id": "old"}], jobs=[])
         with pytest.raises(ValueError, match="conflicting_capture_proof"):
             prepare_capture_inputs(queries=q, legacy_boundary=(10, "b"), legacy_rows=[
                 {"message_id": "old", "created_ms": 1, "event_id": "a", "boundary": [10, "b"], "forward_start": [5, "start"]},
@@ -535,3 +535,80 @@ def test_only_active_unmapped_jobs_block_both_handover_paths(capture_case,state,
             assert receipt['unmapped_terminal_job_refs']==1
             assert p.prepare_handover(snap,legacy_boundary=(10,'b'),**inputs)==receipt
             assert [dict(r) for r in k._store.query('SELECT * FROM knowledge_jobs')]==jobs
+
+
+@pytest.mark.parametrize('conflict', [False, True])
+def test_cross_store_union_of_recorded_fields(case, conflict):
+    from yeoman_gateway.knowledge._history_cutover import prepare_legacy_alias_inputs
+    _, q, _, _ = case
+    source = SourceRef('union', 1, 'whatsapp', q.message('m')['chat_id'], 'whatsapp:10001', 100)
+    first, second = proof(q, 'm', source), proof(q, 'm', source)
+    full = first['original']['state']
+    first['original']['state'] = {k: full[k] for k in ('channel', 'chat_id', 'native_message_id', 'text')}
+    second['original']['state'] = {k: full[k] for k in ('sent_ms', 'time_certainty')}
+    second['origin']['store'] = 'memory'
+    if conflict:
+        second['original']['state']['text'] = 'Conflicting preserved text'
+    for item in (first, second):
+        item['origin']['row_sha256'] = row_sha256(item['original'])
+    rows, locators, counts = prepare_legacy_alias_inputs(queries=q, legacy_rows=[legacy(source)], preserved_rows=[first, second])
+    assert rows[0]['cutover_status'] == ('ambiguous' if conflict else 'mapped')
+    assert counts['ambiguous' if conflict else 'mapped'] == 1
+    if not conflict:
+        assert locators[source.key] == ('m',)
+        assert rows[0]['proven_fields'] == sorted(['channel', 'chat_id', 'native_message_id', 'text', 'sent_ms', 'time_certainty', 'issued', 'original_row_sha256'])
+    assert prepare_legacy_alias_inputs(queries=q, legacy_rows=[legacy(source)], preserved_rows=[second, first]) == (rows, locators, counts)
+
+
+def test_legacy_node_keeps_legacy_authority(case, monkeypatch):
+    from yeoman_gateway.knowledge._history_cutover import prepare_legacy_alias_inputs
+    service, q, authority, _ = case
+    store = service._store
+    with store.transaction():
+        store.execute("UPDATE knowledge_statement_sources SET event_id='legacy-node:synthetic',revision=1,source_audience_json=NULL WHERE event_id='curated-source'")
+    original = dict(store.query_one("SELECT * FROM knowledge_statement_sources WHERE event_id='legacy-node:synthetic'"))
+    rows, locators, counts = prepare_legacy_alias_inputs(queries=q, legacy_rows=[original], preserved_rows=[])
+    assert counts['legacy_node'] == 1 and counts['missing'] == 0
+    assert rows[0]['cutover_status'] == 'legacy_node' and not locators
+    # Even an unavailable history projection cannot become authority for a note.
+    monkeypatch.setattr(q.snapshot, 'assert_current', lambda *a: pytest.fail('note consulted history'))
+    note = authority.verify_source_ref(original['event_id'], original['revision'])
+    assert note == SourceRef(**{k: original[k] for k in SourceRef.__dataclass_fields__})
+    assert authority.verify_source(note)
+    assert authority.permits_principal(note, note.author_principal, now_ms=100)
+    assert service._statements.sources_of(original['statement_id'])[0][0] == note
+    assert authority.register_source(note, authority.evidence_audience(note, basis='')) == note
+    with store.transaction():
+        store.execute("UPDATE knowledge_statement_sources SET source_audience_json='[]' WHERE event_id=?", (note.event_id,))
+    assert not authority.permits_principal(note, note.author_principal, now_ms=100)
+    authority.mark_source_revoked(note)
+    assert authority.verify_source_ref(*note.key) is None
+
+
+def test_no_legacy_row_is_pending_zero(capture_case):
+    from yeoman_gateway.knowledge._history_cutover import prepare_capture_inputs
+    h, k, _, _ = capture_case
+    h.add('never-observed', line=1, known=False)
+    h.add('empty-refusal', line=2)
+    import sqlite3
+    with sqlite3.connect(h.path) as db:
+        db.execute("UPDATE messages SET text='' WHERE message_id='empty-refusal'")
+    p = producer(k)
+    with h.snapshot() as snap:
+        summary = {}
+        inputs = prepare_capture_inputs(queries=HistoryQueries(snap), legacy_boundary=(10, 'b'), legacy_rows=[], jobs=[], summary=summary)
+        assert inputs == {'pending': (), 'processed': (), 'classifications': {'empty-refusal': 'empty_text', 'never-observed': 'pending'}}
+        assert summary['no_legacy_row_pending'] == 1
+        p.prepare_handover(snap, legacy_boundary=(10, 'b'), **inputs)
+        row = k._store.query_one("SELECT * FROM knowledge_history_capture WHERE message_id='never-observed'")
+        assert row['revision'] == 0 and row['outcome'] == 'pending'
+        with pytest.raises(ValueError, match='unclassified_handover_message'):
+            prepare_capture_inputs(queries=HistoryQueries(snap), legacy_boundary=(10, 'b'), legacy_rows=[{'message_id': 'never-observed'}], jobs=[])
+
+
+def test_legacy_node_cannot_be_aliased_even_with_a_native_locator(case):
+    _, q, _, _ = case
+    note = SourceRef('legacy-node:synthetic', 1, 'whatsapp', q.message('m')['chat_id'], 'whatsapp:10001', 100)
+    row = legacy(note, content_fingerprint=q.content_fingerprint('m'))
+    aliases, counts = build_history_source_aliases(queries=q, legacy_rows=[row], locators={note.key: ('m',)})
+    assert not aliases and counts['legacy_node']==1

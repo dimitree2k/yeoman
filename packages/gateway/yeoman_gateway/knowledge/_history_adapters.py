@@ -24,6 +24,7 @@ from typing import Any
 from zoneinfo import ZoneInfo
 
 from ._history_records import NormalizedEvent
+from .models import LEGACY_NODE_PREFIX
 
 _SAFE_ID = re.compile(r"^[A-Za-z0-9][A-Za-z0-9_.-]{0,127}$")
 _HASH = re.compile(r"^[0-9a-f]{64}$")
@@ -1151,7 +1152,7 @@ def _sqlite_row_event(
             account=values.get("account"),
             chat_id=values.get("chat_id"),
             native_id=native_id,
-            event_id=f"legacy-node:{node_id}",
+            event_id=f"{LEGACY_NODE_PREFIX}{node_id}",
             revision=1,
             kind="message" if legacy_original else kind,
             direction=("out" if authored_legacy else "in") if legacy_candidate or authored_legacy else "unknown",
@@ -1162,7 +1163,7 @@ def _sqlite_row_event(
             retention_status="erased" if is_deleted else "retained",
             chat_kind=_chat_kind(values),
             source_kind="memory2_nodes",
-            known_event_ids=(f"legacy-node:{node_id}",),
+            known_event_ids=(f"{LEGACY_NODE_PREFIX}{node_id}",),
             source_authority=(
                 "denied_erased"
                 if is_deleted

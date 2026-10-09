@@ -175,6 +175,7 @@ class FactReadGate:
 
     def _history_permits(self, fact_id: str, read_context: FactReadContext) -> bool:
         from yeoman_gateway.knowledge._history_identity import current_history_scope
+        from yeoman_gateway.knowledge._history_sources import is_legacy_node
         from yeoman_gateway.knowledge.models import SourceRef
         owner = getattr(self._store, '_owner', None)
         scope = current_history_scope(owner) if owner is not None else None
@@ -188,10 +189,18 @@ class FactReadGate:
             # Unmapped legacy facts are withheld rather than trusted by principal string.
             return False
         principals = read_context.current_members if read_context.group_wide else {read_context.principal_id}
-        return all(row['status'] == 'active' and all(scope.sources.permits_principal(
-            SourceRef(row['event_id'], row['revision'], row['channel'], row['chat_id'],
-                      row['author_principal'], row['occurred_at_ms']), principal,
-            now_ms=read_context.now_ms) for principal in principals or ()) for row in rows)
+        for row in rows:
+            note = is_legacy_node(row['event_id'])
+            # Migrated notes lack journal authority ('unknown'); their stored fact ACL is unchanged.
+            if row['status'] != 'active' and not (note and row['status'] == 'unknown'):
+                return False
+            source = (scope.sources.verify_source_ref(row['event_id'], row['revision']) if note else
+                SourceRef(row['event_id'], row['revision'], row['channel'], row['chat_id'],
+                          row['author_principal'], row['occurred_at_ms']))
+            if source is None or not all(scope.sources.permits_principal(
+                    source, principal, now_ms=read_context.now_ms) for principal in principals or ()):
+                return False
+        return True
 
 
 def chat_scope_key(channel: str, chat_id: str) -> str:

@@ -40,6 +40,7 @@ __all__ = [
     "GLOBAL_SCOPE_KEY",
     "IDENTITY_CANDIDATE_SIGNALS",
     "IDENTITY_CANDIDATE_STATUSES",
+    "LEGACY_NODE_PREFIX",
     "MAX_ATTRIBUTE_VALUE_LENGTH",
     "MAX_NAME_LENGTH",
     "MAX_PEOPLE_PER_STATEMENT",
@@ -251,6 +252,7 @@ MAX_ATTRIBUTE_VALUE_LENGTH: Final[int] = 500
 #: The namespace of a channel that carries a single platform account.  A channel adapter
 #: states it explicitly; nothing derives it from a missing value.
 DEFAULT_NAMESPACE: Final[str] = "default"
+LEGACY_NODE_PREFIX: Final[str] = "legacy-node:"
 MAX_PEOPLE_PER_STATEMENT: Final[int] = 64
 MAX_SOURCES_PER_STATEMENT: Final[int] = 32
 MIN_RECALL_LIMIT: Final[int] = 1

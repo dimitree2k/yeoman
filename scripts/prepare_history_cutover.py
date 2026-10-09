@@ -41,13 +41,13 @@ from yeoman_shared.raw_archive.records import enumerate_committed
 _ARGUMENTS = ("snapshot_home", "history_db", "knowledge_source", "knowledge_target",
               "policy_snapshot", "output_root")
 _COUNTS = ("total", "mapped", "missing", "ambiguous", "changed", "purged_revoked",
-           "other_channel", "candidate_copies", "statements", "jobs", "withheld_statements",
+           "other_channel", "legacy_node", "no_legacy_row_pending", "candidate_copies", "statements", "jobs", "withheld_statements",
            "affected_jobs", "duplicate_observations", "unmapped_terminal_job_refs",
            "cited_reason_counts", "uncited_reason_counts")
 
 
 def _affected_counts(rows, statements, jobs, aliases):
-    channels = {(row['event_id'],row['revision']):row.get('channel') for row in rows}
+    channels = {(row['event_id'],row['revision']):row.get('channel') if row['cutover_status'] != 'legacy_node' else None for row in rows}
     return dict(statements=len({r['statement_id'] for r in statements}), jobs=len(jobs),
         withheld_statements=len({r['statement_id'] for r in statements
             if (r['event_id'],r['revision']) not in aliases and channels[r['event_id'],r['revision']]=='whatsapp'}),
@@ -155,6 +155,7 @@ def prepare(args: argparse.Namespace) -> dict[str, Any]:
             capture_summary = {}
             inputs = prepare_capture_inputs(queries=q, legacy_boundary=boundary,
                 legacy_rows=[*rows, *bundle["capture_rows"]], jobs=jobs, summary=capture_summary)
+            counts["no_legacy_row_pending"] = capture_summary["no_legacy_row_pending"]
             counts["duplicate_observations"] = capture_summary["duplicate_observations"]
             counts["unmapped_terminal_job_refs"] = capture_summary["unmapped_terminal_job_refs"]
             for cited,label in ((True,"cited_reason_counts"),(False,"uncited_reason_counts")):

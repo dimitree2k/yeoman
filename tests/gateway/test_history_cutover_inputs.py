@@ -645,3 +645,116 @@ def test_host_input_errors_have_private_counts_and_cli_has_no_content(acquired,t
         argv.extend(['--'+name,str(path)])
     assert inputs.main(argv)==1
     assert json.loads(capsys.readouterr().out)==dict(ok=False,error=str(error),origin_proof_errors=error.store_counts)
+
+
+@pytest.mark.parametrize('shared', [False, True])
+def test_legacy_node_survives_prepare_reopen_and_acl_revalidation(acquired, tmp_path, monkeypatch, shared):
+    from yeoman_gateway.knowledge._history_sources import HistoryKnowledgeSources
+    from yeoman_gateway.knowledge._memory.read_gate import FactReadGate
+    from yeoman_gateway.knowledge._memory.shared_facts import FactReadContext
+    from yeoman_gateway.knowledge.api import open_knowledge_store
+    from yeoman_gateway.knowledge.runtime import RuntimeKnowledgePolicy, RuntimeKnowledgeSources
+
+    from scripts.prepare_history_cutover import prepare
+    home, _, _, _, knowledge, raw = acquired
+    note_id = 'legacy-node:synthetic'
+    chat = 'synthetic-node@g.us'
+    members = {'whatsapp:10001', 'whatsapp:10002'}
+    audience = dumps(sorted(members)) if shared else None
+    with sqlite3.connect(knowledge) as db:
+        db.execute("UPDATE knowledge_statement_sources SET event_id=?,chat_id=?,source_audience_json=?,status='unknown'", (note_id, chat, audience))
+        db.execute("UPDATE memory2_facts SET chat_scope_key=?,visibility_scope=?,group_rule=?",
+            ('channel:whatsapp:chat:'+chat, 'chat_shared' if shared else 'author_only', 'chat_members_at_source' if shared else 'author_only'))
+        if shared:
+            for (fact_id,) in db.execute('SELECT fact_id FROM memory2_facts').fetchall():
+                for principal in members:
+                    db.execute("INSERT OR IGNORE INTO memory2_fact_principals VALUES (?,?,'audience')", (fact_id, principal))
+        db.execute('UPDATE memory2_fact_sources SET source_event_id=?,source_chat_id=?', (note_id, chat))
+        for job_id, refs in db.execute('SELECT job_id,sources_json FROM knowledge_jobs').fetchall():
+            refs = json.loads(refs)
+            for ref in refs:
+                ref.update(event_id=note_id, chat_id=chat)
+            db.execute('UPDATE knowledge_jobs SET sources_json=? WHERE job_id=?', (dumps(refs), job_id))
+        db.commit()
+        db.execute('PRAGMA wal_checkpoint(TRUNCATE)')
+    baseline = open_knowledge_store(knowledge, workspace_id='synthetic', source_authority=RuntimeKnowledgeSources(),
+        policy_authority=RuntimeKnowledgePolicy(engine=None))
+    try:
+        memory = baseline.memory_store()
+        sid = baseline._store.query_one("SELECT statement_id FROM knowledge_statement_sources WHERE event_id=?", (note_id,))['statement_id']
+        fact = memory.get_fact(sid)
+        context = FactReadContext(fact.author_principal, fact.chat_scope_key, frozenset({fact.author_principal}), now_ms=fact.valid_from_ms+1)
+        assert FactReadGate(memory).recheck((sid,), context)==frozenset({sid})
+        from yeoman_gateway.knowledge.models import SourceRef
+        original = dict(baseline._store.query_one('SELECT * FROM knowledge_statement_sources WHERE statement_id=?', (sid,)))
+        expected_source = SourceRef(**{k: original[k] for k in SourceRef.__dataclass_fields__})
+        assert baseline._statements.sources_of(sid)==((expected_source, 'unknown'),)
+    finally:
+        baseline.close()
+    with closing(sqlite3.connect(knowledge)) as db:
+        assert db.execute('PRAGMA wal_checkpoint(TRUNCATE)').fetchone()[0]==0
+    manifest_path = home/'manifest.json'
+    receipt = json.loads(manifest_path.read_text())
+    next(m for m in receipt['members'] if m['path']=='data/knowledge/knowledge.db')['sha256'] = hashlib.sha256(knowledge.read_bytes()).hexdigest()
+    receipt['digest'] = procedure().record_digest(receipt)
+    manifest_path.write_text(dumps(receipt))
+    build(acquired, home/'cutover-inputs.json')
+    history = tmp_path/'history.db'
+    project([raw], history)
+    policy = tmp_path/'policy-copy.json'
+    policy.write_text(dumps({'defaults': {'whoCanTalk': {'mode': 'everyone'}}}))
+    target = tmp_path/'v3.db'
+    output = tmp_path/'aliases'
+    result = prepare(argparse.Namespace(snapshot_home=home, history_db=history, knowledge_source=knowledge,
+        knowledge_target=target, policy_snapshot=policy, output_root=output))
+    assert result['legacy_node']==1 and result['withheld_statements']==0 and result['affected_jobs']==0
+    assert result['cited_reason_counts']=={'legacy_node': 1}
+    manifest = json.loads((output/'legacy-alias-manifest.json').read_text())
+    assert manifest['capture_summary']['no_legacy_row_pending']==0
+    with closing(sqlite3.connect(target)) as db, closing(sqlite3.connect(knowledge)) as original:
+        assert db.execute('SELECT * FROM knowledge_jobs').fetchall()==original.execute('SELECT * FROM knowledge_jobs').fetchall()
+        assert not db.execute('SELECT 1 FROM knowledge_history_source_aliases WHERE event_id=?', (note_id,)).fetchall()
+        assert not db.execute('SELECT 1 FROM knowledge_history_capture WHERE message_id=?', (note_id,)).fetchall()
+    # Fresh runtime authority has no processing-store record for this legacy note.
+    service = open_knowledge_store(target, workspace_id='synthetic', source_authority=RuntimeKnowledgeSources(),
+        policy_authority=RuntimeKnowledgePolicy(engine=None), history_mode=True)
+    reader = HistoryReader(history)
+    with closing(sqlite3.connect(history)) as db:
+        runtime = json.loads(db.execute("SELECT state_json FROM projector_state WHERE file='@runtime'").fetchone()[0])
+    snapshot = reader.open_snapshot(HistoryBoundary(runtime["generation"], tuple(enumerate_committed(raw))))
+    try:
+        q = HistoryQueries(snapshot)
+        authority = HistoryKnowledgeSources(q, {}, service.history_source_ledger, service._legacy_authority)
+        monkeypatch.setattr(q, '_rows', lambda *a: pytest.fail('legacy-node revalidation consulted history'))
+        memory = service.memory_store()
+        sid = service._store.query_one("SELECT statement_id FROM knowledge_statement_sources WHERE event_id=?", (note_id,))['statement_id']
+        fact = memory.get_fact(sid)
+        context = FactReadContext(fact.author_principal, fact.chat_scope_key, frozenset({fact.author_principal}), now_ms=fact.valid_from_ms+1)
+        with service.history_scope(q, authority):
+            monkeypatch.setattr(snapshot, 'assert_current', lambda *a: pytest.fail('legacy-node revalidation consulted history'))
+            gate = FactReadGate(memory)
+            assert gate.recheck((sid,), context)==frozenset({sid})
+            from dataclasses import replace
+            assert gate.recheck((sid,), replace(context, principal_id='whatsapp:outsider'))==frozenset()
+            member_context = replace(context, principal_id='whatsapp:10002', current_members=frozenset(members))
+            assert gate.recheck((sid,), member_context)==(frozenset({sid}) if shared else frozenset())
+            later = replace(context, principal_id='whatsapp:10003', current_members=frozenset(members|{'whatsapp:10003'}))
+            assert gate.recheck((sid,), later)==frozenset()
+            assert not authority.permits_principal(expected_source, later.principal_id, now_ms=later.now_ms)
+            source = service._statements.sources_of(sid)[0][0]
+            assert source==expected_source and source.chat_id==chat
+            authority.mark_source_revoked(source)
+            assert gate.recheck((sid,), context)==frozenset()
+    finally:
+        snapshot.close()
+        reader.close()
+        service.close()
+
+
+def test_supplemental_capture_time_is_not_native_send_time():
+    from scripts.history_cutover_inputs import _original_state
+    record = dict(kind='message', channel='whatsapp', chat_id='synthetic', occurred_ms=200,
+        time_certainty='capture_time_approx', origin={'table':'memory2_nodes'},
+        payload={'messageId':'native'}, original={'content':'Synthetic preserved text'})
+    state = _original_state(record, set())
+    assert state==dict(channel='whatsapp', chat_id='synthetic', native_message_id='native', text='Synthetic preserved text')

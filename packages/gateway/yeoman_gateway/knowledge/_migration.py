@@ -45,6 +45,7 @@ from yeoman_gateway.knowledge._store import (
 )
 from yeoman_gateway.knowledge.models import (
     DEFAULT_NAMESPACE,
+    LEGACY_NODE_PREFIX,
     ValidationError,
     normalize_identifier_value,
 )
@@ -2301,7 +2302,7 @@ def _legacy_canonical_plan(
             "apply_invalid", "legacy node lacks canonical scope or content identity"
         )
     deleted = bool(node["is_deleted"])
-    source_ref = f"legacy-node:{node['id']}"
+    source_ref = f"{LEGACY_NODE_PREFIX}{node['id']}"
     return {
         "node_id": str(node["id"]),
         "workspace_id": workspace_id,

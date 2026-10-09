@@ -179,8 +179,9 @@ def _original_state(record: dict, mutations: set[tuple]) -> dict:
     if record['origin']['table'] != 'events':
         payload = record.get('payload',{})
         state = dict(channel=record['channel'],chat_id=record['chat_id'],
-            native_message_id=payload.get('messageId'),sent_ms=record['occurred_ms'],
-            time_certainty=record['time_certainty'])
+            native_message_id=payload.get('messageId'))
+        if record['time_certainty'] in ('native', 'provider_timestamp'):
+            state.update(sent_ms=record['occurred_ms'], time_certainty=record['time_certainty'])
         table = record['origin']['table']
         text_field = {'inbound_messages':'text','jsonl':'content','memory2_nodes':'content'}.get(table)
         if table == 'message_reference':

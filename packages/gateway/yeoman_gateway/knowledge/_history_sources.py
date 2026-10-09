@@ -10,7 +10,7 @@ from yeoman_gateway.history.ids import classify
 from yeoman_gateway.history.queries import HistoryQueries
 from yeoman_gateway.knowledge._store import KnowledgeStore
 from yeoman_gateway.knowledge.authority import EvidenceAudience, SourceAuthority
-from yeoman_gateway.knowledge.models import KnowledgeError, SourceRef
+from yeoman_gateway.knowledge.models import LEGACY_NODE_PREFIX, KnowledgeError, SourceRef
 from yeoman_gateway.policy.identity import canonical_user_id
 
 
@@ -115,6 +115,15 @@ class HistorySourceLedger:
                                   row['content_fingerprint'], _audience(row['audience_json']))
 
 
+def is_legacy_node(event_id: str) -> bool:
+    # Share the namespace with both legacy memory-node issuers.
+    return isinstance(event_id, str) and event_id.startswith(LEGACY_NODE_PREFIX)
+
+
+def legacy_node_ref(row: Mapping[str, Any]) -> SourceRef:
+    return SourceRef(**{key: row[key] for key in SourceRef.__dataclass_fields__})
+
+
 def _principal(value: str) -> str | None:
     ident = classify(value)
     if ident is None or ident.kind not in ('pn_jid', 'lid'):
@@ -179,7 +188,22 @@ class HistoryKnowledgeSources:
         expected = self.compatibility.get(key)
         return persisted if expected is None or expected == persisted else None
 
+    def _node_source(self, event_id: str, revision: int) -> SourceRef | None:
+        record = self.ledger.lookup(event_id, revision)
+        if record is not None and record.revoked:
+            return None
+        rows = self.ledger.store.query(
+            "SELECT * FROM knowledge_statement_sources WHERE event_id=? AND revision=? AND status IN ('active','unknown')",
+            (event_id, revision))
+        try:
+            refs = {legacy_node_ref(row) for row in rows}
+        except (KnowledgeError, TypeError, ValueError):
+            return None
+        return next(iter(refs)) if len(refs) == 1 else None
+
     def verify_source_ref(self, event_id: str, revision: int) -> SourceRef | None:
+        if is_legacy_node(event_id):
+            return self._node_source(event_id, revision)
         key = event_id, revision
         self.queries.snapshot.assert_current(self.queries.snapshot.generation)
         record = self.ledger.lookup(*key)
@@ -231,18 +255,22 @@ class HistoryKnowledgeSources:
         return source
 
     def verify_source(self, source: SourceRef) -> bool:
+        if is_legacy_node(source.event_id):
+            return self._node_source(*source.key) == source
         if source.channel != 'whatsapp':
             return self.legacy_authority.verify_source(source)
         return self.verify_source_ref(*source.key) == source
 
     def source_revoked(self, source: SourceRef) -> bool:
+        if is_legacy_node(source.event_id):
+            return not self.verify_source(source)
         if source.channel != 'whatsapp':
             return self.legacy_authority.source_revoked(source)
         return not self.verify_source(source)
 
     def mark_source_revoked(self, source: SourceRef) -> None:
         self._verification.clear()
-        if source.channel != 'whatsapp':
+        if source.channel != 'whatsapp' and not is_legacy_node(source.event_id):
             self.legacy_authority.mark_source_revoked(source)
             return
         with self.ledger.store.transaction(write=True):
@@ -254,6 +282,17 @@ class HistoryKnowledgeSources:
             self.ledger.revoke(*source.key, reason='explicit_revocation')
 
     def evidence_audience(self, source: SourceRef, *, basis: str) -> EvidenceAudience | None:
+        if is_legacy_node(source.event_id):
+            if not self.verify_source(source):
+                return None
+            rows = self.ledger.store.query(
+                "SELECT source_audience_json FROM knowledge_statement_sources WHERE event_id=? AND revision=? AND status IN ('active','unknown')",
+                source.key)
+            values = {row['source_audience_json'] for row in rows}
+            if len(values) != 1:
+                return None
+            value = next(iter(values))
+            return EvidenceAudience.author_only() if value is None else EvidenceAudience.known(set(json.loads(value)))
         if source.channel != 'whatsapp':
             return self.legacy_authority.evidence_audience(source, basis=basis)
         if not self.verify_source(source):
@@ -262,6 +301,10 @@ class HistoryKnowledgeSources:
 
     def register_source(self, source: SourceRef, audience: EvidenceAudience) -> SourceRef:
         self._verification.clear()
+        if is_legacy_node(source.event_id):
+            if not self.verify_source(source):
+                raise KnowledgeError('denied_unknown_basis', 'legacy note authority missing')
+            return source
         if source.channel == 'whatsapp':
             issued = self.issue(source.event_id)
             if issued != source:
@@ -278,11 +321,18 @@ class HistoryKnowledgeSources:
         return self.legacy_authority.verify_evidence_ref(evidence_ref)
 
     def author_contact(self, source: SourceRef) -> str | None:
+        if is_legacy_node(source.event_id):
+            return None
         if not self.verify_source(source):
             return None
         return self._verification[source.key][3]
 
     def permits_principal(self, source: SourceRef, principal: str, *, now_ms: int) -> bool:
+        if is_legacy_node(source.event_id):
+            audience = self.evidence_audience(source, basis='')
+            return audience is not None and (
+                (audience.status == 'author_only' and principal == source.author_principal)
+                or (audience.status == 'known' and principal in audience.members))
         if source.channel != 'whatsapp':
             return self.legacy_authority.verify_source(source) and not self.legacy_authority.source_revoked(source)
         if not self.verify_source(source):
@@ -308,6 +358,9 @@ def build_history_source_aliases(*, queries: HistoryQueries, legacy_rows: Iterab
     blocked: set[tuple[str, int]] = set()
     counts = Counter(mapped=0, ambiguous=0, missing=0, revoked=0, native=0, event=0, revision=0)
     for row in legacy_rows:
+        if is_legacy_node(row.get('event_id', '')):
+            counts['legacy_node'] += 1
+            continue
         try:
             source = SourceRef(**{key: row[key] for key in SourceRef.__dataclass_fields__})
         except (KnowledgeError, KeyError, TypeError, ValueError):

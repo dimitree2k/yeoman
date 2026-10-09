@@ -24,7 +24,7 @@ from yeoman_gateway.knowledge._capture_worker import (
     _screen,
     screen_draft,
 )
-from yeoman_gateway.knowledge._history_sources import HistoryKnowledgeSources
+from yeoman_gateway.knowledge._history_sources import HistoryKnowledgeSources, is_legacy_node
 from yeoman_gateway.knowledge.api import KnowledgeService
 from yeoman_gateway.knowledge.models import (
     KnowledgeError,
@@ -120,7 +120,7 @@ class HistoryCaptureProducer:
         with self.store.transaction(), self.scope(snapshot) as (_, authority):
             jobs = [dict(job) for job in self.store.query("SELECT job_id,state,reason,sources_json FROM knowledge_jobs")]
             job_sources = [(job,ref,authority.verify_source_ref(ref["event_id"],ref["revision"]))
-                           for job in jobs for ref in json.loads(job["sources_json"])]
+                           for job in jobs for ref in json.loads(job["sources_json"]) if not is_legacy_node(ref["event_id"])]
             unmapped_terminal = 0
             for job,ref,source in job_sources:
                 if source is None and ref.get("channel", "whatsapp") == "whatsapp":
