@@ -8,7 +8,8 @@ contact:<uuid> for every sender that the contacts cache can now resolve.
 Idempotent: re-running finds nothing left to migrate.
 
 Usage:
-    uv run python scripts/migrate_person_profile_scope.py [--dry-run]
+    uv run python scripts/migrate_person_profile_scope.py \
+        --memory-db COPY/memory.db --contacts-db COPY/contacts.db [--dry-run]
 """
 
 from __future__ import annotations
@@ -20,9 +21,13 @@ import sys
 from datetime import UTC, datetime
 from pathlib import Path
 
+if __package__:
+    from .history_maintenance_guard import preflight_isolated_paths
+else:
+    from history_maintenance_guard import preflight_isolated_paths
+
+from yeoman_gateway.history.export import require_isolated_paths
 from yeoman_gateway.knowledge._contacts.service import ContactsService
-from yeoman_shared.config.loader import load_config
-from yeoman_shared.utils.helpers import get_operational_data_path
 
 USER_SCOPE_RE = re.compile(r"^channel:[^:]+:user:(.+)$")
 
@@ -38,13 +43,17 @@ def _resolve(contacts_jids: dict[str, str], token: str) -> str | None:
 
 def main() -> int:
     parser = argparse.ArgumentParser(description=__doc__)
+    parser.add_argument("--memory-db", required=True, type=Path)
+    parser.add_argument("--contacts-db", required=True, type=Path)
     parser.add_argument("--dry-run", action="store_true")
     args = parser.parse_args()
 
-    config = load_config()
-    memory_db = Path(config.memory.db_path).expanduser().resolve()
+    preflight_isolated_paths(args.memory_db, args.contacts_db)
+    require_isolated_paths(args.memory_db, args.contacts_db)
+    memory_db = args.memory_db.expanduser().resolve()
+    contacts_db = args.contacts_db.expanduser().resolve()
     contacts = ContactsService(
-        db_path=get_operational_data_path() / "contacts" / "contacts.db"
+        db_path=contacts_db
     )
     jids = contacts.known_jids
     if not jids:

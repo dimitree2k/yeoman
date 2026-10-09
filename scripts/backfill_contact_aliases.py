@@ -7,7 +7,8 @@ rows. Also promotes contacts.display_name from raw JID to the most-recent
 push_name when the current display_name is still JID-shaped.
 
 Run with:
-    uv run python scripts/backfill_contact_aliases.py [--dry-run]
+    uv run python scripts/backfill_contact_aliases.py \
+        --archive-db COPY/reply_context.db --contacts-db COPY/contacts.db [--dry-run]
 """
 
 from __future__ import annotations
@@ -18,8 +19,12 @@ import sys
 from datetime import UTC, datetime
 from pathlib import Path
 
-ARCHIVE_DB = Path("~/.yeoman/data/inbound/reply_context.db").expanduser()
-CONTACTS_DB = Path("~/.yeoman/data/contacts/contacts.db").expanduser()
+if __package__:
+    from .history_maintenance_guard import preflight_isolated_paths
+else:
+    from history_maintenance_guard import preflight_isolated_paths
+
+from yeoman_gateway.history.export import require_isolated_paths
 
 
 def _now_iso() -> str:
@@ -32,19 +37,26 @@ def _is_jid_shaped(name: str) -> bool:
 
 def main() -> int:
     parser = argparse.ArgumentParser(description=__doc__)
+    parser.add_argument("--archive-db", required=True, type=Path)
+    parser.add_argument("--contacts-db", required=True, type=Path)
     parser.add_argument("--dry-run", action="store_true", help="print without writing")
     args = parser.parse_args()
 
-    if not ARCHIVE_DB.exists():
-        print(f"archive db not found: {ARCHIVE_DB}", file=sys.stderr)
+    preflight_isolated_paths(args.archive_db, args.contacts_db)
+    require_isolated_paths(args.archive_db, args.contacts_db)
+    archive_db_path = args.archive_db.expanduser().resolve()
+    contacts_db_path = args.contacts_db.expanduser().resolve()
+
+    if not archive_db_path.exists():
+        print(f"archive db not found: {archive_db_path}", file=sys.stderr)
         return 1
-    if not CONTACTS_DB.exists():
-        print(f"contacts db not found: {CONTACTS_DB}", file=sys.stderr)
+    if not contacts_db_path.exists():
+        print(f"contacts db not found: {contacts_db_path}", file=sys.stderr)
         return 1
 
-    archive = sqlite3.connect(f"file:{ARCHIVE_DB}?mode=ro", uri=True)
+    archive = sqlite3.connect(f"file:{archive_db_path}?mode=ro", uri=True)
     archive.row_factory = sqlite3.Row
-    contacts = sqlite3.connect(str(CONTACTS_DB))
+    contacts = sqlite3.connect(str(contacts_db_path))
     contacts.row_factory = sqlite3.Row
     contacts.execute("PRAGMA foreign_keys=ON")
 

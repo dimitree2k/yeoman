@@ -16,16 +16,10 @@ safety:
 
 ## Memory Hygiene
 
-Review the semantic memory database for stale or low-quality entries.
+1. Read `yeoman memory source-accounting` for aggregate Knowledge/source-reference counts.
+2. Sample curated statements through Gateway-authorized `query_memory` with an explicit owner-approved `chat_id` and bounded `limit`. No legacy memory fallback is supported after selection/retirement.
+3. Inspect statement metadata with `yeoman memory statements list` and `show <statement-id>`. Content requires explicit owner diagnostics via `--content`.
+4. Report stale references, pending jobs and quarantined/revoked statements for existing curation. No historical extraction is requested.
+5. Never use `query_db` for history/identity stores, direct retention SQL, legacy DELETE or `prune_memory` on frozen targets. Stop on pause/unavailability.
 
-### Your task
-
-1. Use `query_memory` to sample recent entries across different topics.
-2. Use `query_db` (db_path: `memory/memory.db`) to count entries by age and salience:
-   ```sql
-   SELECT COUNT(*), AVG(salience) FROM memory2_nodes WHERE created_at < date('now', '-90 days')
-   ```
-3. If more than 100 entries are older than 90 days with salience below 0.3, send an alert recommending a prune run.
-4. Report a one-paragraph summary of memory health in your final response.
-
-Do not delete anything. Observe and report only.
+Observe and report only; do not erase statements or contact participants from this job.

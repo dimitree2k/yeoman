@@ -17,6 +17,13 @@ from collections.abc import Mapping, Sequence
 from pathlib import Path
 from typing import Any
 
+if __package__:
+    from .history_maintenance_guard import preflight_isolated_paths
+else:
+    from history_maintenance_guard import preflight_isolated_paths
+
+from yeoman_gateway.history.export import require_isolated_paths
+
 _PRICE_FIELDS = {"input_per_million_tokens", "output_per_million_tokens"}
 _AUDIENCE_SCOPES = {"eligible", "excluded", "unknown"}
 _RATE_UNIT = "currency units per 1,000,000 tokens"
@@ -216,8 +223,14 @@ def main(argv: Sequence[str] | None = None) -> int:
     parser.add_argument("--output", required=True, type=Path)
     args = parser.parse_args(argv)
 
-    segment_rows = _read_json(args.segments)
-    rate_document = _read_json(args.rates)
+    preflight_isolated_paths(args.segments, args.rates, args.output)
+    require_isolated_paths(args.segments, args.rates, args.output)
+    segments_path = args.segments.expanduser().resolve()
+    rates_path = args.rates.expanduser().resolve()
+    output_path = args.output.expanduser().resolve()
+
+    segment_rows = _read_json(segments_path)
+    rate_document = _read_json(rates_path)
     if not isinstance(rate_document, Mapping) or not isinstance(rate_document.get("rates"), Mapping):
         parser.error("--rates must contain a 'rates' object and optional 'evidence' object")
     result = estimate_rebuild(segment_rows, rate_document["rates"])
@@ -232,7 +245,7 @@ def main(argv: Sequence[str] | None = None) -> int:
             if value is not None and not isinstance(value, str):
                 parser.error(f"--rates evidence {field} values must be strings or null")
             result["models"][model][field] = value
-    with args.output.open("w", encoding="utf-8") as stream:
+    with output_path.open("w", encoding="utf-8") as stream:
         json.dump(result, stream, indent=2, sort_keys=True, ensure_ascii=False, allow_nan=False)
         stream.write("\n")
     return 0

@@ -13,6 +13,7 @@ import socket
 import sqlite3
 import threading
 from contextlib import closing
+from contextvars import ContextVar
 from pathlib import Path
 from time import perf_counter
 from types import SimpleNamespace
@@ -51,6 +52,89 @@ def distribution(values):
             if ordered else 0 for name, q in (('p50', .5), ('p95', .95), ('p99', .99), ('max', 1))}}
 
 
+
+_OPERATION = ContextVar('measured_history_operation', default=None)
+
+
+class MeasuredOperationLock:
+    """Test-local timing from acquisition through release, including cancellation."""
+    def __init__(self, lock, holds, waits):
+        self.lock, self.holds, self.waits = lock, holds, waits
+        self.owners = {}
+
+    async def __aenter__(self):
+        task = asyncio.current_task()
+        kind = _OPERATION.get()
+        # Names support the small cancellation self-check without a projector.
+        if kind is None and task is not None:
+            kind = ('worker' if task.get_name().startswith('cutover-worker-') else
+                    'reply' if task.get_name().startswith('cutover-reply-') else None)
+        started = perf_counter()
+        await self.lock.acquire()
+        acquired = perf_counter()
+        self.owners[task] = (kind, acquired)
+        if kind == 'reply':
+            self.waits.append((acquired-started)*1000)
+        return self
+
+    async def __aexit__(self, *exc):
+        kind, acquired = self.owners.pop(asyncio.current_task())
+        try:
+            if kind == 'worker':
+                self.holds.append((perf_counter()-acquired)*1000)
+        finally:
+            self.lock.release()
+
+    def locked(self):
+        return self.lock.locked()
+
+
+def instrument_operation_lock(projector, holds, waits):
+    projector._operation_lock = MeasuredOperationLock(projector._operation_lock, holds, waits)
+    for name, kind in (('worker_snapshot', 'worker'), ('read_turn', 'reply'), ('barrier', 'reply')):
+        original = getattr(projector, name)
+        async def measured(*args, _original=original, _kind=kind, **kwargs):
+            token = _OPERATION.set(_kind)
+            try:
+                return await _original(*args, **kwargs)
+            finally:
+                _OPERATION.reset(token)
+        setattr(projector, name, measured)
+
+
+async def measure_concurrent_reply(projector):
+    entered, release = threading.Event(), threading.Event()
+    def held(snapshot):
+        entered.set()
+        if not release.wait(30):
+            raise AssertionError('worker measurement release missing')
+        snapshot.assert_current(snapshot.generation)
+    job = asyncio.create_task(projector.worker_snapshot(held))
+    reply = None
+    try:
+        assert await asyncio.to_thread(entered.wait, 30)
+        reply = asyncio.create_task(projector.read_turn())
+        await asyncio.sleep(0)
+        assert not reply.done(), 'independent reply did not wait for worker lock'
+        # Cancellation must keep the lock until the thread-owned lease closes.
+        job.cancel()
+        await asyncio.sleep(0)
+        assert projector._operation_lock.locked()
+        release.set()
+        with pytest.raises(asyncio.CancelledError):
+            await job
+        snapshot = await asyncio.wait_for(reply, 30)
+        snapshot.close()
+    finally:
+        release.set()
+        if not job.done():
+            await asyncio.gather(job, return_exceptions=True)
+        if reply is not None:
+            results = await asyncio.gather(reply, return_exceptions=True)
+            for result in results:
+                if hasattr(result, 'close'):
+                    result.close()
+
 def empty_report():
     return {
         'counts': dict.fromkeys(('messages', 'ordinary', 'reconnect', 'reconnect_lines', 'warmup',
@@ -58,6 +142,8 @@ def empty_report():
         'ordinary_ms': dict(DISTRIBUTION), 'reconnect_ms': dict(DISTRIBUTION),
         'raw_commit_to_context_ms': dict(DISTRIBUTION),
         'whole_reply_ms': dict(DISTRIBUTION),
+        'worker_snapshot_lock_hold_ms': dict(DISTRIBUTION),
+        'reply_barrier_wait_ms': dict(DISTRIBUTION),
         'families': {name: {'queries': 0, 'acquisition_ms': dict(DISTRIBUTION),
                             'path_ms': dict(DISTRIBUTION), 'query_plans': []} for name in FAMILIES},
         'storage': dict.fromkeys(('db_bytes', 'page_size', 'page_count'), 0),
@@ -136,6 +222,8 @@ class PerfCase(ConsumerCase):
         self.turn_number = 0
         self.active_family = None
         self.report = empty_report()
+        self.worker_holds, self.reply_waits = [], []
+        instrument_operation_lock(self.projector, self.worker_holds, self.reply_waits)
         self.acquisitions = {name: [] for name in FAMILIES}
         self.family_times = {name: [] for name in FAMILIES}
         self.collect_plans = True
@@ -382,6 +470,9 @@ async def measure_turns(case, *, parity=True):
         if i % 5 == 4:
             await turn(True)
     report = case.report
+    await measure_concurrent_reply(case.projector)
+    report['worker_snapshot_lock_hold_ms'] = distribution(case.worker_holds)
+    report['reply_barrier_wait_ms'] = distribution(case.reply_waits)
     report['ordinary_ms'], report['reconnect_ms'] = distribution(ordinary), distribution(reconnect)
     report['raw_commit_to_context_ms'] = distribution(committed)
     report['whole_reply_ms'] = distribution(whole_reply)
