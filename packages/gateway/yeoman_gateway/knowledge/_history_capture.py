@@ -118,6 +118,17 @@ class HistoryCaptureProducer:
         if classifications is not None:
             receipt["classifications"] = dict(sorted(classifications.items()))
         with self.store.transaction(), self.scope(snapshot) as (_, authority):
+            jobs = [dict(job) for job in self.store.query("SELECT job_id,state,reason,sources_json FROM knowledge_jobs")]
+            job_sources = [(job,ref,authority.verify_source_ref(ref["event_id"],ref["revision"]))
+                           for job in jobs for ref in json.loads(job["sources_json"])]
+            unmapped_terminal = 0
+            for job,ref,source in job_sources:
+                if source is None and ref.get("channel", "whatsapp") == "whatsapp":
+                    if job["state"] in ("queued", "running", "failed") or (
+                            job["state"] == "skipped" and job["reason"] == "queue_full"):
+                        raise ValueError("unmapped_handover_job")
+                    unmapped_terminal += 1
+            receipt["unmapped_terminal_job_refs"] = unmapped_terminal
             existing = self._state("handover")
             if existing is not None:
                 if existing != receipt:
@@ -133,26 +144,22 @@ class HistoryCaptureProducer:
                         raise ValueError("ambiguous_handover_source")
                     assignments[mid] = (source, outcome, None)
             # Preserve exact legacy job identities and all non-success states.
-            for job in self.store.query("SELECT job_id,state,reason,sources_json FROM knowledge_jobs"):
-                for ref in json.loads(job["sources_json"]):
-                    source = authority.verify_source_ref(ref["event_id"], ref["revision"])
-                    if source is None:
-                        raise ValueError("unmapped_handover_job")
-                    if source.channel != "whatsapp":
-                        continue
-                    mid = self._message_id(source)
-                    state = "published" if job["state"] == "done" else (
-                        "queued" if job["state"] in ("queued", "running", "failed") else (
-                            "pending" if job["state"] == "skipped" and job["reason"] == "queue_full" else "cancelled"))
-                    previous = assignments.get(mid)
-                    if previous is not None:
-                        old_source, old_state, old_job = previous
-                        if (old_source != source or (old_job is not None and old_job != job["job_id"])
-                                or (old_state == "processed" and state != "published")
-                                or (old_state == "pending" and state not in ("queued", "pending"))
-                                or (old_job is not None and old_state != state)):
-                            raise ValueError("ambiguous_handover_job")
-                    assignments[mid] = (source, state, job["job_id"])
+            for job,ref,source in job_sources:
+                if source is None or source.channel != "whatsapp":
+                    continue
+                mid = self._message_id(source)
+                state = "published" if job["state"] == "done" else (
+                    "queued" if job["state"] in ("queued", "running", "failed") else (
+                        "pending" if job["state"] == "skipped" and job["reason"] == "queue_full" else "cancelled"))
+                previous = assignments.get(mid)
+                if previous is not None:
+                    old_source, old_state, old_job = previous
+                    if (old_source != source or (old_job is not None and old_job != job["job_id"])
+                            or (old_state == "processed" and state != "published")
+                            or (old_state == "pending" and state not in ("queued", "pending"))
+                            or (old_job is not None and old_state != state)):
+                        raise ValueError("ambiguous_handover_job")
+                assignments[mid] = (source, state, job["job_id"])
             cursor = snapshot.connection.execute(
                 "SELECT m.* FROM messages_current m WHERE channel='whatsapp'")
             rows = [dict(zip([c[0] for c in cursor.description], row, strict=True)) for row in cursor]

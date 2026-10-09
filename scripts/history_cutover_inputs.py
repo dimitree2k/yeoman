@@ -13,8 +13,12 @@ from pathlib import Path
 from typing import Literal
 
 from jsonschema import Draft202012Validator
+from yeoman_gateway.history.convert.common import clean_text, epoch_or_iso_to_ms
 from yeoman_gateway.history.convert.journal import _event
-from yeoman_gateway.history.layer1 import row_sha256
+from yeoman_gateway.history.convert.memory_nodes import _line as memory_line
+from yeoman_gateway.history.convert.session_jsonl import _line as session_line
+from yeoman_gateway.history.layer1 import Origin, row_sha256
+from yeoman_gateway.knowledge._history_sources import _principal
 from yeoman_gateway.knowledge.models import SourceRef
 from yeoman_shared.raw_archive.records import validate_import_manifest
 
@@ -87,11 +91,51 @@ def _authority(row: Mapping) -> dict:
                 occurred_at_ms=row['occurred_at_ms'])
 
 
+def _native_original(record: dict) -> dict:
+    """Reconstruct non-encoded converted evidence directly from acquired originals."""
+    original,origin = record['original'],record['origin']
+    provenance = Origin(origin['store'],origin['path'],origin['table'],origin['row_key'])
+    if origin['table']=='jsonl':
+        return session_line(record['channel'],record['chat_id'],provenance,original)
+    if origin['table']=='memory2_nodes':
+        return memory_line(original,provenance)
+    if origin['table']=='inbound_messages':
+        timestamp,certainty = epoch_or_iso_to_ms(original.get('timestamp'))
+        if timestamp is None:
+            timestamp,certainty = epoch_or_iso_to_ms(original.get('created_at'))
+        return dict(record,channel=original.get('channel') or 'whatsapp',chat_id=original.get('chat_id'),
+            occurred_ms=timestamp,time_certainty=certainty,payload=dict(
+                messageId=original.get('message_id'),senderId=original.get('sender_id'),
+                participantJid=original.get('participant'),text=original.get('text')))
+    return record
+
+
 def _original_state(record: dict, mutations: set[tuple]) -> dict:
-    """Only journal message originals with explicit payload evidence can prove state."""
+    """Extract only fields supported by the hash-bound original, never history."""
     original = record['original']
-    if (record['origin']['table'] != 'events' or original.get('kind') != 'message'
-            or isinstance(record.get('payload',{}).get('segments'),list)):
+    if record.get('kind') != 'message' or isinstance(record.get('payload',{}).get('segments'),list):
+        return {}
+    if record['origin']['table'] != 'events':
+        payload = record.get('payload',{})
+        state = dict(channel=record['channel'],chat_id=record['chat_id'],
+            native_message_id=payload.get('messageId'),sent_ms=record['occurred_ms'],
+            time_certainty=record['time_certainty'])
+        table = record['origin']['table']
+        text_field = {'inbound_messages':'text','jsonl':'content','memory2_nodes':'content'}.get(table)
+        if table == 'message_reference':
+            # The pinned conversion's decoder binds these fields to encoded row bytes.
+            if 'text' in payload:
+                state['text'] = payload['text']
+        elif text_field in original:
+            cleaned = clean_text(original[text_field])
+            if not cleaned.changed:
+                state['text'] = original[text_field]
+        if 'reply_to_message_id' in original:
+            state['reply_to_native_id'] = original['reply_to_message_id']
+        if 'is_deleted' in original:
+            state['deleted'] = bool(original['is_deleted'])
+        return state
+    if original.get('kind') != 'message':
         return {}
     converted = _event(original)
     payload = converted['payload']
@@ -101,7 +145,7 @@ def _original_state(record: dict, mutations: set[tuple]) -> dict:
         sent_ms=converted['occurred_ms'],time_certainty=converted['time_certainty'],
         provenance=converted['provenance'],deleted=bool(original['payload_purged_ms']))
     if 'text' in raw_payload:
-        state.update(text=payload.get('text'),current_text=payload.get('text'))
+        state.update(text=raw_payload['text'],current_text=raw_payload['text'])
     if 'media' in raw_payload and not payload.get('generatedDescription'):
         state['media_json'] = raw_payload['media'] or None
     if 'reply_to_message_id' in raw_payload or 'reply_to' in raw_payload:
@@ -228,45 +272,105 @@ def build_cutover_inputs(*, acquisition_home: Path, conversion_manifest: Path,
     by_event = {}
     for key in sorted(legacy):
         by_event.setdefault(key[0],[]).append(key)
+    by_locator = defaultdict(set)
+    for key,row in legacy.items():
+        by_locator[row['channel'],row['chat_id'],key[0]].add(key)
+        event = event_by_id.get(key[0])
+        if event:
+            payload = json.loads(event['payload_json']) if event.get('payload_json') else {}
+            native = payload.get('provider_message_id') or payload.get('message_id') or event.get('source_message_id')
+            if native:
+                by_locator[row['channel'],row['chat_id'],native].add(key)
     originals_cache = {(str(processing),'events'):{row_sha256(e) for e in events}}
     paths_cache = {}
     authority_cache = {str(processing):authorities}
     events_cache = {str(processing):{(e['channel'],e['chat_id'],e['target_message_id'])
         for e in events if e['kind'] in ('edit','delete')}}
+    file_originals = {}
     for relative,blob in blobs.items():
         for number,line in enumerate(blob.splitlines(),1):
             record = json.loads(line)
             original,origin = record.get('original'),record.get('origin')
             if not isinstance(original,dict) or not origin:
                 continue
-            if original.get('event_id') not in by_event:
+            record = _native_original(record)
+            payload = record.get('payload',{})
+            keys = set(by_event.get(original.get('event_id'),()))
+            locator_keys = by_locator.get((record.get('channel'),record.get('chat_id'),payload.get('messageId')),())
+            keys.update(key for key in locator_keys if origin['table'] != 'events' or key[0] not in event_by_id)
+            if not keys:
                 continue
-            # Never resolve the manifest's logical source path against the host.
-            if origin['path'] not in paths_cache:
-                if origin['path'] not in members or members[origin['path']]['kind'] != 'sqlite':
-                    raise ValueError('conversion_origin_not_acquired')
-                paths_cache[origin['path']] = _member(acquisition_home,dict(path=origin['path'],kind='sqlite',restore=False))
-            source = paths_cache[origin['path']]
+            # Absolute Bridge paths are accepted only under this acquired home.
+            logical = Path(origin['path'])
+            if logical.is_absolute():
+                try:
+                    logical = logical.relative_to(acquisition_home)
+                except ValueError:
+                    raise ValueError('conversion_origin_not_acquired') from None
+            name = logical.as_posix()
+            if name not in paths_cache:
+                member = members.get(name)
+                if member and member['kind']=='sqlite':
+                    source = _member(acquisition_home,member)
+                    paths_cache[name] = (source,'sqlite')
+                else:
+                    source = acquisition_home/logical
+                    preflight_isolated_paths(source)
+                    if '..' in logical.parts or not any(
+                        m['kind']=='tree' and name.startswith(m['path']+'/')
+                        and name[len(m['path'])+1:] in m['files'] for m in members.values()):
+                        raise ValueError('conversion_origin_not_acquired')
+                    paths_cache[name] = (source,'file')
+            source,kind = paths_cache[name]
             cache_key = str(source),origin['table']
-            if cache_key not in originals_cache:
-                originals_cache[cache_key] = {row_sha256(r) for r in _rows(source,origin['table'])}
-            if origin['row_sha256'] not in originals_cache[cache_key]:
+            if kind=='sqlite':
+                if cache_key not in originals_cache:
+                    originals_cache[cache_key] = {row_sha256(r) for r in _rows(source,origin['table'])}
+                acquired_hashes = originals_cache[cache_key]
+            else:
+                if str(source) not in file_originals:
+                    if origin['table']=='jsonl':
+                        file_originals[str(source)] = {str(i):row_sha256(json.loads(line))
+                            for i,line in enumerate(source.read_bytes().splitlines(),1) if line.strip()}
+                    elif origin['table']=='message_reference':
+                        file_originals[str(source)] = {source.name:row_sha256(json.loads(source.read_bytes()))}
+                    else:
+                        raise ValueError('unsupported_conversion_original')
+                acquired_hashes = {file_originals[str(source)].get(origin['row_key'])}
+            if origin['row_sha256'] not in acquired_hashes or origin['row_sha256'] != row_sha256(original):
                 raise ValueError('conversion_original_not_acquired')
-            if str(source) not in events_cache:
+            if origin['table']=='events' and str(source) not in events_cache:
                 events_cache[str(source)] = {(e['channel'],e['chat_id'],e['target_message_id'])
                     for e in _rows(source,'events') if e['kind'] in ('edit','delete')}
                 authority_cache[str(source)] = {(r['event_id'],r['revision']):r
                     for r in _rows(source,'event_source_authority')}
-            state = _original_state(record,events_cache[str(source)])
-            for key in by_event[original['event_id']]:
+            state = _original_state(record,events_cache.get(str(source),set()))
+            if origin['table']=='events':
+                principal = original.get('principal')
+            elif origin['table']=='message_reference':
+                principal = _principal(str(payload.get('senderPhoneJid') or payload.get('participantJid') or payload.get('senderId') or ''))
+            else:
+                # Inferred session-chat senders are not preserved authorship.
+                principal = _principal(str(original.get('participant') or original.get('sender_id') or ''))
+            if principal and state:
+                state['author_principal'] = principal
+            for key in sorted(keys):
                 envelope = dict(state=state)
-                authority = authority_cache[str(source)].get(key)
-                if authority and original.get('principal')==authority['author_principal']:
-                    envelope['issued'] = _authority(authority)
+                authority = authority_cache.get(str(source),{}).get(key)
+                if origin['table']=='events':
+                    if authority and original.get('event_id')==key[0] and principal==authority['author_principal']:
+                        envelope['issued'] = _authority(authority)
+                    elif (original.get('event_id')!=key[0] and principal==legacy[key]['author_principal']
+                            and state.get('sent_ms')==legacy[key]['occurred_at_ms']
+                            and state.get('time_certainty') in ('native','provider_timestamp')):
+                        envelope['issued'] = _issued(legacy[key])
+                elif (principal==legacy[key]['author_principal'] and state.get('sent_ms')==legacy[key]['occurred_at_ms']
+                        and state.get('time_certainty') in ('native','provider_timestamp')):
+                    envelope['issued'] = _issued(legacy[key])
                 if type(original.get('created_ms')) is int:
                     envelope['created_ms'] = original['created_ms']
                 ref = f'{relative}#{number}'
-                segments = record.get('payload',{}).get('segments')
+                segments = payload.get('segments')
                 refs = [f'{ref}/{i}' for i in range(len(segments))] if isinstance(segments,list) else [ref]
                 for source_ref in refs:
                     if source_ref not in manifest['ref_map']:

@@ -9,7 +9,7 @@ from typing import Any
 
 from yeoman_gateway.history.layer1 import row_sha256
 from yeoman_gateway.history.queries import HistoryQueries
-from yeoman_gateway.knowledge._history_sources import build_history_source_aliases
+from yeoman_gateway.knowledge._history_sources import _principal, build_history_source_aliases
 from yeoman_gateway.knowledge.models import KnowledgeError, SourceRef
 
 _STATE_FIELDS = ("channel", "chat_id", "native_message_id", "direction", "sent_ms",
@@ -42,12 +42,12 @@ def prepare_legacy_alias_inputs(*, queries: HistoryQueries,
     legacy_rows: Iterable[Mapping[str, Any]],
     preserved_rows: Iterable[Mapping[str, Any]]) -> tuple[
         list[dict[str, Any]], dict[tuple[str, int], tuple[str, ...]], dict[str, int]]:
-    """Join issued keys to preserved six-field refs and complete original message state.
+    """Join issued keys to hash-bound originals, checking only recorded fields.
 
     Preserved envelope: event_id/revision, original {issued, state, created_ms},
     origin {store,path,table,row_key,row_sha256}, source_ref (conversion segment ref).
-    State contains every _STATE_FIELDS field plus the original ordered edit/delete
-    events. Missing state/proof stays withheld. Neither text nor timestamps match
+    State requires locator and original text; optional fields remain unrecorded.
+    Missing identity/proof stays withheld. Neither text nor timestamps match
     locators; only (channel, chat, native ID) does.
     """
     originals: dict[tuple[str, int], list[Mapping[str, Any]]] = defaultdict(list)
@@ -71,6 +71,7 @@ def prepare_legacy_alias_inputs(*, queries: HistoryQueries,
             (0, item[0][1]) if type(item[0][1]) is int else (1, str(item[0][1])))):
         source = _source(row)
         status = "missing"
+        reason = "no_preserved_original"
         targets: set[str] = set()
         proofs = []
         states = []
@@ -80,10 +81,12 @@ def prepare_legacy_alias_inputs(*, queries: HistoryQueries,
                                      else 'invalid_source_ref')
         elif source.channel != "whatsapp":
             status = "other_channel"
+            reason = "other_channel"
         elif row.get("status") in ("revoked", "purged"):
             status = "purged_revoked"
+            reason = "purged_revoked"
         elif "source_audience_json" not in row:
-            status = "missing"
+            reason = "no_audience_proof"
         else:
             invalid = False
             for preserved in originals.get(key, ()):
@@ -100,8 +103,8 @@ def prepare_legacy_alias_inputs(*, queries: HistoryQueries,
                     continue
                 state = original.get("state")
                 issued = original.get("issued")
-                if (not isinstance(state, dict) or not isinstance(issued, dict)
-                        or not all(k in state for k in (*_STATE_FIELDS, "events"))
+                if (not isinstance(state, dict) or (issued is not None and not isinstance(issued, dict))
+                        or not all(k in state for k in ("channel", "chat_id", "native_message_id"))
                         or not state["native_message_id"]):
                     invalid = True
                     continue
@@ -112,32 +115,61 @@ def prepare_legacy_alias_inputs(*, queries: HistoryQueries,
                 targets.update(match["message_id"] for match in matches)
                 proofs.append({"origin": {k: origin[k] for k in ("store", "path", "table", "row_key", "row_sha256")}, "source_ref": preserved["source_ref"],
                                "native_locator": [state["channel"], state["chat_id"], state["native_message_id"]]})
-            if len(targets) > 1 or len({row_sha256(state) for state in states}) > 1:
-                status = "ambiguous"
-            elif not invalid and len(targets) == 1 and states:
+            conflicts = any((left_issued is not None and right_issued is not None and left_issued != right_issued) or any(
+                left[k] != right[k] for k in left.keys() & right.keys())
+                for i,(left_issued,left) in enumerate(states) for right_issued,right in states[i+1:])
+            if len(targets) > 1 or conflicts:
+                status, reason = "ambiguous", "ambiguous_locator"
+            elif invalid:
+                reason = "incomplete_original_proof"
+            elif not targets and states:
+                reason = "locator_not_in_history"
+            elif len(targets) == 1 and states:
                 mid = next(iter(targets))
                 current = queries._rows("SELECT * FROM messages_current WHERE message_id=?", (mid,))[0]
+                recorded = {k:v for _,state in states for k,v in state.items()}
+                expected = _state(queries, current)
+                expected["author_principal"] = _principal(current["sender_identifier"] or "")
+                # An original observation with no mutations proves pre-edit text.
+                if not recorded.get("events"):
+                    expected["events"] = []
+                    expected["current_text"] = expected["text"]
+                issued_proofs = [issued for issued,state in states if issued is not None
+                    and all(k in state for k in ("text", "sent_ms", "time_certainty"))]
                 if current["deleted"]:
-                    status = "purged_revoked"
-                elif states[0][0] != asdict(source) or states[0][1] != _state(queries, current):
-                    status = "changed"
+                    status, reason = "purged_revoked", "purged_revoked"
+                elif not issued_proofs:
+                    reason = "no_author_or_text_proof"
+                elif issued_proofs[0] != asdict(source):
+                    status, reason = "changed", ("author_mismatch" if issued_proofs[0].get("author_principal") != source.author_principal
+                        else "time_mismatch" if issued_proofs[0].get("occurred_at_ms") != source.occurred_at_ms
+                        else "issued_source_mismatch")
+                elif recorded["text"] != expected["text"]:
+                    status, reason = "changed", "text_mismatch"
+                elif any(k not in expected or expected[k] != value for k,value in recorded.items()):
+                    status, reason = "changed", ("author_mismatch" if recorded.get("author_principal", expected["author_principal"]) != expected["author_principal"]
+                        else "recorded_field_mismatch")
                 else:
-                    # Only after independent complete-state equality can history supply its hash.
                     row["content_fingerprint"] = queries.content_fingerprint(mid)
                     row["native_id"] = current["native_message_id"]
                     locators[key] = (mid,)
                     aliases, _ = build_history_source_aliases(queries=queries, legacy_rows=[row], locators=locators)
                     if key in aliases:
-                        status = "mapped"
+                        status, reason = "mapped", "mapped"
                         row["message_id"] = mid
+                        row["proven_fields"] = sorted([*recorded, "issued", "original_row_sha256"])
                         order_values = {p["original"].get("created_ms") for p in originals[key]}
                         if len(order_values) == 1 and type(next(iter(order_values))) is int:
                             row["created_ms"] = next(iter(order_values))
                     else:
-                        status = "missing"
+                        principal = "whatsapp:" + (current["sender_identifier"] or "").split("@")[0]
+                        reason = ("author_mismatch" if source.author_principal != principal else
+                                  "time_mismatch" if source.occurred_at_ms != current["sent_ms"] else
+                                  "no_author_or_audience_proof")
         if status != "mapped":
             locators.pop(key, None)
             row.pop("content_fingerprint", None)
+        row.setdefault("cutover_reason", reason)
         row["cutover_status"] = status
         row["preserved_proofs"] = sorted(
             {row_sha256(p): p for p in proofs}.values(), key=row_sha256)
@@ -216,6 +248,7 @@ def prepare_capture_inputs(*, queries: HistoryQueries,
             raise ValueError("conflicting_capture_proof")
         refs[source.key] = mid, source
     job_mids = set()
+    unmapped_terminal = 0
     for job in jobs:
         for ref in json.loads(job["sources_json"]):
             key = ref["event_id"], ref["revision"]
@@ -223,7 +256,10 @@ def prepare_capture_inputs(*, queries: HistoryQueries,
                 if refs[key][1].channel == "whatsapp":
                     job_mids.add(refs[key][0])
             elif ref.get("channel", "whatsapp") == "whatsapp":
-                raise ValueError("unmapped_handover_job")
+                if job.get("state") in ("queued", "running", "failed") or (
+                        job.get("state") == "skipped" and job.get("reason") == "queue_full"):
+                    raise ValueError("unmapped_handover_job")
+                unmapped_terminal += 1
     pending, processed, classifications = [], [], {}
     sources_by_mid = {mid: source for mid, source in sources_by_mid.items() if source.channel == "whatsapp"}
     prefix = native_prefix(queries)
@@ -277,7 +313,7 @@ def prepare_capture_inputs(*, queries: HistoryQueries,
             else:
                 raise ValueError("unclassified_handover_message")
     if summary is not None:
-        summary.update(duplicate_observations=sum(max(0, len(values)-1) for values in observations.values()),
+        summary.update(unmapped_terminal_job_refs=unmapped_terminal, duplicate_observations=sum(max(0, len(values)-1) for values in observations.values()),
             observations={mid: [dict(created_ms=created,event_id=event) for created,event in sorted(values)]
                           for mid,values in sorted(observations.items()) if len(values)>1})
     return {"pending": tuple(sorted(pending, key=lambda s: s.key)),

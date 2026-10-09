@@ -78,7 +78,7 @@ def test_cutover_alias_requires_unique_locator_and_original_proof(case):
     missing = copy.deepcopy(good)
     del missing["original"]["state"]["media_json"]
     missing["origin"]["row_sha256"] = row_sha256(missing["original"])
-    assert prepare_legacy_alias_inputs(queries=q, legacy_rows=[legacy(source)], preserved_rows=[missing])[2]["missing"] == 1
+    assert prepare_legacy_alias_inputs(queries=q, legacy_rows=[legacy(source)], preserved_rows=[missing])[2]["mapped"] == 1
     broken = copy.deepcopy(good)
     broken["origin"]["row_sha256"] = "bad"
     assert prepare_legacy_alias_inputs(queries=q, legacy_rows=[legacy(source)], preserved_rows=[broken])[2]["missing"] == 1
@@ -460,3 +460,78 @@ def test_duplicate_observation_tie_breaks_by_event_id(capture_case):
         result = prepare_capture_inputs(queries=HistoryQueries(snap),legacy_boundary=(10,'b'),legacy_rows=rows,jobs=[],summary=summary)
     assert result['classifications']=={'duplicate':'historical_not_selected'}
     assert summary['observations']['duplicate'][0]==dict(created_ms=5,event_id='a')
+
+
+@pytest.mark.parametrize('edited',[False,True])
+def test_recorded_partial_state_maps_and_records_proven_fields(case,edited):
+    from yeoman_gateway.knowledge._history_cutover import prepare_legacy_alias_inputs
+    _,q,_,db = case
+    source = SourceRef('partial',1,'whatsapp',q.message('m')['chat_id'],'whatsapp:10001',100)
+    original = proof(q,'m',source)
+    for field in ('media_json','mentions_json','current_text','reply_to_native_id','events'):
+        original['original']['state'].pop(field)
+    original['origin']['row_sha256'] = row_sha256(original['original'])
+    if edited:
+        event(db,'edit-after','edit',200,{'text':'Edited synthetic'},target='m')
+    rows,locators,counts = prepare_legacy_alias_inputs(queries=q,legacy_rows=[legacy(source)],preserved_rows=[original])
+    assert counts['mapped']==1 and locators[source.key]==('m',)
+    assert 'text' in rows[0]['proven_fields'] and 'media_json' not in rows[0]['proven_fields']
+    bad = copy.deepcopy(original)
+    bad['original']['state']['mentions_json'] = ['different']
+    bad['origin']['row_sha256'] = row_sha256(bad['original'])
+    rows,_,counts = prepare_legacy_alias_inputs(queries=q,legacy_rows=[legacy(source)],preserved_rows=[bad])
+    assert counts['changed']==1 and rows[0]['cutover_reason']=='recorded_field_mismatch'
+
+
+def test_compatible_partial_copies_collapse_and_missing_reasons(case):
+    from yeoman_gateway.knowledge._history_cutover import prepare_legacy_alias_inputs
+    _,q,_,_ = case
+    source = SourceRef('partial',1,'whatsapp',q.message('m')['chat_id'],'whatsapp:10001',100)
+    first = proof(q,'m',source)
+    second = copy.deepcopy(first)
+    second['original']['state'].pop('media_json')
+    second['origin']['row_sha256'] = row_sha256(second['original'])
+    rows,_,counts = prepare_legacy_alias_inputs(queries=q,legacy_rows=[legacy(source)],preserved_rows=[first,second])
+    assert counts['mapped']==1
+    second['original'].pop('issued')
+    second['original']['state'].pop('text')
+    second['origin']['row_sha256'] = row_sha256(second['original'])
+    rows,_,counts = prepare_legacy_alias_inputs(queries=q,legacy_rows=[legacy(source)],preserved_rows=[first,second])
+    assert counts['mapped']==1
+    rows,_,_ = prepare_legacy_alias_inputs(queries=q,legacy_rows=[legacy(source)],preserved_rows=[])
+    assert rows[0]['cutover_reason']=='no_preserved_original'
+    row = legacy(source)
+    row.pop('source_audience_json')
+    rows,_,_ = prepare_legacy_alias_inputs(queries=q,legacy_rows=[row],preserved_rows=[first])
+    assert rows[0]['cutover_reason']=='no_audience_proof'
+
+
+@pytest.mark.parametrize(('state','reason','active'),[
+    ('done',None,False),('cancelled',None,False),('skipped','policy',False),
+    ('queued',None,True),('running',None,True),('failed',None,True),('skipped','queue_full',True)])
+def test_only_active_unmapped_jobs_block_both_handover_paths(capture_case,state,reason,active):
+    from yeoman_gateway.knowledge._history_cutover import prepare_capture_inputs
+    h,k,_,_ = capture_case
+    h.add('unmapped',line=1)
+    mapped, = issue(h,k,('unmapped',))
+    p = producer(k)
+    source = SourceRef('unmapped-old',1,'whatsapp',GROUP,'whatsapp:10001',MS)
+    with h.snapshot() as snap, p.scope(snap):
+        k.enqueue_capture((mapped,),context=TrustedCaptureContext('legacy',k.policy_revision,'observed_source_batch',(mapped,)),ts_ms=MS)
+    k._store.execute('UPDATE knowledge_jobs SET state=?,reason=?,sources_json=?',(state,reason,json.dumps([asdict(source)])))
+    jobs = [dict(r) for r in k._store.query('SELECT * FROM knowledge_jobs')]
+    rows = [dict(message_id='unmapped',event_id='unmapped-old',created_ms=1,boundary=[10,'b'],forward_start=[5,'start'])]
+    with h.snapshot() as snap:
+        if active:
+            with pytest.raises(ValueError,match='unmapped_handover_job'):
+                prepare_capture_inputs(queries=HistoryQueries(snap),legacy_boundary=(10,'b'),legacy_rows=rows,jobs=jobs)
+            with pytest.raises(ValueError,match='unmapped_handover_job'):
+                p.prepare_handover(snap,pending=(),processed=(),legacy_boundary=(10,'b'),classifications={'unmapped':'historical_not_selected'})
+        else:
+            summary = {}
+            inputs = prepare_capture_inputs(queries=HistoryQueries(snap),legacy_boundary=(10,'b'),legacy_rows=rows,jobs=jobs,summary=summary)
+            assert summary['unmapped_terminal_job_refs']==1
+            receipt = p.prepare_handover(snap,legacy_boundary=(10,'b'),**inputs)
+            assert receipt['unmapped_terminal_job_refs']==1
+            assert p.prepare_handover(snap,legacy_boundary=(10,'b'),**inputs)==receipt
+            assert [dict(r) for r in k._store.query('SELECT * FROM knowledge_jobs')]==jobs

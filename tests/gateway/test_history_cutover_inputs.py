@@ -178,6 +178,8 @@ def test_builder_feeds_prepare_full_native_prefix(acquired,tmp_path):
     assert result['total'] == 6 and result['handover']
     assert result['mapped'] == 1 and result['missing'] == 1 and result['ambiguous'] == 1
     assert result['changed'] == 1 and result['purged_revoked'] == 1 and result['other_channel'] == 1
+    assert result['cited_reason_counts']=={}
+    assert result['uncited_reason_counts']=={'ambiguous_locator':1,'no_preserved_original':1,'other_channel':1,'purged_revoked':1,'text_mismatch':1}
     receipt = json.loads((tmp_path/'aliases/legacy-alias-manifest.json').read_text())
     assert len(receipt['handover']['classifications']) == 6
     assert receipt['handover']['classifications']['whatsapp:10001@s.whatsapp.net:historical'] == 'historical_not_selected'
@@ -329,7 +331,132 @@ def test_prepare_withholds_statement_with_unissued_source(acquired,tmp_path):
     result = prepare(argparse.Namespace(snapshot_home=home,history_db=history,knowledge_source=knowledge,
         knowledge_target=tmp_path/'v3.db',policy_snapshot=policy,output_root=tmp_path/'aliases'))
     assert result['handover'] and result['missing']==1 and result['withheld_statements']==1
+    assert result['cited_reason_counts']=={'unissued_principal':1}
+    assert sum(result['uncited_reason_counts'].values())==4
     manifest = json.loads((tmp_path/'aliases/legacy-alias-manifest.json').read_text())
     entry = next(e for e in manifest['entries'] if e['issued']['event_id']=='missing')
     assert entry['status']=='missing' and entry['reason']=='unissued_principal'
     assert entry['issued']['author_principal']=='' and 'alias' not in entry
+
+
+@pytest.mark.parametrize('store',['reply_context','inbound_archive','session_jsonl','memory_nodes','bridge_refs'])
+def test_native_original_from_non_journal_store_maps(acquired,tmp_path,store):
+    from yeoman_gateway.history.convert.bridge_refs import convert_bridge_refs
+    from yeoman_gateway.history.convert.inbound_db import convert_inbound_db
+    from yeoman_gateway.history.convert.memory_nodes import convert_memory_nodes
+    from yeoman_gateway.history.convert.session_jsonl import convert_session_jsonl
+
+    from scripts.prepare_history_cutover import prepare
+    home,manifest,staged,_,knowledge,raw = acquired
+    phone = '10001@s.whatsapp.net'
+    ts = 1_800_000_000_000
+    if store in ('reply_context','inbound_archive'):
+        source = home/('data/'+store+'.db')
+        with sqlite3.connect(source) as db:
+            db.execute('CREATE TABLE inbound_messages (channel TEXT,chat_id TEXT,message_id TEXT,sender_id TEXT,text TEXT,timestamp INTEGER)')
+            db.execute('INSERT INTO inbound_messages VALUES (?,?,?,?,?,?)',('whatsapp',phone,'missing',phone,'Synthetic missing',ts))
+        records = list(convert_inbound_db(home,source.relative_to(home).as_posix(),store))
+        member = dict(path=source.relative_to(home).as_posix(),kind='sqlite',exists=True,restore=True,sha256=hashlib.sha256(source.read_bytes()).hexdigest())
+    else:
+        folder = home/'data/inbound' if store=='session_jsonl' else home/('data/'+store)
+        folder.mkdir(parents=True)
+        if store=='session_jsonl':
+            source = folder/('whatsapp_'+phone+'.jsonl')
+            source.write_text(dumps(dict(role='user',message_id='missing',sender_id=phone,content='Synthetic missing',timestamp=ts))+'\n')
+            records = list(convert_session_jsonl(home))
+        elif store=='bridge_refs':
+            source = folder/'reference.json'
+            source.write_text(dumps(dict(chatJid=phone,encoded='synthetic-encoded',storedAtMs=ts)))
+            decoded = dict(key=dict(id='missing',remoteJid=phone,participant=phone),
+                           messageTimestamp=ts//1000,message=dict(conversation='Synthetic missing'))
+            records = list(convert_bridge_refs([folder],lambda batch:{name:{'value':decoded} for name,_ in batch}))
+        else:
+            source = folder/'nodes.db'
+            with sqlite3.connect(source) as db:
+                db.execute('CREATE TABLE memory2_nodes (id TEXT,kind TEXT,channel TEXT,chat_id TEXT,sender_id TEXT,source_message_id TEXT,content TEXT,created_at INTEGER,source TEXT,source_role TEXT,meta_json TEXT,is_deleted INTEGER)')
+                db.execute('INSERT INTO memory2_nodes VALUES (?,?,?,?,?,?,?,?,?,?,?,?)',('node','utterance','whatsapp',phone,phone,'missing','Synthetic missing',ts,'native','user','{}',0))
+            records = list(convert_memory_nodes(home,source.relative_to(home).as_posix(),store))
+            # Memory only records approximate capture time: the native source time is
+            # intentionally not invented; its identity still stays withheld.
+        files = {p.relative_to(folder).as_posix():hashlib.sha256(p.read_bytes()).hexdigest() for p in folder.rglob('*') if p.is_file()}
+        member = dict(path=folder.relative_to(home).as_posix(),kind='tree',exists=True,restore=True,files=files,sha256=procedure().record_digest(files))
+        if store=='memory_nodes':
+            member = dict(path=source.relative_to(home).as_posix(),kind='sqlite',exists=True,restore=True,sha256=hashlib.sha256(source.read_bytes()).hexdigest())
+    receipt = json.loads((home/'manifest.json').read_text())
+    receipt['members'].append(member)
+    receipt['digest'] = procedure().record_digest(receipt)
+    (home/'manifest.json').write_text(dumps(receipt))
+    (staged/('backfill/'+store+'.jsonl')).write_text('\n'.join(map(dumps,records))+'\n')
+    manifest.write_text(dumps(prepare_import_manifest(staged)))
+    build(acquired,home/'cutover-inputs.json')
+    bundle = json.loads((home/'cutover-inputs.json').read_text())
+    originals = [r for r in bundle['preserved_rows'] if r['event_id']=='missing']
+    assert originals and originals[0]['origin']['store']==store
+    assert originals[0]['origin']['row_sha256']==row_sha256(originals[0]['preserved_original'])
+    history = tmp_path/'history.db'
+    project([raw],history)
+    policy = tmp_path/'policy-copy.json'
+    policy.write_text(dumps({'defaults':{'whoCanTalk':{'mode':'everyone'}}}))
+    result = prepare(argparse.Namespace(snapshot_home=home,history_db=history,knowledge_source=knowledge,
+        knowledge_target=tmp_path/'v3.db',policy_snapshot=policy,output_root=tmp_path/'aliases'))
+    assert result['mapped']==(1 if store=='memory_nodes' else 2)
+    entries = json.loads((tmp_path/'aliases/legacy-alias-manifest.json').read_text())['entries']
+    missing = next(e for e in entries if e['issued']['event_id']=='missing')
+    assert missing['reason']==('no_author_or_text_proof' if store=='memory_nodes' else 'mapped')
+    if store!='memory_nodes':
+        assert 'text' in missing['proven_fields'] and 'media_json' not in missing['proven_fields']
+
+
+@pytest.mark.parametrize('inferred',[False,True])
+def test_original_identity_is_bound_without_projected_defaults(acquired,tmp_path,inferred):
+    home,manifest,staged,*_ = acquired
+    if inferred:
+        from yeoman_gateway.history.convert.session_jsonl import convert_session_jsonl
+        folder = home/'data/inbound'
+        folder.mkdir(parents=True)
+        source = folder/'whatsapp_10001@s.whatsapp.net.jsonl'
+        source.write_text(dumps(dict(role='user',message_id='missing',content='Synthetic missing',timestamp=1_800_000_000_000))+'\n')
+        rows = list(convert_session_jsonl(home))
+        files = {source.name:hashlib.sha256(source.read_bytes()).hexdigest()}
+        member = dict(path='data/inbound',kind='tree',exists=True,restore=True,files=files,sha256=procedure().record_digest(files))
+    else:
+        source = home/'data/ops/processing.db'
+        with sqlite3.connect(source) as db:
+            db.execute("UPDATE events SET event_id='journal-wrapper' WHERE event_id='missing'")
+            db.row_factory = sqlite3.Row
+            original = dict(db.execute("SELECT * FROM events WHERE event_id='journal-wrapper'").fetchone())
+            db.commit()
+            db.execute('PRAGMA wal_checkpoint(TRUNCATE)')
+        rows = [_event(original)]
+        member = dict(path='data/ops/processing.db',kind='sqlite',exists=True,restore=True,sha256=hashlib.sha256(source.read_bytes()).hexdigest())
+    receipt = json.loads((home/'manifest.json').read_text())
+    receipt['members'] = [m for m in receipt['members'] if m['path']!=member['path']]+[member]
+    receipt['digest'] = procedure().record_digest(receipt)
+    (home/'manifest.json').write_text(dumps(receipt))
+    (staged/'backfill/identity.jsonl').write_text('\n'.join(map(dumps,rows))+'\n')
+    manifest.write_text(dumps(prepare_import_manifest(staged)))
+    output = tmp_path/'identity-inputs.json'
+    build(acquired,output)
+    bundle = json.loads(output.read_text())
+    candidate, = [r for r in bundle['preserved_rows'] if r['event_id']=='missing']
+    assert candidate['origin']['row_sha256']==row_sha256(candidate['preserved_original'])
+    if inferred:
+        assert 'issued' not in candidate['original']
+        assert 'author_principal' not in candidate['original']['state']
+    else:
+        legacy = next(r for r in bundle['legacy_rows'] if r['event_id']=='missing')
+        assert candidate['original']['issued']=={k:legacy[k] for k in candidate['original']['issued']}
+        assert candidate['original']['state']['text']=='Synthetic missing'
+
+
+def test_journal_proof_keeps_original_text_bytes(acquired):
+    from scripts.history_cutover_inputs import _original_state
+    home,*_ = acquired
+    with sqlite3.connect(home/'data/ops/processing.db') as db:
+        db.row_factory = sqlite3.Row
+        original = dict(db.execute("SELECT * FROM events WHERE event_id='mapped'").fetchone())
+    payload = json.loads(original['payload_json'])
+    payload['text'] = '  Synthetic original bytes  '
+    original['payload_json'] = dumps(payload)
+    state = _original_state(_event(original),set())
+    assert state['text']==payload['text'] and state['current_text']==payload['text']

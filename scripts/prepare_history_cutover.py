@@ -13,6 +13,7 @@ import hashlib
 import json
 import os
 import sqlite3
+from collections import Counter
 from contextlib import closing
 from dataclasses import asdict
 from pathlib import Path
@@ -41,7 +42,8 @@ _ARGUMENTS = ("snapshot_home", "history_db", "knowledge_source", "knowledge_targ
               "policy_snapshot", "output_root")
 _COUNTS = ("total", "mapped", "missing", "ambiguous", "changed", "purged_revoked",
            "other_channel", "candidate_copies", "statements", "jobs", "withheld_statements",
-           "affected_jobs", "duplicate_observations")
+           "affected_jobs", "duplicate_observations", "unmapped_terminal_job_refs",
+           "cited_reason_counts", "uncited_reason_counts")
 
 
 def _affected_counts(rows, statements, jobs, aliases):
@@ -154,6 +156,11 @@ def prepare(args: argparse.Namespace) -> dict[str, Any]:
             inputs = prepare_capture_inputs(queries=q, legacy_boundary=boundary,
                 legacy_rows=[*rows, *bundle["capture_rows"]], jobs=jobs, summary=capture_summary)
             counts["duplicate_observations"] = capture_summary["duplicate_observations"]
+            counts["unmapped_terminal_job_refs"] = capture_summary["unmapped_terminal_job_refs"]
+            for cited,label in ((True,"cited_reason_counts"),(False,"uncited_reason_counts")):
+                counts[label] = dict(sorted(Counter(row['cutover_reason'] for row in rows
+                    if row['cutover_status'] != 'mapped'
+                    and (((row['event_id'],row['revision']) in required) == cited)).items()))
             handover = HistoryCaptureProducer(knowledge).prepare_handover(
                 snapshot, legacy_boundary=boundary, **inputs)
         entries = []
@@ -168,6 +175,7 @@ def prepare(args: argparse.Namespace) -> dict[str, Any]:
                 value["audience"]["members"] = sorted(alias.audience.members)
                 value["audience"]["allowed"] = sorted(alias.audience.allowed)
                 entry["alias"] = value
+                entry["proven_fields"] = row["proven_fields"]
             entries.append(entry)
         manifest = {"version": 1, "inputs": {
             "snapshot_digest": bundle["snapshot_digest"], "conversion_digest": bundle["conversion_digest"],
@@ -176,7 +184,8 @@ def prepare(args: argparse.Namespace) -> dict[str, Any]:
             "raw_boundary_digest": row_sha256([asdict(s) for s in vector]),
             "schema_digest": row_sha256({"history": 4, "knowledge": upgrade["schema_version"],
                                          "knowledge_source": upgrade["source_digest"]})},
-            "entries": entries, "handover": handover, "capture_summary": capture_summary}
+            "entries": entries, "handover": handover, "capture_summary": capture_summary,
+            "cited_reason_counts": counts["cited_reason_counts"], "uncited_reason_counts": counts["uncited_reason_counts"]}
         manifest["digest"] = row_sha256(manifest)
         args.output_root.mkdir(mode=0o700)
         _private_json(manifest_path, manifest)
