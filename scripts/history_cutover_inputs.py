@@ -19,15 +19,27 @@ from yeoman_shared.raw_archive.records import validate_import_manifest
 
 try:
     from scripts.history_cutover import (
+        _bridge_package,
+        _interpreter,
         _member,
         _paths,
         _private_json,
+        _rehearsal_paths,
         check_window_timing,
         record_digest,
     )
     from scripts.history_maintenance_guard import preflight_isolated_paths
 except ModuleNotFoundError:
-    from history_cutover import _member, _paths, _private_json, check_window_timing, record_digest
+    from history_cutover import (
+        _bridge_package,
+        _interpreter,
+        _member,
+        _paths,
+        _private_json,
+        _rehearsal_paths,
+        check_window_timing,
+        record_digest,
+    )
     from history_maintenance_guard import preflight_isolated_paths
 
 
@@ -273,11 +285,17 @@ def build_cutover_record(*, inventory: Path, layout: Mapping[str,str],
     inv['expected_gateway_jobs'] = expected_gateway_jobs
     inv['host_crontab'].update(window_safe=True,window_start_ms=window[0],window_end_ms=window[1])
     check_window_timing(inv)
-    _paths(*(Path(v) for v in (source['home'],source['output'],source['receipts'],source['python'],*layout.values())))
+    _paths(*(Path(v) for v in (source['home'],source['output'],source['receipts'],*layout.values())))
+    _interpreter(Path(source['python']))
+    _bridge_package(Path(inv['bridge_package_dir']))
     if mode=='rehearsal':
-        preflight_isolated_paths(*(Path(v) for v in (source['home'],source['output'],source['receipts'],*layout.values())))
+        if not source.get('rehearsal_root'):
+            raise ValueError('rehearsal_root_required')
+        _rehearsal_paths(Path(source['rehearsal_root']), Path(source['home']), *(Path(v) for v in (source['output'],source['receipts'],*layout.values())))
     record = dict(version=1,mode=mode,approved=False,approval=None,
         **{k:source[k] for k in ('home','output','receipts','python','candidate','prior')},
+        bridge_package_dir=inv['bridge_package_dir'],
+        **({'rehearsal_root':source['rehearsal_root']} if mode=='rehearsal' else {}),
         inventory=inv,layout=dict(layout),commands={},inventory_source_sha256=_hash(inventory),
         confirmation_token=str(Path(source['receipts'])/'interactive-confirmation.token'))
     record['digest'] = record_digest(record)

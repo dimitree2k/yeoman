@@ -580,11 +580,16 @@ def _suppression_delta(action: str, payload: dict, inventory: Mapping) -> dict:
     return dict(ok=current, delta_applied=current, current_denials=current)
 
 
-def rehearsal_host_controls(*, copy_home: Path, inventory: Mapping[str, Any], runner=None, **_):
+def rehearsal_host_controls(*, copy_home: Path, inventory: Mapping[str, Any], rehearsal_root: Path | None = None, runner=None, **_):
     """Simulate service actions; data proofs come exclusively from the isolated copy."""
     preflight_isolated_paths(copy_home)
     require_isolated_paths(copy_home)
     copy_home = copy_home.resolve()
+    root = _path(str(rehearsal_root)).resolve() if rehearsal_root is not None else copy_home
+    preflight_isolated_paths(root)
+    require_isolated_paths(root)
+    if copy_home != root and root not in copy_home.parents:
+        raise ValueError('rehearsal_layout_outside_root')
     local = dict(inventory)
     for key in ('processing_db', 'config_path', 'knowledge_db', 'pause_path'):
         if key in local:
@@ -594,12 +599,17 @@ def rehearsal_host_controls(*, copy_home: Path, inventory: Mapping[str, Any], ru
     def execute(action: str, payload: dict) -> dict:
         if _path(payload['home']).resolve() != copy_home:
             raise ValueError('rehearsal_home_mismatch')
-        for value in payload['record'].get('layout', {}).values():
+        record = payload['record']
+        if 'rehearsal_root' in record and _path(record['rehearsal_root']).resolve() != root:
+            raise ValueError('rehearsal_root_mismatch')
+        paths = list(record.get('layout', {}).values())
+        paths.extend(record[k] for k in ('output', 'receipts') if k in record)
+        for value in paths:
             path = _path(value)
             preflight_isolated_paths(path)
             require_isolated_paths(path)
-            if copy_home not in path.parents:
-                raise ValueError('rehearsal_layout_outside_copy')
+            if path.resolve() != root and root not in path.resolve().parents:
+                raise ValueError('rehearsal_layout_outside_root')
         if action in SERVICE_ACTIONS:
             units = inventory.get('timers', []) if action == 'start-timers' else [u['name'] for u in inventory.get('units', [])]
             result = dict(ok=True, simulated=True, units=units)

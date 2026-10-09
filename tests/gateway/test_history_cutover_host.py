@@ -221,7 +221,7 @@ def test_rehearsal_barrier_reads_copy_and_refuses_external_layout(tmp_path):
     (home/'raw-state.json').write_text(json.dumps(dict(state='ok', spooled=1, pending_in_memory=0)))
     assert not control('all-committed-barrier', p)['ok']
     p['record']['layout']['raw'] = str(tmp_path/'outside')
-    with pytest.raises(ValueError, match='outside_copy'):
+    with pytest.raises(ValueError, match='outside_root'):
         control('all-committed-barrier', p)
     assert runner.calls == []
 
@@ -365,9 +365,11 @@ def test_cli_installs_explicit_factory_and_refuses_unselected_apply(tmp_path, mo
     assert m.main() == 1
     assert json.loads(capsys.readouterr().out)['error'] == 'cutover_refused'
     seen = []
-    def compose(*, host, probes):
+    def compose(*, host, probes, decode):
         seen.append(host.mode)
         return Controls(m)
+    from yeoman_gateway.history.convert import bridge_refs
+    monkeypatch.setattr(bridge_refs,'node_batch_decoder',lambda _: lambda items: {})
     from scripts import history_cutover_probes
     monkeypatch.setattr(history_cutover_probes,'build_probes',lambda **_: {})
     monkeypatch.setattr(m, 'preparation_controls', compose)

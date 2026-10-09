@@ -40,9 +40,14 @@ def record(tmp_path):
              for name in ('knowledge.db', 'cron.json', 'outbox', 'disposition')]
     items += [{'path': name, 'kind': 'tree', 'restore': False} for name in ('raw', 'spool')]
     items.append(dict(path='external/installed-text', source=str(tmp_path/'installed-text'), kind='file', restore=True))
-    value = dict(version=1, mode='rehearsal', approved=True, approval='synthetic-owner-gate', home=str(home),
+    package = tmp_path/'bridge-package'
+    entry = package/'node_modules/@whiskeysockets/baileys/WAProto/index.js'
+    entry.parent.mkdir(parents=True)
+    entry.write_text('/* injected synthetic decoder */')
+    (package/'package.json').write_text('{}')
+    value = dict(rehearsal_root=str(tmp_path), bridge_package_dir=str(package), version=1, mode='rehearsal', approved=True, approval='synthetic-owner-gate', home=str(home),
                  candidate='synthetic-candidate', prior='synthetic-prior', inventory=dict(
-                     members=items, raw_path='raw', bridge=dict(mode='stopped'),
+                     bridge_package_dir=str(package), members=items, raw_path='raw', bridge=dict(mode='stopped'),
                      gateway_jobs=0, expected_gateway_jobs=0, units=['overseer', 'gateway', 'bridge', 'a2a'], timers=['watch'],
                      host_crontab=dict(window_safe=True,timezone='UTC',window_start_ms=1791532800000,window_end_ms=1791534600000,danger_minutes=[240])), output=str(tmp_path / 'acquisition'),
                  receipts=str(tmp_path / 'receipts'), commands={})
@@ -491,6 +496,7 @@ async def test_whole_restore_does_not_revive_purged_knowledge_source(statement_c
     legacy = c.knowledge._legacy_authority
     (tmp_path/'cutover').mkdir()
     path, home, value = record(tmp_path/'cutover')
+    value['rehearsal_root'] = str(tmp_path)
     value['inventory']['members'] = [dict(path='knowledge.db',source=str(knowledge_path),kind='sqlite',restore=True),
         dict(path='raw',source=str(c.raw),kind='tree',restore=False,role='raw')]
     value['digest'] = m.record_digest(value)

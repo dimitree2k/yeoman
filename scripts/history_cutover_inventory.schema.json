@@ -14,7 +14,7 @@
     "prior": {"type": "string", "minLength": 1},
     "inventory": {
       "type": "object",
-      "required": ["members", "raw_path", "bridge", "gateway_jobs", "units", "timers", "manual_routes", "host_crontab", "overseer_jobs", "external_text_targets", "forward_start_evidence_member", "reader_smoke"],
+      "required": ["members", "raw_path", "bridge", "gateway_jobs", "units", "timers", "manual_routes", "host_crontab", "overseer_jobs", "external_text_targets", "forward_start_evidence_member", "reader_smoke", "bridge_package_dir"],
       "properties": {
         "members": {"type": "array", "items": {"type": "object", "required": ["path", "kind", "restore"], "properties": {"path": {"type": "string", "minLength": 1}, "kind": {"enum": ["sqlite", "tree", "file"]}, "restore": {"type": "boolean"}, "role": {"type": "string"}, "source": {"type": "string", "pattern": "^/"}, "optional": {"type": "boolean"}}}},
         "raw_path": {"type": "string", "minLength": 1},
@@ -27,8 +27,10 @@
         "overseer_jobs": {"type": "array", "items": {"type": "object"}},
         "external_text_targets": {"type": "array", "items": {"type": "object", "required": ["path", "sha256"], "properties": {"path": {"type": "string", "pattern": "^/"}, "sha256": {"type": "string", "pattern": "^[a-f0-9]{64}$"}}}},
         "forward_start_evidence_member": {"type": "string", "minLength": 1},
-        "reader_smoke": {"type": "object", "required": ["workspace_id", "channel", "chat_id", "principal", "phone", "message_id", "source_event_id", "statement_id", "query", "text", "curated_text", "at_ms", "owner_scope", "rights"], "additionalProperties": false, "properties": {"workspace_id": {"type": "string"}, "channel": {"const": "whatsapp"}, "chat_id": {"type": "string"}, "principal": {"type": "string"}, "phone": {"type": "string"}, "message_id": {"type": "string"}, "source_event_id": {"type": "string"}, "statement_id": {"type": "string"}, "query": {"type": "string"}, "text": {"type": "string"}, "curated_text": {"type": "string"}, "at_ms": {"type": "integer"}, "owner_scope": {"type": "boolean"}, "rights": {"type": "object", "required": ["knowledge_read", "tools_read", "owner_export"], "additionalProperties": false, "properties": {"knowledge_read": {"type": "boolean"}, "tools_read": {"type": "boolean"}, "owner_export": {"type": "boolean"}}}}}
+        "reader_smoke": {"type": "object", "required": ["workspace_id", "channel", "chat_id", "principal", "phone", "message_id", "source_event_id", "statement_id", "query", "text", "curated_text", "at_ms", "owner_scope", "rights"], "additionalProperties": false, "properties": {"workspace_id": {"type": "string"}, "channel": {"const": "whatsapp"}, "chat_id": {"type": "string"}, "principal": {"type": "string"}, "phone": {"type": "string"}, "message_id": {"type": "string"}, "source_event_id": {"type": "string"}, "statement_id": {"type": "string"}, "query": {"type": "string"}, "text": {"type": "string"}, "curated_text": {"type": "string"}, "at_ms": {"type": "integer"}, "owner_scope": {"type": "boolean"}, "rights": {"type": "object", "required": ["knowledge_read", "tools_read", "owner_export"], "additionalProperties": false, "properties": {"knowledge_read": {"type": "boolean"}, "tools_read": {"type": "boolean"}, "owner_export": {"type": "boolean"}}}}},
+        "bridge_package_dir": {"type": "string", "pattern": "^/"}
       }
-    }
+    },
+    "rehearsal_root": {"type": "string", "pattern": "^/"}
   }
 }

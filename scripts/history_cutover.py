@@ -71,6 +71,43 @@ def _member(home: Path, entry: Mapping[str, Any]) -> Path:
     return path
 
 
+def _interpreter(path: Path) -> None:
+    _paths(path.parent)
+    try:
+        target = path.resolve(strict=True)
+    except (OSError, RuntimeError) as exc:
+        raise ValueError('invalid_interpreter') from exc
+    if not path.is_absolute() or not target.is_file() or not os.access(target, os.X_OK):
+        raise ValueError('invalid_interpreter')
+
+
+def _rehearsal_paths(root: Path, home: Path, *paths: Path) -> None:
+    try:
+        from scripts.history_maintenance_guard import preflight_isolated_paths
+    except ModuleNotFoundError:
+        from history_maintenance_guard import preflight_isolated_paths
+    _paths(root, home, *paths)
+    preflight_isolated_paths(root, home, *paths)
+    root, home = root.resolve(), home.resolve()
+    if root not in home.parents or any(p.resolve() != root and root not in p.resolve().parents for p in paths):
+        raise ValueError('rehearsal_layout_outside_root')
+
+
+def _rehearsal_environment(home: Path) -> None:
+    environment = os.environ.get('YEOMAN_HOME')
+    if not environment:
+        raise ValueError('rehearsal_environment_required')
+    sandbox = Path(environment).resolve()
+    if sandbox == Path('/home/dm/.yeoman') or sandbox == home.resolve() or home.resolve() in sandbox.parents:
+        raise ValueError('unsafe_rehearsal_environment')
+
+
+def _bridge_package(path: Path) -> None:
+    _paths(path)
+    if not path.is_dir() or not (path/'package.json').is_file() or not (path/'node_modules/@whiskeysockets/baileys/WAProto/index.js').is_file():
+        raise ValueError('bridge_package_unusable')
+
+
 def _private_json(path: Path, value: Any) -> None:
     path.parent.mkdir(parents=True, mode=0o700, exist_ok=True)
     fd = os.open(path, os.O_WRONLY | os.O_CREAT | os.O_EXCL, 0o600)
@@ -419,14 +456,10 @@ def _load(record: Path, home: Path, *, apply: bool) -> dict[str, Any]:
     if mode not in ('live', 'rehearsal'):
         raise ValueError('explicit_record_mode_required')
     if mode == 'rehearsal':
-        try:
-            from scripts.history_maintenance_guard import preflight_isolated_paths
-        except ModuleNotFoundError:
-            from history_maintenance_guard import preflight_isolated_paths
         isolated = [home, Path(value['output']), Path(value['receipts'])]
         isolated.extend(Path(v) for v in value.get('layout', {}).values())
         isolated.extend(Path(m['source']) for m in value['inventory']['members'] if 'source' in m)
-        preflight_isolated_paths(*isolated)
+        _rehearsal_paths(Path(value['rehearsal_root']), home, *isolated)
     controls = _CONTROLS.get()
     if apply and getattr(controls, 'mode', None) != mode:
         raise ValueError('control_record_mode_mismatch')
@@ -564,8 +597,9 @@ def _run(value: dict[str, Any], home: Path, actions: list[str], *, restore: bool
             if action == 'release-fence':
                 journal['fenced'] = False
         journal['ok'] = True
-    except Exception:
+    except Exception as exc:
         journal['failed_phase'] = action
+        journal['error_code'] = str(exc) if isinstance(exc, ValueError) and re.fullmatch(r'[a-z0-9_]+', str(exc)) else f'unexpected_{type(exc).__name__}'
         journal['fenced'] = True
         if not any(p['action'] == 'fence-effects' and 'receipt' in p for p in journal['phases']):
             journal['fence_unverified'] = True
@@ -678,6 +712,9 @@ def main() -> int:
     parser.add_argument('--controls', choices=('rehearsal', 'live'))
     args = parser.parse_args()
     try:
+        value = _load(args.record, args.home, apply=False)
+        if value['mode'] == 'rehearsal':
+            _rehearsal_environment(args.home)
         if args.controls:
             try:
                 from scripts.history_cutover_host import live_host_controls, rehearsal_host_controls
@@ -685,12 +722,17 @@ def main() -> int:
             except ModuleNotFoundError:
                 from history_cutover_host import live_host_controls, rehearsal_host_controls
                 from history_cutover_probes import build_probes
-            value = _load(args.record, args.home, apply=False)
             if value['mode'] != args.controls:
                 raise ValueError('control_record_mode_mismatch')
+            from yeoman_gateway.history.convert.bridge_refs import node_batch_decoder
+            package = Path(value['bridge_package_dir'])
+            _bridge_package(package)
+            decode = node_batch_decoder(package)
+            if args.apply:
+                decode([])  # Prove the package can load before stopping any writer.
             host = (live_host_controls(inventory=value['inventory']) if args.controls == 'live'
-                    else rehearsal_host_controls(copy_home=args.home, inventory=value['inventory']))
-            controls = preparation_controls(host=host,probes=build_probes(record=value,home=args.home))
+                    else rehearsal_host_controls(copy_home=args.home, rehearsal_root=Path(value['rehearsal_root']), inventory=value['inventory']))
+            controls = preparation_controls(host=host,probes=build_probes(record=value,home=args.home),decode=decode)
         else:
             controls = None
         with injected_controls(controls):

@@ -254,7 +254,7 @@ def test_record_builder_loads_and_refuses_drift(tmp_path,mode):
     example = json.loads((Path(__file__).parents[2]/'scripts/history_cutover_inventory.example.json').read_text())
     value['inventory'].update(overseer_jobs=[],external_text_targets=[],gateway_jobs=0,manual_routes=[],
         forward_start_evidence_member='inputs/forward-start.json',reader_smoke=example['inventory']['reader_smoke'])
-    inventory.write_text(dumps({k:v for k,v in value.items() if k in ('home','output','receipts','candidate','prior','inventory')} | {'version':1,'python':'/synthetic/python'}))
+    inventory.write_text(dumps({k:v for k,v in value.items() if k in ('home','output','receipts','candidate','prior','inventory','rehearsal_root')} | {'version':1,'python':__import__('sys').executable}))
     generated = build_cutover_record(inventory=inventory,layout={},mode=mode,
         window=(1791532800000,1791534600000),expected_gateway_jobs=0)
     assert generated['approved'] is False and generated['mode'] == mode

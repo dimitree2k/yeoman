@@ -105,6 +105,9 @@ async def test_all_six_probes_exercise_selected_adapters(statement_case, tmp_pat
     (tmp_path/'cli').mkdir()
     record_path, cli_home, cli_record = synthetic_record(tmp_path/'cli')
     shutil.copytree(case.raw,cli_home/'raw',dirs_exist_ok=True)
+    from yeoman_gateway.history.convert import bridge_refs
+    monkeypatch.setattr(bridge_refs,'node_batch_decoder',lambda _: lambda items: {})
+    cli_record['rehearsal_root'] = str(tmp_path)
     cli_record['layout'] = dict(record['layout'],history=str(case.path),raw=str(case.raw))
     cli_record['inventory']['reader_smoke'] = record['inventory']['reader_smoke']
     cli_record['digest'] = operator.record_digest(cli_record)
