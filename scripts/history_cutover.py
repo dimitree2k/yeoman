@@ -17,6 +17,7 @@ import re
 import shutil
 import sqlite3
 import time
+from collections import Counter
 from collections.abc import Callable, Mapping, Sequence
 from contextlib import closing, contextmanager
 from contextvars import ContextVar
@@ -151,6 +152,17 @@ def _static_copy(source: Path, target: Path) -> str:
     return digest
 
 
+def _sqlite_copy_proof(source: sqlite3.Connection, copy: sqlite3.Connection) -> int:
+    if copy.execute('PRAGMA integrity_check').fetchall() != [('ok',)]:
+        raise ValueError('snapshot_integrity_failed')
+    def violations(db):
+        return Counter((table, parent, rowid, fkid) for table, rowid, parent, fkid in db.execute('PRAGMA foreign_key_check'))
+    original, copied = violations(source), violations(copy)
+    if original != copied:
+        raise ValueError('snapshot_fk_drift')
+    return sum(copied.values())
+
+
 def acquire_cutover_snapshot(*, home: Path, output: Path,
                              inventory: Mapping[str, Any]) -> dict[str, Any]:
     """Caller proves writers stopped. WAL-aware SQLite and re-stat static copies."""
@@ -185,11 +197,10 @@ def acquire_cutover_snapshot(*, home: Path, output: Path,
             with closing(sqlite3.connect(source.as_uri() + '?mode=ro', uri=True)) as src, closing(sqlite3.connect(target)) as dst:
                 src.backup(dst)
                 dst.execute('PRAGMA wal_checkpoint(TRUNCATE)')
-                if dst.execute('PRAGMA integrity_check').fetchone()[0] != 'ok' or dst.execute('PRAGMA foreign_key_check').fetchall():
-                    raise ValueError('snapshot_integrity_failed')
+                info['fk_violations'] = _sqlite_copy_proof(src, dst)
                 tables = [r[0] for r in dst.execute("SELECT name FROM sqlite_master WHERE type='table' ORDER BY name")]
                 info['counts'] = {t: dst.execute('SELECT count(*) FROM "' + t.replace('"', '""') + '"').fetchone()[0] for t in tables}
-                info['integrity'] = True
+                info['integrity'] = 'ok'
             os.chmod(target, 0o600)
             with target.open('rb') as stream:
                 os.fsync(stream.fileno())
@@ -674,6 +685,8 @@ def _restore_files(value: Mapping[str, Any], home: Path) -> dict[str, Any]:
             _static_copy(source, staging)
             # Stopped old SQLite sidecars cannot belong to the replacement inode.
             if entry['kind'] == 'sqlite':
+                with closing(sqlite3.connect(source.as_uri() + '?mode=ro', uri=True)) as src, closing(sqlite3.connect(staging.as_uri() + '?mode=ro', uri=True)) as dst:
+                    _sqlite_copy_proof(src, dst)
                 for suffix in ('-wal', '-shm'):
                     Path(str(target) + suffix).unlink(missing_ok=True)
         os.replace(staging, target)

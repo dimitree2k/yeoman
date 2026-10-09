@@ -534,3 +534,74 @@ async def test_whole_restore_does_not_revive_purged_knowledge_source(statement_c
         result = await asyncio.to_thread(m.restore_prior_set,record=path,home=home,failed_snapshot=tmp_path/'failed-purge',apply=True)
     assert result['ok'] and result['fence_verified']
     assert {p.relative_to(c.raw).as_posix():p.read_bytes() for p in c.raw.rglob('*.jsonl')} == raw_after_purge
+
+
+def orphan_database(home):
+    path = home/'orphan.db'
+    with sqlite3.connect(path) as db:
+        db.execute('CREATE TABLE memory2_nodes(id INTEGER PRIMARY KEY)')
+        db.execute('CREATE TABLE memory2_embeddings(id INTEGER PRIMARY KEY, node INTEGER REFERENCES memory2_nodes(id))')
+        db.execute('INSERT INTO memory2_embeddings VALUES (1, 99)')
+    return path
+
+
+def test_snapshot_restores_preexisting_fk_violations_unchanged(tmp_path):
+    m = procedure()
+    path, home, value = record(tmp_path)
+    original = orphan_database(home)
+    value['inventory']['members'] = [dict(path='orphan.db',kind='sqlite',restore=True)]
+    receipt = m.acquire_cutover_snapshot(home=home,output=Path(value['output']),inventory=value['inventory'])
+    assert receipt['members'][0]['integrity'] == 'ok'
+    assert receipt['members'][0]['fk_violations'] == 1
+    manifest = json.loads((Path(value['output'])/'manifest.json').read_text())
+    assert manifest['members'][0]['fk_violations'] == 1
+    assert 'memory2_embeddings' not in json.dumps({k:v for k,v in manifest['members'][0].items() if k not in ('counts',)})
+    preserved = (Path(value['output'])/'orphan.db').read_bytes()
+    with sqlite3.connect(original) as db:
+        db.execute('INSERT INTO memory2_nodes VALUES (99)')
+    assert m._restore_files(value,home)['complete']
+    assert original.read_bytes() == preserved
+    with sqlite3.connect(original) as db:
+        assert db.execute('SELECT * FROM memory2_nodes').fetchall() == []
+        assert db.execute('SELECT * FROM memory2_embeddings').fetchall() == [(1,99)]
+        assert db.execute('PRAGMA integrity_check').fetchall() == [('ok',)]
+        assert db.execute('PRAGMA foreign_key_check').fetchall() == [('memory2_embeddings',1,'memory2_nodes',0)]
+
+
+@pytest.mark.parametrize('operation',['acquire','restore'])
+@pytest.mark.parametrize('change',['gain','lose','same_count_changed_row'])
+def test_snapshot_refuses_changed_fk_multiset(tmp_path,monkeypatch,operation,change):
+    m = procedure()
+    path, home, value = record(tmp_path)
+    original = orphan_database(home)
+    value['inventory']['members'] = [dict(path='orphan.db',kind='sqlite',restore=True)]
+    def corrupt(db):
+        if change=='gain':
+            db.execute('INSERT INTO memory2_embeddings VALUES (2, 98)')
+        elif change=='lose':
+            db.execute('DELETE FROM memory2_embeddings')
+        else:
+            db.execute('UPDATE memory2_embeddings SET id=2')
+        db.commit()
+    if operation=='acquire':
+        connect = sqlite3.connect
+        class ChangedBackup(sqlite3.Connection):
+            def backup(self,target,*args,**kwargs):
+                super().backup(target,*args,**kwargs)
+                corrupt(target)
+        monkeypatch.setattr(m.sqlite3,'connect',lambda *args,**kwargs: connect(*args,**(kwargs|dict(factory=ChangedBackup))))
+        with pytest.raises(ValueError,match='snapshot_fk_drift'):
+            m.acquire_cutover_snapshot(home=home,output=Path(value['output']),inventory=value['inventory'])
+    else:
+        m.acquire_cutover_snapshot(home=home,output=Path(value['output']),inventory=value['inventory'])
+        prior = original.read_bytes()
+        copy = m._static_copy
+        def changed_copy(source,target):
+            digest = copy(source,target)
+            with sqlite3.connect(target) as db:
+                corrupt(db)
+            return digest
+        monkeypatch.setattr(m,'_static_copy',changed_copy)
+        with pytest.raises(ValueError,match='snapshot_fk_drift'):
+            m._restore_files(value,home)
+        assert original.read_bytes() == prior
