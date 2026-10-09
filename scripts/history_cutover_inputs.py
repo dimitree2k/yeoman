@@ -6,6 +6,7 @@ import argparse
 import hashlib
 import json
 import sqlite3
+from collections import defaultdict
 from collections.abc import Mapping
 from contextlib import closing
 from pathlib import Path
@@ -115,6 +116,40 @@ def _original_state(record: dict, mutations: set[tuple]) -> dict:
     return state
 
 
+def _enrich_legacy(legacy,statements,links,bindings,parsed_jobs,event_by_id,boundary,start):
+    people_by_key = defaultdict(set)
+    completed = set()
+    for link in links:
+        key = link['event_id'],link['revision']
+        statement = statements[link['statement_id']]
+        if statement['speaker_person_id']:
+            people_by_key[key].add(statement['speaker_person_id'])
+        if statement['status'] in ('assertion','confirmed','superseded','expired'):
+            completed.add(key)
+    for job,sources in parsed_jobs:
+        if job['state']=='done':
+            completed.update((source['event_id'],source['revision']) for source in sources)
+    bindings_by_identifier = defaultdict(list)
+    for binding in bindings:
+        if binding['kind']=='phone_jid' and binding['mapping_verified']==1 and binding['status'] in ('active','ended'):
+            bindings_by_identifier[binding['channel'],binding['value']].append(binding)
+    for key,row in legacy.items():
+        people = set(people_by_key[key])
+        principal = row['author_principal']
+        if isinstance(principal,str):
+            number = principal.removeprefix('whatsapp:')
+            people.update(b['person_id'] for b in bindings_by_identifier[row['channel'],number+'@s.whatsapp.net']
+                if b['valid_from_ms'] <= row['occurred_at_ms']
+                and (not b['valid_until_ms'] or row['occurred_at_ms'] < b['valid_until_ms']))
+        if len(people)==1:
+            row['author_contact_id'] = next(iter(people))
+        event = event_by_id.get(key[0])
+        if event:
+            row.update(created_ms=event['created_ms'],boundary=boundary,forward_start=start)
+        if key in completed:
+            row['completed'] = True
+
+
 def build_cutover_inputs(*, acquisition_home: Path, conversion_manifest: Path,
     staged_raw: Path, forward_start_evidence: Path, output: Path) -> dict:
     preflight_isolated_paths(acquisition_home,conversion_manifest,staged_raw,forward_start_evidence,output)
@@ -178,8 +213,9 @@ def build_cutover_inputs(*, acquisition_home: Path, conversion_manifest: Path,
         elif not row.get('audience_conflict'):
             row['source_audience_json'] = link_audience
         row['status'] = 'revoked' if row.get('status')=='revoked' or link['status']=='revoked' else link['status']
-    for job in jobs:
-        for source in json.loads(job['sources_json']):
+    parsed_jobs = [(job,json.loads(job['sources_json'])) for job in jobs]
+    for job,sources in parsed_jobs:
+        for source in sources:
             key = source['event_id'],source['revision']
             if all(field in source for field in SourceRef.__dataclass_fields__):
                 if key in legacy and _issued(legacy[key]) != _issued(source):
@@ -187,31 +223,13 @@ def build_cutover_inputs(*, acquisition_home: Path, conversion_manifest: Path,
                 legacy.setdefault(key,dict(_issued(source),status='unknown'))
             elif key not in legacy:
                 raise ValueError('unproven_legacy_job_source')
-    for key,row in legacy.items():
-        people = {statements[link['statement_id']]['speaker_person_id'] for link in links
-                  if (link['event_id'],link['revision'])==key and statements[link['statement_id']]['speaker_person_id']}
-        number = row['author_principal'].removeprefix('whatsapp:')
-        people.update(b['person_id'] for b in bindings if b['channel']==row['channel']
-            and b['kind']=='phone_jid' and b['value']==number+'@s.whatsapp.net'
-            and b['mapping_verified']==1 and b['status'] in ('active','ended')
-            and b['valid_from_ms'] <= row['occurred_at_ms']
-            and (not b['valid_until_ms'] or row['occurred_at_ms'] < b['valid_until_ms']))
-        if len(people)==1:
-            row['author_contact_id'] = next(iter(people))
-        event = event_by_id.get(key[0])
-        if event:
-            row.update(created_ms=event['created_ms'],boundary=boundary,forward_start=start)
-        if any((link['event_id'],link['revision'])==key and statements[link['statement_id']]['status'] in
-               ('assertion','confirmed','superseded','expired') for link in links):
-            row['completed'] = True
-        if any(j['state']=='done' and any((s['event_id'],s['revision'])==key for s in
-               json.loads(j['sources_json'])) for j in jobs):
-            row['completed'] = True
+    _enrich_legacy(legacy,statements,links,bindings,parsed_jobs,event_by_id,boundary,start)
     preserved = []
     by_event = {}
     for key in sorted(legacy):
         by_event.setdefault(key[0],[]).append(key)
-    originals_cache = {}
+    originals_cache = {(str(processing),'events'):{row_sha256(e) for e in events}}
+    paths_cache = {}
     authority_cache = {str(processing):authorities}
     events_cache = {str(processing):{(e['channel'],e['chat_id'],e['target_message_id'])
         for e in events if e['kind'] in ('edit','delete')}}
@@ -224,9 +242,11 @@ def build_cutover_inputs(*, acquisition_home: Path, conversion_manifest: Path,
             if original.get('event_id') not in by_event:
                 continue
             # Never resolve the manifest's logical source path against the host.
-            source = _member(acquisition_home,dict(path=origin['path'],kind='sqlite',restore=False))
-            if origin['path'] not in members or members[origin['path']]['kind'] != 'sqlite':
-                raise ValueError('conversion_origin_not_acquired')
+            if origin['path'] not in paths_cache:
+                if origin['path'] not in members or members[origin['path']]['kind'] != 'sqlite':
+                    raise ValueError('conversion_origin_not_acquired')
+                paths_cache[origin['path']] = _member(acquisition_home,dict(path=origin['path'],kind='sqlite',restore=False))
+            source = paths_cache[origin['path']]
             cache_key = str(source),origin['table']
             if cache_key not in originals_cache:
                 originals_cache[cache_key] = {row_sha256(r) for r in _rows(source,origin['table'])}
@@ -237,8 +257,9 @@ def build_cutover_inputs(*, acquisition_home: Path, conversion_manifest: Path,
                     for e in _rows(source,'events') if e['kind'] in ('edit','delete')}
                 authority_cache[str(source)] = {(r['event_id'],r['revision']):r
                     for r in _rows(source,'event_source_authority')}
+            state = _original_state(record,events_cache[str(source)])
             for key in by_event[original['event_id']]:
-                envelope = dict(state=_original_state(record,events_cache[str(source)]))
+                envelope = dict(state=state)
                 authority = authority_cache[str(source)].get(key)
                 if authority and original.get('principal')==authority['author_principal']:
                     envelope['issued'] = _authority(authority)

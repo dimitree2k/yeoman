@@ -267,3 +267,69 @@ def test_record_builder_loads_and_refuses_drift(tmp_path,mode):
     path.write_text(dumps(generated))
     with pytest.raises(ValueError,match='record_pin_mismatch'):
         procedure()._load(path,home,apply=False)
+
+
+def original_enrichment(legacy,statements,links,bindings,parsed_jobs,event_by_id,boundary,start):
+    """Pre-optimization metadata join, retained only as a small-fixture byte oracle."""
+    for key,row in legacy.items():
+        people = {statements[link['statement_id']]['speaker_person_id'] for link in links
+            if (link['event_id'],link['revision'])==key and statements[link['statement_id']]['speaker_person_id']}
+        number = row['author_principal'].removeprefix('whatsapp:')
+        people.update(b['person_id'] for b in bindings if b['channel']==row['channel']
+            and b['kind']=='phone_jid' and b['value']==number+'@s.whatsapp.net'
+            and b['mapping_verified']==1 and b['status'] in ('active','ended')
+            and b['valid_from_ms'] <= row['occurred_at_ms']
+            and (not b['valid_until_ms'] or row['occurred_at_ms'] < b['valid_until_ms']))
+        if len(people)==1:
+            row['author_contact_id'] = next(iter(people))
+        event = event_by_id.get(key[0])
+        if event:
+            row.update(created_ms=event['created_ms'],boundary=boundary,forward_start=start)
+        if any((link['event_id'],link['revision'])==key and statements[link['statement_id']]['status'] in
+            ('assertion','confirmed','superseded','expired') for link in links):
+            row['completed'] = True
+        if any(j['state']=='done' and any((s['event_id'],s['revision'])==key for s in json.loads(j['sources_json'])) for j,_ in parsed_jobs):
+            row['completed'] = True
+
+
+@pytest.mark.parametrize('variant',['original','missing_fields','segments'])
+def test_indexed_builder_matches_original_bytes(acquired,tmp_path,monkeypatch,variant):
+    from scripts import history_cutover_inputs as module
+    if variant=='missing_fields':
+        test_missing_payload_proof_remains_absent(acquired,tmp_path)
+    elif variant=='segments':
+        test_segment_refs_preserve_original_without_inventing_state(acquired,tmp_path)
+    first,reference = tmp_path/'indexed.json',tmp_path/'reference.json'
+    build(acquired,first)
+    monkeypatch.setattr(module,'_enrich_legacy',original_enrichment)
+    build(acquired,reference)
+    assert first.read_bytes()==reference.read_bytes()
+
+
+def test_prepare_withholds_statement_with_unissued_source(acquired,tmp_path):
+    from scripts.prepare_history_cutover import prepare
+    home,_,_,_,knowledge,raw = acquired
+    output = home/'cutover-inputs.json'
+    build(acquired,output)
+    bundle = json.loads(output.read_text())
+    row = next(r for r in bundle['legacy_rows'] if r['event_id']=='missing')
+    row['author_principal'] = ''
+    with sqlite3.connect(knowledge) as db:
+        db.row_factory = sqlite3.Row
+        link = dict(db.execute('SELECT * FROM knowledge_statement_sources LIMIT 1').fetchone())
+        link.update(event_id='missing',author_principal='')
+        db.execute('INSERT INTO knowledge_statement_sources ('+','.join(link)+') VALUES ('+','.join('?' for _ in link)+')',tuple(link.values()))
+        db.commit()
+        db.execute('PRAGMA wal_checkpoint(TRUNCATE)')
+    output.write_text(dumps(bundle))
+    history = tmp_path/'history.db'
+    project([raw],history)
+    policy = tmp_path/'policy-copy.json'
+    policy.write_text(dumps({'defaults':{'whoCanTalk':{'mode':'everyone'}}}))
+    result = prepare(argparse.Namespace(snapshot_home=home,history_db=history,knowledge_source=knowledge,
+        knowledge_target=tmp_path/'v3.db',policy_snapshot=policy,output_root=tmp_path/'aliases'))
+    assert result['handover'] and result['missing']==1 and result['withheld_statements']==1
+    manifest = json.loads((tmp_path/'aliases/legacy-alias-manifest.json').read_text())
+    entry = next(e for e in manifest['entries'] if e['issued']['event_id']=='missing')
+    assert entry['status']=='missing' and entry['reason']=='unissued_principal'
+    assert entry['issued']['author_principal']=='' and 'alias' not in entry

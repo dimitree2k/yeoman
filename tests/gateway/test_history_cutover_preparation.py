@@ -341,3 +341,46 @@ def test_other_channel_jobs_have_no_whatsapp_assignment(capture_case):
         assert inputs == {"pending": (), "processed": (), "classifications": {}}
         p.prepare_handover(snap, legacy_boundary=(10, "b"), **inputs)
     assert [dict(row) for row in k._store.query("SELECT * FROM knowledge_jobs")] == jobs
+
+
+@pytest.mark.parametrize(('bad','reason'),[
+    ({'author_principal':''},'unissued_principal'),
+    ({'author_principal':'   '},'unissued_principal'),
+    ({'author_principal':'bad\x00principal'},'invalid_source_ref'),
+    ({'author_principal':None},'invalid_source_ref'),
+    ({'occurred_at_ms':-1},'invalid_source_ref'),
+    ({'channel':''},'invalid_source_ref'),
+    ({'revision':0},'invalid_source_ref'),
+])
+def test_unissuable_legacy_source_is_missing_per_key(case,bad,reason):
+    from yeoman_gateway.knowledge._history_cutover import prepare_legacy_alias_inputs
+    _,q,_,db = case
+    source = SourceRef("unissued",1,"whatsapp",q.message("m")["chat_id"],"whatsapp:10001",100)
+    row = legacy(source,**bad)
+    rows,locators,counts = prepare_legacy_alias_inputs(queries=q,legacy_rows=[row,row],preserved_rows=[])
+    assert counts['total']==counts['missing']==1
+    assert counts['mapped']==0 and locators=={}
+    assert rows[0]['cutover_status']=='missing' and rows[0]['cutover_reason']==reason
+    assert rows[0]['author_principal']==bad.get('author_principal',source.author_principal)
+
+
+@pytest.mark.asyncio
+async def test_unissued_source_pending_zero_does_not_rescue_active_job(capture_case):
+    from yeoman_gateway.knowledge._history_cutover import prepare_capture_inputs
+    h,k,_,_ = capture_case
+    h.add('unissued',line=1,known=False)
+    p = producer(k)
+    rows = [dict(message_id='unissued',event_id='unissued',revision=1,author_principal='',
+        channel='whatsapp',cutover_status='missing',created_ms=11,boundary=[10,'b'])]
+    with h.snapshot() as snap:
+        q = HistoryQueries(snap)
+        job = dict(state='queued',sources_json=json.dumps([dict(event_id='unissued',revision=1,channel='whatsapp')]))
+        from scripts.prepare_history_cutover import _affected_counts
+        assert _affected_counts(rows,[dict(statement_id='withheld',event_id='unissued',revision=1)],[job],{}) == dict(statements=1,jobs=1,withheld_statements=1,affected_jobs=1)
+        with pytest.raises(ValueError,match='unmapped_handover_job'):
+            prepare_capture_inputs(queries=q,legacy_boundary=(10,'b'),legacy_rows=rows,jobs=[job])
+        inputs = prepare_capture_inputs(queries=q,legacy_boundary=(10,'b'),legacy_rows=rows,jobs=[])
+        assert inputs['classifications']=={'unissued':'pending'}
+        p.prepare_handover(snap,legacy_boundary=(10,'b'),**inputs)
+    row = k._store.query_one("SELECT revision,outcome FROM knowledge_history_capture WHERE message_id='unissued'")
+    assert tuple(row)==(0,'pending')

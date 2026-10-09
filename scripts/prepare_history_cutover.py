@@ -44,6 +44,15 @@ _COUNTS = ("total", "mapped", "missing", "ambiguous", "changed", "purged_revoked
            "affected_jobs")
 
 
+def _affected_counts(rows, statements, jobs, aliases):
+    channels = {(row['event_id'],row['revision']):row.get('channel') for row in rows}
+    return dict(statements=len({r['statement_id'] for r in statements}), jobs=len(jobs),
+        withheld_statements=len({r['statement_id'] for r in statements
+            if (r['event_id'],r['revision']) not in aliases and channels[r['event_id'],r['revision']]=='whatsapp'}),
+        affected_jobs=sum(any((r['event_id'],r['revision']) not in aliases
+            and channels[r['event_id'],r['revision']]=='whatsapp' for r in json.loads(job['sources_json'])) for job in jobs))
+
+
 def _guard(paths: list[Path]) -> None:
     if any(not p.is_absolute() for p in paths):
         raise ValueError("unsafe_paths")
@@ -112,7 +121,7 @@ def prepare(args: argparse.Namespace) -> dict[str, Any]:
         upgrade = upgrade_history_knowledge(source=args.knowledge_source, target=args.knowledge_target)
         legacy_authority = RuntimeKnowledgeSources()
         for row in rows:
-            if row["channel"] != "whatsapp" and "source_audience_json" in row:
+            if row["cutover_status"] == "other_channel" and "source_audience_json" in row:
                 source = SourceRef(**{k: row[k] for k in SourceRef.__dataclass_fields__})
                 audience = (EvidenceAudience.author_only(snapshot_id=row.get("snapshot_id"))
                     if row["source_audience_json"] is None else
@@ -137,6 +146,7 @@ def prepare(args: argparse.Namespace) -> dict[str, Any]:
             required.update((r["event_id"], r["revision"]) for job in jobs for r in json.loads(job["sources_json"]))
             if not required <= known_keys:
                 raise ValueError("incomplete_source_inventory")
+            counts.update(_affected_counts(rows,statements,jobs,aliases))
             boundary = knowledge.capture_boundary()
             if boundary is None:
                 raise ValueError("missing_legacy_boundary")
@@ -146,11 +156,11 @@ def prepare(args: argparse.Namespace) -> dict[str, Any]:
                 snapshot, legacy_boundary=boundary, **inputs)
         entries = []
         for row in rows:
-            issued = {key: row[key] for key in SourceRef.__dataclass_fields__}
+            issued = {key: row[key] for key in SourceRef.__dataclass_fields__ if key in row}
             key = row["event_id"], row["revision"]
             alias = aliases.get(key)
             entry = {"issued": issued, "status": row["cutover_status"],
-                     "reason": row["cutover_status"], "proofs": row["preserved_proofs"]}
+                     "reason": row.get("cutover_reason", row["cutover_status"]), "proofs": row["preserved_proofs"]}
             if alias is not None:
                 value = asdict(alias)
                 value["audience"]["members"] = sorted(alias.audience.members)
@@ -168,15 +178,6 @@ def prepare(args: argparse.Namespace) -> dict[str, Any]:
         manifest["digest"] = row_sha256(manifest)
         args.output_root.mkdir(mode=0o700)
         _private_json(manifest_path, manifest)
-        counts["statements"] = len({r["statement_id"] for r in statements})
-        counts["jobs"] = len(jobs)
-        channels = {(row["event_id"], row["revision"]): row["channel"] for row in rows}
-        counts["withheld_statements"] = len({r["statement_id"] for r in statements
-            if (r["event_id"], r["revision"]) not in aliases
-            and channels[r["event_id"], r["revision"]] == "whatsapp"})
-        counts["affected_jobs"] = sum(any((r["event_id"], r["revision"]) not in aliases
-            and channels[r["event_id"], r["revision"]] == "whatsapp"
-            for r in json.loads(job["sources_json"])) for job in jobs)
         return {"ok": True, "handover": True, **{k: counts[k] for k in _COUNTS}}
     finally:
         if knowledge is not None:

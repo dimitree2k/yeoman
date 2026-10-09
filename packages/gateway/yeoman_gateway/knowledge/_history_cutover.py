@@ -10,15 +10,18 @@ from typing import Any
 from yeoman_gateway.history.layer1 import row_sha256
 from yeoman_gateway.history.queries import HistoryQueries
 from yeoman_gateway.knowledge._history_sources import build_history_source_aliases
-from yeoman_gateway.knowledge.models import SourceRef
+from yeoman_gateway.knowledge.models import KnowledgeError, SourceRef
 
 _STATE_FIELDS = ("channel", "chat_id", "native_message_id", "direction", "sent_ms",
                  "time_certainty", "text", "current_text", "media_json", "reply_to_native_id",
                  "mentions_json", "provenance", "deleted")
 
 
-def _source(row: Mapping[str, Any]) -> SourceRef:
-    return SourceRef(**{key: row[key] for key in SourceRef.__dataclass_fields__})
+def _source(row: Mapping[str, Any]) -> SourceRef | None:
+    try:
+        return SourceRef(**{key: row[key] for key in SourceRef.__dataclass_fields__})
+    except (KnowledgeError, KeyError, TypeError, ValueError):
+        return None
 
 
 def _state(queries: HistoryQueries, row: Mapping[str, Any]) -> dict[str, Any]:
@@ -56,20 +59,26 @@ def prepare_legacy_alias_inputs(*, queries: HistoryQueries,
     distinct: dict[tuple[str, int], dict[str, Any]] = {}
     for item in legacy_rows:
         row = dict(item)
-        key = _source(row).key
+        source = _source(row)
+        key = source.key if source is not None else (row.get('event_id'), row.get('revision'))
         if key in distinct and distinct[key] != row:
             raise ValueError("conflicting_legacy_key")
         distinct[key] = row
     counts = Counter({key: 0 for key in (
         "mapped", "missing", "ambiguous", "changed", "purged_revoked", "other_channel")})
     prepared, locators = [], {}
-    for key, row in sorted(distinct.items()):
+    for key, row in sorted(distinct.items(), key=lambda item: (str(item[0][0]),
+            (0, item[0][1]) if type(item[0][1]) is int else (1, str(item[0][1])))):
         source = _source(row)
         status = "missing"
         targets: set[str] = set()
         proofs = []
         states = []
-        if source.channel != "whatsapp":
+        if source is None:
+            principal = row.get('author_principal')
+            row['cutover_reason'] = ('unissued_principal' if isinstance(principal, str) and not principal.strip()
+                                     else 'invalid_source_ref')
+        elif source.channel != "whatsapp":
             status = "other_channel"
         elif row.get("status") in ("revoked", "purged"):
             status = "purged_revoked"
@@ -183,10 +192,12 @@ def prepare_capture_inputs(*, queries: HistoryQueries,
             row = {**previous, **row}
         rows[mid] = row
         if "source" in row:
-            source = SourceRef(**row["source"])
+            source = _source(row["source"])
         elif row.get("cutover_status") in ("mapped", "other_channel"):
             source = _source(row)
         else:
+            continue
+        if source is None:
             continue
         if source.key in refs and refs[source.key] != (mid, source):
             raise ValueError("conflicting_capture_proof")
