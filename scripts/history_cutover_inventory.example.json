@@ -85,7 +85,8 @@
         "owner_export": true
       }
     },
-    "bridge_package_dir": "/synthetic/bridge-package"
+    "bridge_package_dir": "/synthetic/bridge-package",
+    "optional_conversion_stores": []
   },
   "rehearsal_root": "/synthetic"
 }

@@ -5,12 +5,13 @@ from __future__ import annotations
 import argparse
 import hashlib
 import json
+import re
 import sqlite3
-from collections import defaultdict
+from collections import Counter, defaultdict
 from collections.abc import Mapping
 from contextlib import closing
 from pathlib import Path
-from typing import Literal
+from typing import Any, Literal
 
 from jsonschema import Draft202012Validator
 from yeoman_gateway.history.convert.common import clean_text, epoch_or_iso_to_ms
@@ -56,6 +57,66 @@ def _rows(path: Path, table: str) -> list[dict]:
     with closing(sqlite3.connect(path.as_uri()+'?mode=ro&immutable=1', uri=True)) as db:
         db.row_factory = sqlite3.Row
         return [dict(r) for r in db.execute('SELECT * FROM "'+table.replace('"','""')+'"')]
+
+
+class InputProofError(ValueError):
+    def __init__(self, code: str, store_counts: dict):
+        super().__init__(code)
+        self.store_counts = store_counts
+
+
+def _source_paths(home: Path, members: Mapping) -> dict:
+    """Match exact relative DB/session and absolute Bridge path strings by digest."""
+    result = {}
+    for member in members.values():
+        names = ([member['path']+'/'+name for name in member['files']]
+                 if member['kind']=='tree' else [member['path']])
+        for name in names:
+            path = home/name
+            kind = 'file' if member['kind']=='tree' else member['kind']
+            for spelling in (name,path.as_posix()):
+                digest = hashlib.sha256(spelling.encode('utf-8')).hexdigest()
+                previous = result.get(digest)
+                if previous and previous[0] != path:
+                    raise ValueError('ambiguous_acquired_source_path')
+                if previous is None or kind=='sqlite':
+                    result[digest] = path,kind
+    return result
+
+
+def _original_hashes(source: Path, table: str) -> set[str]:
+    if table=='effects':
+        # Journal originals include receipt linkage, not merely SELECT * effects.
+        with closing(sqlite3.connect(source.as_uri()+'?mode=ro&immutable=1',uri=True)) as db:
+            db.row_factory = sqlite3.Row
+            rows = [dict(r) for r in db.execute(
+                'SELECT e.*,r.provider_message_id AS r_provider_message_id,r.chat_id AS r_chat_id,'
+                'r.confirmed_ms AS r_confirmed_ms FROM effects e LEFT JOIN transport_receipts r'
+                ' ON r.effect_id=e.effect_id ORDER BY e.created_ms,e.effect_id,r.confirmed_ms')]
+    else:
+        rows = _rows(source,table)
+    # This is the converter's canonical_json(default=str), including SQLite BLOBs.
+    return {row_sha256(row) for row in rows}
+
+
+def _file_originals(source: Path, table: str) -> dict:
+    if table=='message_reference':
+        return {source.name:row_sha256(json.loads(source.read_bytes()))}
+    if table!='jsonl':
+        return {}
+    result = {}
+    with source.open(encoding='utf-8',errors='replace') as stream:
+        for number,line in enumerate(stream,1):
+            if not line.strip():
+                continue
+            try:
+                original = json.loads(line)
+            except json.JSONDecodeError:
+                original = None
+            if not isinstance(original,dict):
+                original = {'_unparsed':line.rstrip('\n')}
+            result[str(number)] = row_sha256(original)
+    return result
 
 
 def _acquisition(home: Path) -> dict:
@@ -195,7 +256,8 @@ def _enrich_legacy(legacy,statements,links,bindings,parsed_jobs,event_by_id,boun
 
 
 def build_cutover_inputs(*, acquisition_home: Path, conversion_manifest: Path,
-    staged_raw: Path, forward_start_evidence: Path, output: Path) -> dict:
+    staged_raw: Path, forward_start_evidence: Path, output: Path,
+    record: Mapping[str,Any] | None = None) -> dict:
     preflight_isolated_paths(acquisition_home,conversion_manifest,staged_raw,forward_start_evidence,output)
     for root in (acquisition_home,staged_raw):
         for path in root.rglob('*'):
@@ -206,6 +268,14 @@ def build_cutover_inputs(*, acquisition_home: Path, conversion_manifest: Path,
     members = {m['path']:m for m in receipt['members'] if m['exists']}
     if any(str(p.relative_to(acquisition_home)) not in members for p in (knowledge,processing)):
         raise ValueError('required_acquisition_members_missing')
+    optional = set(record.get('inventory',{}).get('optional_conversion_stores',())) if record else set()
+    if optional and (record.get('version') != 1 or record.get('approved') is not True or not record.get('approval')
+            or record.get('digest') != record_digest(record) or record.get('output') != str(acquisition_home)
+            or receipt.get('inventory_digest') != record_digest(record['inventory'])):
+        raise ValueError('approved_optional_store_record_required')
+    source_paths = _source_paths(acquisition_home,members)
+    store_errors = defaultdict(Counter)
+    required_errors = []
     manifest = json.loads(conversion_manifest.read_bytes())
     blobs = validate_import_manifest(staged_raw,manifest)
     evidence = json.loads(forward_start_evidence.read_bytes())
@@ -282,7 +352,6 @@ def build_cutover_inputs(*, acquisition_home: Path, conversion_manifest: Path,
             if native:
                 by_locator[row['channel'],row['chat_id'],native].add(key)
     originals_cache = {(str(processing),'events'):{row_sha256(e) for e in events}}
-    paths_cache = {}
     authority_cache = {str(processing):authorities}
     events_cache = {str(processing):{(e['channel'],e['chat_id'],e['target_message_id'])
         for e in events if e['kind'] in ('edit','delete')}}
@@ -293,52 +362,42 @@ def build_cutover_inputs(*, acquisition_home: Path, conversion_manifest: Path,
             original,origin = record.get('original'),record.get('origin')
             if not isinstance(original,dict) or not origin:
                 continue
+            bound_origin = manifest['files'][relative]['rows'][number-1]['origin']
             record = _native_original(record)
             payload = record.get('payload',{})
             keys = set(by_event.get(original.get('event_id'),()))
             locator_keys = by_locator.get((record.get('channel'),record.get('chat_id'),payload.get('messageId')),())
             keys.update(key for key in locator_keys if origin['table'] != 'events' or key[0] not in event_by_id)
+            inventory_entry = manifest['source_inventory'].get(bound_origin.get('inventory_id'),{})
+            located = source_paths.get(inventory_entry.get('origin_path_sha256'))
+            code = None
+            if located is None or located[1] not in ('sqlite','file'):
+                code = 'conversion_origin_not_acquired'
+            else:
+                source,kind = located
+                cache_key = str(source),origin['table']
+                if kind=='sqlite':
+                    if cache_key not in originals_cache:
+                        try:
+                            originals_cache[cache_key] = _original_hashes(source,origin['table'])
+                        except sqlite3.OperationalError:
+                            originals_cache[cache_key] = set()
+                    acquired_hashes = originals_cache[cache_key]
+                else:
+                    if cache_key not in file_originals:
+                        file_originals[cache_key] = _file_originals(source,origin['table'])
+                    acquired_hashes = {file_originals[cache_key].get(origin['row_key'])}
+                if origin['row_sha256'] not in acquired_hashes or origin['row_sha256'] != row_sha256(original):
+                    code = 'conversion_original_not_acquired'
+            if code:
+                store = origin.get('store','unknown_store')
+                store = store if isinstance(store,str) and re.fullmatch(r'[a-z][a-z0-9_-]*',store) else 'unknown_store'
+                store_errors[store][code] += 1
+                if store not in optional:
+                    required_errors.append(code)
+                continue
             if not keys:
                 continue
-            # Absolute Bridge paths are accepted only under this acquired home.
-            logical = Path(origin['path'])
-            if logical.is_absolute():
-                try:
-                    logical = logical.relative_to(acquisition_home)
-                except ValueError:
-                    raise ValueError('conversion_origin_not_acquired') from None
-            name = logical.as_posix()
-            if name not in paths_cache:
-                member = members.get(name)
-                if member and member['kind']=='sqlite':
-                    source = _member(acquisition_home,member)
-                    paths_cache[name] = (source,'sqlite')
-                else:
-                    source = acquisition_home/logical
-                    preflight_isolated_paths(source)
-                    if '..' in logical.parts or not any(
-                        m['kind']=='tree' and name.startswith(m['path']+'/')
-                        and name[len(m['path'])+1:] in m['files'] for m in members.values()):
-                        raise ValueError('conversion_origin_not_acquired')
-                    paths_cache[name] = (source,'file')
-            source,kind = paths_cache[name]
-            cache_key = str(source),origin['table']
-            if kind=='sqlite':
-                if cache_key not in originals_cache:
-                    originals_cache[cache_key] = {row_sha256(r) for r in _rows(source,origin['table'])}
-                acquired_hashes = originals_cache[cache_key]
-            else:
-                if str(source) not in file_originals:
-                    if origin['table']=='jsonl':
-                        file_originals[str(source)] = {str(i):row_sha256(json.loads(line))
-                            for i,line in enumerate(source.read_bytes().splitlines(),1) if line.strip()}
-                    elif origin['table']=='message_reference':
-                        file_originals[str(source)] = {source.name:row_sha256(json.loads(source.read_bytes()))}
-                    else:
-                        raise ValueError('unsupported_conversion_original')
-                acquired_hashes = {file_originals[str(source)].get(origin['row_key'])}
-            if origin['row_sha256'] not in acquired_hashes or origin['row_sha256'] != row_sha256(original):
-                raise ValueError('conversion_original_not_acquired')
             if origin['table']=='events' and str(source) not in events_cache:
                 events_cache[str(source)] = {(e['channel'],e['chat_id'],e['target_message_id'])
                     for e in _rows(source,'events') if e['kind'] in ('edit','delete')}
@@ -377,7 +436,10 @@ def build_cutover_inputs(*, acquisition_home: Path, conversion_manifest: Path,
                         raise ValueError('conversion_segment_ref_missing')
                     preserved.append(dict(event_id=key[0],revision=key[1],original=envelope,
                         preserved_original=original,envelope_sha256=row_sha256(envelope),
-                        origin=origin,source_ref=source_ref))
+                        origin=bound_origin,source_ref=source_ref))
+    proof_errors = {store:dict(sorted(errors.items())) for store,errors in sorted(store_errors.items())}
+    if required_errors:
+        raise InputProofError(required_errors[0],proof_errors)
     capture = []
     for event in events:
         if event['kind']=='message' and event['channel']=='whatsapp':
@@ -389,8 +451,11 @@ def build_cutover_inputs(*, acquisition_home: Path, conversion_manifest: Path,
     bundle = dict(version=1,snapshot_digest=receipt['digest'],conversion_digest=manifest['package_digest'],
                   forward_start_evidence=evidence,legacy_rows=[legacy[k] for k in sorted(legacy)],
                   preserved_rows=preserved,capture_rows=capture)
+    if proof_errors:
+        bundle['origin_proof_errors'] = proof_errors
     _private_json(output,bundle)
-    return {k:len(bundle[k]) for k in ('legacy_rows','preserved_rows','capture_rows')}
+    return {k:len(bundle[k]) for k in ('legacy_rows','preserved_rows','capture_rows')} | (
+        {'origin_proof_errors':proof_errors} if proof_errors else {})
 
 
 def build_cutover_record(*, inventory: Path, layout: Mapping[str,str],
@@ -433,6 +498,7 @@ def main(argv=None) -> int:
     inputs = sub.add_parser('inputs')
     for name in ('acquisition-home','conversion-manifest','staged-raw','forward-start-evidence','output'):
         inputs.add_argument('--'+name,type=Path,required=True)
+    inputs.add_argument('--record',type=Path,help='Approved digest-bound record for optional store omissions')
     record = sub.add_parser('record')
     for name in ('inventory','layout','output'):
         record.add_argument('--'+name,type=Path,required=True)
@@ -443,7 +509,11 @@ def main(argv=None) -> int:
     args = parser.parse_args(argv)
     try:
         if args.operation=='inputs':
-            result = build_cutover_inputs(**{k:v for k,v in vars(args).items() if k!='operation'})
+            kwargs = {k:v for k,v in vars(args).items() if k not in ('operation','record')}
+            if args.record is not None:
+                preflight_isolated_paths(args.record)
+                kwargs['record'] = json.loads(args.record.read_bytes())
+            result = build_cutover_inputs(**kwargs)
         else:
             preflight_isolated_paths(args.layout,args.output)
             value = build_cutover_record(inventory=args.inventory,layout=json.loads(args.layout.read_bytes()),
@@ -452,6 +522,9 @@ def main(argv=None) -> int:
             result = dict(version=1,units=len(value['inventory']['units']),members=len(value['inventory']['members']))
         print(json.dumps(result,sort_keys=True))
         return 0
+    except InputProofError as error:
+        print(json.dumps(dict(ok=False,error=str(error),origin_proof_errors=error.store_counts),sort_keys=True))
+        return 1
     except Exception:
         print('{"ok":false,"error":"cutover_inputs_refused"}')
         return 1

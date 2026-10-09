@@ -242,9 +242,9 @@ def _configure(payload: dict, inventory: Mapping) -> dict:
 
 def _prepare_inputs(payload: dict, inventory: Mapping) -> dict:
     try:
-        from scripts.history_cutover_inputs import build_cutover_inputs
+        from scripts.history_cutover_inputs import InputProofError, build_cutover_inputs
     except ModuleNotFoundError:
-        from history_cutover_inputs import build_cutover_inputs
+        from history_cutover_inputs import InputProofError, build_cutover_inputs
     layout = payload['record']['layout']
     snapshot = _path(payload['record']['output'])
     home = _path(layout['preparation_home'])
@@ -256,9 +256,14 @@ def _prepare_inputs(payload: dict, inventory: Mapping) -> dict:
     evidence = snapshot / inventory['forward_start_evidence_member']
     if snapshot not in evidence.parents:
         raise ValueError('forward_evidence_not_acquired')
-    summary = build_cutover_inputs(acquisition_home=snapshot,
-        conversion_manifest=_path(layout['conversion_manifest']),staged_raw=_path(layout['staged']),
-        forward_start_evidence=evidence,output=home/'cutover-inputs.json')
+    try:
+        summary = build_cutover_inputs(acquisition_home=snapshot,
+            conversion_manifest=_path(layout['conversion_manifest']),staged_raw=_path(layout['staged']),
+            forward_start_evidence=evidence,output=home/'cutover-inputs.json',record=payload['record'])
+    except InputProofError as error:
+        _write(_path(payload['record']['receipts'])/'prepare-input-bundle-errors.json',
+            json.dumps(dict(error_code=str(error),origin_proof_errors=error.store_counts),sort_keys=True).encode(),exclusive=True)
+        raise
     return dict(ok=True,complete=True,**summary)
 
 

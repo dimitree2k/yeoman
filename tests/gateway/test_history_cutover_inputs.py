@@ -460,3 +460,188 @@ def test_journal_proof_keeps_original_text_bytes(acquired):
     original['payload_json'] = dumps(payload)
     state = _original_state(_event(original),set())
     assert state['text']==payload['text'] and state['current_text']==payload['text']
+
+
+def test_preserved_origins_use_manifest_source_inventory(acquired,tmp_path):
+    _,manifest,*_ = acquired
+    output = tmp_path/'inventory-inputs.json'
+    build(acquired,output)
+    bundle = json.loads(output.read_text())
+    package = json.loads(manifest.read_text())
+    for preserved in bundle['preserved_rows']:
+        file,number = preserved['source_ref'].split('#')
+        expected = package['files'][file]['rows'][int(number)-1]['origin']
+        assert preserved['origin']==expected
+        assert expected['path']==package['source_inventory'][expected['inventory_id']]['path']
+
+
+@pytest.mark.parametrize('code',['conversion_origin_not_acquired','conversion_original_not_acquired'])
+@pytest.mark.parametrize('optional',[False,True])
+def test_origin_errors_are_counted_per_store_and_require_approved_record(acquired,tmp_path,code,optional):
+    from scripts.history_cutover_inputs import build_cutover_inputs
+    home,manifest,staged,evidence,*_ = acquired
+    path = staged/'backfill/journal.jsonl'
+    rows = [json.loads(line) for line in path.read_text().splitlines()]
+    if code=='conversion_origin_not_acquired':
+        for row in rows:
+            row['origin']['path'] = 'data/unacquired.db'
+    else:
+        for row in rows:
+            row['original']['trace_id'] = 'changed-synthetic'
+            row['origin']['row_sha256'] = row_sha256(row['original'])
+    path.write_text('\n'.join(map(dumps,rows))+'\n')
+    manifest.write_text(dumps(prepare_import_manifest(staged)))
+    inventory = dict(optional_conversion_stores=['journal'] if optional else [])
+    record = dict(version=1,approved=True,approval='synthetic-review',output=str(home),inventory=inventory)
+    record['digest'] = procedure().record_digest(record)
+    receipt = json.loads((home/'manifest.json').read_text())
+    receipt['inventory_digest'] = procedure().record_digest(inventory)
+    receipt['digest'] = procedure().record_digest(receipt)
+    (home/'manifest.json').write_text(dumps(receipt))
+    args = dict(acquisition_home=home,conversion_manifest=manifest,staged_raw=staged,
+                forward_start_evidence=evidence,output=tmp_path/'errors-inputs.json',record=record)
+    if optional:
+        result = build_cutover_inputs(**args)
+        assert result['origin_proof_errors']=={'journal':{code:len(rows)}}
+        assert result['preserved_rows']==0
+        assert json.loads(args['output'].read_text())['origin_proof_errors']==result['origin_proof_errors']
+        record['approved'] = False
+        record['digest'] = procedure().record_digest(record)
+        args['output'] = tmp_path/'unapproved.json'
+        with pytest.raises(ValueError,match='approved_optional_store_record_required'):
+            build_cutover_inputs(**args)
+        assert not args['output'].exists()
+    else:
+        with pytest.raises(ValueError,match=code) as failure:
+            build_cutover_inputs(**args)
+        assert failure.value.store_counts=={'journal':{code:len(rows)}}
+        assert not args['output'].exists()
+
+
+def test_real_conversion_inventory_collects_all_native_stores(acquired,tmp_path):
+    from yeoman_gateway.history.convert.run import run_conversion
+    from yeoman_gateway.processing.models import TextPayload
+    from yeoman_shared.utils.helpers import get_operational_store_path
+
+    from scripts.prepare_history_cutover import prepare
+    home,_,_,_,knowledge,raw = acquired
+    phone,ts = '10001@s.whatsapp.net',1_800_000_000_000
+    inbound = home/'data/inbound'
+    inbound.mkdir(parents=True)
+    members = []
+    for filename,store in (('reply_context.db','reply_context'),('archive.db','inbound_archive')):
+        path = inbound/filename
+        with sqlite3.connect(path) as db:
+            db.execute('CREATE TABLE inbound_messages (channel TEXT,chat_id TEXT,message_id TEXT,sender_id TEXT,text TEXT,timestamp INTEGER,opaque BLOB)')
+            db.execute('INSERT INTO inbound_messages VALUES (?,?,?,?,?,?,?)',('whatsapp',phone,store,phone,'Synthetic '+store,ts,b'\x00\xff'))
+        members.append(dict(path=path.relative_to(home).as_posix(),kind='sqlite',exists=True,restore=True))
+    session = inbound/('whatsapp_'+phone+'.jsonl')
+    session.write_text(dumps(dict(role='user',message_id='session_jsonl',sender_id=phone,content='Synthetic session_jsonl',timestamp=ts))+'\n')
+    members.append(dict(path=session.relative_to(home).as_posix(),kind='file',exists=True,restore=True))
+    folder = get_operational_store_path('bridge_references',data_dir=home/'data')
+    folder.mkdir(parents=True)
+    reference = folder/'reference.json'
+    reference.write_text(dumps(dict(chatJid=phone,encoded='synthetic-encoded',storedAtMs=ts)))
+    members.append(dict(path=folder.relative_to(home).as_posix(),kind='tree',exists=True,restore=True))
+    memory = home/'data/memory/memory.db'
+    memory.parent.mkdir(parents=True)
+    with sqlite3.connect(memory) as db:
+        db.execute('CREATE TABLE memory2_nodes (id TEXT,kind TEXT,channel TEXT,chat_id TEXT,sender_id TEXT,source_message_id TEXT,content TEXT,created_at INTEGER,source TEXT,source_role TEXT,meta_json TEXT,is_deleted INTEGER,opaque BLOB)')
+        db.execute('INSERT INTO memory2_nodes VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?)',('node','utterance','whatsapp',phone,phone,'memory','Synthetic memory',ts,'native','user','{}',0,b'\x00\xff'))
+    members.append(dict(path=memory.relative_to(home).as_posix(),kind='sqlite',exists=True,restore=True))
+    processing = home/'data/ops/processing.db'
+    p = ProcessingStore(processing)
+    p.enqueue_effect(effect_id='synthetic-effect',operation_key='synthetic-operation',payload=TextPayload('Synthetic effect'),now_ms=ts)
+    p.close()
+    stores = ('reply_context','inbound_archive','session_jsonl','bridge_refs','memory')
+    with sqlite3.connect(processing) as db:
+        db.row_factory = sqlite3.Row
+        authority = dict(db.execute("SELECT * FROM event_source_authority WHERE event_id='mapped'").fetchone())
+        for name in stores:
+            row = dict(authority,event_id=name)
+            db.execute('INSERT INTO event_source_authority ('+','.join(row)+') VALUES ('+','.join('?' for _ in row)+')',tuple(row.values()))
+        db.commit()
+        db.execute('PRAGMA wal_checkpoint(TRUNCATE)')
+    with sqlite3.connect(knowledge) as db:
+        db.row_factory = sqlite3.Row
+        template = dict(db.execute('SELECT * FROM knowledge_jobs LIMIT 1').fetchone())
+        for name in stores:
+            row = dict(template,job_id='done-'+name,state='done',sources_json=dumps([dict(event_id=name,revision=1,channel='whatsapp')]))
+            db.execute('INSERT INTO knowledge_jobs ('+','.join(row)+') VALUES ('+','.join('?' for _ in row)+')',tuple(row.values()))
+        db.commit()
+        db.execute('PRAGMA wal_checkpoint(TRUNCATE)')
+    with (raw/'whatsapp/messages.jsonl').open('a') as out:
+        for name in stores[:-1]:
+            out.write(dumps(dict(account='synthetic',archive_version=1,channel='whatsapp',chat_id=phone,
+                direction='in',kind='message',received_ms=100,correlation_id='',media=None,native=dict(type='message',payload=dict(
+                    chatJid=phone,senderId=phone,timestamp=ts,messageId=name,text='Synthetic '+name))))+'\n')
+    receipt = json.loads((home/'manifest.json').read_text())
+    receipt['members'].extend(members)
+    for member in receipt['members']:
+        path = home/member['path']
+        if member['kind']=='tree':
+            member['files'] = {p.relative_to(path).as_posix():hashlib.sha256(p.read_bytes()).hexdigest() for p in path.rglob('*') if p.is_file()}
+            member['sha256'] = procedure().record_digest(member['files'])
+        else:
+            member['sha256'] = hashlib.sha256(path.read_bytes()).hexdigest()
+    receipt['digest'] = procedure().record_digest(receipt)
+    (home/'manifest.json').write_text(dumps(receipt))
+    staged = tmp_path/'real-conversion'
+    decoded = dict(key=dict(id='bridge_refs',remoteJid=phone,participant=phone),messageTimestamp=ts//1000,
+                   message=dict(conversation='Synthetic bridge_refs'))
+    run_conversion(home,staged,decode=lambda batch:{name:{'value':decoded} for name,_ in batch})
+    package = prepare_import_manifest(staged)
+    manifest = tmp_path/'real-conversion.json'
+    manifest.write_text(dumps(package))
+    assert all(entry['path'].startswith('sources/') for entry in package['source_inventory'].values())
+    assert not (home/'sources').exists()
+    revised = (home,manifest,staged,acquired[3],knowledge,raw)
+    build(revised,home/'cutover-inputs.json')
+    bundle = json.loads((home/'cutover-inputs.json').read_text())
+    assert {'journal',*stores}<={r['origin']['store'] for r in bundle['preserved_rows']}
+    for row in bundle['preserved_rows']:
+        file,number = row['source_ref'].split('#')
+        assert row['origin']==package['files'][file]['rows'][int(number)-1]['origin']
+        assert row['origin']['row_sha256']==row_sha256(row['preserved_original'])
+    history = tmp_path/'history.db'
+    project([raw],history)
+    policy = tmp_path/'policy-copy.json'
+    policy.write_text(dumps({'defaults':{'whoCanTalk':{'mode':'everyone'}}}))
+    result = prepare(argparse.Namespace(snapshot_home=home,history_db=history,knowledge_source=knowledge,
+        knowledge_target=tmp_path/'v3.db',policy_snapshot=policy,output_root=tmp_path/'aliases'))
+    entries = json.loads((tmp_path/'aliases/legacy-alias-manifest.json').read_text())['entries']
+    for name in stores[:-1]:
+        entry = next(e for e in entries if e['issued']['event_id']==name)
+        assert entry['status']=='mapped' and entry['alias']['message_id']=='whatsapp:'+phone+':'+name
+        assert {proof['origin']['store'] for proof in entry['proofs']}=={name}
+    assert result['unmapped_terminal_job_refs']==1  # Memory capture time does not prove issuance.
+
+
+def test_host_input_errors_have_private_counts_and_cli_has_no_content(acquired,tmp_path,monkeypatch,capsys):
+    from scripts import history_cutover_inputs as inputs
+    from scripts.history_cutover_host import _prepare_inputs
+    home,manifest,staged,evidence,_,raw = acquired
+    acquired_evidence = home/'forward.json'
+    acquired_evidence.write_bytes(evidence.read_bytes())
+    receipts = tmp_path/'receipts'
+    receipts.mkdir()
+    record = dict(output=str(home),receipts=str(receipts),inventory={'optional_conversion_stores':['journal']},layout=dict(
+        preparation_home=str(tmp_path/'prepared'),raw=str(raw),conversion_manifest=str(manifest),staged=str(staged)))
+    error = inputs.InputProofError('conversion_original_not_acquired',{'journal':{'conversion_original_not_acquired':2}})
+    def refuse(**kwargs):
+        assert kwargs['record']==record
+        raise error
+    monkeypatch.setattr(inputs,'build_cutover_inputs',refuse)
+    with pytest.raises(inputs.InputProofError):
+        _prepare_inputs({'record':record},dict(forward_start_evidence_member='forward.json'))
+    proof = receipts/'prepare-input-bundle-errors.json'
+    assert proof.stat().st_mode & 0o777 == 0o600
+    assert json.loads(proof.read_text())==dict(error_code=str(error),origin_proof_errors=error.store_counts)
+    record_file = tmp_path/'record.json'
+    record_file.write_text(dumps(record))
+    argv = ['inputs']
+    for name,path in (('acquisition-home',home),('conversion-manifest',manifest),('staged-raw',staged),
+                      ('forward-start-evidence',evidence),('output',tmp_path/'cli-inputs.json'),('record',record_file)):
+        argv.extend(['--'+name,str(path)])
+    assert inputs.main(argv)==1
+    assert json.loads(capsys.readouterr().out)==dict(ok=False,error=str(error),origin_proof_errors=error.store_counts)
