@@ -16,6 +16,7 @@ from loguru import logger
 from yeoman_gateway.core.models import ArchivedMessage, InboundEvent
 from yeoman_gateway.core.pipeline import NextFn, PipelineContext
 from yeoman_gateway.core.ports import ReplyArchivePort
+from yeoman_gateway.history.live import HistoryPaused
 
 if TYPE_CHECKING:
     from yeoman_gateway.knowledge._contacts.service import ContactsService
@@ -39,14 +40,29 @@ class ReplyContextMiddleware:
         reply_context_window_limit: int = 6,
         reply_context_line_max_chars: int = 500,
         ambient_window_limit: int = 30,
+        history_selected: bool = False,
     ) -> None:
-        self._archive = archive
+        self._legacy_archive = archive
+        self._history_selected = history_selected
         self._contacts = contacts
         #: Public knowledge facade; used in preference to the legacy contacts cache.
         self._knowledge = knowledge
         self._reply_window_limit = max(1, int(reply_context_window_limit))
         self._line_max_chars = max(32, int(reply_context_line_max_chars))
         self._ambient_limit = max(0, int(ambient_window_limit))
+
+    @property
+    def _archive(self) -> ReplyArchivePort | None:
+        if self._history_selected:
+            from yeoman_gateway.adapters.reply_archive_history import HistoryReplyArchiveAdapter
+            from yeoman_gateway.history.context import current_history_snapshot
+            from yeoman_gateway.history.live import HistoryPaused
+            from yeoman_gateway.history.queries import HistoryQueries
+            snapshot = current_history_snapshot()
+            if snapshot is None:
+                raise HistoryPaused('history_scope_required')
+            return HistoryReplyArchiveAdapter(HistoryQueries(snapshot))
+        return self._legacy_archive
 
     async def __call__(self, ctx: PipelineContext, next: NextFn) -> None:
         event, lookup_attempted, archive_hit = self._resolve_reply_context(ctx.event)
@@ -67,6 +83,12 @@ class ReplyContextMiddleware:
             return event, False, False
 
         reply_to_message_id = (event.reply_to_message_id or "").strip()
+        from yeoman_gateway.adapters.reply_archive_history import HistoryReplyArchiveAdapter
+        selected = isinstance(self._archive, HistoryReplyArchiveAdapter)
+        if selected:
+            raw = {key: value for key, value in event.raw_metadata.items() if key not in {
+                'reply_context_source', 'reply_context_window', 'ambient_context_window', 'ambient_context_rows'}}
+            event = replace(event, reply_to_text=None, raw_metadata=raw)
         payload_reply_text = (event.reply_to_text or "").strip()
         # Bridge re-extracts quoted text from the proto, so voice messages
         # arrive as "[Voice Message]" even if the archive has a transcript.
@@ -90,7 +112,7 @@ class ReplyContextMiddleware:
         row = self._archive.lookup_message(
             event.channel, event.chat_id, reply_to_message_id
         )
-        if row is None:
+        if row is None and not selected:
             row = self._archive.lookup_message_any_chat(
                 event.channel,
                 reply_to_message_id,
@@ -142,6 +164,8 @@ class ReplyContextMiddleware:
                 anchor.message_id,
                 limit=self._reply_window_limit,
             )
+        except HistoryPaused:
+            raise
         except Exception:
             return []
         return self._format_lines(before)
@@ -159,6 +183,8 @@ class ReplyContextMiddleware:
                 event.message_id,
                 limit=self._ambient_limit,
             )
+        except HistoryPaused:
+            raise
         except Exception:
             return []
         return self._format_lines(_without_own_thread(before, event))
@@ -175,6 +201,8 @@ class ReplyContextMiddleware:
                 event.message_id,
                 limit=self._ambient_limit,
             )
+        except HistoryPaused:
+            raise
         except Exception:
             return []
         rows: list[dict[str, str | None]] = []
@@ -202,6 +230,9 @@ class ReplyContextMiddleware:
         return lines[: max(self._reply_window_limit, self._ambient_limit)]
 
     def _resolve_speaker(self, row: ArchivedMessage) -> str:
+        from yeoman_gateway.adapters.reply_archive_history import HistoryReplyArchiveAdapter
+        if isinstance(self._archive, HistoryReplyArchiveAdapter):
+            return row.sender_name or row.sender_id or 'unknown'
         if row.sender_id:
             if self._knowledge is not None:
                 # Knowledge names the speaker whenever it can; an outage or an unproven
@@ -209,6 +240,8 @@ class ReplyContextMiddleware:
                 # reported, so it does not look like "this person has no name".
                 try:
                     name = self._knowledge.name_for_identifier(row.sender_id, for_group=True)
+                except HistoryPaused:
+                    raise
                 except Exception as exc:
                     logger.warning(
                         "reply context naming degraded: knowledge lookup failed ({})",

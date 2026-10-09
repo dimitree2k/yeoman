@@ -17,6 +17,7 @@ from typing import TYPE_CHECKING, Any
 from loguru import logger
 
 from yeoman_gateway.agent.tools.base import Tool
+from yeoman_gateway.history.live import HistoryPaused
 
 if TYPE_CHECKING:
     from yeoman_gateway.knowledge._contacts.models import Contact
@@ -204,6 +205,8 @@ def resolve_contact_reference(
                 participant_map=participant_map,
                 participant_ids=participant_ids,
             )
+        except HistoryPaused:
+            raise
         except Exception as exc:
             # Knowledge is optional for the turn: no authority, no target.  The failure
             # stays visible instead of looking exactly like "no proven person".
@@ -414,6 +417,24 @@ class ResolveContactTool(Tool):
         self._chat_id = chat_id
 
     @property
+    def _channel(self) -> str:
+        from yeoman_gateway.processing.tool_context import tool_target
+        return tool_target(default_channel=self._default_channel, default_chat_id=self._default_chat_id)[0]
+
+    @_channel.setter
+    def _channel(self, value: str) -> None:
+        self._default_channel = value
+
+    @property
+    def _chat_id(self) -> str:
+        from yeoman_gateway.processing.tool_context import tool_target
+        return tool_target(default_channel=self._default_channel, default_chat_id=self._default_chat_id)[1]
+
+    @_chat_id.setter
+    def _chat_id(self, value: str) -> None:
+        self._default_chat_id = value
+
+    @property
     def name(self) -> str:
         return "resolve_contact"
 
@@ -439,6 +460,11 @@ class ResolveContactTool(Tool):
         }
 
     async def execute(self, query: str, **kwargs: Any) -> str:
+        from yeoman_gateway.processing.tool_context import tool_history_snapshot
+        snapshot = tool_history_snapshot(selected=getattr(self, '_history_selected', False))
+        if snapshot is not None and self._knowledge is None:
+            from yeoman_gateway.history.live import HistoryPaused
+            raise HistoryPaused('history_knowledge_required')
         del kwargs
         result = resolve_contact_reference(
             contacts=self._contacts,

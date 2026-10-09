@@ -9,6 +9,8 @@ from yeoman_gateway.agent.tools.send_voice import (
     _unresolved_whatsapp_target_error,
 )
 from yeoman_gateway.bus.events import OutboundMessage
+from yeoman_gateway.history.context import history_effect_metadata
+from yeoman_gateway.history.live import HistoryPaused
 
 
 class MessageTool(Tool):
@@ -130,11 +132,14 @@ class MessageTool(Tool):
         msg = OutboundMessage(
             channel=channel,
             chat_id=chat_id,
-            content=content
+            content=content,
+            metadata=history_effect_metadata(),
         )
 
         try:
             await self._send_callback(msg)
             return f"Message delivered to {channel}:{chat_id}. Delivery complete — now produce your brief text confirmation."
+        except HistoryPaused:
+            raise
         except Exception as e:
             return f"Error sending message: {str(e)}"

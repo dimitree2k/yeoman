@@ -11,7 +11,7 @@ import time
 from dataclasses import dataclass, field
 from datetime import datetime, timedelta
 from pathlib import Path
-from typing import TYPE_CHECKING, Any, Awaitable, Callable, override
+from typing import TYPE_CHECKING, Any, Awaitable, Callable, cast, override
 
 from loguru import logger
 from yeoman_shared.telemetry import tracing as lf
@@ -54,6 +54,7 @@ from yeoman_gateway.bus.events import OutboundMessage
 from yeoman_gateway.bus.queue import MessageBus
 from yeoman_gateway.core.models import InboundEvent, PolicyDecision
 from yeoman_gateway.core.ports import ResponderPort, SecurityPort, TelemetryPort
+from yeoman_gateway.history.live import HistoryPaused
 from yeoman_gateway.history.reader import HistorySnapshot
 from yeoman_gateway.media.tts import (
     strip_markdown_for_tts,
@@ -697,6 +698,10 @@ class LLMResponder(ResponderPort):
         self.memory = memory_service
         #: Public person-knowledge facade.  Read paths that need names, rosters or a
         #: protected recall use this instead of reaching into contacts/memory stores.
+        self._history_selected = False
+        self._history_tools_selected = False
+        self._history_projector: Any = None
+        self._history_knowledge: Any = None
         self.knowledge = knowledge
         #: Proof owner for archived turn sources.  Retained for the compositions that
         #: still inject it; registration itself goes through the public facade so the
@@ -918,6 +923,8 @@ class LLMResponder(ResponderPort):
             return
         try:
             self.telemetry.incr(name, value, labels)
+        except HistoryPaused:
+            raise
         except Exception as exc:  # pragma: no cover - defensive logging
             logger.debug("telemetry incr failed {}={}: {}", name, value, exc)
 
@@ -932,11 +939,11 @@ class LLMResponder(ResponderPort):
         reply_to_message_id: str | None = None,
         request_text: str = "",
     ) -> None:
+        from yeoman_gateway.history.context import current_history_snapshot
         from yeoman_gateway.processing.tool_context import (
             ToolInvocationContext,
             set_tool_context,
         )
-
         set_tool_context(
             ToolInvocationContext(
                 channel=channel,
@@ -946,6 +953,8 @@ class LLMResponder(ResponderPort):
                 is_owner=is_owner,
                 reply_to_message_id=reply_to_message_id,
                 request_text=request_text,
+                history_snapshot=(current_history_snapshot()
+                    if getattr(self, '_history_tools_selected', False) and channel == 'whatsapp' else None),
             )
         )
         message_tool = self.tools.get("message")
@@ -1047,6 +1056,8 @@ class LLMResponder(ResponderPort):
             return None, "WhatsApp group resolver is not configured"
         try:
             return resolver(reference)
+        except HistoryPaused:
+            raise
         except Exception as e:
             return None, f"group resolver failed: {e}"
 
@@ -1173,6 +1184,8 @@ class LLMResponder(ResponderPort):
         if self._recording_notifier is not None:
             try:
                 await self._recording_notifier(channel, chat_id)
+            except HistoryPaused:
+                raise
             except Exception:
                 pass  # best-effort
 
@@ -1183,6 +1196,8 @@ class LLMResponder(ResponderPort):
                 voice=voice,
                 format="opus",
             )
+        except HistoryPaused:
+            raise
         except Exception as e:
             return f"Error: TTS synthesis failed ({e.__class__.__name__})"
         if not audio:
@@ -1205,6 +1220,8 @@ class LLMResponder(ResponderPort):
                     media=[str(path)],
                 )
             )
+        except HistoryPaused:
+            raise
         except Exception as exc:
             return f"Error: voice message not delivered ({exc})"
         return f"Voice message delivered to {channel}:{chat_id}."
@@ -1271,6 +1288,8 @@ class LLMResponder(ResponderPort):
                 origin_chat_id=current_chat_id,
                 origin_label=origin_label or current_chat_id,
             )
+        except HistoryPaused:
+            raise
         except Exception as exc:
             logger.warning("private handoff open failed: {}", exc)
 
@@ -1739,6 +1758,8 @@ class LLMResponder(ResponderPort):
                 },
             )
             try:
+                from yeoman_gateway.history.context import history_effect_metadata
+                history_effect_metadata()
                 response = await chat_provider.chat(
                     messages=messages,
                     tools=self._tool_definitions(active_tools),
@@ -1753,6 +1774,8 @@ class LLMResponder(ResponderPort):
                         model or self.model,
                     )
                     raise LLMProviderError()
+            except HistoryPaused:
+                raise
             except Exception:
                 lf.end_generation(
                     generation,
@@ -2350,6 +2373,8 @@ class LLMResponder(ResponderPort):
                 ),
                 timeout=6.0,
             )
+        except HistoryPaused:
+            raise
         except Exception as exc:
             logger.debug("talkative llm message generation failed: {}", exc)
             return None
@@ -2426,7 +2451,30 @@ class LLMResponder(ResponderPort):
                 return llm_message
         return self._talkative_message_for(content)
 
-    async def _generate(
+    async def _generate(self, **kwargs: Any) -> str | None:
+        from yeoman_gateway.history.context import current_history_snapshot
+        from yeoman_gateway.processing.tool_context import (
+            current_tool_context,
+            reset_tool_context,
+            set_tool_context,
+        )
+        selected = getattr(self, '_history_selected', False) and kwargs['channel'] == 'whatsapp'
+        snapshot = kwargs.get('history_snapshot') or current_history_snapshot()
+        if selected and snapshot is None:
+            raise HistoryPaused('history_scope_required')
+        if snapshot is not None:
+            snapshot.assert_current(snapshot.generation)
+        if selected:
+            kwargs['history_snapshot'] = snapshot
+        if not selected and not getattr(self, '_history_tools_selected', False):
+            return await self._generate_scoped(**kwargs)
+        token = set_tool_context(current_tool_context())
+        try:
+            return await self._generate_scoped(**kwargs)
+        finally:
+            reset_tool_context(token)
+
+    async def _generate_scoped(
         self,
         *,
         session_key: str,
@@ -2534,6 +2582,8 @@ class LLMResponder(ResponderPort):
             writer_model = str(getattr(resolved_profile, "model", "") or "").strip()
             try:
                 writer_provider = self._provider_for_profile(resolved_profile)
+            except HistoryPaused:
+                raise
             except Exception as exc:  # noqa: BLE001 - route binding fails closed
                 raise ParticipationDraftError("provider_error") from exc
             if not writer_model or writer_provider is None:
@@ -2733,7 +2783,8 @@ class LLMResponder(ResponderPort):
         )
 
         if self._should_hold_back_after_social_reply(
-            session_messages=session.messages,
+            session_messages=(self.sessions.recent_history(channel=channel, chat_id=chat_id,
+                snapshot=history_snapshot, limit=30) if session.operational_store is not None else session.messages),
             content=content,
             metadata=metadata,
             is_owner=is_owner,
@@ -2768,12 +2819,14 @@ class LLMResponder(ResponderPort):
                         "temporary_media_retrieval_chars",
                         len(str(retrieval.get("content") or "")),
                     )
+            except HistoryPaused:
+                raise
             except Exception as e:
                 logger.warning("lazy media retrieval failed: {}", e)
 
         retrieved_memory_text = ""
         retrieved_hits_count = 0
-        if self.memory is not None:
+        if self.memory is not None and not (getattr(self, '_history_selected', False) and channel == 'whatsapp'):
             try:
                 # Augment the memory query with recent ambient messages so that vague
                 # inputs like "what do you think?" can surface relevant memories.
@@ -2808,6 +2861,8 @@ class LLMResponder(ResponderPort):
                 )
                 if shared_text:
                     retrieved_memory_text = f"{retrieved_memory_text}\n{shared_text}".strip()
+            except HistoryPaused:
+                raise
             except Exception as e:
                 logger.warning("memory recall failed: {}", e)
 
@@ -2817,6 +2872,14 @@ class LLMResponder(ResponderPort):
                 self._metric("memory_recall_miss")
             if retrieved_memory_text:
                 self._metric("memory_prompt_chars", len(retrieved_memory_text))
+
+        if getattr(self, '_history_selected', False) and channel == 'whatsapp':
+            shared = self._shared_fact_context(query=content, channel=channel, chat_id=chat_id, is_owner=is_owner)
+            context = self._knowledge_read_context(channel=channel, chat_id=chat_id,
+                principal=canonical_id, is_owner=is_owner)
+            from yeoman_gateway.knowledge.models import RecallQuery
+            statements = cast(Any, self.knowledge).recall(RecallQuery(text=content, limit=5), context=context, require_match=True).text if self.knowledge is not None and context is not None else ''
+            retrieved_memory_text = '\n'.join(value for value in (shared, statements) if value)
 
         talkative_reply = await self._maybe_talkative_cooldown_reply(
             session_key=session_key,
@@ -2979,6 +3042,8 @@ class LLMResponder(ResponderPort):
                     self._metric("memory_capture_dropped_safety", capture_result.dropped_safety)
                 if capture_result.deduped:
                     self._metric("memory_capture_deduped", capture_result.deduped)
+            except HistoryPaused:
+                raise
             except Exception as e:
                 logger.warning("memory capture failed: {}", e)
 
@@ -2986,6 +3051,8 @@ class LLMResponder(ResponderPort):
             # on its own worker thread, so this never waits for a model call here.
             try:
                 self._enqueue_shared_extraction(channel=channel, chat_id=chat_id)
+            except HistoryPaused:
+                raise
             except Exception as e:
                 logger.warning("shared fact extraction enqueue failed: {}", e)
 
@@ -2994,6 +3061,8 @@ class LLMResponder(ResponderPort):
             # is not a capture: no statement is published here.
             try:
                 self._register_turn_knowledge_sources(channel=channel, chat_id=chat_id)
+            except HistoryPaused:
+                raise
             except Exception as e:
                 logger.warning("knowledge source registration failed: {}", e)
 
@@ -3005,6 +3074,8 @@ class LLMResponder(ResponderPort):
         if private_handoff_id and self._private_handoff_store is not None:
             try:
                 self._private_handoff_store.consume_reply(private_handoff_id)
+            except HistoryPaused:
+                raise
             except Exception as exc:
                 logger.warning("private handoff consume failed: {}", exc)
         lf.end_span(
@@ -3218,6 +3289,8 @@ class LLMResponder(ResponderPort):
         if callable(issued):
             try:
                 known = issued(str(event_id), int(revision))
+            except HistoryPaused:
+                raise
             except Exception:  # pragma: no cover - defensive
                 known = None
             if known is not None:
@@ -3228,6 +3301,8 @@ class LLMResponder(ResponderPort):
         if callable(get_event):
             try:
                 event = get_event(str(event_id))
+            except HistoryPaused:
+                raise
             except Exception:  # pragma: no cover - defensive
                 event = None
             if event is not None:
@@ -3262,6 +3337,8 @@ class LLMResponder(ResponderPort):
             if callable(method):
                 try:
                     value = method(event_id)
+                except HistoryPaused:
+                    raise
                 except Exception:  # pragma: no cover - defensive
                     value = None
                 if value:
@@ -3333,6 +3410,12 @@ class LLMResponder(ResponderPort):
         session_key: str | None = None,
         history_snapshot: HistorySnapshot | None = None,
     ) -> str | None:
+        from yeoman_gateway.history.context import current_history_snapshot
+        if self._history_selected and event.channel == 'whatsapp':
+            history_snapshot = history_snapshot or current_history_snapshot()
+            if history_snapshot is None:
+                raise HistoryPaused('history_scope_required')
+            history_snapshot.assert_current(history_snapshot.generation)
         route_channel, route_chat_id = self._route_for_event(event)
         # A caller that knows the thread passes a thread-scoped key; without one the
         # previous chat-scoped derivation stays byte-identical.
@@ -3537,6 +3620,8 @@ class LLMResponder(ResponderPort):
                 require_managed=True,
                 admission=admission,
             )
+        except HistoryPaused:
+            raise
         except Exception as exc:
             logger.warning(
                 "participation_submission_failed error_type={}", type(exc).__name__
@@ -3579,6 +3664,8 @@ class LLMResponder(ResponderPort):
                 require_managed=True,
                 admission=admission,
             )
+        except HistoryPaused:
+            raise
         except Exception as exc:
             logger.warning(
                 "participation_reaction_failed error_type={}", type(exc).__name__
@@ -3645,6 +3732,18 @@ class LLMResponder(ResponderPort):
         sender_id: str | None = None,
         metadata: dict[str, object] | None = None,
     ) -> str:
+        from yeoman_gateway.history.context import (
+            current_history_snapshot,
+            history_knowledge_scope,
+            history_turn,
+        )
+        if (self._history_selected or self._history_tools_selected) and channel == 'whatsapp' and current_history_snapshot() is None:
+            arguments = dict(locals())
+            for key in ('self', 'content', 'current_history_snapshot', 'history_knowledge_scope', 'history_turn'):
+                arguments.pop(key, None)
+            async with history_turn(self._history_projector) as snapshot:
+                with history_knowledge_scope(snapshot, self._history_knowledge):
+                    return await self.process_direct(content, **arguments)
         return await self._generate(
             session_key=session_key,
             channel=channel,

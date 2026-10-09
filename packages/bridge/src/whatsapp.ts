@@ -15,7 +15,7 @@ import { Boom } from '@hapi/boom';
 import pino from 'pino';
 import qrcode from 'qrcode-terminal';
 
-import { createEventEnvelope, deriveEditSignalIdentity, deriveProviderEventIdentity, MAX_BRIDGE_FRAME_BYTES, MEDIA_METADATA_FIELDS, type BridgeForwardResult, type BridgePollResult } from './protocol.js';
+import { validHistoryMentions, createEventEnvelope, deriveEditSignalIdentity, deriveProviderEventIdentity, MAX_BRIDGE_FRAME_BYTES, MEDIA_METADATA_FIELDS, type BridgeForwardResult, type BridgePollResult } from './protocol.js';
 import {
   defaultMessageReferenceDir,
   MessageReferenceStore,
@@ -107,6 +107,7 @@ export interface SendMediaInput {
   caption?: string;
   replyToMessageId?: string;
   mentions?: string[];
+  historyMentionsResolved?: boolean;
   clientMessageId?: string;
 }
 
@@ -1011,16 +1012,20 @@ export class WhatsAppClient {
    * where a mapping is known. Returns translated JIDs and a token replacement
    * map (LID token → phone token) for rewriting mention text.
    */
-  private translateMentions(mentions: string[] | undefined): {
+  private translateMentions(mentions: string[] | undefined, historyMentionsResolved = false): {
     jids: string[] | undefined;
     textReplacements: Map<string, string>;
   } {
     const textReplacements = new Map<string, string>();
+    if (historyMentionsResolved) {
+      if (!validHistoryMentions({ historyMentionsResolved, mentions })) throw new Error('Unresolved history mention');
+      return { jids: mentions, textReplacements };
+    }
     if (!mentions || mentions.length === 0) return { jids: mentions, textReplacements };
     const result: string[] = [];
     const seen = new Set<string>();
     for (const jid of mentions) {
-      const phone = this.resolvePhoneJid(jid);
+      const phone = jid.endsWith('@lid') ? this.resolvePhoneJid(jid) : undefined;
       const resolved = phone || jid;
       if (phone) {
         const lidToken = jidUserToken(jid);
@@ -2324,6 +2329,7 @@ export class WhatsAppClient {
     replyToMessageId?: string,
     mentions?: string[],
     clientMessageId?: string,
+    historyMentionsResolved = false,
   ): Promise<{
     to: string;
     messageId?: string;
@@ -2333,8 +2339,9 @@ export class WhatsAppClient {
     if (!this.sock || !this.connected) {
       throw new Error('Not connected');
     }
+    if (!validHistoryMentions({ historyMentionsResolved, mentions })) throw new Error('Unresolved history mention');
     const quoted = await this.resolveQuotedMessage(to, replyToMessageId);
-    const { jids: translatedMentions, textReplacements } = this.translateMentions(normalizeMentions(mentions));
+    const { jids: translatedMentions, textReplacements } = this.translateMentions(historyMentionsResolved ? mentions : normalizeMentions(mentions), historyMentionsResolved);
     let finalText = limitText(text, 8_000);
     for (const [lidToken, phoneToken] of textReplacements) {
       finalText = finalText.replaceAll(`@${lidToken}`, `@${phoneToken}`);
@@ -2406,13 +2413,14 @@ export class WhatsAppClient {
       throw new Error('Not connected');
     }
 
+    if (!validHistoryMentions(input as unknown as Record<string, unknown>)) throw new Error('Unresolved history mention');
     const quoted = await this.resolveQuotedMessage(input.to, input.replyToMessageId);
     const media = await loadMediaSource(input, {
       allowedLocalMediaRoots: [this.mediaOutgoingDir],
     });
     const kind = mediaKindFromMime(media.mimeType);
     let caption = input.caption ? limitText(input.caption, 2_000) : undefined;
-    const translated = caption ? this.translateMentions(normalizeMentions(input.mentions)) : undefined;
+    const translated = caption ? this.translateMentions(input.historyMentionsResolved ? input.mentions : normalizeMentions(input.mentions), input.historyMentionsResolved) : undefined;
     const mentions = translated?.jids;
     const sendOptions = {
       ...(quoted ? { quoted } : {}),

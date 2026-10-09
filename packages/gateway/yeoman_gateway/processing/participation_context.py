@@ -26,6 +26,7 @@ from dataclasses import dataclass
 from datetime import UTC, datetime
 from typing import Any
 
+from yeoman_gateway.history.live import HistoryPaused
 from yeoman_gateway.policy.engine import ParticipationSnapshot
 from yeoman_gateway.processing.participation import (
     ParticipationDecisionError,
@@ -95,6 +96,18 @@ class ParticipationDecisionInputs:
         )
 
 
+class _ParticipationArchive:
+    def __init__(self, adapter):
+        self.adapter = adapter
+
+    def lookup_message(self, channel, chat_id, message_id):
+        row = self.adapter.row(channel, chat_id, message_id)
+        return {**row, 'message_id': message_id} if row else None
+
+    def lookup_messages_in_range(self, *args, **kwargs):
+        return self.adapter.lookup_messages_in_range(*args, **kwargs)
+
+
 class ParticipationContextBuilder:
     """Builds the bounded judge/generator view from archived sources and anchors."""
 
@@ -111,7 +124,8 @@ class ParticipationContextBuilder:
         knowledge_context_supplier: Callable[[ParticipationOpportunity, Mapping[str, Any]], Any]
         | None = None,
     ) -> None:
-        self._archive = archive
+        self._legacy_archive = archive
+        self._history_selected = False
         # Kept on the constructor for old object construction; decision inputs are the
         # sole source of trusted policy values during ``build``.
         self._policy = policy
@@ -121,6 +135,20 @@ class ParticipationContextBuilder:
         self._source_authorizer = source_authorizer
         self._knowledge_selector = knowledge_selector
         self._knowledge_context_supplier = knowledge_context_supplier
+
+    @property
+    def _archive(self):
+        if self._history_selected:
+            from yeoman_gateway.adapters.reply_archive_history import HistoryReplyArchiveAdapter
+            from yeoman_gateway.history.context import current_history_snapshot
+            from yeoman_gateway.history.queries import HistoryQueries
+            snapshot = current_history_snapshot()
+            if snapshot is None:
+                raise HistoryPaused('history_scope_required')
+            adapter = HistoryReplyArchiveAdapter(HistoryQueries(snapshot))
+            # Participation consumes row dictionaries, not the reply port's model.
+            return _ParticipationArchive(adapter)
+        return self._legacy_archive
 
     async def build(
         self,
@@ -236,7 +264,14 @@ class ParticipationContextBuilder:
                     continue
                 if not anchor.get("provider_message_id"):
                     continue
-                anchors.append(dict(anchor))
+                current = dict(anchor)
+                if self._history_selected and opportunity.channel == 'whatsapp':
+                    row = self._archive.lookup_message(opportunity.channel, opportunity.chat_id,
+                        str(anchor['provider_message_id']))
+                    if row is None:
+                        continue
+                    current['message'] = row['text']
+                anchors.append(current)
 
         current_source_ids = _unique_ids(inputs.current_source_ids) or required_ids
         allowed_intents = tuple(sorted(str(item) for item in inputs.allowed_intents))
@@ -317,6 +352,8 @@ class ParticipationContextBuilder:
                     )
                 else:
                     context["knowledge_selection_status"] = "denied"
+            except HistoryPaused:
+                raise
             except Exception:
                 # Retrieval outages preserve the existing recent-chat-only path.
                 context["knowledge_selection_status"] = "error"
@@ -387,6 +424,8 @@ class ParticipationContextBuilder:
             return False
         try:
             return bool(self._source_authorizer(row))
+        except HistoryPaused:
+            raise
         except Exception:
             return False
 
@@ -402,6 +441,8 @@ class ParticipationContextBuilder:
             return []
         try:
             hits = self._taste(opportunity.channel, opportunity.chat_id)
+        except HistoryPaused:
+            raise
         except Exception:
             return []
         if not isinstance(hits, Iterable):

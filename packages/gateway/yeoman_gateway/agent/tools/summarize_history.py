@@ -47,6 +47,34 @@ class SummarizeHistoryTool(Tool):
         self._is_owner = is_owner
 
     @property
+    def _channel(self) -> str:
+        from yeoman_gateway.processing.tool_context import tool_target
+        return tool_target(default_channel=self._default_channel, default_chat_id=self._default_chat_id)[0]
+
+    @_channel.setter
+    def _channel(self, value: str) -> None:
+        self._default_channel = value
+
+    @property
+    def _chat_id(self) -> str:
+        from yeoman_gateway.processing.tool_context import tool_target
+        return tool_target(default_channel=self._default_channel, default_chat_id=self._default_chat_id)[1]
+
+    @_chat_id.setter
+    def _chat_id(self, value: str) -> None:
+        self._default_chat_id = value
+
+    @property
+    def _is_owner(self) -> bool:
+        from yeoman_gateway.processing.tool_context import current_tool_context
+        context = current_tool_context()
+        return context.is_owner if context is not None else self._default_is_owner
+
+    @_is_owner.setter
+    def _is_owner(self, value: bool) -> None:
+        self._default_is_owner = value
+
+    @property
     def name(self) -> str:
         return "summarize_history"
 
@@ -120,9 +148,16 @@ class SummarizeHistoryTool(Tool):
         hours_back = kwargs.get("hours_back")
         since = self._compute_since(hours_back)
 
-        rows = self._archive.lookup_messages_in_range(
-            target_channel, target_chat_id, since, limit=300
-        )
+        from yeoman_gateway.processing.tool_context import tool_history_snapshot
+        snapshot = tool_history_snapshot(selected=getattr(self, '_history_selected', False))
+        if snapshot is not None and target_channel == 'whatsapp':
+            from yeoman_gateway.adapters.reply_archive_history import HistoryReplyArchiveAdapter
+            from yeoman_gateway.history.queries import HistoryQueries
+            rows = HistoryReplyArchiveAdapter(HistoryQueries(snapshot)).lookup_messages_in_range(
+                target_channel, target_chat_id, since, limit=300)
+        else:
+            rows = self._archive.lookup_messages_in_range(
+                target_channel, target_chat_id, since, limit=300)
         if not rows:
             return "No messages found in the requested time range."
 
@@ -173,6 +208,14 @@ class SummarizeHistoryTool(Tool):
         nothing and raises nothing - a summary is still worth printing with the names
         the archive already carries.
         """
+        from yeoman_gateway.processing.tool_context import tool_history_snapshot
+        snapshot = tool_history_snapshot(selected=getattr(self, '_history_selected', False))
+        if snapshot is not None:
+            from yeoman_gateway.history.queries import HistoryQueries
+            queries = HistoryQueries(snapshot)
+            contact_id = queries.resolve_identifier(identifier, at_ms=None, time_basis='current')
+            contact = queries.contact(contact_id) if contact_id else None
+            return contact['display_name'] if contact else None
         if self._knowledge is not None:
             try:
                 person_id = self._knowledge.person_id_for_value(identifier)

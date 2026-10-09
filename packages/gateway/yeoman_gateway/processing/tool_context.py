@@ -14,6 +14,10 @@ from __future__ import annotations
 
 from contextvars import ContextVar
 from dataclasses import dataclass
+from typing import TYPE_CHECKING
+
+if TYPE_CHECKING:
+    from yeoman_gateway.history.reader import HistorySnapshot
 
 
 @dataclass(frozen=True, slots=True)
@@ -30,6 +34,7 @@ class ToolInvocationContext:
     turn_revision: int | None = None
     canonical_user_id: str = ""
     request_text: str = ""
+    history_snapshot: HistorySnapshot | None = None
 
 
 CURRENT_TOOL_CONTEXT: ContextVar[ToolInvocationContext | None] = ContextVar(
@@ -52,6 +57,19 @@ CURRENT_TURN_SIGNALS: ContextVar[dict[str, object] | None] = ContextVar(
 def current_tool_context() -> ToolInvocationContext | None:
     """The context of the tool call currently running, if the caller set one."""
     return CURRENT_TOOL_CONTEXT.get()
+
+
+def tool_history_snapshot(*, selected: bool = False) -> HistorySnapshot | None:
+    context = current_tool_context()
+    if context is not None and context.channel != 'whatsapp':
+        return None
+    snapshot = context.history_snapshot if context is not None else None
+    if snapshot is not None:
+        snapshot.assert_current(snapshot.generation)
+    elif selected:
+        from yeoman_gateway.history.live import HistoryPaused
+        raise HistoryPaused('tool_history_scope_required')
+    return snapshot
 
 
 def set_tool_context(context: ToolInvocationContext | None):

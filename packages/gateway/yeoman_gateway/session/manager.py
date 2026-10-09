@@ -167,6 +167,7 @@ class Session:
         if self.operational_store is not None:
             if self.history_snapshot is None:
                 raise HistoryPaused("session_snapshot_required")
+            from yeoman_gateway.adapters.reply_archive_history import history_text
             queries = HistoryQueries(self.history_snapshot)
             rows = queries.recent(
                 chat_id=self.chat_id,
@@ -193,7 +194,7 @@ class Session:
                 local.append(row)
             history = local
             preceding = [{"role": "assistant" if row["direction"] == "out" else "user",
-                          "content": row["current_text"] or "", "message_id": row["native_message_id"],
+                          "content": history_text(row), "message_id": row["native_message_id"],
                           "timestamp": row["sent_ms"], "sender_id": row["sender_identifier"]}
                          for row in rows]
             if self.thread_id and not self.chat_id.endswith("@g.us"):

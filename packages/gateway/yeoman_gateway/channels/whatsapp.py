@@ -12,6 +12,7 @@ import threading
 import time
 import unicodedata
 import uuid
+from contextvars import ContextVar
 from dataclasses import dataclass, replace
 from datetime import UTC, datetime
 from typing import TYPE_CHECKING, Any
@@ -40,6 +41,7 @@ from yeoman_gateway.bus.queue import MessageBus
 from yeoman_gateway.channels.base import BaseChannel
 from yeoman_gateway.channels.whatsapp_runtime import WhatsAppRuntimeManager
 from yeoman_gateway.core.models import InboundEvent as CoreInboundEvent
+from yeoman_gateway.history.live import HistoryPaused
 from yeoman_gateway.implicit_addressing import (
     DEFAULT_BOT_NAME_ALIASES,
     contains_bot_name,
@@ -84,6 +86,7 @@ def _canonical_provider_value(value: Any) -> Any:
     }
 
 if TYPE_CHECKING:
+    from yeoman_gateway.history.reader import HistorySnapshot
     from yeoman_gateway.media.document_cache import DocumentCache
     from yeoman_gateway.media.router import ModelRouter
     from yeoman_gateway.providers.factory import ProviderFactory
@@ -129,6 +132,58 @@ def _markdown_to_whatsapp(text: str) -> str:
         text = text.replace(f"\x00CB{i}\x00", f"```\n{code}\n```")
 
     return text.strip()
+
+
+_SEND_HISTORY_GENERATION: ContextVar[int | None] = ContextVar('whatsapp_send_history_generation', default=None)
+
+
+def resolve_history_mentions(text: str, metadata: dict[str, Any] | None, *, chat_id: str, snapshot: HistorySnapshot | None) -> tuple[str, dict[str, Any]]:
+    from yeoman_gateway.history.live import HistoryPaused
+    from yeoman_gateway.history.queries import HistoryQueries
+    if snapshot is None:
+        raise HistoryPaused('mention_history_scope_required')
+    queries = HistoryQueries(snapshot)
+    candidates = list((metadata or {}).get('mentions') or ()) + list((metadata or {}).get('mention_candidates') or ())
+    explicit = set((metadata or {}).get('mentions') or ())
+    now_ms = time.time_ns() // 1_000_000
+    resolved = []
+    replacements = {}
+    for candidate in candidates:
+        phone = queries.mention(candidate, chat_id=chat_id, at_ms=now_ms)
+        if phone is None:
+            if candidate in explicit:
+                raise HistoryPaused('mention_unresolved')
+            continue
+        if phone not in resolved and candidate in explicit:
+            resolved.append(phone)
+        candidate_token = _whatsapp_jid_user_token(candidate)
+        if candidate_token in replacements and replacements[candidate_token] != phone:
+            raise HistoryPaused('mention_ambiguous')
+        replacements[candidate_token] = phone
+    for match in _WHATSAPP_MENTION_RE.finditer(text):
+        token = match.group(1).rstrip(_WHATSAPP_MENTION_TOKEN_TRAILING)
+        phone = replacements.get(token)
+        if phone is None:
+            values = (token,) if '@' in token else (f'{token}@s.whatsapp.net', f'{token}@lid') if token.isdigit() else ()
+            phones = {value for candidate in values if (value := queries.mention(candidate, chat_id=chat_id, at_ms=now_ms)) is not None}
+            if len(phones) == 1:
+                phone = next(iter(phones))
+        if phone is None:
+            if token.endswith('@lid'):
+                raise HistoryPaused('mention_unresolved')
+            continue
+        replacements[token] = phone
+        if phone not in resolved:
+            resolved.append(phone)
+    def rewrite(match: re.Match[str]) -> str:
+        raw = match.group(1)
+        token = raw.rstrip(_WHATSAPP_MENTION_TOKEN_TRAILING)
+        phone = replacements.get(token)
+        if phone is None:
+            return match.group(0)
+        return '@' + _whatsapp_jid_user_token(phone) + raw[len(token):]
+    text = _WHATSAPP_MENTION_RE.sub(rewrite, text)
+    return text, {'historyMentionsResolved': True, 'mentions': resolved}
 
 
 _WHATSAPP_MENTION_RE = re.compile(r"(?<!\w)@([^\s@]+(?:@[^\s@]+)?)")
@@ -283,6 +338,10 @@ class WhatsAppChannel(BaseChannel):
     ):
         super().__init__(config, bus)
         self.config: WhatsAppConfig = config
+        self._history_projector: Any = None
+        self._history_selected = False
+        self._history_mentions_selected = False
+        self._history_knowledge: Any = None
         self.inbound_archive = inbound_archive
         self._model_router = model_router
         self._media_storage = media_storage or MediaStorage(
@@ -575,6 +634,32 @@ class WhatsAppChannel(BaseChannel):
             self._chat_registry = None
 
     async def send(self, msg: OutboundMessage) -> None:
+        from yeoman_gateway.history.context import (
+            current_history_snapshot,
+            history_effect_metadata,
+            history_turn,
+        )
+        generation = msg.metadata.get('history_generation')
+        if generation is None:
+            generation = history_effect_metadata().get('history_generation')
+        if getattr(self, '_history_mentions_selected', getattr(self, '_history_selected', False)) and not msg.metadata.get('historyMentionsResolved'):
+            snapshot = current_history_snapshot()
+            if snapshot is None:
+                # Bus consumers own no turn; prepare identity before waiting on transport.
+                async with history_turn(self._history_projector) as snapshot:
+                    text, mentions = resolve_history_mentions(msg.content, msg.metadata, chat_id=msg.chat_id, snapshot=snapshot)
+                    if generation is None:
+                        generation = history_effect_metadata()['history_generation']
+            else:
+                text, mentions = resolve_history_mentions(msg.content, msg.metadata, chat_id=msg.chat_id, snapshot=snapshot)
+            msg = replace(msg, content=text, metadata={**msg.metadata, **mentions})
+        token = _SEND_HISTORY_GENERATION.set(generation)
+        try:
+            return await self._send_scoped(msg)
+        finally:
+            _SEND_HISTORY_GENERATION.reset(token)
+
+    async def _send_scoped(self, msg: OutboundMessage) -> None:
         """Send a message through WhatsApp."""
         if not self._connected:
             connected = await self._wait_connected_for_send(SEND_CONNECT_WAIT_SECONDS)
@@ -649,7 +734,8 @@ class WhatsAppChannel(BaseChannel):
         text = _markdown_to_whatsapp(msg.content)
         # Rewrite +phone to @phone so the mention resolver picks them up.
         text = _PHONE_MENTION_RE.sub(r"@\1", text)
-        mentions = self._resolve_outbound_mentions(text, msg.metadata)
+        mentions = (list(msg.metadata.get('mentions') or ()) if msg.metadata.get('historyMentionsResolved')
+                    else self._resolve_outbound_mentions(text, msg.metadata))
         allow_mentions = bool(mentions) and msg.chat_id.endswith("@g.us")
 
         if msg.media:
@@ -699,6 +785,8 @@ class WhatsAppChannel(BaseChannel):
                 }
                 if reply_to:
                     payload["replyToMessageId"] = reply_to
+                if msg.metadata.get('historyMentionsResolved'):
+                    payload['historyMentionsResolved'] = True
                 if allow_mentions and caption:
                     payload["mentions"] = list(mentions)
                 media_result = await self._send_command_with_retry(
@@ -735,6 +823,8 @@ class WhatsAppChannel(BaseChannel):
             "to": msg.chat_id,
             "text": text,
         }
+        if msg.metadata.get('historyMentionsResolved'):
+            payload['historyMentionsResolved'] = True
         if reply_to:
             payload["replyToMessageId"] = reply_to
         if allow_mentions:
@@ -781,6 +871,17 @@ class WhatsAppChannel(BaseChannel):
         await self._stop_typing(chat_id)
 
     async def send_reaction(self, msg: ReactionMessage) -> None:
+        from yeoman_gateway.history.context import history_effect_metadata
+        generation = msg.metadata.get('history_generation')
+        if generation is None:
+            generation = history_effect_metadata().get('history_generation')
+        token = _SEND_HISTORY_GENERATION.set(generation)
+        try:
+            return await self._send_reaction_scoped(msg)
+        finally:
+            _SEND_HISTORY_GENERATION.reset(token)
+
+    async def _send_reaction_scoped(self, msg: ReactionMessage) -> None:
         """Send a reaction emoji to a specific message via WhatsApp."""
         if not self._connected:
             connected = await self._wait_connected_for_send(SEND_CONNECT_WAIT_SECONDS)
@@ -1746,6 +1847,18 @@ class WhatsAppChannel(BaseChannel):
         return "\n".join(part for part in parts if part)
 
     async def _maybe_answer_ambient(self, event: InboundEvent) -> _AmbientOutcome:
+        if self._history_selected:
+            from yeoman_gateway.history.context import history_knowledge_scope, history_turn
+            from yeoman_gateway.history.live import HistoryPaused
+            try:
+                async with history_turn(self._history_projector) as snapshot:
+                    with history_knowledge_scope(snapshot, self._history_knowledge):
+                        return await self._answer_ambient_scoped(event)
+            except HistoryPaused:
+                return _AmbientOutcome()
+        return await self._answer_ambient_scoped(event)
+
+    async def _answer_ambient_scoped(self, event: InboundEvent) -> _AmbientOutcome:
         """Ask the judge about an unaddressed message.
 
         The brake already ran in the gate, so this is the second half of the decision. The
@@ -1766,6 +1879,8 @@ class WhatsAppChannel(BaseChannel):
             return _AmbientOutcome()
         try:
             verdict = await self._ambient_judge.decide(self._judge_input(event))
+        except HistoryPaused:
+            raise
         except Exception as exc:
             logger.warning(
                 "ambient_judge_failed chat={} message_id={} error_type={}",
@@ -1787,6 +1902,8 @@ class WhatsAppChannel(BaseChannel):
         try:
             core_event = self._to_core_event(event, event.message_id)
             assignment = self._processing_gate.reconcile_reply(core_event)
+        except HistoryPaused:
+            raise
         except Exception as exc:
             logger.warning(
                 "ambient_reply_failed chat={} message_id={} error_type={}",
@@ -1986,6 +2103,23 @@ class WhatsAppChannel(BaseChannel):
         if self._is_duplicate(event.chat_jid, event.message_id):
             return
 
+        from yeoman_gateway.history.context import history_knowledge_scope, history_turn
+        from yeoman_gateway.history.live import HistoryPaused
+        if self._history_selected:
+            try:
+                async with history_turn(self._history_projector) as snapshot:
+                    with history_knowledge_scope(snapshot, self._history_knowledge):
+                        event, ambient_candidate, denied = await self._admit_inbound_event(event)
+            except HistoryPaused:
+                self._archive_inbound_event(event)
+                return
+        else:
+            event, ambient_candidate, denied = await self._admit_inbound_event(event)
+        if denied:
+            return
+        await self._enrich_and_publish_inbound(event, ambient_candidate)
+
+    async def _admit_inbound_event(self, event):
         ambient_candidate = False
         if self._processing_gate is not None:
             request = self._processing_request(event)
@@ -2029,8 +2163,10 @@ class WhatsAppChannel(BaseChannel):
                 # The owner wants a complete inbound record, so a refused message is
                 # archived before the pipeline drops it.
                 self._archive_inbound_event(event)
-                return
+                return event, ambient_candidate, True
+        return event, ambient_candidate, False
 
+    async def _enrich_and_publish_inbound(self, event, ambient_candidate):
         event = await self._enrich_media_event(event)
         self._index_approved_enrichments(event)
         if ambient_candidate:
@@ -2366,7 +2502,7 @@ class WhatsAppChannel(BaseChannel):
             )
             # Seed quoted target text when available so reply lookups can work
             # even if the original inbound message was not captured by this runtime.
-            if event.reply_to_message_id and event.reply_to_text:
+            if not self._history_selected and event.reply_to_message_id and event.reply_to_text:
                 self.inbound_archive.record_inbound(
                     channel=self.name,
                     chat_id=event.chat_jid,
@@ -2997,6 +3133,10 @@ class WhatsAppChannel(BaseChannel):
         if not self._ws:
             raise RuntimeError("Bridge websocket not connected")
 
+        if command_type in {'send_text', 'send_media'}:
+            from yeoman_shared.whatsapp_protocol import valid_history_mentions
+            if not valid_history_mentions(payload):
+                raise ValueError('invalid history mentions')
         request_id = uuid.uuid4().hex
         envelope = {
             "version": PROTOCOL_VERSION,
@@ -3035,6 +3175,10 @@ class WhatsAppChannel(BaseChannel):
                 self._summarize_command_payload(command_type, payload),
             )
             async with self._send_lock:
+                generation = _SEND_HISTORY_GENERATION.get()
+                if generation is not None:
+                    from yeoman_gateway.history.context import validate_history_effect_generation
+                    validate_history_effect_generation(self._history_projector, generation)
                 await self._ws.send(encoded)
             result = await asyncio.wait_for(future, timeout=timeout_seconds)
             try:
@@ -3233,6 +3377,8 @@ class WhatsAppChannel(BaseChannel):
                     timeout_seconds=timeout_seconds,
                 )
             except asyncio.CancelledError:
+                raise
+            except HistoryPaused:
                 raise
             except Exception as err:
                 if attempt >= attempts or not self._is_retryable_send_error(err):

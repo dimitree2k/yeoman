@@ -45,6 +45,34 @@ class MediaHistoryTool(Tool):
         self._is_owner = is_owner
 
     @property
+    def _channel(self) -> str:
+        from yeoman_gateway.processing.tool_context import tool_target
+        return tool_target(default_channel=self._default_channel, default_chat_id=self._default_chat_id)[0]
+
+    @_channel.setter
+    def _channel(self, value: str) -> None:
+        self._default_channel = value
+
+    @property
+    def _chat_id(self) -> str:
+        from yeoman_gateway.processing.tool_context import tool_target
+        return tool_target(default_channel=self._default_channel, default_chat_id=self._default_chat_id)[1]
+
+    @_chat_id.setter
+    def _chat_id(self, value: str) -> None:
+        self._default_chat_id = value
+
+    @property
+    def _is_owner(self) -> bool:
+        from yeoman_gateway.processing.tool_context import current_tool_context
+        context = current_tool_context()
+        return context.is_owner if context is not None else self._default_is_owner
+
+    @_is_owner.setter
+    def _is_owner(self, value: bool) -> None:
+        self._default_is_owner = value
+
+    @property
     def name(self) -> str:
         return "media_history"
 
@@ -134,7 +162,30 @@ class MediaHistoryTool(Tool):
         message_id = str(kwargs.get("message_id") or "").strip()
         limit = max(1, min(12, int(kwargs.get("limit") or self._max_results)))
 
-        if message_id:
+        from yeoman_gateway.processing.tool_context import tool_history_snapshot
+        snapshot = tool_history_snapshot(selected=getattr(self, '_history_selected', False))
+        if snapshot is not None and target_channel == 'whatsapp':
+            from dataclasses import replace
+
+            from yeoman_gateway.adapters.reply_archive_history import archive_row
+            from yeoman_gateway.history.queries import HistoryQueries
+            queries = HistoryQueries(snapshot)
+            rows = queries.media(chat_id=target_chat_id, limit=limit, native_id=message_id or None)
+            items = []
+            for row in reversed(rows):
+                item = self._cache.lookup_by_message(target_channel, target_chat_id, row['native_message_id'])
+                if item is None:
+                    continue
+                current = archive_row(queries, row)
+                item = replace(item, sender_id=current['sender_id'], sender_name=current['sender_name'])
+                if kwargs.get('kind') and item.kind != kwargs['kind']:
+                    continue
+                if kwargs.get('sender') and str(kwargs['sender']).lower() not in (item.sender_name or '').lower():
+                    continue
+                if kwargs.get('file_name') and str(kwargs['file_name']).lower() not in (item.file_name or '').lower():
+                    continue
+                items.append(item)
+        elif message_id:
             item = self._cache.lookup_by_message(target_channel, target_chat_id, message_id)
             items = [item] if item is not None else []
         else:

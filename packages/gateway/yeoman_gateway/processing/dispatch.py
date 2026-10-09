@@ -28,6 +28,7 @@ from yeoman_shared.reactions import SYSTEM_ORIGIN, allowed_reaction
 from yeoman_gateway.bus.events import OutboundMessage, ReactionMessage
 from yeoman_gateway.consciousness.log import DELIVERY_RESERVATION_TTL_MS
 from yeoman_gateway.core.intents import SendOutboundIntent, SendReactionIntent
+from yeoman_gateway.history.context import history_effect_metadata
 from yeoman_gateway.processing.budget import ChatBudget, ThreadBudget
 from yeoman_gateway.processing.models import (
     DeletePayload,
@@ -123,6 +124,7 @@ class BusEffectExecutor:
         delete_handler: Callable[[EffectEnvelope], Awaitable[bool]] | None = None,
         external_handler: Callable[[EffectEnvelope], Awaitable[bool]] | None = None,
         mark_provenance: bool = False,
+        history_mentions_selected: bool = False,
         security: Any | None = None,
         security_block_message: str = "\U0001f602",
         direct_sender: Callable[[OutboundMessage], Awaitable[None]] | None = None,
@@ -132,6 +134,7 @@ class BusEffectExecutor:
     ) -> None:
         self._bus = bus
         self._mark_provenance = mark_provenance
+        self._history_mentions_selected = history_mentions_selected
         self._security = security
         self._security_block_message = security_block_message
         self._direct_sender = direct_sender
@@ -206,7 +209,9 @@ class BusEffectExecutor:
         payload = envelope.payload
         target = envelope.target
 
+        from yeoman_gateway.history.context import history_effect_metadata
         provenance = {EFFECT_PROVENANCE_KEY: envelope.effect_id} if self._mark_provenance else {}
+        provenance.update(history_effect_metadata())
         receipt: TransportReceipt | None = None
 
         if isinstance(payload, TextPayload):
@@ -227,6 +232,12 @@ class BusEffectExecutor:
                 reply_to=payload.reply_to,
                 metadata=dict(provenance),
             )
+            if self._history_mentions_selected and target.channel == 'whatsapp':
+                from yeoman_gateway.channels.whatsapp import resolve_history_mentions
+                from yeoman_gateway.history.context import current_history_snapshot
+                text, mentions = resolve_history_mentions(message.content, message.metadata,
+                    chat_id=target.chat_id, snapshot=current_history_snapshot())
+                message = replace(message, content=text, metadata={**message.metadata, **mentions})
             self._check_participation_pre_dispatch(dispatch_envelope)
             receipt = await self._deliver(message)
         elif isinstance(payload, ForwardPayload):
@@ -262,6 +273,12 @@ class BusEffectExecutor:
                 media=list(payload.media),
                 metadata=dict(provenance),
             )
+            if self._history_mentions_selected and target.channel == 'whatsapp':
+                from yeoman_gateway.channels.whatsapp import resolve_history_mentions
+                from yeoman_gateway.history.context import current_history_snapshot
+                text, mentions = resolve_history_mentions(message.content, message.metadata,
+                    chat_id=target.chat_id, snapshot=current_history_snapshot())
+                message = replace(message, content=text, metadata={**message.metadata, **mentions})
             self._check_participation_pre_dispatch(dispatch_envelope)
             receipt = await self._deliver(message)
         elif isinstance(payload, ReactionPayload):
@@ -655,7 +672,8 @@ class ServiceEffectProducer:
                 )
             await self._bus.publish_outbound(
                 OutboundMessage(
-                    channel=channel, chat_id=chat_id, content=content, reply_to=reply_to
+                    channel=channel, chat_id=chat_id, content=content, reply_to=reply_to,
+                    metadata=history_effect_metadata(),
                 )
             )
             return None
@@ -963,6 +981,8 @@ class IntentEffectRouter:
         own_lineage: bool = False,
         admission: Any | None = None,
     ) -> EffectReceipt:
+        from yeoman_gateway.history.context import history_effect_metadata
+        history_effect_metadata()
         now = self._clock()
         processing = self._config.processing
         deadlines = getattr(processing, "deadlines", None) or getattr(

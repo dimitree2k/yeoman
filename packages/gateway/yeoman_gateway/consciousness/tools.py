@@ -575,8 +575,15 @@ class ConsciousnessTools:
                     "status": "approval_queue_failed",
                     "reason": "invalid_knowledge_evidence",
                 }
+            from yeoman_gateway.history.context import validate_history_evidence
+            if not validate_history_evidence(evidence):
+                return {'status': 'approval_queue_failed', 'reason': 'history_sources_changed'}
             try:
-                selection_from_mapping(evidence)
+                knowledge_proof = {key: value for key, value in evidence.items() if key != 'history'}
+                if knowledge_proof:
+                    selection_from_mapping(knowledge_proof)
+                elif 'history' not in evidence:
+                    raise ParticipationKnowledgeEvidenceError('empty evidence')
             except ParticipationKnowledgeEvidenceError:
                 return {
                     "status": "approval_queue_failed",

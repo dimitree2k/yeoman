@@ -51,7 +51,7 @@ def _frame(kind: str, payload: dict, *, version: int = PROTOCOL_VERSION) -> str:
     )
 
 
-def test_protocol_is_v5_and_gateway_rejects_older_frames(tmp_path: Path) -> None:
+def test_protocol_is_v6_and_gateway_rejects_older_frames(tmp_path: Path) -> None:
     store = ProcessingStore(tmp_path / "p.db")
     channel = _channel(store)
 
@@ -60,7 +60,7 @@ def test_protocol_is_v5_and_gateway_rejects_older_frames(tmp_path: Path) -> None
         "emoji": "🔥", "timestamp": 1_700_000_000,
     }, version=3)))
 
-    assert PROTOCOL_VERSION == 5
+    assert PROTOCOL_VERSION == 6
     # A v3 frame is dropped instead of being half understood.
     assert store.count_events() == 0
     store.close()

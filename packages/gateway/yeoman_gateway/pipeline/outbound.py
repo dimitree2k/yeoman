@@ -24,6 +24,7 @@ from yeoman_gateway.core.intents import (
 from yeoman_gateway.core.models import OutboundEvent
 from yeoman_gateway.core.pipeline import NextFn, PipelineContext
 from yeoman_gateway.core.ports import SecurityPort
+from yeoman_gateway.history.live import HistoryPaused
 
 if TYPE_CHECKING:
     from yeoman_gateway.core.models import InboundEvent
@@ -167,6 +168,7 @@ class OutboundMiddleware:
         self,
         *,
         contacts: "ContactsService | None" = None,
+        history_selected: bool = False,
         security: SecurityPort | None = None,
         security_block_message: str = "😂",
         tts: "TTSSynthesizer | None" = None,
@@ -179,6 +181,7 @@ class OutboundMiddleware:
         knowledge: object | None = None,
     ) -> None:
         self._contacts = contacts
+        self._history_selected = history_selected
         #: Public knowledge facade; used in preference to the legacy contacts cache.
         self._knowledge = knowledge
         self._security = security
@@ -320,6 +323,8 @@ class OutboundMiddleware:
                                 prefer=tuple(seen),
                                 prefer_kind="phone_jid",
                             )
+                        except HistoryPaused:
+                            raise
                         except Exception as exc:
                             logger.warning(
                                 "mention resolution degraded: knowledge lookup failed ({})",
@@ -327,7 +332,7 @@ class OutboundMiddleware:
                             )
                             identifier = None
                         jid = None if identifier is None else identifier.value
-                    elif self._contacts is not None:
+                    elif self._contacts is not None and not self._history_selected:
                         jid = self._contacts.resolve_name_to_jid(
                             name, channel="whatsapp",
                             group_participants=list(seen),

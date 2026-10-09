@@ -1,6 +1,6 @@
 import { createHash } from 'node:crypto';
 
-export const PROTOCOL_VERSION = 5 as const;
+export const PROTOCOL_VERSION = 6 as const;
 export const MAX_BRIDGE_FRAME_BYTES = 262_144 as const;
 
 export const REPLAYABLE_EVENT_TYPES = [
@@ -82,6 +82,7 @@ export interface SendTextPayload {
   text: string;
   replyToMessageId?: string;
   mentions?: string[];
+  historyMentionsResolved?: boolean;
   clientMessageId?: string;
 }
 
@@ -95,6 +96,7 @@ export interface SendMediaPayload {
   caption?: string;
   replyToMessageId?: string;
   mentions?: string[];
+  historyMentionsResolved?: boolean;
   clientMessageId?: string;
 }
 
@@ -451,6 +453,13 @@ function asOptionalClientMessageId(value: unknown): string | undefined | null {
   return parsed;
 }
 
+export function validHistoryMentions(payload: Record<string, unknown>): boolean {
+  if (payload.historyMentionsResolved !== undefined && typeof payload.historyMentionsResolved !== 'boolean') return false;
+  if (payload.historyMentionsResolved !== true) return true;
+  const mentions = payload.mentions === undefined ? [] : payload.mentions;
+  return Array.isArray(mentions) && mentions.every(jid => typeof jid === 'string' && /^[0-9]+@s\.whatsapp\.net$/.test(jid));
+}
+
 function parseSendText(payload: Record<string, unknown>): SendTextPayload | null {
   const to = asString(payload.to);
   const text = asString(payload.text);
@@ -459,8 +468,9 @@ function parseSendText(payload: Record<string, unknown>): SendTextPayload | null
   const clientMessageId = asOptionalClientMessageId(payload.clientMessageId);
   if (!to || !text) return null;
   if (payload.mentions !== undefined && !mentions) return null;
+  if (!validHistoryMentions(payload)) return null;
   if (clientMessageId === null) return null;
-  return { to, text, replyToMessageId, mentions, clientMessageId };
+  return { to, text, replyToMessageId, mentions, clientMessageId, historyMentionsResolved: payload.historyMentionsResolved as boolean | undefined };
 }
 
 function parseSendMedia(payload: Record<string, unknown>): SendMediaPayload | null {
@@ -477,6 +487,7 @@ function parseSendMedia(payload: Record<string, unknown>): SendMediaPayload | nu
   const clientMessageId = asOptionalClientMessageId(payload.clientMessageId);
   if (!mediaUrl && !mediaBase64 && !mediaPath) return null;
   if (payload.mentions !== undefined && !mentions) return null;
+  if (!validHistoryMentions(payload)) return null;
   if (clientMessageId === null) return null;
   return {
     to,
@@ -488,6 +499,7 @@ function parseSendMedia(payload: Record<string, unknown>): SendMediaPayload | nu
     caption,
     replyToMessageId,
     mentions,
+    historyMentionsResolved: payload.historyMentionsResolved as boolean | undefined,
     clientMessageId,
   };
 }

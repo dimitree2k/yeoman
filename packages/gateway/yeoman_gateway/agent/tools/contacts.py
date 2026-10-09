@@ -5,6 +5,7 @@ from __future__ import annotations
 from typing import TYPE_CHECKING, Any
 
 from yeoman_gateway.agent.tools.base import Tool
+from yeoman_gateway.history.live import HistoryPaused
 
 if TYPE_CHECKING:
     from yeoman_gateway.knowledge._contacts.service import ContactsService
@@ -30,6 +31,24 @@ class ContactsTool(Tool):
     def set_context(self, channel: str, chat_id: str) -> None:
         self._channel = channel
         self._chat_id = chat_id
+
+    @property
+    def _channel(self) -> str:
+        from yeoman_gateway.processing.tool_context import tool_target
+        return tool_target(default_channel=self._default_channel, default_chat_id=self._default_chat_id)[0]
+
+    @_channel.setter
+    def _channel(self, value: str) -> None:
+        self._default_channel = value
+
+    @property
+    def _chat_id(self) -> str:
+        from yeoman_gateway.processing.tool_context import tool_target
+        return tool_target(default_channel=self._default_channel, default_chat_id=self._default_chat_id)[1]
+
+    @_chat_id.setter
+    def _chat_id(self, value: str) -> None:
+        self._default_chat_id = value
 
     @property
     def name(self) -> str:
@@ -90,6 +109,11 @@ class ContactsTool(Tool):
         }
 
     async def execute(self, **kwargs: Any) -> str:
+        from yeoman_gateway.processing.tool_context import tool_history_snapshot
+        snapshot = tool_history_snapshot(selected=getattr(self, '_history_selected', False))
+        if snapshot is not None and self._knowledge is None:
+            from yeoman_gateway.history.live import HistoryPaused
+            raise HistoryPaused('history_knowledge_required')
         action = kwargs.get("action", "")
         match action:
             case "search":
@@ -219,6 +243,8 @@ class ContactsTool(Tool):
                 channel=self._channel or "whatsapp",
                 chat_id=self._chat_id or "cli",
             )
+        except HistoryPaused:
+            raise
         except Exception as exc:  # domain errors are reported, never swallowed
             return f"Error: {exc}"
         label_str = f" ({label})" if label else ""

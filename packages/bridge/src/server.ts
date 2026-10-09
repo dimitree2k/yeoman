@@ -457,6 +457,7 @@ export class BridgeServer {
         parsed.replyToMessageId,
         parsed.mentions,
         parsed.clientMessageId,
+        parsed.historyMentionsResolved,
       );
       return { sent };
     }

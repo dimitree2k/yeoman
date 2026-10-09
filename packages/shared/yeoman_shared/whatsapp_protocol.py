@@ -1,7 +1,7 @@
 """Shared constants for the WhatsApp bridge wire protocol."""
 
-PROTOCOL_VERSION = 5
-"""Bridge v5 carries authenticated replay metadata and complete WhatsApp payload shapes."""
+PROTOCOL_VERSION = 6
+"""Bridge v6 adds Gateway-authoritative mention resolution."""
 
 MAX_BRIDGE_FRAME_BYTES = 262_144
 """UTF-8 serialized event and WebSocket frame ceiling shared with the Bridge."""
@@ -93,3 +93,18 @@ def valid_group_metadata(value: object) -> bool:
             and ("actorJid" not in value or bridge_string(value["actorJid"]) is not None)
             and ("occurredMs" not in value or _js_safe_integer(value["occurredMs"]) and value["occurredMs"] >= 0)
             and (not value["snapshot"] or not {"actorJid", "occurredMs"} & set(value)))
+
+
+def valid_history_mentions(payload: object) -> bool:
+    """Gateway-authoritative mentions contain only canonical phone JIDs."""
+    import re
+    if not isinstance(payload, dict):
+        return False
+    if 'historyMentionsResolved' in payload and type(payload['historyMentionsResolved']) is not bool:
+        return False
+    if not payload.get('historyMentionsResolved', False):
+        return True
+    mentions = payload.get('mentions', [])
+    return isinstance(mentions, list) and all(
+        isinstance(jid, str) and re.fullmatch(r'[0-9]+@s\.whatsapp\.net', jid) is not None
+        for jid in mentions)

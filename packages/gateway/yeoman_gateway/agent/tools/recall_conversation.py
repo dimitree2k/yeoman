@@ -23,6 +23,24 @@ class RecallConversationTool(Tool):
         self._chat_id = chat_id
 
     @property
+    def _channel(self) -> str:
+        from yeoman_gateway.processing.tool_context import tool_target
+        return tool_target(default_channel=self._default_channel, default_chat_id=self._default_chat_id)[0]
+
+    @_channel.setter
+    def _channel(self, value: str) -> None:
+        self._default_channel = value
+
+    @property
+    def _chat_id(self) -> str:
+        from yeoman_gateway.processing.tool_context import tool_target
+        return tool_target(default_channel=self._default_channel, default_chat_id=self._default_chat_id)[1]
+
+    @_chat_id.setter
+    def _chat_id(self, value: str) -> None:
+        self._default_chat_id = value
+
+    @property
     def name(self) -> str:
         return "recall_conversation"
 
@@ -65,6 +83,17 @@ class RecallConversationTool(Tool):
 
         max_messages = int(kwargs.get("max_messages") or 30)
         max_messages = max(1, min(50, max_messages))
+
+        from yeoman_gateway.processing.tool_context import tool_history_snapshot
+        snapshot = tool_history_snapshot(selected=getattr(self, '_history_selected', False))
+        if snapshot is not None and self._channel == 'whatsapp':
+            from yeoman_gateway.adapters.reply_archive_history import history_text
+            from yeoman_gateway.history.queries import HistoryQueries
+            rows = HistoryQueries(snapshot).search(chat_ids=(self._chat_id,), query=query, limit=max_messages)
+            if not rows:
+                return f"No matching messages found for '{query}'."
+            lines = [f"[{row['sent_ms']}] [{'assistant' if row['direction'] == 'out' else 'user'}]: {history_text(row)}" for row in rows]
+            return f"Found {len(lines)} matching message(s):\n" + '\n'.join(lines)
 
         session_key = f"{self._channel}:{self._chat_id}"
         session = self._session_manager.get_or_create(session_key)

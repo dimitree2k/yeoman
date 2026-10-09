@@ -1848,3 +1848,22 @@ test('group_metadata_provider_buffered_fetch_single_snapshot', async (t) => {
   assert.equal(signals.filter((s: any) => s.kind.startsWith('group_')).length, 2);
   assert.ok(before.every((s: any) => s.payload.snapshot && !s.payload.actorJid && !s.payload.occurredMs));
 });
+
+test('history mentions ignore stale Bridge mappings and refuse unresolved LIDs', async () => {
+  const root = await mkdtemp(join(tmpdir(), 'history-mentions-'));
+  try {
+    const client = new WhatsAppClient({ authDir: join(root, 'auth'), messageReferenceDir: join(root, 'refs'),
+      readReceipts: false, onMessage: () => {}, onQR: () => {}, onStatus: () => {}, onError: () => {} });
+    const sent: any[] = [];
+    (client as any).connected = true;
+    (client as any).sock = { sendMessage: async (_to: string, payload: any) => { sent.push(payload); return { key: { id: 'synthetic' } }; } };
+    (client as any).lidToPhone.set('491000000001', '491999999999@s.whatsapp.net');
+    await client.sendText('synthetic@g.us', 'hello @491000000001', undefined, ['491000000001@s.whatsapp.net'], undefined, true);
+    assert.deepEqual(sent[0].mentions, ['491000000001@s.whatsapp.net']);
+    assert.equal(sent[0].text, 'hello @491000000001');
+    await assert.rejects(client.sendText('synthetic@g.us', 'hello', undefined, ['100000000001@lid'], undefined, true));
+    assert.equal(sent.length, 1);
+  } finally {
+    await rm(root, { recursive: true, force: true });
+  }
+});

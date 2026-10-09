@@ -7,6 +7,7 @@ from dataclasses import dataclass
 from typing import Any, Awaitable, Callable
 
 from yeoman_gateway.agent.tools.base import Tool
+from yeoman_gateway.history.live import HistoryPaused
 
 _PHONE_CHARS_RE = re.compile(r"[\s().-]+")
 
@@ -218,5 +219,7 @@ class SendVoiceTool(Tool):
 
         try:
             return await self._send_callback(request)
+        except HistoryPaused:
+            raise
         except Exception as e:
             return f"Error sending voice: {e}"

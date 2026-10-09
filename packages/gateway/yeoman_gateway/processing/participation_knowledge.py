@@ -10,6 +10,7 @@ from dataclasses import dataclass, replace
 from types import MappingProxyType
 from typing import Any
 
+from yeoman_gateway.history.live import HistoryPaused
 from yeoman_gateway.knowledge._memory.shared_facts import FactReadContext, FactRetrievalResult
 from yeoman_gateway.knowledge.models import (
     KnowledgeContext,
@@ -245,6 +246,8 @@ class ParticipationKnowledgeSelector:
                     lexical_only=True,
                     max_chars=remaining_chars,
                 )
+        except HistoryPaused:
+            raise
         except Exception:
             return _empty("error")
 
@@ -374,6 +377,8 @@ class ParticipationKnowledgeSelector:
                         query=selection.query,
                     )
                 )
+        except HistoryPaused:
+            raise
         except Exception as exc:
             raise ParticipationKnowledgeInvalidatedError("revalidation unavailable") from exc
 

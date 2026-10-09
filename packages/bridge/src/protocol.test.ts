@@ -11,7 +11,7 @@ import {
 
 test('protocol version gates deterministic message ids', () => {
   // v5 adds the authenticated event subscription and durable event ACKs.
-  assert.equal(PROTOCOL_VERSION, 5);
+  assert.equal(PROTOCOL_VERSION, 6);
 });
 
 test('test_membership_change_identity_uses_logical_change_id', () => {
@@ -472,4 +472,20 @@ test('group_metadata_snapshot_not_historical_change validator mirror', async () 
   }
   assert.equal(validGroupMetadata({ chatJid: payload.chatJid, snapshot: true, observedAtMs: payload.observedAtMs }), false);
   assert.equal(validGroupMetadata({ ...payload, snapshot: false, actorJid: 'members@g.us', occurredMs: 1700000000000 }), true);
+});
+
+test('history mentions require a boolean and resolved phone JIDs', () => {
+  for (const type of ['send_text', 'send_media']) {
+    const payload = type === 'send_text' ? { to: 'synthetic@g.us', text: 'hello' }
+      : { to: 'synthetic@g.us', mediaPath: '/synthetic/image.png' };
+    const parse = (extra: object) => parseBridgeCommand({ version: PROTOCOL_VERSION,
+      token: 'synthetic-token', requestId: 'synthetic-id', type, payload: { ...payload, ...extra } });
+    assert.equal(parse({ historyMentionsResolved: true, mentions: ['491000000001@s.whatsapp.net'] }).ok, true);
+    for (const mentions of [['100000000001@lid'], ['100000000001'], ['alice@s.whatsapp.net']]) {
+      assert.equal(parse({ historyMentionsResolved: true, mentions }).ok, false);
+    }
+    assert.equal(parse({ historyMentionsResolved: 'true' }).ok, false);
+    assert.equal(parse({ historyMentionsResolved: true }).ok, true);
+    assert.equal(parse({ mentions: ['100000000001@lid'] }).ok, true);
+  }
 });

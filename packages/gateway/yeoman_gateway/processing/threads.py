@@ -750,8 +750,16 @@ class ThreadRegistry:
         views: list[Any] = []
         for _turn_id, event_id, role, _message_id in self._store.thread_source_refs(thread_id):
             event = self._store.get_event(event_id)
+            from yeoman_gateway.history.context import current_history_snapshot
+            from yeoman_gateway.history.queries import HistoryQueries
+            history = current_history_snapshot()
             payload = getattr(event, "payload", None)
-            text = str(payload.get("text") or "") if isinstance(payload, dict) else ""
+            if history is not None and getattr(event, 'channel', '') == 'whatsapp':
+                row = HistoryQueries(history).native_message(chat_id=event.chat_id,
+                    native_id=_message_id or event.source_message_id or '')
+                text = str(row['current_text'] or '') if row else ''
+            else:
+                text = str(payload.get("text") or "") if isinstance(payload, dict) else ""
             if not text:
                 continue
             views.append(
@@ -759,8 +767,8 @@ class ThreadRegistry:
                     event_id=event_id,
                     text=text,
                     role=role,
-                    principal=str(getattr(event, "principal", "") or ""),
-                    occurred_ms=getattr(event, "occurred_ms", None),
+                    principal=str(row['sender_identifier'] or '') if history is not None and getattr(event, 'channel', '') == 'whatsapp' else str(getattr(event, "principal", "") or ""),
+                    occurred_ms=row['sent_ms'] if history is not None and getattr(event, 'channel', '') == 'whatsapp' else getattr(event, "occurred_ms", None),
                 )
             )
         return tuple(views)
@@ -772,8 +780,19 @@ class ThreadRegistry:
             effect = self._store.get_effect(effect_id)
             if effect is None or str(getattr(effect, "state", "")) != "sent":
                 continue
+            from yeoman_gateway.history.context import current_history_snapshot
+            from yeoman_gateway.history.queries import HistoryQueries
+            history = current_history_snapshot()
             payload = getattr(effect, "payload", None)
-            text = str(getattr(payload, "text", "") or "") if payload is not None else ""
+            if history is not None and effect.target is None:
+                continue
+            if history is not None and effect.target.channel == 'whatsapp':
+                receipt = self._store.effect_transport_receipt(effect_id)
+                row = HistoryQueries(history).native_message(chat_id=effect.target.chat_id,
+                    native_id=receipt.provider_message_id) if receipt else None
+                text = str(row['current_text'] or '') if row else ''
+            else:
+                text = str(getattr(payload, "text", "") or "") if payload is not None else ""
             if not text:
                 continue
             out.append((str(effect.effect_id), text, getattr(effect, "updated_ms", None)))

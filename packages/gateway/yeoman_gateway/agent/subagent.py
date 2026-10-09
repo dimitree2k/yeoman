@@ -111,9 +111,14 @@ class SubagentManager:
 
         # Create background task
         context = invocation_context or current_tool_context()
+        from yeoman_gateway.history.context import current_history_snapshot
+        clear_history = current_history_snapshot() is not None or (context is not None and context.history_snapshot is not None)
+        if clear_history and context is not None:
+            from dataclasses import replace
+            context = replace(context, history_snapshot=None)
         bg_task = asyncio.create_task(
             self._run_subagent_with_context(task_id, task, display_label, origin, context),
-            context=contextvars.copy_context(),
+            context=contextvars.Context() if clear_history else None,
         )
         self._running_tasks[task_id] = bg_task
 

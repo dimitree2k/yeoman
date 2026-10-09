@@ -17,7 +17,7 @@ async function loadOutbox(): Promise<any> {
 
 function event(overrides: Record<string, unknown> = {}): Record<string, unknown> {
   return {
-    version: 5,
+    version: 6,
     type: 'message',
     ts: 1_700_000_000_000,
     observedAt: 1_700_000_000_000,

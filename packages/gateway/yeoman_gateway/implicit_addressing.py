@@ -605,8 +605,17 @@ def _last_session_assistant_content(
     channel: str,
     chat_id: str,
 ) -> str | None:
-    session = session_manager.get_or_create(f"{channel}:{chat_id}")
-    messages = getattr(session, "messages", [])
+    from yeoman_gateway.session.manager import SessionManager
+    if isinstance(session_manager, SessionManager) and session_manager.uses_history(channel):
+        from yeoman_gateway.history.context import current_history_snapshot
+        snapshot = current_history_snapshot()
+        if snapshot is None:
+            from yeoman_gateway.history.live import HistoryPaused
+            raise HistoryPaused('history_scope_required')
+        messages = session_manager.recent_history(channel=channel, chat_id=chat_id, snapshot=snapshot, limit=30)
+    else:
+        session = session_manager.get_or_create(f"{channel}:{chat_id}")
+        messages = getattr(session, "messages", [])
     if not isinstance(messages, list):
         return None
     for row in reversed(messages):
@@ -630,8 +639,17 @@ def seconds_since_last_assistant(
 ) -> float | None:
     if session_manager is None:
         return None
-    session = session_manager.get_or_create(f"{channel}:{chat_id}")
-    messages = getattr(session, "messages", [])
+    from yeoman_gateway.session.manager import SessionManager
+    if isinstance(session_manager, SessionManager) and session_manager.uses_history(channel):
+        from yeoman_gateway.history.context import current_history_snapshot
+        snapshot = current_history_snapshot()
+        if snapshot is None:
+            from yeoman_gateway.history.live import HistoryPaused
+            raise HistoryPaused('history_scope_required')
+        messages = session_manager.recent_history(channel=channel, chat_id=chat_id, snapshot=snapshot, limit=30)
+    else:
+        session = session_manager.get_or_create(f"{channel}:{chat_id}")
+        messages = getattr(session, "messages", [])
     if not isinstance(messages, list):
         return None
     for row in reversed(messages):

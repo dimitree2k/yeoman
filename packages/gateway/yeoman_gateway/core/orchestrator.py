@@ -75,6 +75,7 @@ class Orchestrator:
         identity_observation_issuer: "Callable[[TrustedIdentityObservation], object] | None" = None,
         mention_context_factory: "Callable[[InboundEvent], TrustedReadContext | None] | None" = None,
         reply_context_window_limit: int,
+        history_reply_selected: bool = False,
         reply_context_line_max_chars: int,
         ambient_window_limit: int = 30,
         dedupe_ttl_seconds: int = 20 * 60,
@@ -118,6 +119,7 @@ class Orchestrator:
             layers.append(
                 ContactsMiddleware(
                     knowledge=knowledge,
+                    history_selected=history_reply_selected,
                     observation_issuer=identity_observation_issuer,
                     mention_context_factory=mention_context_factory,
                 )
@@ -125,6 +127,7 @@ class Orchestrator:
         layers.extend([
             ReplyContextMiddleware(
                 archive=reply_archive,
+                history_selected=history_reply_selected,
                 contacts=contacts,
                 knowledge=knowledge,
                 reply_context_window_limit=reply_context_window_limit,
@@ -183,6 +186,7 @@ class Orchestrator:
             ),
             OutboundMiddleware(
                 contacts=contacts,
+                history_selected=history_reply_selected,
                 knowledge=knowledge,
                 security=security,
                 security_block_message=security_block_message,
@@ -195,8 +199,14 @@ class Orchestrator:
                 allowed_reaction_emojis=allowed_reaction_emojis,
             ),
         ])
+        self._history_reply_selected = history_reply_selected
         self._pipeline = Pipeline(layers)
 
     async def handle(self, event: InboundEvent) -> list[OrchestratorIntent]:
         """Process one inbound event and return executable intents."""
+        if self._history_reply_selected and event.channel == 'whatsapp':
+            from yeoman_gateway.history.context import current_history_snapshot
+            from yeoman_gateway.history.live import HistoryPaused
+            if current_history_snapshot() is None:
+                raise HistoryPaused('history_scope_required')
         return await self._pipeline.run(event)

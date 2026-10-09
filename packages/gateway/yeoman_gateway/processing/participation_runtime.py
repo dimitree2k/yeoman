@@ -28,6 +28,7 @@ from typing import Any, Protocol, TypeAlias
 from loguru import logger
 
 from yeoman_gateway.consciousness.log import deterministic_effect_id
+from yeoman_gateway.history.live import HistoryPaused
 from yeoman_gateway.processing.models import (
     ReactionPayload,
     TextPayload,
@@ -160,11 +161,15 @@ class ParticipationRuntime:
         submission: Any | None = None,
         reactor: Any | None = None,
         writer_available: bool = True,
+        history_projector: Any = None,
+        history_knowledge: Any = None,
         clock_ms: Callable[[], int] | None = None,
         direct_work_active: Callable[[str, str], bool] | None = None,
         revalidate_knowledge: Callable[[ParticipationOpportunity, Mapping[str, Any], Any], Any]
         | None = None,
     ) -> None:
+        self._history_projector = history_projector
+        self._history_knowledge = history_knowledge
         self._judge = judge
         self._context_builder = context_builder
         self._ledger = ledger
@@ -230,9 +235,36 @@ class ParticipationRuntime:
 
     # -- entrypoint --------------------------------------------------------------------
 
-    async def evaluate_participation(
+    async def evaluate_participation(self, opportunity: ParticipationOpportunity) -> dict[str, object]:
+        from yeoman_gateway.history.context import history_knowledge_scope, history_turn
+        from yeoman_gateway.history.live import HistoryPaused
+        selected = self._history_projector is not None and opportunity.channel == 'whatsapp'
+        try:
+            if selected:
+                async with history_turn(self._history_projector) as snapshot:
+                    with history_knowledge_scope(snapshot, self._history_knowledge):
+                        result = await self._evaluate_participation(opportunity)
+            else:
+                result = await self._evaluate_participation(opportunity)
+            if not isinstance(result, tuple):
+                return result
+            decision, inputs, context, policy_snapshot = result
+            if selected:
+                async with history_turn(self._history_projector) as snapshot:
+                    with history_knowledge_scope(snapshot, self._history_knowledge):
+                        inputs = await self._decision_inputs(opportunity, policy_snapshot)
+                        context = await self._context_builder.build(opportunity, inputs=inputs)
+                        self._validate_decision(decision, opportunity=opportunity, inputs=inputs, context=context)
+                        return await self._execute_decision(opportunity, decision, inputs, context, policy_snapshot)
+            return await self._execute_decision(opportunity, decision, inputs, context, policy_snapshot)
+        except HistoryPaused:
+            return {'status': 'skipped', 'reason': 'history_paused'}
+        except ParticipationDecisionError as exc:
+            return {'status': 'skipped', 'reason': exc.reason}
+
+    async def _evaluate_participation(
         self, opportunity: ParticipationOpportunity
-    ) -> dict[str, object]:
+    ):
         """Evaluate one admitted opportunity. Never raises for a decision failure."""
         self._count("admitted")
         if self._direct_active(opportunity):
@@ -249,6 +281,8 @@ class ParticipationRuntime:
             self._count("preflight_skipped")
             await self._record(opportunity, "preflight_skipped", blocked.reason)
             return {"status": "skipped", "reason": blocked.reason}
+        except HistoryPaused:
+            raise
         except Exception:
             self._count("preflight_skipped")
             await self._record(opportunity, "preflight_skipped", "snapshot_error")
@@ -288,6 +322,8 @@ class ParticipationRuntime:
             self._count("preflight_skipped")
             await self._record(opportunity, "preflight_skipped", failure.reason)
             return {"status": "skipped", "reason": failure.reason}
+        except HistoryPaused:
+            raise
         except Exception:
             self._count("preflight_skipped")
             await self._record(opportunity, "preflight_skipped", "context_error")
@@ -384,6 +420,8 @@ class ParticipationRuntime:
             await self._record_judge_failure(attempt_id, failure, opportunity.chat_id)
             await self._record(opportunity, "judge_failed", failure.reason)
             return {"status": "judge_failed", "reason": failure.reason}
+        except HistoryPaused:
+            raise
         except Exception as exc:  # noqa: BLE001 - one chat must not stop the queue
             self._count("judge_failed")
             logger.warning(
@@ -426,6 +464,11 @@ class ParticipationRuntime:
                 "intent": decision.intent,
             }
 
+        if decision.action == 'silence':
+            return await self._execute_decision(opportunity, decision, inputs, context, snapshot)
+        return decision, inputs, context, snapshot
+
+    async def _execute_decision(self, opportunity, decision, inputs, context, snapshot):
         if decision.action == "silence":
             self._count("deliberate_silence")
             await self._record(opportunity, "decided_silence", decision.reason)
@@ -480,6 +523,8 @@ class ParticipationRuntime:
             return False
         try:
             return bool(checker(opportunity.channel, opportunity.chat_id))
+        except HistoryPaused:
+            raise
         except Exception:  # noqa: BLE001 - an unreadable fence must stop work
             return True
 
@@ -518,6 +563,8 @@ class ParticipationRuntime:
                             anchor_message_id=anchor_id,
                         )
                     )
+                except HistoryPaused:
+                    raise
                 except Exception:  # noqa: BLE001 - unknown closure fails closed
                     closed = True
                 if closed:
@@ -540,6 +587,8 @@ class ParticipationRuntime:
             return "direct_request"
         try:
             pause = self._is_paused(opportunity.channel, opportunity.chat_id)
+        except HistoryPaused:
+            raise
         except Exception:  # noqa: BLE001 - unreadable pause state fails closed
             return "pause_state_unavailable"
         if pause:
@@ -548,6 +597,8 @@ class ParticipationRuntime:
             source_allowed = self._is_source_allowed(
                 opportunity.channel, opportunity.chat_id, opportunity.source_event_ids
             )
+        except HistoryPaused:
+            raise
         except Exception:  # noqa: BLE001 - unreadable source ACL fails closed
             return "source_not_authorized"
         if not source_allowed:
@@ -764,6 +815,8 @@ class ParticipationRuntime:
                     window_ms=window_ms,
                     window_kind=window_kind,
                 )
+            except HistoryPaused:
+                raise
             except Exception as exc:  # noqa: BLE001 - capacity evidence is fail-closed
                 raise ParticipationBlockedError("capacity_unavailable") from exc
             try:
@@ -790,6 +843,8 @@ class ParticipationRuntime:
                 chat_id=opportunity.chat_id,
                 since_ms=now_ms - 3_600_000,
             )
+        except HistoryPaused:
+            raise
         except Exception as exc:  # noqa: BLE001 - capacity evidence is fail-closed
             raise ParticipationBlockedError("capacity_unavailable") from exc
         try:
@@ -1166,6 +1221,8 @@ class ParticipationRuntime:
             await self._release_comment(opportunity, effect_id, exc.reason)
             await self._record(opportunity, "generation_failed", exc.reason)
             return {"status": "generation_failed", "reason": exc.reason}
+        except HistoryPaused:
+            raise
         except Exception as exc:  # noqa: BLE001 - a failed draft releases the hold
             logger.warning(
                 "participation_draft_failed chat={} error_type={}",
@@ -1410,6 +1467,8 @@ class ParticipationRuntime:
                 anchor_message_id=token,
                 now_ms=int(self._clock_ms()),
             )
+        except HistoryPaused:
+            raise
         except Exception as exc:  # noqa: BLE001 - delivery already happened; retain evidence
             logger.warning(
                 "participation_social_closure_failed chat={} error_type={}",
@@ -1623,6 +1682,8 @@ class ParticipationRuntime:
                 await self._release_comment(initial_opportunity, effect_id, failure.reason)
                 await self._record(current.opportunity, "judge_failed", failure.reason)
                 return {"status": "judge_failed", "reason": failure.reason}
+            except HistoryPaused:
+                raise
             except Exception as exc:  # noqa: BLE001 - one chat must not stop the queue
                 logger.warning(
                     "participation_rejudge_error chat={} error_type={}",
@@ -1767,6 +1828,8 @@ class ParticipationRuntime:
                         current.opportunity, "generation_failed", exc.reason
                     )
                     return {"status": "generation_failed", "reason": exc.reason}
+                except HistoryPaused:
+                    raise
                 except Exception as exc:  # noqa: BLE001 - release definite failure
                     logger.warning(
                         "participation_replacement_failed chat={} error_type={}",
@@ -1825,6 +1888,8 @@ class ParticipationRuntime:
                         decision=reevaluated,
                         context=current.context,
                     )
+                except HistoryPaused:
+                    raise
                 except Exception as exc:  # noqa: BLE001 - release definite failure
                     logger.warning(
                         "participation_replacement_failed chat={} error_type={}",
@@ -1901,6 +1966,8 @@ class ParticipationRuntime:
             raise ParticipationBlockedError("knowledge_revalidation_failed")
         try:
             updated = self._revalidate_knowledge(opportunity, context, selection)
+        except HistoryPaused:
+            raise
         except Exception as exc:  # noqa: BLE001 - lost authority invalidates influenced work
             raise ParticipationBlockedError("knowledge_revalidation_failed") from exc
         if updated is None or not hasattr(updated, "text"):
@@ -1946,6 +2013,8 @@ class ParticipationRuntime:
                 epoch=int(opportunity.activation_epoch),
                 opportunity=opportunity,
             )
+        except HistoryPaused:
+            raise
         except Exception as exc:  # noqa: BLE001 - final freshness is fail-closed
             raise ParticipationBlockedError("freshness_unavailable") from exc
         fresh_snapshot = _snapshot_mapping(raw)
@@ -1960,12 +2029,13 @@ class ParticipationRuntime:
         )
         observed = _revision_token(fresh_snapshot, fresh_opportunity, context)
         changed = _revision_token_changed(baseline, observed)
-        if not knowledge_changed and not changed and not context.get("advisory_taste"):
+        if (self._history_projector is None and not knowledge_changed and not changed
+                and not context.get("advisory_taste")):
             return None
         fresh_inputs = await self._decision_inputs(fresh_opportunity, fresh_snapshot)
         fresh_context: dict[str, Any] = dict(context)
         rebuild = baseline[:2] != observed[:2] or baseline[4:] != observed[4:]
-        if rebuild or context.get("advisory_taste"):
+        if self._history_projector is not None or rebuild or context.get("advisory_taste"):
             fresh_context = dict(
                 await self._context_builder.build(
                     fresh_opportunity, inputs=fresh_inputs
@@ -2013,6 +2083,8 @@ class ParticipationRuntime:
             values = self._source_principals(
                 opportunity.channel, opportunity.chat_id, opportunity.source_event_ids
             )
+        except HistoryPaused:
+            raise
         except Exception as exc:  # noqa: BLE001 - source ACL evidence is mandatory
             raise ParticipationBlockedError("source_principals_unavailable") from exc
         if values is None:
@@ -2126,6 +2198,8 @@ class ParticipationRuntime:
                 source_ids=opportunity.source_event_ids,
                 now_ms=int(self._clock_ms()),
             )
+        except HistoryPaused:
+            raise
         except Exception as exc:  # noqa: BLE001 - recording must not break decisions
             logger.warning("participation_record_failed error_type={}", type(exc).__name__)
 
@@ -2295,17 +2369,30 @@ def _knowledge_evidence_for_admission(
     it. ``None`` means no knowledge influenced the draft: the legacy recent-only case
     the approval path already handled.
     """
+    from yeoman_gateway.history.context import current_history_snapshot
+    from yeoman_gateway.history.queries import HistoryQueries
     existing = getattr(admission, "knowledge_evidence", None)
-    if isinstance(existing, Mapping):
-        return existing
-    encoded = context.get("_knowledge_evidence")
-    if not isinstance(encoded, Mapping):
-        return None
-    try:
-        selection_from_mapping(encoded)
-    except ParticipationKnowledgeEvidenceError:
-        return None
-    return encoded
+    encoded = existing if isinstance(existing, Mapping) else context.get("_knowledge_evidence")
+    evidence = None
+    if isinstance(encoded, Mapping):
+        try:
+            selection_from_mapping({key: value for key, value in encoded.items() if key != 'history'})
+        except ParticipationKnowledgeEvidenceError:
+            pass
+        else:
+            evidence = dict(encoded)
+    snapshot = current_history_snapshot()
+    if snapshot is not None:
+        from yeoman_gateway.adapters.reply_archive_history import HistoryReplyArchiveAdapter
+        queries = HistoryQueries(snapshot)
+        archive = HistoryReplyArchiveAdapter(queries)
+        revisions = {}
+        for source_id in admission.source_event_ids:
+            row = archive.row(admission.channel, admission.chat_id, source_id)
+            if row is not None:
+                revisions[row['event_id']] = queries.content_fingerprint(row['event_id'])
+        evidence = {**(evidence or {}), 'history': {'generation': snapshot.generation, 'revisions': revisions}}
+    return evidence
 
 
 def _selected_knowledge_token(context: Mapping[str, Any]) -> tuple[str, str] | None:

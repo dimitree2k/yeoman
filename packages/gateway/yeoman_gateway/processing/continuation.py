@@ -9,7 +9,7 @@ from __future__ import annotations
 import asyncio
 import json
 from collections.abc import Callable
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 from typing import Any
 
 from loguru import logger
@@ -97,6 +97,19 @@ class ContinuationResolver:
             if not sources:
                 continue
             source = sources[-1]
+            from yeoman_gateway.history.context import current_history_snapshot
+            from yeoman_gateway.history.queries import HistoryQueries
+            snapshot = current_history_snapshot()
+            bot_text = effect.payload.text
+            if snapshot is not None and event.channel == 'whatsapp':
+                queries = HistoryQueries(snapshot)
+                human = queries.native_message(chat_id=event.chat_id, native_id=source.source_message_id or target or '')
+                bot = queries.native_message(chat_id=event.chat_id, native_id=receipt.provider_message_id)
+                if human is None or bot is None:
+                    continue
+                source = replace(source, payload={'text': human['current_text'] or ''},
+                    principal=human['sender_identifier'] or source.principal)
+                bot_text = bot['current_text'] or ''
             authority = self._store.get_event_source_authority(source.event_id, source.revision)
             if authority is not None and authority.get("revoked_at_ms") is not None:
                 continue
@@ -117,7 +130,7 @@ class ContinuationResolver:
             seen.add(key)
             result.append(ContinuationAnchor(
                 message_id=receipt.provider_message_id, effect_id=effect.effect_id,
-                text=effect.payload.text, source=source, thread_id=thread_id,
+                text=bot_text, source=source, thread_id=thread_id,
                 confirmed_ms=receipt.confirmed_ms,
             ))
         return tuple(result)
@@ -135,6 +148,17 @@ class ContinuationResolver:
             since_ms=now_ms - self._threads.policy.followup_window_ms,
             before_ms=now_ms, limit=self._context_limit,
         )
+        from yeoman_gateway.history.context import current_history_snapshot
+        from yeoman_gateway.history.queries import HistoryQueries
+        snapshot = current_history_snapshot()
+        if snapshot is not None and event.channel == 'whatsapp':
+            queries = HistoryQueries(snapshot)
+            current = []
+            for item in context:
+                row = queries.native_message(chat_id=event.chat_id, native_id=item.source_message_id or '')
+                if row is not None:
+                    current.append(replace(item, payload={'text': row['current_text'] or ''}))
+            context = current
         selected = await self._judge.choose(
             text=str((event.payload or {}).get("text") or ""),
             anchors=[{"id": item.message_id, "bot": item.text[:4000],

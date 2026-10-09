@@ -13,6 +13,7 @@ from loguru import logger
 
 from yeoman_gateway.a2a.contracts import A2AContractValidationError, ContractSchemas
 from yeoman_gateway.core.models import InboundEvent
+from yeoman_gateway.history.live import HistoryPaused
 from yeoman_gateway.knowledge.models import GLOBAL_SCOPE_KEY
 from yeoman_gateway.processing.dispatch import SERVICE_PRINCIPALS, EffectNotDeliveredError
 from yeoman_gateway.processing.models import DELIVERED_STATUSES_TUPLE, EffectReceipt
@@ -97,6 +98,8 @@ def resolve_whatsapp_recipient(
                 )
                 if not identifier.value.endswith("@g.us")
             )
+        except HistoryPaused:
+            raise
         except Exception as exc:
             # A knowledge outage is an unavailable recipient, not a broken interface and
             # never a reason to fall back to the unproven legacy cache.  It is reported,
@@ -189,6 +192,59 @@ def _business_status(store: _EffectStore, effect_id: str) -> tuple[str, str | No
 
 
 async def process_a2a_invocation(
+    *,
+    peer: str,
+    skill: str,
+    input: dict[str, Any],
+    task_id: str,
+    context_id: str,
+    effect_id: str,
+    configured_peer: str,
+    advertised_skills: Collection[str],
+    policy_adapter: _PolicyAdapter,
+    recipient_resolver: _RecipientResolver,
+    effects: _Effects | None,
+    effect_store: _EffectStore,
+    sender_account: str,
+    enabled_content_types: Collection[str] = frozenset({"text", "voice"}),
+    voice_generator: _VoiceGenerator | None = None,
+    resolved_artifacts: Collection[Mapping[str, Any]] = (),
+    artifact_root: Path | None = None,
+    media_sender: _MediaSender | None = None,
+    clock: Callable[[], float] | None = None,
+    schemas: ContractSchemas | None = None,
+    history_projector: Any = None,
+    history_knowledge: Any = None,
+) -> dict[str, object]:
+    arguments = dict(locals())
+    arguments.pop('history_projector')
+    arguments.pop('history_knowledge')
+    if history_projector is None or skill != 'whatsapp.send':
+        return await _process_a2a_invocation(**arguments)
+    # Untrusted requests are refused by the existing checks before a history acquisition.
+    if peer != configured_peer or not configured_peer or skill not in advertised_skills:
+        return await _process_a2a_invocation(**arguments)
+    checked = schemas or ContractSchemas.load()
+    try:
+        checked.validate_invocation({'skill': skill, 'input': input})
+        checked.validate_request(skill, input)
+    except A2AContractValidationError:
+        return await _process_a2a_invocation(**arguments)
+    from yeoman_gateway.history.context import history_knowledge_scope, history_turn
+    from yeoman_gateway.history.live import HistoryPaused
+    try:
+        if history_knowledge is None:
+            raise HistoryPaused('history_knowledge_required')
+        async with history_turn(history_projector) as snapshot:
+            with history_knowledge_scope(snapshot, history_knowledge):
+                return await _process_a2a_invocation(**arguments)
+    except HistoryPaused:
+        return _failure(skill=skill, code='HISTORY_PAUSED', message='History is unavailable.',
+            correlation=_correlation(task_id=task_id, context_id=context_id,
+                idempotency_key=input.get('idempotency_key')))
+
+
+async def _process_a2a_invocation(
     *,
     peer: str,
     skill: str,
@@ -423,6 +479,8 @@ async def process_a2a_invocation(
             correlation=correlation,
         )
 
+    from yeoman_gateway.history.context import history_effect_metadata
+    history_effect_metadata()
     try:
         if media_path is not None:
             send_media = media_sender

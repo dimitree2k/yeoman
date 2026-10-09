@@ -93,6 +93,12 @@ class EffectGateway:
         self._worker_id = worker_id or "effect-gateway"
         self._lease_ms = lease_ms
         self._clock = clock or _now_ms
+        self._history_projector = None
+        self._history_knowledge = None
+
+    def set_history_scope(self, projector, knowledge) -> None:
+        self._history_projector = projector
+        self._history_knowledge = knowledge
 
     @property
     def store(self) -> ProcessingStore:
@@ -167,6 +173,15 @@ class EffectGateway:
     # -- execution ---------------------------------------------------------------------
 
     async def execute_ready(self, effect_id: str) -> EffectReceipt:
+        from yeoman_gateway.history.context import history_knowledge_scope, history_turn
+        stored = self._store.get_effect(effect_id)
+        if self._history_projector is not None and stored is not None and stored.target is not None and stored.target.channel == 'whatsapp':
+            async with history_turn(self._history_projector) as snapshot:
+                with history_knowledge_scope(snapshot, self._history_knowledge):
+                    return await self._execute_ready_scoped(effect_id)
+        return await self._execute_ready_scoped(effect_id)
+
+    async def _execute_ready_scoped(self, effect_id: str) -> EffectReceipt:
         """Authorize, claim and execute one queued effect at most once.
 
         Refuses loudly when the authorizer or executor is missing: a half-wired gateway

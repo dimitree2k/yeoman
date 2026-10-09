@@ -16,6 +16,8 @@ from typing import Any
 
 from loguru import logger
 
+from yeoman_gateway.history.context import current_history_snapshot
+from yeoman_gateway.history.live import HistoryPaused
 from yeoman_gateway.history.reader import HistorySnapshot
 from yeoman_gateway.processing.actor import (
     MAX_ADDITIONAL_GENERATIONS,
@@ -126,6 +128,14 @@ class ThreadActorResponder:
     # -- port --------------------------------------------------------------------------
 
     async def generate_reply(self, event: Any, decision: Any) -> str | None:
+        if getattr(self._inner, '_history_selected', False) and event.channel == 'whatsapp':
+            from yeoman_gateway.history.context import history_knowledge_scope, history_turn
+            async with history_turn(self._inner._history_projector) as snapshot:
+                with history_knowledge_scope(snapshot, self._inner._history_knowledge):
+                    return await self._generate_reply_scoped(event, decision)
+        return await self._generate_reply_scoped(event, decision)
+
+    async def _generate_reply_scoped(self, event: Any, decision: Any) -> str | None:
         direct_binding = self._direct_binding_for_event(event)
         try:
             thread_id = self.thread_for_event(event)
@@ -153,6 +163,8 @@ class ThreadActorResponder:
 
             try:
                 return await self._run_loop(actor, event, decision)
+            except HistoryPaused:
+                raise
             except Exception as exc:
                 # The actor must never cost a reply: degrade to the plain path and say so.
                 logger.warning(
@@ -172,6 +184,7 @@ class ThreadActorResponder:
             channel=str(getattr(event, "channel", "") or ""),
             chat_id=str(getattr(event, "chat_id", "") or ""),
             session_key=session_key,
+            history_snapshot=current_history_snapshot(),
         )
         for _attempt in range(MAX_ADDITIONAL_GENERATIONS + 1):
             snapshot = actor.freeze_snapshot()
@@ -236,13 +249,23 @@ class ThreadActorResponder:
             if not event_id:
                 continue
             source = self._store.get_event(event_id)
+            from yeoman_gateway.history.context import current_history_snapshot
+            from yeoman_gateway.history.queries import HistoryQueries
+            history = current_history_snapshot()
             payload = getattr(source, "payload", None)
+            if history is not None and getattr(source, 'channel', '') == 'whatsapp':
+                row = HistoryQueries(history).native_message(chat_id=source.chat_id,
+                    native_id=source.source_message_id or '')
+                from yeoman_gateway.adapters.reply_archive_history import history_text
+                payload = {'text': history_text(row)} if row else None
             text = ""
             if isinstance(payload, dict):
                 text = str(payload.get("text") or "").strip()
             if text:
                 texts.append(text)
         if not texts:
+            if current_history_snapshot() is not None and event.channel == 'whatsapp':
+                raise HistoryPaused('thread_source_unavailable')
             return event
         content = "\n".join(texts)
         original = str(getattr(event, "content", "") or "")
@@ -260,6 +283,8 @@ class ThreadActorResponder:
             from dataclasses import replace as dataclass_replace
 
             return dataclass_replace(event, content=content)
+        except HistoryPaused:
+            raise
         except Exception:  # pragma: no cover - event shapes without dataclass semantics
             logger.debug("request event could not be rebuilt; keeping the original")
             return event
@@ -273,6 +298,8 @@ class ThreadActorResponder:
             return None
         try:
             assignment = self._store.event_assignment(event_id)
+        except HistoryPaused:
+            raise
         except Exception as exc:
             logger.warning(
                 "assignment_unavailable event_id={} error_type={}", event_id, type(exc).__name__
@@ -307,6 +334,8 @@ class ThreadActorResponder:
                 channel=str(getattr(event, "channel", "") or ""),
                 chat_id=str(getattr(event, "chat_id", "") or ""),
             )
+        except HistoryPaused:
+            raise
         except Exception as exc:  # noqa: BLE001 - cleanup cannot grant authority
             logger.warning(
                 "direct_binding_lookup_failed event_id={} error_type={}",
@@ -327,6 +356,8 @@ class ThreadActorResponder:
             if self._release_chat is not None and self._direct_work_active is not None:
                 if not self._direct_work_active(channel, chat_id):
                     self._release_chat(channel, chat_id)
+        except HistoryPaused:
+            raise
         except Exception as exc:  # noqa: BLE001 - terminal cleanup is best effort
             logger.warning(
                 "direct_binding_finish_failed chat={} error_type={}",
@@ -404,6 +435,8 @@ class ThreadActorResponder:
                 "system", LEGACY_CONTEXT_MARKER + "\n" + "\n".join(reversed(lines))
             )
             sessions.save(thread_session)
+        except HistoryPaused:
+            raise
         except Exception as exc:  # continuity is best effort, never fatal
             logger.warning(
                 "legacy_context_carryover_failed chat={} error_type={}",

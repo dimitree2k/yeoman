@@ -26,6 +26,7 @@ from typing import TYPE_CHECKING, Any
 from loguru import logger
 
 from yeoman_gateway.core.pipeline import NextFn, PipelineContext
+from yeoman_gateway.history.live import HistoryPaused
 
 if TYPE_CHECKING:
     from yeoman_gateway.core.models import InboundEvent
@@ -87,6 +88,8 @@ def build_mention_read_context(
         return None
     try:
         record = chat_registry.get_chat(event.channel, str(event.chat_id))
+    except HistoryPaused:
+        raise
     except Exception:
         return None
     membership_revision = None
@@ -119,10 +122,12 @@ class ContactsMiddleware:
         self,
         *,
         knowledge: "KnowledgeService | None" = None,
+        history_selected: bool = False,
         observation_issuer: "Callable[[TrustedIdentityObservation], object] | None" = None,
         mention_context_factory: "Callable[[InboundEvent], TrustedReadContext | None] | None" = None,
     ) -> None:
         self._knowledge = knowledge
+        self._history_selected = history_selected
         # The source authority only verifies an observation that was issued to it.  The
         # composition root hands its issuer in, because this middleware is where the
         # channel's proven metadata becomes an observation.
@@ -132,6 +137,22 @@ class ContactsMiddleware:
     async def __call__(self, ctx: PipelineContext, next: NextFn) -> None:
         event = ctx.event
 
+        if self._history_selected and event.channel == 'whatsapp':
+            from yeoman_gateway.history.context import current_history_snapshot
+            from yeoman_gateway.history.queries import HistoryQueries
+            snapshot = current_history_snapshot()
+            if snapshot is None:
+                raise HistoryPaused('history_scope_required')
+            queries = HistoryQueries(snapshot)
+            values = [str(event.raw_metadata.get('sender_phone_jid') or ''),
+                      str(event.raw_metadata.get('participant_jid') or ''), event.participant or '', event.sender_id]
+            owners = {owner for value in values if value and (owner := queries.resolve_identifier(
+                value, at_ms=int(event.timestamp.timestamp() * 1000), time_basis='native')) is not None}
+            raw = {key: value for key, value in event.raw_metadata.items() if key not in {'contact_id','identity_status','identity_reason','mentioned_person_candidates'}}
+            if len(owners) == 1:
+                raw.update(contact_id=next(iter(owners)), identity_status='resolved', identity_reason='history')
+            event = replace(event, raw_metadata=raw)
+            ctx.event = event
         if event.channel not in _IDENTITY_CHANNELS or self._knowledge is None:
             await next(ctx)
             return
@@ -186,6 +207,8 @@ class ContactsMiddleware:
                     )
             if candidates:
                 new_meta["mentioned_person_candidates"] = candidates
+        except HistoryPaused:
+            raise
         except Exception as exc:
             logger.warning(
                 "mention_identity_resolution_failed error_type={}", type(exc).__name__
@@ -195,6 +218,9 @@ class ContactsMiddleware:
             event = replace(event, raw_metadata=new_meta)
             ctx.event = event
 
+        if self._history_selected and event.channel == 'whatsapp':
+            await next(ctx)
+            return
         observation = self._observation(event.channel, event.participant, event.sender_id, raw)
         if observation is None:
             await next(ctx)
@@ -204,6 +230,8 @@ class ContactsMiddleware:
             if self._observation_issuer is not None:
                 self._observation_issuer(observation)
             resolution = self._knowledge.resolve_observation(observation)
+        except HistoryPaused:
+            raise
         except Exception as exc:
             # Knowledge is degraded.  The observation is already durable in the
             # processing journal, so nothing is lost and nothing is invented: this turn
@@ -259,6 +287,8 @@ class ContactsMiddleware:
                 identifier = Identifier(
                     channel=channel, kind=kind, value=value, namespace=account_id
                 )
+            except HistoryPaused:
+                raise
             except Exception:
                 continue
             if identifier not in identifiers:
@@ -311,6 +341,8 @@ class ContactsMiddleware:
         for kind, value in candidates:
             try:
                 identifier = Identifier(channel=channel, kind=kind, value=value, namespace=namespace)
+            except HistoryPaused:
+                raise
             except Exception:
                 # An unparseable identifier is dropped, never reinterpreted.
                 continue
@@ -340,6 +372,8 @@ class ContactsMiddleware:
                 mapping_verified=mapping_verified,
                 account_namespace=namespace,
             )
+        except HistoryPaused:
+            raise
         except Exception:
             return None
 
