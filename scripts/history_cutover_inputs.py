@@ -486,8 +486,10 @@ def build_cutover_record(*, inventory: Path, layout: Mapping[str,str],
     if mode=='live' and 'gateway_socket' not in inv:
         _paths(Path(inv['config_path']))
         config = json.loads(Path(inv['config_path']).read_bytes())
+        from yeoman_shared.config.loader import _migrate_config_with_change, convert_keys
         from yeoman_shared.config.schema import Config
-        socket = Config.model_validate(config).ipc.gateway_socket_path
+        migrated, _ = _migrate_config_with_change(config)
+        socket = Config.model_validate(convert_keys(migrated)).ipc.gateway_socket_path
         if socket is None or socket=='~/.yeoman/run/gateway.sock':
             socket = str(home/'run/gateway.sock')
         if not Path(socket).is_absolute():

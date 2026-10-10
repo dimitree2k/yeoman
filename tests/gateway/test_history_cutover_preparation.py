@@ -735,3 +735,185 @@ def test_identical_unresolved_authors_are_withheld_with_identity_reason(case):
     assert rows[0]['cutover_reason']=='author_mismatch'
     assert rows[0]['author_reason']=='author_unresolved'
     assert counts['author_unresolved']==1 and counts['mapped']==0
+
+
+@pytest.mark.parametrize(('bare','lid_contact','expected','reason'),[
+    ('10001',None,'mapped','mapped'),
+    ('90001','a','mapped','mapped'),
+    ('10001','a','mapped','mapped'),
+    ('10001','b','ambiguous','author_unresolved'),
+    ('90001','b','ambiguous','author_different_contact'),
+    ('90001',None,'ambiguous','author_unresolved'),
+])
+def test_bare_digit_authors_resolve_phone_and_lid_without_rewriting(case,bare,lid_contact,expected,reason):
+    from yeoman_gateway.knowledge._history_cutover import prepare_legacy_alias_inputs
+
+    from tests.gateway.convhist.test_hist_queries import identifier
+    _,q,sources,db = case
+    if lid_contact:
+        identifier(db,lid_contact,bare+'@lid',start=1)
+    source = SourceRef('bare-author',1,'whatsapp',q.message('m')['chat_id'],bare,100)
+    copies = [proof(q,'m',source),proof(q,'m',source)]
+    for item,author in zip(copies,(bare,'whatsapp:10001'),strict=True):
+        item['original']['state']['author_principal'] = author
+        item['original']['issued']['author_principal'] = author
+        item['origin']['row_sha256'] = row_sha256(item['original'])
+    rows,locators,counts = prepare_legacy_alias_inputs(queries=q,legacy_rows=[legacy(source)],preserved_rows=copies)
+    assert rows[0]['cutover_status']==expected
+    assert rows[0].get('author_reason',rows[0]['cutover_reason'])==reason
+    assert copies[0]['original']['issued']['author_principal']==bare
+    if expected=='mapped':
+        aliases,_ = build_history_source_aliases(queries=q,legacy_rows=rows,locators=locators)
+        assert aliases[source.key].issued==source
+        sources.ledger.persist_aliases(aliases)
+        assert sources.verify_source_ref(*source.key)==source
+        assert sources.permits_principal(source,'whatsapp:10001',now_ms=100)
+        assert not sources.permits_principal(source,'whatsapp:10002',now_ms=100)
+    else:
+        assert counts[reason]==1 and counts['mapped']==0
+
+
+@pytest.mark.parametrize('contact',['a','b'])
+@pytest.mark.parametrize('bare',['10001','90001'])
+@pytest.mark.parametrize('integer_original',[False,True])
+def test_real_shape_journal_reply_bridge_author_union(case,bare,integer_original,contact):
+    from yeoman_gateway.knowledge._history_cutover import prepare_legacy_alias_inputs
+
+    from tests.gateway.convhist.test_hist_queries import identifier
+    _,q,sources,db = case
+    identifier(db,contact,'90001@lid',start=1)
+    source = SourceRef('three-store',1,'whatsapp',q.message('m')['chat_id'],bare,100)
+    copies = [proof(q,'m',source) for _ in range(3)]
+    journal_author = int(bare) if integer_original else bare
+    for item,store,author in zip(copies,('journal','reply_context','bridge_refs'),
+            (journal_author,'whatsapp:10001','whatsapp:90001@lid'),strict=True):
+        item['original']['state']['author_principal'] = author
+        item['original']['issued']['author_principal'] = author
+        item['origin'].update(store=store,row_sha256=row_sha256(item['original']))
+    rows,locators,counts = prepare_legacy_alias_inputs(queries=q,legacy_rows=[legacy(source)],preserved_rows=copies)
+    if contact=='b':
+        assert rows[0]['cutover_status']=='ambiguous'
+        assert rows[0]['author_reason']=='author_different_contact'
+        assert counts['author_different_contact']==1 and counts['mapped']==0
+        return
+    assert rows[0]['cutover_status']=='mapped' and counts['mapped']==1
+    aliases,_ = build_history_source_aliases(queries=q,legacy_rows=rows,locators=locators)
+    sources.ledger.persist_aliases(aliases)
+    assert sources.verify_source_ref(*source.key)==source
+    assert aliases[source.key].issued.author_principal==bare
+    assert copies[0]['original']['state']['author_principal']==journal_author
+
+
+def test_author_resolution_uses_message_clock_not_issued_clock(case):
+    from yeoman_gateway.knowledge._history_cutover import prepare_legacy_alias_inputs
+
+    from tests.gateway.convhist.test_hist_queries import identifier
+    _,q,_,db = case
+    identifier(db,'a','90001@lid',start=1,end=101)
+    source = SourceRef('clock',1,'whatsapp',q.message('m')['chat_id'],'90001',101)
+    copies = [proof(q,'m',source),proof(q,'m',source)]
+    for item,value in zip(copies,('90001','whatsapp:10001'),strict=True):
+        item['original']['state']['author_principal'] = value
+        item['origin']['row_sha256'] = row_sha256(item['original'])
+    rows,_,counts = prepare_legacy_alias_inputs(queries=q,legacy_rows=[legacy(source)],preserved_rows=copies)
+    assert rows[0]['cutover_reason']=='time_mismatch'
+    assert counts['mapped']==0 and counts['author_unresolved']==0
+
+
+@pytest.mark.parametrize(('audience','reason'),[('different','audience_mismatch'),('malformed','audience_unproven'),('absent','audience_unproven')])
+def test_alias_audience_refusals_have_specific_reason(case,audience,reason):
+    from yeoman_gateway.knowledge._history_cutover import prepare_legacy_alias_inputs
+    _,q,_,_ = case
+    source = SourceRef('audience-refusal',1,'whatsapp',q.message('m')['chat_id'],'10001',100)
+    row = legacy(source,content_fingerprint=q.content_fingerprint('m'))
+    if audience=='different':
+        row['source_audience_json']='["whatsapp:10003"]'
+    elif audience=='malformed':
+        row['source_audience_json']='not-json'
+    else:
+        row.pop('source_audience_json')
+    aliases,counts = build_history_source_aliases(queries=q,legacy_rows=[row],locators={source.key:('m',)})
+    assert not aliases and counts[reason]==1
+    if audience!='absent':
+        rows,_,_ = prepare_legacy_alias_inputs(queries=q,legacy_rows=[row],preserved_rows=[proof(q,'m',source)])
+        assert rows[0]['cutover_reason']==reason
+
+
+@pytest.mark.parametrize('unknown',[False,True])
+@pytest.mark.parametrize('members',[None,['whatsapp:10001','whatsapp:10002','whatsapp:10003']])
+def test_alias_audience_ceiling_and_legacy_basis(case,unknown,members):
+    from tests.gateway.convhist.test_hist_queries import contact, identifier
+    _,q,sources,db = case
+    if unknown:
+        db.execute("DELETE FROM message_events WHERE kind='member_snapshot'")
+    source = SourceRef('audience-ceiling',1,'whatsapp',q.message('m')['chat_id'],'10001',100)
+    row = legacy(source,content_fingerprint=q.content_fingerprint('m'),
+        source_audience_json=None if members is None else json.dumps(members))
+    aliases,counts = build_history_source_aliases(queries=q,legacy_rows=[row],locators={source.key:('m',)})
+    assert counts['mapped']==1
+    alias = aliases[source.key]
+    assert alias.audience_basis==('legacy_proof' if unknown else 'history_intersection')
+    assert alias.audience.members==frozenset(() if members is None else members if unknown else members[:2])
+    sources.ledger.persist_aliases(aliases)
+    assert sources.ledger.alias(source.key)==alias
+    assert sources.verify_source_ref(*source.key)==source
+    assert sources.evidence_audience(source,basis='')==alias.audience
+    contact(db,'later')
+    identifier(db,'later','10004@s.whatsapp.net',start=1)
+    event(db,'later-member','member_add',200,{'participants':[['10004@s.whatsapp.net']]})
+    assert not sources.permits_principal(source,'whatsapp:10004',now_ms=300)
+    if unknown:
+        with pytest.raises(Exception) as refused:
+            sources.issue('m')
+        assert refused.value.code=='denied_unknown_basis'
+
+
+@pytest.mark.parametrize('null_author',[None,''])
+def test_coordinator_null_author_and_projected_contact(case,null_author):
+    from yeoman_gateway.knowledge._history_cutover import prepare_legacy_alias_inputs
+    _,q,_,db = case
+    db.execute("UPDATE messages SET sender_identifier='10001' WHERE message_id='m'")
+    source = SourceRef('projected-contact',1,'whatsapp',q.message('m')['chat_id'],'10001',100)
+    copies = [proof(q,'m',source),proof(q,'m',source)]
+    for item,value in zip(copies,('10001',null_author),strict=True):
+        item['original']['state']['author_principal']=value
+        item['origin']['row_sha256']=row_sha256(item['original'])
+    rows,_,counts = prepare_legacy_alias_inputs(queries=q,legacy_rows=[legacy(source)],preserved_rows=copies)
+    assert counts['mapped']==1 and counts['author_unresolved']==0
+    assert rows[0]['cutover_status']=='mapped'
+    assert copies[1]['original']['state']['author_principal']==null_author
+
+
+@pytest.mark.parametrize(('change','reason'),[('history','history_sender_contact_unproven'),('legacy','legacy_author_unresolvable')])
+def test_alias_contact_refusal_subcases(case,change,reason):
+    _,q,_,db=case
+    source = SourceRef('contact-refusal',1,'whatsapp',q.message('m')['chat_id'],
+                       '99999' if change=='legacy' else '10001',100)
+    if change=='history':
+        db.execute("UPDATE messages SET sender_contact_id=NULL WHERE message_id='m'")
+    row = legacy(source,content_fingerprint=q.content_fingerprint('m'))
+    aliases,counts=build_history_source_aliases(queries=q,legacy_rows=[row],locators={source.key:('m',)})
+    assert not aliases and counts[reason]==1
+
+
+def test_author_lookup_after_partial_original_has_message_time(case,monkeypatch):
+    from yeoman_gateway.knowledge import _history_cutover as cutover
+    _,q,_,_=case
+    source=SourceRef('partial-clock',1,'whatsapp',q.message('m')['chat_id'],'10001',100)
+    partial,complete=proof(q,'m',source),proof(q,'m',source)
+    for item in (partial,complete):
+        item['original']['state']['author_principal']='10001'
+    for field in ('channel','chat_id','native_message_id','sent_ms','time_certainty'):
+        partial['original']['state'].pop(field)
+    for item in (partial,complete):
+        item['origin']['row_sha256']=row_sha256(item['original'])
+    seen=[]
+    original=cutover._author_contact
+    def observed(queries,value,*,at_ms):
+        seen.append(at_ms)
+        return original(queries,value,at_ms=at_ms)
+    monkeypatch.setattr(cutover,'_author_contact',observed)
+    rows,_,counts=cutover.prepare_legacy_alias_inputs(queries=q,legacy_rows=[legacy(source)],
+        preserved_rows=[partial,complete])
+    assert counts['mapped']==1 and counts['author_unresolved']==0
+    assert rows[0]['cutover_status']=='mapped' and seen and set(seen)=={100}

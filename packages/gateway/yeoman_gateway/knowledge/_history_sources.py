@@ -22,6 +22,7 @@ class HistorySourceAlias:
     author_contact_id: str
     content_fingerprint: str
     audience: EvidenceAudience
+    audience_basis: str = "history_intersection"
 
 
 @dataclass(frozen=True)
@@ -42,6 +43,7 @@ def _audience_json(audience: EvidenceAudience) -> str:
 
 def _audience(payload: str) -> EvidenceAudience:
     values = json.loads(payload)
+    values.pop("audience_basis", None)
     values['members'] = frozenset(values['members'])
     values['allowed'] = frozenset(values['allowed'])
     return EvidenceAudience(**values)
@@ -102,7 +104,8 @@ class HistorySourceLedger:
                 self.store.execute('INSERT OR IGNORE INTO knowledge_history_source_aliases VALUES (?,?,?,?,?,?,?,?)',
                                    (*alias.issued.key, json.dumps(asdict(alias.issued), sort_keys=True),
                                     alias.message_id, alias.revision, alias.author_contact_id,
-                                    alias.content_fingerprint, _audience_json(alias.audience)))
+                                    alias.content_fingerprint, json.dumps({**json.loads(_audience_json(alias.audience)),
+                                        "audience_basis": alias.audience_basis}, sort_keys=True)))
                 self._insert(HistorySourceRecord(alias.issued, alias.content_fingerprint,
                                                 alias.author_contact_id, alias.audience, False))
 
@@ -112,7 +115,8 @@ class HistorySourceLedger:
             return None
         return HistorySourceAlias(SourceRef(**json.loads(row['issued_json'])), row['message_id'],
                                   row['message_revision'], row['author_contact_id'],
-                                  row['content_fingerprint'], _audience(row['audience_json']))
+                                  row['content_fingerprint'], _audience(row['audience_json']),
+                                  json.loads(row['audience_json']).get('audience_basis', 'history_intersection'))
 
 
 def is_legacy_node(event_id: str) -> bool:
@@ -137,13 +141,19 @@ def _canonical_author(value: Any) -> Any:
     if not isinstance(value, str):
         return value
     identifier = value.removeprefix('whatsapp:')
-    # Only hash-bound author fields use bare phones; runtime native-ID checks remain typed.
+    # Lexical normalization alone does not establish the identity of bare digits.
     if '@' in identifier:
         return _principal(identifier) or value
     return canonical_user_id('whatsapp', metadata={'sender_phone_jid': identifier}) or value
 
 
 def _author_contact(queries: HistoryQueries, value: Any, *, at_ms: int, time_basis: str = 'native') -> str | None:
+    if type(value) is int and value >= 0:
+        value = str(value)  # Comparison only; preserved/issued values remain unchanged.
+    if isinstance(value, str) and value.isascii() and value.isdigit():
+        owners = {queries.resolve_identifier(value + suffix, at_ms=at_ms, time_basis=time_basis)
+                  for suffix in ('@s.whatsapp.net', '@lid')} - {None}
+        return next(iter(owners)) if len(owners) == 1 else None
     canonical = _canonical_author(value)
     if not isinstance(canonical, str) or not canonical.startswith('whatsapp:'):
         return None
@@ -162,20 +172,38 @@ def principal_identifier(principal: str) -> str | None:
     return value if _principal(value) == principal else None
 
 
-def _proof(queries: HistoryQueries, message_id: str) -> tuple[dict[str, Any], str, str, EvidenceAudience] | None:
+def _proof(queries: HistoryQueries, message_id: str, *, legacy_alias: bool = False) -> tuple[dict[str, Any], str, str, EvidenceAudience] | None:
     row = queries.message(message_id)
     if (row is None or row['sent_ms'] is None or row['time_certainty'] not in ('native', 'provider_timestamp')
             or row['direction'] != 'in' or row['sender_basis'] not in ('native_identifier', 'owner_attested')):
         return None
     principal = _principal(row['sender_identifier'] or '')
     contact = queries.resolve_identifier(row['sender_identifier'] or '', at_ms=row['sent_ms'], time_basis=row['time_certainty'])
-    if (principal is None or contact is None or row['sender_contact_id'] is None
+    if legacy_alias and row['sender_contact_id'] is not None:
+        # Projected temporal attribution remains authoritative for legacy aliases.
+        contact = queries.terminal(row['sender_contact_id'])
+    if ((principal is None and not legacy_alias) or contact is None or row['sender_contact_id'] is None
             or queries.terminal(row['sender_contact_id']) != contact):
         return None
     audience = queries.audience(message_id)
-    if audience.status == 'unknown':
+    if audience.status == 'unknown' and not legacy_alias:
         return None
     return row, principal, contact, audience
+
+
+def _alias_audience(legacy: EvidenceAudience, historical: EvidenceAudience, *,
+                    queries: HistoryQueries, contact: str, at_ms: int) -> EvidenceAudience | None:
+    if historical.status == 'unknown':
+        return legacy
+    if historical.status == 'author_only':
+        if legacy.status == 'author_only':
+            return legacy
+        members = frozenset(p for p in legacy.members if _author_contact(queries, p, at_ms=at_ms) == contact)
+    elif legacy.status == 'author_only':
+        return legacy if any(_author_contact(queries, p, at_ms=at_ms) == contact for p in historical.members) else None
+    else:
+        members = legacy.members & historical.members
+    return replace(legacy, members=members) if members else None
 
 
 class HistoryKnowledgeSources:
@@ -258,7 +286,7 @@ class HistoryKnowledgeSources:
         fingerprint = alias.content_fingerprint if alias else record.content_fingerprint
         owner = alias.author_contact_id if alias else record.author_contact_id
         audience = alias.audience if alias else record.audience
-        proof = _proof(self.queries, message_id)
+        proof = _proof(self.queries, message_id, legacy_alias=alias is not None)
         if proof is None or fingerprint != self.queries.content_fingerprint(message_id):
             return None
         row, principal, contact, historical = proof
@@ -267,10 +295,11 @@ class HistoryKnowledgeSources:
             return None
         if audience.status == 'unknown':
             return None
-        if audience.status == 'known':
-            if historical.status != 'known':
-                return None
-            audience = replace(audience, members=audience.members & historical.members)
+        if historical.status == 'unknown' and (alias is None or alias.audience_basis != 'legacy_proof'):
+            return None
+        audience = _alias_audience(audience, historical, queries=self.queries, contact=contact, at_ms=row['sent_ms'])
+        if audience is None:
+            return None
         self._verification[key] = (state, source, audience, contact)
         return source
 
@@ -405,25 +434,43 @@ def build_history_source_aliases(*, queries: HistoryQueries, legacy_rows: Iterab
         if not targets:
             counts['missing'] += 1
             continue
-        proof = _proof(queries, targets[0])
+        proof = _proof(queries, targets[0], legacy_alias=True)
         fingerprint = queries.content_fingerprint(targets[0])
         owner = row.get('author_contact_id')
-        if (proof is None or not owner or queries.terminal(str(owner)) != proof[2]
-                or fingerprint != row.get('content_fingerprint') or _author_contact(queries, source.author_principal, at_ms=proof[0]['sent_ms'], time_basis=proof[0]['time_certainty']) != proof[2]
-                or source.chat_id != proof[0]['chat_id'] or source.occurred_at_ms != proof[0]['sent_ms']):
+        author = (_author_contact(queries, source.author_principal, at_ms=proof[0]['sent_ms'],
+                                  time_basis=proof[0]['time_certainty']) if proof is not None else None)
+        owner_contact = queries.terminal(str(owner)) if owner else None
+        current = queries.message(targets[0])
+        reason = ('history_sender_contact_unproven' if current is not None and not current['sender_contact_id']
+                  else 'source_unproven' if proof is None
+                  else 'legacy_author_unresolvable' if author is None
+                  else 'author_different_contact' if author != proof[2]
+                  else 'legacy_author_contact_unproven' if owner_contact is None
+                  else 'author_contact_mismatch' if owner_contact != proof[2]
+                  else 'fingerprint_mismatch' if fingerprint != row.get('content_fingerprint')
+                  else 'chat_mismatch' if source.chat_id != proof[0]['chat_id']
+                  else 'time_mismatch' if source.occurred_at_ms != proof[0]['sent_ms'] else None)
+        if reason is not None:
             counts['missing'] += 1
+            counts[reason] += 1
             continue
         members = row.get('source_audience_json')
         try:
+            if 'source_audience_json' not in row:
+                raise ValueError('audience_unproven')
             audience = (EvidenceAudience.author_only(snapshot_id=row.get('snapshot_id')) if members is None
                         else EvidenceAudience.known(set(json.loads(members)), snapshot_id=row.get('snapshot_id')))
         except (TypeError, ValueError):
             counts['missing'] += 1
+            counts['audience_unproven'] += 1
             continue
-        if audience.status == 'known' and (proof[3].status != 'known' or audience.members != proof[3].members):
+        audience = _alias_audience(audience, proof[3], queries=queries, contact=proof[2], at_ms=proof[0]['sent_ms'])
+        if audience is None:
             counts['missing'] += 1
+            counts['audience_mismatch'] += 1
             continue
-        alias = HistorySourceAlias(source, targets[0], int(row.get('message_revision', 1)), str(owner), fingerprint, audience)
+        basis = 'legacy_proof' if proof[3].status == 'unknown' else 'history_intersection'
+        alias = HistorySourceAlias(source, targets[0], int(row.get('message_revision', 1)), str(owner), fingerprint, audience, basis)
         if source.key in aliases and aliases[source.key] != alias:
             aliases.pop(source.key)
             blocked.add(source.key)

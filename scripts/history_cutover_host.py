@@ -229,12 +229,14 @@ def _configure(payload: dict, inventory: Mapping) -> dict:
     before = path.read_bytes()
     config = json.loads(before)
     config['history'] = payload['selection']
+    from yeoman_shared.config.loader import _migrate_config_with_change, convert_keys
     from yeoman_shared.config.schema import Config
-    Config.model_validate(config)
+    migrated, _ = _migrate_config_with_change(config)
+    Config.model_validate(convert_keys(migrated))
     backup = _path(payload['record']['receipts']) / 'config-before.json'
     if not backup.exists():
         _write(backup, before, exclusive=True)
-    _write(path, json.dumps(config, sort_keys=True).encode())
+    _write(path, json.dumps(config, indent=2).encode())
     observed = json.loads(path.read_bytes())['history']
     return dict(ok=observed == payload['selection'], selection=observed, backup=str(backup))
 

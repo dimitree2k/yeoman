@@ -12,7 +12,6 @@ from yeoman_gateway.history.queries import HistoryQueries
 from yeoman_gateway.knowledge._history_sources import (
     _author_contact,
     _canonical_author,
-    _principal,
     build_history_source_aliases,
     is_legacy_node,
 )
@@ -80,16 +79,21 @@ def prepare_legacy_alias_inputs(*, queries: HistoryQueries,
         status = "missing"
         reason = "no_preserved_original"
         targets: set[str] = set()
+        target_times: dict[str, Any] = {}
         proofs = []
         states = []
         contacts = {}
+        message_time = None
         def author(value):
+            # Never cache a lookup made before this key's message time is known.
+            key = (row_sha256(value), message_time if type(message_time) is int else None)
+            if key not in contacts:
+                contacts[key] = (_author_contact(queries, value, at_ms=message_time)
+                                 if type(message_time) is int else None)
+            if contacts[key] is not None:
+                return ('contact', contacts[key])
             canonical = _canonical_author(value)
-            if not isinstance(canonical, str):
-                return ('unresolved', row_sha256(canonical))
-            if canonical not in contacts:
-                contacts[canonical] = _author_contact(queries, canonical, at_ms=source.occurred_at_ms)
-            return ('contact', contacts[canonical]) if contacts[canonical] is not None else ('unresolved', canonical)
+            return ('unresolved', canonical if isinstance(canonical, str) else row_sha256(canonical))
         def author_reason(values):
             return 'author_unresolved' if any(v[0]=='unresolved' for v in values) else 'author_different_contact'
 
@@ -128,26 +132,33 @@ def prepare_legacy_alias_inputs(*, queries: HistoryQueries,
                     continue
                 # Comparison views never alter the hash-bound originals or issued refs.
                 state = dict(state)
-                if 'author_principal' in state:
-                    state['author_principal'] = author(state['author_principal'])
+                if state.get('author_principal') in (None, ''):
+                    state.pop('author_principal', None)
                 if state.get('reply_to_native_id') in (None, ''):
                     state.pop('reply_to_native_id', None)
                 if issued is not None:
                     issued = dict(issued)
-                    if 'author_principal' in issued:
-                        issued['author_principal'] = author(issued['author_principal'])
                 states.append((issued, state))
                 if all(state.get(k) for k in ("channel", "chat_id", "native_message_id")):
                     matches = queries._rows(
                         "SELECT * FROM messages_current WHERE channel=? AND chat_id=? AND native_message_id=?",
                         (state["channel"], state["chat_id"], state["native_message_id"]))
                     targets.update(match["message_id"] for match in matches)
+                    target_times.update((match["message_id"], match["sent_ms"]) for match in matches)
                 proofs.append({"origin": {k: origin[k] for k in ("store", "path", "table", "row_key", "row_sha256")}, "source_ref": preserved["source_ref"],
                                "native_locator": [state.get(k) for k in ("channel", "chat_id", "native_message_id")]})
+            times = {state['sent_ms'] for _,state in states if type(state.get('sent_ms')) is int}
+            message_time = (target_times.get(next(iter(targets))) if len(targets)==1
+                            else next(iter(times)) if len(times)==1 else None)
+            for issued,state in states:
+                if state.get('author_principal') not in (None, ''):  # null/empty = not recorded
+                    state['author_principal'] = author(state['author_principal'])
+                if issued is not None and 'author_principal' in issued:
+                    issued['author_principal'] = author(issued['author_principal'])
             conflicts = any((left_issued is not None and right_issued is not None and left_issued != right_issued) or any(
                 left[k] != right[k] for k in left.keys() & right.keys())
                 for i,(left_issued,left) in enumerate(states) for right_issued,right in states[i+1:])
-            author_values = {state['author_principal'] for _,state in states if 'author_principal' in state}
+            author_values = {state['author_principal'] for _,state in states if state.get('author_principal') not in (None, '')}
             author_values.update(issued['author_principal'] for issued,_ in states if issued is not None and 'author_principal' in issued)
             if len(author_values)>1:
                 row['author_reason'] = author_reason(author_values)
@@ -167,7 +178,9 @@ def prepare_legacy_alias_inputs(*, queries: HistoryQueries,
                 mid = next(iter(targets))
                 current = queries._rows("SELECT * FROM messages_current WHERE message_id=?", (mid,))[0]
                 expected = _state(queries, current)
-                expected["author_principal"] = author(_principal(current["sender_identifier"] or ""))
+                # History already resolved this sender; its terminal contact is the authority.
+                expected["author_principal"] = (("contact", current["sender_contact_id"]) if current.get("sender_contact_id")
+                                                else author(current["sender_identifier"] or None))
                 # An original observation with no mutations proves pre-edit text.
                 if not recorded.get("events"):
                     expected["events"] = []
@@ -193,7 +206,7 @@ def prepare_legacy_alias_inputs(*, queries: HistoryQueries,
                     row["content_fingerprint"] = queries.content_fingerprint(mid)
                     row["native_id"] = current["native_message_id"]
                     locators[key] = (mid,)
-                    aliases, _ = build_history_source_aliases(queries=queries, legacy_rows=[row], locators=locators)
+                    aliases, alias_counts = build_history_source_aliases(queries=queries, legacy_rows=[row], locators=locators)
                     if key in aliases:
                         status, reason = "mapped", "mapped"
                         row["message_id"] = mid
@@ -202,10 +215,13 @@ def prepare_legacy_alias_inputs(*, queries: HistoryQueries,
                         if len(order_values) == 1 and type(next(iter(order_values))) is int:
                             row["created_ms"] = next(iter(order_values))
                     else:
-                        principal = author(_principal(current["sender_identifier"] or ""))
+                        principal = (("contact", current["sender_contact_id"]) if current.get("sender_contact_id")
+                                     else author(current["sender_identifier"] or None))
                         reason = ("author_mismatch" if author(source.author_principal) != principal else
                                   "time_mismatch" if source.occurred_at_ms != current["sent_ms"] else
-                                  "no_author_or_audience_proof")
+                                  next((code for code in ("audience_unproven", "audience_mismatch", "history_sender_contact_unproven", "legacy_author_unresolvable", "legacy_author_contact_unproven",
+                                      "author_contact_mismatch", "fingerprint_mismatch", "source_unproven", "chat_mismatch")
+                                      if alias_counts.get(code)), "no_author_or_audience_proof"))
         if reason == 'author_mismatch':
             row['author_reason'] = author_reason([*author_values,author(source.author_principal),expected['author_principal']])
         if 'author_reason' in row:

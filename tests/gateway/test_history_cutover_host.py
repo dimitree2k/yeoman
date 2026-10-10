@@ -532,3 +532,33 @@ def test_proc_scan_matches_configured_executable_symlink(tmp_path):
     inv['units'][0]['executable'] = str(configured)
     proof = host_module().live_host_controls(inventory=inv, runner=Runner(), proc_root=proc)('verify-quiescent', payload(tmp_path))
     assert not proof['ok'] and not proof['writers_absent']
+
+
+@pytest.mark.parametrize('mode',['live','rehearsal'])
+def test_configure_uses_loader_migration_preserving_raw_profile_keys(tmp_path,mode):
+    from yeoman_shared.config.loader import load_config
+    home,p = data_home(tmp_path)
+    config = home/'camel-config.json'
+    original = dict(ownerExtension={'untouchedKey':'synthetic'},models=dict(
+        profiles={'syntheticFast':{'kind':'chat','model':'synthetic','maxTokens':123}},
+        routes={'assistant.reply':'syntheticFast'}),ipc={'gatewaySocketPath':str(home/'run/synthetic.sock')},
+        history={},channels={'whatsapp':{'replyContextWindowLimit':7}})
+    config.write_text(json.dumps(original,indent=2))
+    before = config.read_bytes()
+    p['selection'] = dict(legacyWritersDisabled=True,liveProjectionEnabled=True,readers=dict(knowledge=True))
+    inv = dict(inventory(),config_path=str(config))
+    runner = Runner()
+    h = host_module()
+    control = (h.live_host_controls(inventory=inv,runner=runner) if mode=='live'
+        else h.rehearsal_host_controls(copy_home=home,inventory=inv))
+    result = control('configure-retirement',p)
+    assert result['ok'] and runner.calls==[]
+    assert Path(result['backup']).read_bytes()==before
+    after = json.loads(config.read_bytes())
+    assert list(after)==list(original)
+    assert {k:v for k,v in after.items() if k!='history'}=={k:v for k,v in original.items() if k!='history'}
+    assert after['history']==p['selection']
+    loaded = load_config(config)
+    assert loaded.history.legacy_writers_disabled and loaded.history.live_projection_enabled
+    assert loaded.history.readers.knowledge
+    assert loaded.models.routes['assistant.reply']=='synthetic_fast'

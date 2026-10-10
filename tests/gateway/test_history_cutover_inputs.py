@@ -768,7 +768,7 @@ def test_record_derives_control_paths_hashes_and_config_socket(tmp_path,mode):
     for key in ('config_path','pause_path','knowledge_db','processing_db','gateway_socket',
             'frozen_watermarks','prepared_text_manifest_sha256'):
         inv.pop(key)
-    (home/'config.json').write_text(dumps({'ipc':{'gateway_socket_path':str(home/'run/custom.sock')}}))
+    (home/'config.json').write_text(dumps({'ipc':{'gatewaySocketPath':str(home/'run/custom.sock')},'models':{'profiles':{'syntheticFast':{'kind':'chat','model':'synthetic'}},'routes':{'assistant.reply':'syntheticFast'}}}))
     inv['frozen_files'] = [str(home/'cron.json')]
     source = {k:value[k] for k in ('home','output','receipts','candidate','prior','inventory','rehearsal_root')}
     source.update(version=1,python=__import__('sys').executable)

@@ -154,7 +154,9 @@ class HistoryCaptureProducer:
                 previous = assignments.get(mid)
                 if previous is not None:
                     old_source, old_state, old_job = previous
-                    if (old_source != source or (old_job is not None and old_job != job["job_id"])
+                    # Two completed jobs for the same source are a re-run, not a conflict.
+                    rerun = old_source == source and old_state == state == "published"
+                    if (old_source != source or (old_job is not None and old_job != job["job_id"] and not rerun)
                             or (old_state == "processed" and state != "published")
                             or (old_state == "pending" and state not in ("queued", "pending"))
                             or (old_job is not None and old_state != state)):
