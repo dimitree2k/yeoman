@@ -899,7 +899,13 @@ def test_rehearsal_and_live_execute_the_same_command_argv(tmp_path, monkeypatch,
     assert calls[0][1]['env']['YEOMAN_HOME'] == str(tmp_path / 'live-home')
     assert calls[1][1]['env']['YEOMAN_SOURCE_DIR'] == str(source)
     assert str(source / 'packages/gateway') in calls[1][1]['env']['PYTHONPATH']
-    assert {k: v for k, v in live_result.items() if k != 'mode'} == \
+    # The live import controls additionally journal why they did not skip this package
+    # (its layout manifest binds no staged rows); everything else stays identical.
+    extra = set(live_result) - set(rehearsal_result)
+    assert extra <= {'skip_check'}
+    if extra:
+        assert live_result['skip_check']['provable'] is False
+    assert {k: v for k, v in live_result.items() if k not in ('mode', 'skip_check')} == \
            {k: v for k, v in rehearsal_result.items() if k != 'mode'}
 
 
@@ -1328,3 +1334,266 @@ def test_capture_readiness_is_false_while_unobservable_and_true_once_ready(tmp_p
         db.execute("INSERT INTO knowledge_history_capture_state VALUES ('handover',?,1)",
                    (json.dumps(dict(version=1, generation=1, sources=[])),))
     assert module._capture_ready(p) is True
+
+
+# ---------------------------------------------------------------------------
+# Import skip: a package a completed import already wrote in full.
+# Every CLI child below is injected, but it runs the same library calls the real
+# import-backfill command runs, so its refusals are the real refusals.
+# ---------------------------------------------------------------------------
+
+def skip_backfill(name, mid, *, kind='message', payload=None, store='snapshot'):
+    from yeoman_gateway.history.layer1 import Origin, backfill_line
+    return backfill_line(channel='whatsapp', kind=kind, provenance='native',
+                         time_certainty='native', occurred_ms=100, direction='in', chat_id='c1',
+                         payload={'messageId': mid, 'text': 'synthetic'} if payload is None else payload,
+                         origin=Origin(store, 'source.db', 'rows', name),
+                         original={'uuid': name, 'received_ms': 100})
+
+
+def skip_derived(row_key, mid, text):
+    from yeoman_gateway.history.layer1 import row_sha256
+    original = {'id': row_key, 'content': text, 'created_at': '2026-01-01T00:00:00Z'}
+    return {'derived_version': 1, 'kind': 'media_description', 'channel': 'whatsapp', 'chat_id': 'c1',
+            'native_message_id': mid, 'mode': 'description', 'generator': None, 'generated_ms': 200,
+            'text': text, 'origin': {'store': 'document_cache', 'path': 'data/document_cache.db',
+                                     'table': 'media_extractions', 'row_key': row_key,
+                                     'row_sha256': row_sha256(original)}, 'original': original}
+
+
+def write_package(root, files):
+    from yeoman_gateway.history.layer1 import canonical_json
+    for relative, rows in files.items():
+        path = root / relative
+        path.parent.mkdir(parents=True, exist_ok=True)
+        path.write_text(''.join(canonical_json(row) + '\n' for row in rows))
+    return root
+
+
+def imported_package(tmp_path, grown=(), *, identities=('m1', 'm2')):
+    """A synthetic archive one completed import already wrote, plus a grown package.
+
+    The grown package repeats both destinations byte for byte and appends *grown*.
+    """
+    from yeoman_gateway.history.convert.run import prepare_import_manifest
+    from yeoman_shared.raw_archive import records
+    raw = tmp_path / 'data/raw'
+    first = write_package(tmp_path / 'first', {
+        'backfill/alpha.jsonl': [skip_backfill('a', 'm1'), skip_backfill('b', 'm2')],
+        'derived/media-descriptions.jsonl': [skip_derived('one', 'm1', 'one'), skip_derived('two', 'm2', 'two')],
+    })
+    manifest = prepare_import_manifest(first)
+    assert records.import_backfill(raw, first, manifest)['status'] == 'complete'
+    staged = write_package(tmp_path / 'second', {
+        'backfill/alpha.jsonl': [skip_backfill('a', 'm1'), skip_backfill('b', 'm2'), *grown],
+        'derived/media-descriptions.jsonl': [skip_derived('one', 'm1', 'one'), skip_derived('two', 'm2', 'two')],
+    })
+    fresh = prepare_import_manifest(staged)
+    path = tmp_path / 'conversion.json'
+    path.write_text(json.dumps(fresh))
+    if identities:
+        month = raw / 'whatsapp/2026-01.jsonl'
+        month.parent.mkdir(parents=True, exist_ok=True)
+        month.write_text(''.join(json.dumps(
+            {'channel': 'whatsapp', 'kind': 'message', 'native_id': f'w-{mid}',
+             'native': {'payload': {'messageId': mid}}, 'received_ms': 100}) + '\n' for mid in identities))
+    return raw, staged, path, manifest['package_digest']
+
+
+def skip_control(tmp_path, raw, staged, manifest_path, *, action='import', operation='cutover'):
+    """The live control with a CLI child that runs the real library calls, never a DB."""
+    from yeoman_shared.raw_archive import records
+    module = host_module()
+    record = dict(python=sys.executable, receipts=str(tmp_path / 'receipts'), digest='a' * 64,
+                  layout=dict(raw=str(raw), staged=str(staged), conversion_manifest=str(manifest_path)))
+    # The CLI resolves raw_root() from YEOMAN_HOME, so the live home owns the layout tree.
+    payload = dict(home=str(tmp_path), record=record, receipts=[], operation=operation,
+                   argv=procedure().command_for(action, record))
+    package = json.loads(manifest_path.read_text())
+    calls = []
+
+    def runner(argv, **options):
+        calls.append(argv)
+        try:
+            if action == 'import-preview':
+                planned = records.preview_import(raw, staged, package)
+                status = 'dry-run'
+            else:
+                planned = records.import_backfill(raw, staged, package)
+                status = planned['status']
+        except (OSError, ValueError, TypeError, KeyError):
+            # The real command reports exactly this bounded diagnostic and exits 2.
+            return CompletedProcess(argv, 2, '', 'Error: import package validation or publication failed\n')
+        return CompletedProcess(argv, 0, json.dumps(
+            {'status': status, 'files': len(planned['files']),
+             'records': sum(f['lines'] for f in package['files'].values()),
+             'suppressed': sum(f['suppressed'] for f in planned['files'].values())}), '')
+
+    return module.live_host_controls(inventory=inventory(), runner=runner, clock=Clock()), payload, calls
+
+
+def skip_tree(root):
+    return {str(path.relative_to(root)): path.read_bytes() for path in root.rglob('*') if path.is_file()}
+
+
+def test_import_skip_verifies_complete_receipts_and_leaves_the_archive_untouched(tmp_path):
+    """Witness 1 (and the content rule): an absent body already present in Layer 1."""
+    raw, staged, manifest, first_digest = imported_package(
+        tmp_path, grown=[skip_backfill('c', 'm5')], identities=('m1', 'm2', 'm5'))
+    before = skip_tree(raw)
+    control, payload, calls = skip_control(tmp_path, raw, staged, manifest)
+    result = control('import', payload)
+    assert calls == []                                     # no CLI child, no write
+    assert result['ok'] is True and result['complete'] is True
+    assert result['skipped'] == 'already-imported' and result['wrote'] is False
+    assert result['status'] == 'complete' and result['package_digest'] == json.loads(manifest.read_text())['package_digest']
+    assert result['destinations_verified'] == result['destinations_checked'] == 2
+    assert result['destinations_unverified'] == []
+    assert (result['rows_total'], result['rows_suppressed']) == (5, 4)
+    assert (result['absent_rows'], result['absent_content_rows'], result['absent_reference_rows']) == (1, 1, 0)
+    assert result['absent_content_identities_found'] == 1
+    assert result['absent_by_source'] == {'backfill/alpha.jsonl': {'message': 1}}
+    assert result['covering_receipts'] == [first_digest]
+    assert (result['layer1_files'], result['layer1_identities']) == (3, 6)
+    assert result['inputs']['raw'] == str(raw) and result['inputs']['staged'] == str(staged)
+    assert skip_tree(raw) == before                        # the archive tree is unchanged
+
+
+def test_import_skip_records_reference_only_absent_rows_by_kind(tmp_path):
+    """Witness 5: reference and media-metadata rows are censused, never fatal."""
+    reference = skip_backfill('ref', 'm7', payload={'chatJid': 'c1', 'messageId': 'm7',
+                                                     'participantJid': 'p', 'senderId': 's', 'senderName': 'n'})
+    media = skip_backfill('doc', None, kind='media_record', store='document_cache',
+                          payload={'chatJid': 'c1', 'media': {'kind': 'image', 'mimeType': 'image/png',
+                                                              'fileName': 'x.png', 'path': '/cache/x.png',
+                                                              'bytes': 12}})
+    raw, staged, manifest, _ = imported_package(tmp_path, grown=[reference, media])
+    control, payload, calls = skip_control(tmp_path, raw, staged, manifest)
+    result = control('import', payload)
+    assert calls == []
+    assert result['skipped'] == 'already-imported' and result['ok'] is True
+    assert (result['absent_rows'], result['absent_content_rows'], result['absent_reference_rows']) == (2, 0, 2)
+    assert result['absent_by_source'] == {'backfill/alpha.jsonl': {'message': 1, 'media_record': 1}}
+    assert result['absent_content_identities_found'] == 0
+
+
+def test_absent_content_row_without_a_layer1_identity_runs_the_cli(tmp_path):
+    """Witness 2: absent body whose identity Layer 1 never received is never skipped."""
+    raw, staged, manifest, _ = imported_package(tmp_path, grown=[skip_backfill('lost', 'm9')])
+    before = skip_tree(raw)
+    control, payload, calls = skip_control(tmp_path, raw, staged, manifest)
+    with pytest.raises(ValueError, match='command_failed_exit_2'):
+        control('import', payload)
+    assert calls == [payload['argv']]
+    assert skip_tree(raw) == before                        # the real refusal wrote nothing
+
+
+def test_changed_destination_bytes_run_the_cli(tmp_path):
+    """Witness 3: a destination that is not the recorded post-image is never skipped."""
+    raw, staged, manifest, _ = imported_package(tmp_path, grown=[skip_backfill('c', 'm5')],
+                                                identities=('m1', 'm2', 'm5'))
+    (raw / 'backfill/alpha.jsonl').write_bytes((raw / 'backfill/alpha.jsonl').read_bytes() + b'{"tampered":true}\n')
+    before = skip_tree(raw)
+    control, payload, calls = skip_control(tmp_path, raw, staged, manifest)
+    with pytest.raises(ValueError, match='command_failed_exit_2'):
+        control('import', payload)
+    assert calls == [payload['argv']]
+    assert skip_tree(raw) == before                        # 'import destination prefix changed'
+
+
+def test_uncovered_destination_runs_the_cli_and_still_writes(tmp_path):
+    """Witness 4: no receipt for a package destination refuses the skip, not the import."""
+    from yeoman_gateway.history.convert.run import prepare_import_manifest
+    raw, _, _, _ = imported_package(tmp_path, identities=())
+    staged = write_package(tmp_path / 'fresh', {'backfill/gamma.jsonl': [skip_backfill('g', 'm3')]})
+    manifest = tmp_path / 'conversion.json'
+    manifest.write_text(json.dumps(prepare_import_manifest(staged)))
+    control, payload, calls = skip_control(tmp_path, raw, staged, manifest)
+    result = control('import', payload)
+    assert calls == [payload['argv']]
+    assert 'skipped' not in result
+    assert result['ok'] is True and result['complete'] is True
+    assert result['skip_check']['provable'] is False
+    assert result['skip_check']['reason'] == 'destination_not_covered'
+    assert (raw / 'backfill/gamma.jsonl').read_bytes() == (staged / 'backfill/gamma.jsonl').read_bytes()
+
+
+def test_record_pinned_command_is_never_skipped(tmp_path):
+    """A record-pinned command names a package the proof never read."""
+    from yeoman_gateway.history.convert.run import prepare_import_manifest
+    raw, _, _, _ = imported_package(tmp_path, identities=())
+    staged = write_package(tmp_path / 'fresh', {'backfill/gamma.jsonl': [skip_backfill('g', 'm3')]})
+    manifest = tmp_path / 'conversion.json'
+    manifest.write_text(json.dumps(prepare_import_manifest(staged)))
+    control, payload, calls = skip_control(tmp_path, raw, staged, manifest)
+    elsewhere = tmp_path / 'elsewhere'
+    payload['record']['commands'] = {'import': [*payload['argv'][:6], '--staged', str(elsewhere),
+                                                '--manifest', str(manifest), '--confirm']}
+    payload['argv'] = payload['record']['commands']['import']
+    result = control('import', payload)
+    assert calls == [payload['argv']]
+    assert 'skipped' not in result and result['skip_check']['reason'] == 'non_canonical_command'
+
+
+def test_restore_never_skips_even_when_the_preconditions_hold(tmp_path):
+    """Witness 6: the same package skips as a cutover and runs the CLI as a restore."""
+    raw, staged, manifest, _ = imported_package(tmp_path, grown=[skip_backfill('c', 'm5')],
+                                                identities=('m1', 'm2', 'm5'))
+    control, payload, calls = skip_control(tmp_path, raw, staged, manifest)
+    assert control('import', payload)['skipped'] == 'already-imported'
+    assert calls == []
+    restore = dict(payload, operation='restore')
+    with pytest.raises(ValueError, match='command_failed_exit_2'):
+        control('import', restore)
+    assert calls == [restore['argv']]
+
+
+def test_import_preview_skip_writes_nothing_at_all(tmp_path):
+    """Witness 7: the preview skip leaves every byte of the archive identical."""
+    raw, staged, manifest, _ = imported_package(tmp_path, grown=[skip_backfill('c', 'm5')],
+                                                identities=('m1', 'm2', 'm5'))
+    before = skip_tree(raw)
+    control, payload, calls = skip_control(tmp_path, raw, staged, manifest, action='import-preview')
+    result = control('import-preview', payload)
+    assert calls == []
+    assert result['ok'] is True and result['status'] == 'dry-run'
+    assert result['skipped'] == 'already-imported' and result['wrote'] is False
+    assert (result['files'], result['records'], result['suppressed']) == (2, 5, 4)
+    assert result['destinations_verified'] == 2 and result['absent_rows'] == 1
+    assert skip_tree(raw) == before
+
+
+def test_skip_receipt_rebinds_originals_exactly_as_the_owner_package_does(tmp_path):
+    """The plan-shaped receipt still resolves a staged original to its Layer 1 row."""
+    import hashlib
+    raw, staged, manifest, _ = imported_package(tmp_path, grown=[skip_backfill('c', 'm5')],
+                                                identities=('m1', 'm2', 'm5'))
+    control, payload, _ = skip_control(tmp_path, raw, staged, manifest)
+    receipt = control('import', payload)
+    row = json.loads(manifest.read_text())['files']['backfill/alpha.jsonl']['rows'][0]
+    ref = receipt['ref_map'][row['source_ref']]
+    base, number = ref.split('#')
+    blob = (raw / base).read_bytes().splitlines(keepends=True)[int(number) - 1]
+    assert hashlib.sha256(blob).hexdigest() == row['sha256']
+    assert receipt['files'][base]['row_hashes'][int(row['source_ref'].split('#')[1]) - 1] == row['sha256']
+    # An absent row has no final reference: a later phase refuses instead of inventing one.
+    assert 'backfill/alpha.jsonl#3' not in receipt['ref_map']
+
+
+def test_skipped_import_phase_stays_distinguishable_in_the_journal(tmp_path):
+    """The journal names the skip instead of an import that wrote."""
+    m = procedure()
+    raw, staged, manifest, _ = imported_package(tmp_path, grown=[skip_backfill('c', 'm5')],
+                                                identities=('m1', 'm2', 'm5'))
+    control, payload, calls = skip_control(tmp_path, raw, staged, manifest)
+    value = dict(version=1, mode='live', digest='a' * 64, receipts=str(tmp_path / 'receipts'),
+                 python=sys.executable, layout=payload['record']['layout'])
+    with m.injected_controls(control):
+        outcome = m._run(value, tmp_path, ['import'], record_dir=tmp_path)
+    assert outcome['ok'] is True and calls == []
+    journal = json.loads((Path(value['receipts']) / 'cutover.json').read_text())
+    receipt = journal['phases'][0]['receipt']
+    assert journal['phases'][0]['action'] == 'import'
+    assert receipt['skipped'] == 'already-imported' and receipt['wrote'] is False
+    assert receipt['wrote'] is False and receipt['rows_suppressed'] == 4
+    assert receipt['absent_by_source'] == {'backfill/alpha.jsonl': {'message': 1}}

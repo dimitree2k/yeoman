@@ -27,9 +27,14 @@ from yeoman_gateway.history.reader import HistoryReader
 from yeoman_shared.raw_archive.records import (
     SourceBoundary,
     _import_receipt,
+    _import_receipts,
+    archive_files,
     copy_committed,
     enumerate_committed,
+    iter_records,
     preview_import,
+    record_identities,
+    validate_import_manifest,
 )
 
 try:
@@ -459,6 +464,250 @@ def _import_proof(payload: dict, report: dict) -> dict:
         checked = preview_import(_path(layout['raw']), _path(layout['staged']), manifest)
         complete = checked == observed and report.get('status') == 'complete'
     return dict(observed or {}, ok=complete, complete=complete)
+
+_IMPORT_SKIP_ACTIONS = ('import', 'import-preview')
+# Message content a skip could lose: bodies, segments and inline media/document payloads.
+# Identifiers, timestamps, sender/participant/chat fields and cache pointers are not content.
+_SKIP_CONTENT_KEYS = ('text', 'body', 'caption', 'content')
+_SKIP_INLINE_KEYS = ('content', 'text', 'body', 'caption', 'data', 'base64', 'value')
+_SKIP_MEDIA_KEYS = ('media', 'document', 'attachment', 'file')
+
+
+def _nonempty(value: Any) -> bool:
+    if isinstance(value, str):
+        return bool(value.strip())
+    return isinstance(value, (list, dict, tuple)) and bool(value)
+
+
+def _inline_content(value: Any) -> bool:
+    """Content carried inside a media/document envelope; pointers and sizes stay metadata."""
+    if isinstance(value, dict):
+        return any(_nonempty(item) for key, item in value.items() if key in _SKIP_INLINE_KEYS)
+    if isinstance(value, (list, tuple)):
+        return any(_inline_content(item) for item in value)
+    return False
+
+
+def _carries_content(record: Mapping[str, Any]) -> bool:
+    """Whether a staged row carries message content rather than a reference or metadata."""
+    payload = record.get('payload')
+    containers = (record, payload) if isinstance(payload, dict) else (record,)
+    for container in containers:
+        if any(_nonempty(container.get(key)) for key in _SKIP_CONTENT_KEYS):
+            return True
+        segments = container.get('segments')
+        if isinstance(segments, list) and any(isinstance(item, dict) and item for item in segments):
+            return True
+        if any(_inline_content(container.get(key)) for key in _SKIP_MEDIA_KEYS):
+            return True
+    return False
+
+
+def _skip_deadline(record: Mapping[str, Any], clock) -> float | None:
+    """The existing readiness timeout bounds this read-only pass as well."""
+    try:
+        from scripts.history_cutover import validate_readiness_timeout
+    except ModuleNotFoundError:
+        from history_cutover import validate_readiness_timeout
+    try:
+        return clock.monotonic() + validate_readiness_timeout(record)
+    except (TypeError, ValueError):
+        return None
+
+
+def _canonical_import_command(action: str, payload: Mapping[str, Any]) -> bool:
+    """The proof may only describe the layout-pinned argv, never a record-pinned command.
+
+    Mirrors ``history_cutover.command_for``'s layout derivation; a record that overrides
+    ``commands`` names a package this proof never read, so it is never skipped.
+    """
+    record = payload.get('record')
+    layout = record.get('layout') if isinstance(record, Mapping) else None
+    argv = payload.get('argv')
+    if not isinstance(record, Mapping) or not isinstance(layout, Mapping) or not isinstance(argv, list):
+        return False
+    if not all(isinstance(value, str) and value for value in
+               (record.get('python'), layout.get('staged'), layout.get('conversion_manifest'))):
+        return False
+    expected = [record['python'], '-m', 'yeoman_gateway', 'history', 'import-backfill',
+                '--staged', layout['staged'], '--manifest', layout['conversion_manifest'],
+                '--dry-run' if action == 'import-preview' else '--confirm']
+    return argv == expected
+
+
+def _import_skip(action: str, payload: Mapping[str, Any], *, clock=time) -> dict:
+    """Read-only proof that the protected import has nothing left to write.
+
+    Preconditions: every ``backfill/`` destination a package names is already the
+    byte-exact post-image a complete import receipt recorded for that path, and no staged
+    row absent from its destination would lose message content. One pass each over the
+    package, the receipt journal and the archive tree; nothing is written and no symlink
+    is traversed. Any doubt leaves ``provable`` false, and the caller then runs the CLI
+    exactly as before.
+    """
+    record = payload.get('record')
+    layout = record.get('layout') if isinstance(record, Mapping) else None
+    if not isinstance(layout, Mapping) or not {'raw', 'staged', 'conversion_manifest'} <= set(layout):
+        return dict(provable=False, reason='layout_unproven')
+    if not _canonical_import_command(action, payload):
+        return dict(provable=False, reason='non_canonical_command')
+    try:
+        raw = _path(str(layout['raw']))
+        staged = _path(str(layout['staged']))
+        manifest_path = _path(str(layout['conversion_manifest']))
+        home = _path(str(payload['home']))
+    except (KeyError, TypeError, ValueError):
+        return dict(provable=False, reason='layout_unproven')
+    if raw != home / 'data' / 'raw':
+        # The CLI resolves its archive from YEOMAN_HOME; only that tree is provable here.
+        return dict(provable=False, reason='raw_layout_unproven')
+    try:
+        manifest = json.loads(manifest_path.read_bytes())
+        if not isinstance(manifest, dict):
+            raise ValueError('invalid manifest')
+    except (OSError, ValueError, TypeError, KeyError):
+        return dict(provable=False, reason='manifest_unproven')
+    inputs = dict(raw=str(raw), staged=str(staged), conversion_manifest=str(manifest_path),
+                  package_digest=manifest.get('package_digest'),
+                  snapshot_identity=manifest.get('snapshot_identity'))
+    try:
+        blobs = validate_import_manifest(staged, manifest)
+    except (OSError, ValueError, TypeError, KeyError):
+        return dict(provable=False, reason='package_unproven', inputs=inputs)
+    deadline = _skip_deadline(record, clock)
+    if deadline is None:
+        return dict(provable=False, reason='readiness_timeout_unproven', inputs=inputs)
+    try:
+        receipts = _import_receipts(raw)  # one pass over the receipt journal
+    except (OSError, ValueError, TypeError, KeyError):
+        return dict(provable=False, reason='receipt_journal_unproven', inputs=inputs)
+    digest = manifest['package_digest']
+    if any(row.get('package_digest') != digest and row.get('status') == 'partial' for row in receipts):
+        return dict(provable=False, reason='partial_import_pending', inputs=inputs)
+    covering: dict[str, dict] = {}
+    covering_receipts: set[str] = set()
+    for row in reversed(receipts):
+        if row.get('status') != 'complete' or not isinstance(row.get('files'), dict):
+            continue
+        for relative, info in row['files'].items():
+            if relative not in covering and isinstance(info, dict):
+                covering[relative] = info
+                if isinstance(row.get('package_digest'), str):
+                    covering_receipts.add(row['package_digest'])
+    files: dict[str, Any] = {}
+    ref_map: dict[str, str] = {}
+    verified: list[str] = []
+    unverified: list[str] = []
+    absent_by_source: dict[str, dict[str, int]] = {}
+    content_identities: list[set[str]] = []
+    rows = suppressed = absent = absent_reference = 0
+    for relative in sorted(blobs):
+        if clock.monotonic() > deadline:
+            return dict(provable=False, reason='skip_check_deadline', inputs=inputs)
+        target = raw / relative
+        blob = blobs[relative]
+        try:
+            if any(part.is_symlink() for part in (target, *target.parents)):
+                return dict(provable=False, reason='destination_symlinked', inputs=inputs)
+            current = target.read_bytes() if target.is_file() else b''
+        except OSError:
+            return dict(provable=False, reason='destination_unreadable', inputs=inputs)
+        info = covering.get(relative)
+        pinned = (info is not None and len(current) == info.get('bytes')
+                  and hashlib.sha256(current).hexdigest() == info.get('sha256'))
+        if not pinned and relative.startswith('backfill/'):
+            # A write-once destination must be the exact post-image an import recorded.
+            reason = 'destination_not_covered' if info is None else 'destination_bytes_changed'
+            return dict(provable=False, reason=reason, inputs=inputs)
+        # A derived destination is append-with-dedupe, not write-once, and may already carry
+        # rows this package never planned: that state is censused, never a refusal by itself.
+        (verified if pinned else unverified).append(relative)
+        slots: dict[bytes, list[int]] = {}
+        for number, line in enumerate(current.splitlines(keepends=True), 1):
+            slots.setdefault(line, []).append(number)
+        staged_lines = blob.splitlines(keepends=True)
+        matched = 0
+        for number, line in enumerate(staged_lines, 1):
+            try:
+                parsed = json.loads(line)
+            except ValueError:
+                parsed = None
+            staged_record = parsed if isinstance(parsed, dict) else {}
+            available = slots.get(line)
+            if available:
+                # The exact bytes already hold this row's slot: the import would not add it.
+                final = available.pop() if relative.startswith('backfill/') else available[0]
+                ref_map[f'{relative}#{number}'] = f'{relative}#{final}'
+                segments = staged_record.get('payload')
+                segments = segments.get('segments') if isinstance(segments, dict) else None
+                if isinstance(segments, list):
+                    for index in range(len(segments)):
+                        ref_map[f'{relative}#{number}/{index}'] = f'{relative}#{final}/{index}'
+                matched += 1
+                continue
+            absent += 1
+            kind = str(staged_record.get('kind') or '')
+            absent_by_source.setdefault(relative, {})
+            absent_by_source[relative][kind] = absent_by_source[relative].get(kind, 0) + 1
+            if staged_record and _carries_content(staged_record):
+                try:
+                    content_identities.append(record_identities(staged_record))
+                except (TypeError, ValueError):
+                    # An unreadable identity can never be proven present, so it refuses.
+                    content_identities.append(set())
+            else:
+                absent_reference += 1
+        files[relative] = dict(base_bytes=len(current), base_sha256=hashlib.sha256(current).hexdigest(),
+                               bytes=len(current), sha256=hashlib.sha256(current).hexdigest(),
+                               lines=current.count(b'\n'),
+                               row_hashes=[hashlib.sha256(line).hexdigest() for line in staged_lines],
+                               suppressed=matched)
+        rows += len(staged_lines)
+        suppressed += matched
+    try:  # one pass over the archive tree; a symlinked member refuses the proof
+        if any(entry.is_symlink() for entry in raw.iterdir() if entry.name != 'media'):
+            return dict(provable=False, reason='archive_symlinked', inputs=inputs)
+        identities: set[str] = set()
+        scanned = 0
+        for path in archive_files(raw):
+            if clock.monotonic() > deadline:
+                return dict(provable=False, reason='skip_check_deadline', inputs=inputs)
+            scanned += 1
+            for _, row, _line in iter_records(path):
+                if row is None or row.get('purged_version'):
+                    continue
+                identities |= record_identities(row)
+    except (OSError, ValueError, TypeError, KeyError):
+        return dict(provable=False, reason='archive_unproven', inputs=inputs)
+    found = sum(1 for ids in content_identities if ids & identities)
+    evidence = dict(destinations_verified=len(verified), destinations_checked=len(blobs),
+                    destinations_unverified=sorted(unverified),
+                    rows_total=rows, rows_suppressed=suppressed,
+                    absent_rows=absent, absent_content_rows=len(content_identities),
+                    absent_reference_rows=absent_reference,
+                    absent_content_identities_found=found,
+                    absent_by_source=absent_by_source,
+                    layer1_files=scanned, layer1_identities=len(identities),
+                    covering_receipts=sorted(covering_receipts), inputs=inputs)
+    if found != len(content_identities):
+        return dict(provable=False, reason='absent_content_identity_missing',
+                    inputs=inputs, evidence=evidence)
+    plan = dict(version=1, package_digest=manifest['package_digest'],
+                snapshot_identity=manifest['snapshot_identity'], status='complete',
+                files=files, ref_map=ref_map)
+    return dict(provable=True, reason='already-imported', plan=plan, evidence=evidence)
+
+
+def _import_skip_result(action: str, proof: Mapping[str, Any]) -> dict:
+    """The journalled phase receipt of a skip; it never claims that a write happened."""
+    evidence = dict(proof['evidence'])
+    if action == 'import-preview':
+        return dict(ok=True, status='dry-run', files=len(proof['plan']['files']),
+                    records=evidence['rows_total'], suppressed=evidence['rows_suppressed'],
+                    skipped='already-imported', wrote=False, **evidence)
+    return dict(proof['plan'], ok=True, complete=True, suppressed=evidence['rows_suppressed'],
+                skipped='already-imported', wrote=False, **evidence)
+
 
 def _procedure_digest(value):
     try:
@@ -1002,9 +1251,20 @@ def live_host_controls(*, inventory: Mapping[str, Any],
             verified &= (source / 'pyproject.toml').is_file()
             result = dict(ok=verified, pins_verified=verified)
         elif action in COMMAND_ACTIONS:
-            response = run(payload['argv'], payload)
-            result = _command_result(action, payload, response)
-            result['ok'] &= response.returncode == 0
+            check = None
+            if action in _IMPORT_SKIP_ACTIONS and payload.get('operation') != 'restore':
+                # An import that provably has nothing left to write is never run: the
+                # receipt records the evidence instead of a CLI child's output.
+                check = _import_skip(action, payload, clock=clock)
+            if check is not None and check['provable']:
+                result = _import_skip_result(action, check)
+            else:
+                response = run(payload['argv'], payload)
+                result = _command_result(action, payload, response)
+                result['ok'] &= response.returncode == 0
+                if check is not None:
+                    # The refused precondition stays visible with the phase it refused.
+                    result['skip_check'] = check
         elif action == 'prepare-input-bundle':
             result = _prepare_inputs(payload, inventory)
         elif action in ACK_ACTIONS:
