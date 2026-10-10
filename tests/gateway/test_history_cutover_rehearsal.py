@@ -276,6 +276,10 @@ def test_cli_operator_contract_real_sequence(tmp_path,monkeypatch,capsys,file_in
     actions = [p['action'] for p in journal['phases']]
     assert actions == history_cutover._sequence(value)
     assert all(p['receipt']['complete'] for p in journal['phases'] if p['action'] in ('prepare-v3','publish-v3'))
+    prepared = next(p['receipt'] for p in journal['phases'] if p['action']=='prepare-v3')
+    capture_summary=json.loads((work/'aliases/legacy-alias-manifest.json').read_text())['capture_summary']
+    for counter in ('duplicate_mapped_sources','historical_backfill_aliases'):
+        assert prepared[counter]==capture_summary[counter]
     assert sum(a.startswith('smoke-reader-') for a in actions)==6
     if not file_invocation:
         assert any(items==[('synthetic.json','c3ludGhldGlj')] for items in decoded)

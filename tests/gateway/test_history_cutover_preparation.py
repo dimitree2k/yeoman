@@ -258,11 +258,13 @@ def test_operator_prepares_private_manifest_and_handover(tmp_path, capsys,duplic
     summary = json.loads(capsys.readouterr().out)
     assert summary["ok"] and summary["handover"] and summary["total"] == 0
     assert summary["duplicate_observations"]==int(duplicate)
+    assert summary["duplicate_mapped_sources"]==summary["historical_backfill_aliases"]==0
     assert set(summary) == {"ok", "handover", *module._COUNTS}
     manifest_path = output / "legacy-alias-manifest.json"
     manifest = json.loads(manifest_path.read_text())
     assert manifest["version"] == 1 and manifest["entries"] == []
     assert manifest["capture_summary"]["duplicate_observations"]==int(duplicate)
+    assert manifest["capture_summary"]["duplicate_mapped_sources"]==manifest["capture_summary"]["historical_backfill_aliases"]==0
     if duplicate:
         assert manifest["capture_summary"]["observations"][mid]==[dict(created_ms=1,event_id="old"),dict(created_ms=11,event_id="redelivery")]
     digest = manifest.pop("digest")
@@ -917,3 +919,110 @@ def test_author_lookup_after_partial_original_has_message_time(case,monkeypatch)
         preserved_rows=[partial,complete])
     assert counts['mapped']==1 and counts['author_unresolved']==0
     assert rows[0]['cutover_status']=='mapped' and seen and set(seen)=={100}
+
+
+@pytest.mark.parametrize('different_author',[False,True])
+def test_legacy_numeric_match_requires_agreeing_issued_author(case,different_author):
+    from yeoman_gateway.knowledge._history_sources import _proof
+    from yeoman_gateway.knowledge.models import KnowledgeError
+    _,q,sources,db=case
+    db.execute("UPDATE messages SET sender_basis='numeric_match' WHERE message_id='m'")
+    assert _proof(q,'m') is None
+    assert _proof(q,'m',legacy_alias=True) is not None
+    with pytest.raises(KnowledgeError,match='temporal attribution'):
+        sources.issue('m')
+    source=SourceRef('numeric-legacy',1,'whatsapp',q.message('m')['chat_id'],
+                     'whatsapp:10002' if different_author else '10001',100)
+    row=legacy(source,content_fingerprint=q.content_fingerprint('m'))
+    aliases,counts=build_history_source_aliases(queries=q,legacy_rows=[row],locators={source.key:('m',)})
+    if different_author:
+        assert not aliases and counts['author_different_contact']==1
+    else:
+        assert counts['mapped']==1
+        sources.ledger.persist_aliases(aliases)
+        assert sources.verify_source_ref(*source.key)==source
+
+
+@pytest.mark.parametrize('second_state',['done','queued','running','failed','cancelled','skipped'])
+def test_handover_completed_job_rerun_only_same_state(capture_case,second_state):
+    h,k,_,_=capture_case
+    h.add('rerun-source',line=1)
+    source=issue(h,k,('rerun-source',))[0]
+    with k._store.transaction():
+        for job_id,state in (('first','done'),('second',second_state)):
+            k._store.execute("INSERT INTO knowledge_jobs(job_id,workspace_id,scope_key,kind,sources_json,extractor_version,state,due_ms,created_ms,updated_ms) VALUES (?,?,?,?,?,?,?,?,?,?)",
+                (job_id,'synthetic','synthetic','statement_capture',json.dumps([asdict(source)]),'statement-capture-v1',state,MS,MS,MS))
+    with h.snapshot() as snap:
+        if second_state!='done':
+            with pytest.raises(ValueError,match='^ambiguous_handover_job$'):
+                producer(k).prepare_handover(snap,pending=(),processed=(),legacy_boundary=(10,'b'))
+            assert k._store.scalar('SELECT count(*) FROM knowledge_history_capture')==0
+            return
+        receipt=producer(k).prepare_handover(snap,pending=(),processed=(),legacy_boundary=(10,'b'))
+        assert receipt['processed']==receipt['pending']==[]
+    assert k._store.scalar("SELECT outcome FROM knowledge_history_capture WHERE message_id='rerun-source'")=='published'
+    assert [(r['job_id'],r['state']) for r in k._store.query('SELECT job_id,state FROM knowledge_jobs ORDER BY job_id')]==[('first','done'),('second','done')]
+
+
+@pytest.mark.parametrize('reverse',[False,True])
+@pytest.mark.parametrize('completed',[False,True])
+def test_duplicate_mapped_keys_prefer_completed_then_earliest(case,reverse,completed):
+    from yeoman_gateway.knowledge._history_cutover import prepare_capture_inputs
+    from yeoman_shared.raw_archive.records import SourceBoundary
+    _,q,sources,db=case
+    q.snapshot.sources=(SourceBoundary('whatsapp/synthetic.jsonl',1,100,'synthetic'),)
+    db.execute("UPDATE messages SET source_refs=? WHERE message_id='m'", (json.dumps(['whatsapp/synthetic.jsonl#1']),))
+    first=SourceRef('wa_journal',1,'whatsapp',q.message('m')['chat_id'],'10001',100)
+    second=replace(first,event_id='native-id',author_principal='whatsapp:10001')
+    rows=[legacy(first,message_id='m',cutover_status='mapped',created_ms=6,completed=False,boundary=[10,'b'],forward_start=[5,'start'],content_fingerprint=q.content_fingerprint('m')),
+          legacy(second,message_id='m',cutover_status='mapped',created_ms=12,completed=completed,boundary=[10,'b'],forward_start=[5,'start'],content_fingerprint=q.content_fingerprint('m'))]
+    aliases,counts=build_history_source_aliases(queries=q,legacy_rows=rows,locators={first.key:('m',),second.key:('m',)})
+    assert counts['mapped']==2
+    sources.ledger.persist_aliases(aliases)
+    if reverse:
+        rows.reverse()
+    summary={}
+    inputs=prepare_capture_inputs(queries=q,legacy_boundary=(10,'b'),legacy_rows=rows,jobs=[],summary=summary)
+    assert inputs['processed' if completed else 'pending']==(second if completed else first,)
+    assert summary['duplicate_mapped_sources']==1
+    assert sources.verify_source_ref(*first.key)==first and sources.verify_source_ref(*second.key)==second
+    nonpreferred=next(row for row in rows if row['event_id']==('wa_journal' if completed else 'native-id'))
+    repeated_summary={}
+    repeated=prepare_capture_inputs(queries=q,legacy_boundary=(10,'b'),legacy_rows=[*rows,dict(nonpreferred)],jobs=[],summary=repeated_summary)
+    assert repeated==inputs and repeated_summary['duplicate_mapped_sources']==1
+    with pytest.raises(ValueError,match='^conflicting_capture_proof$'):
+        prepare_capture_inputs(queries=q,legacy_boundary=(10,'b'),
+            legacy_rows=[*rows,dict(nonpreferred,completed=not nonpreferred['completed'])],jobs=[])
+
+
+@pytest.mark.parametrize('conflict',['hint','issued'])
+def test_duplicate_mapped_keys_conflicting_contact_refuses(case,conflict):
+    from yeoman_gateway.knowledge._history_cutover import prepare_capture_inputs
+    _,q,_,_=case
+    source=SourceRef('wa_journal',1,'whatsapp',q.message('m')['chat_id'],'10001',100)
+    other=replace(source,event_id='native-id',author_principal='whatsapp:10002' if conflict=='issued' else source.author_principal)
+    rows=[legacy(source,message_id='m',cutover_status='mapped',completed=True),
+          legacy(other,message_id='m',cutover_status='mapped',completed=True,author_contact_id='b' if conflict=='hint' else 'a')]
+    with pytest.raises(ValueError,match='^conflicting_capture_proof$'):
+        prepare_capture_inputs(queries=q,legacy_boundary=(10,'b'),legacy_rows=rows,jobs=[],summary={})
+
+
+@pytest.mark.parametrize('in_prefix',[False,True])
+def test_historical_backfill_alias_has_no_assignment_prefix_still_requires_classification(capture_case,in_prefix):
+    from yeoman_gateway.knowledge._history_cutover import prepare_capture_inputs
+    h,k,_,_=capture_case
+    h.add('historical',line=1,refs=None if in_prefix else ['backfill/journal.jsonl#1'])
+    source=issue(h,k,('historical',))[0]
+    row=dict(asdict(source),message_id='historical',cutover_status='mapped',author_contact_id='a',completed=False)
+    summary={}
+    with h.snapshot() as snap:
+        if in_prefix:
+            with pytest.raises(ValueError,match='^unclassified_handover_message$'):
+                prepare_capture_inputs(queries=HistoryQueries(snap),legacy_boundary=(10,'b'),legacy_rows=[row],jobs=[],summary=summary)
+            return
+        inputs=prepare_capture_inputs(queries=HistoryQueries(snap),legacy_boundary=(10,'b'),legacy_rows=[row],jobs=[],summary=summary)
+        assert inputs==dict(processed=(),pending=(),classifications={})
+        assert summary['historical_backfill_aliases']==1
+        producer(k).prepare_handover(snap,legacy_boundary=(10,'b'),**inputs)
+    assert k._store.scalar('SELECT count(*) FROM knowledge_history_capture')==0
+    assert k.history_source_ledger.lookup(*source.key) is not None

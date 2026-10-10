@@ -274,6 +274,8 @@ def prepare_capture_inputs(*, queries: HistoryQueries,
     refs: dict[tuple[str, int], tuple[str, SourceRef]] = {}
     sources_by_mid: dict[str, SourceRef] = {}
     observations: dict[str, set[tuple[int, str]]] = defaultdict(set)
+    source_rows: dict[tuple[str, int], Mapping[str, Any]] = {}
+    duplicate_mapped_sources = historical_backfill_aliases = 0
     for row in legacy_rows:
         mid = row.get("message_id")
         if not mid and row.get("cutover_status") == "other_channel":
@@ -286,6 +288,42 @@ def prepare_capture_inputs(*, queries: HistoryQueries,
         order = (row.get('created_ms'), row.get('event_id'))
         if type(order[0]) is int and isinstance(order[1], str):
             observations[mid].add(order)
+        new_source = source is not None and source.key not in refs
+        if source is not None:
+            if source.key in refs and refs[source.key] != (mid, source):
+                raise ValueError('conflicting_capture_proof')
+            previous_row = source_rows.get(source.key)
+            if previous_row is not None and any(previous_row[k] != row[k]
+                    for k in (previous_row.keys() & row.keys()) - {'event_id', 'created_ms'}):
+                raise ValueError('conflicting_capture_proof')
+            source_rows[source.key] = row
+        previous_source = sources_by_mid.get(mid)
+        if (source is not None and previous_source is not None and previous_source.key != source.key
+                and row.get('cutover_status') == 'mapped' and rows[mid].get('cutover_status') == 'mapped'):
+            # Two legacy keys (e.g. a wa_ journal ID and the native ID) both proven for one
+            # message: both stay aliases; capture progress uses one preferred proof.
+            current = queries.message(mid)
+            if current is None or not current['sender_contact_id']:
+                raise ValueError('conflicting_capture_proof')
+            contact = queries.terminal(current['sender_contact_id'])
+            for candidate, issued in ((rows[mid], previous_source), (row, source)):
+                owner = candidate.get('author_contact_id')
+                if (not owner or queries.terminal(str(owner)) != contact
+                        or _author_contact(queries, issued.author_principal, at_ms=current['sent_ms'],
+                                           time_basis=current['time_certainty']) != contact
+                        or (issued.channel, issued.chat_id, issued.occurred_at_ms) !=
+                           (current['channel'], current['chat_id'], current['sent_ms'])):
+                    raise ValueError('conflicting_capture_proof')
+            def rank(candidate):
+                order = (candidate.get('created_ms'), candidate.get('event_id'))
+                return (candidate.get('completed') is not True,
+                        order if type(order[0]) is int and isinstance(order[1], str) else (2**63, ''))
+            preferred = min((rows[mid], row), key=rank)
+            refs[source.key] = mid, source
+            rows[mid] = preferred
+            sources_by_mid[mid] = source if preferred is row else previous_source
+            duplicate_mapped_sources += int(new_source)
+            continue
         if mid in rows:
             previous = rows[mid]
             if any(previous[k] != row[k] for k in (previous.keys() & row.keys()) - {'event_id', 'created_ms'}):
@@ -380,9 +418,10 @@ def prepare_capture_inputs(*, queries: HistoryQueries,
                   and (rows[mid]["created_ms"], rows[mid]["event_id"]) > legacy_boundary):
                 pending.append(source)
             else:
-                raise ValueError("unclassified_handover_message")
+                # Backfill-only aliases need no forward capture assignment.
+                historical_backfill_aliases += 1
     if summary is not None:
-        summary.update(no_legacy_row_pending=no_legacy_row_pending, unmapped_terminal_job_refs=unmapped_terminal, duplicate_observations=sum(max(0, len(values)-1) for values in observations.values()),
+        summary.update(duplicate_mapped_sources=duplicate_mapped_sources, historical_backfill_aliases=historical_backfill_aliases, no_legacy_row_pending=no_legacy_row_pending, unmapped_terminal_job_refs=unmapped_terminal, duplicate_observations=sum(max(0, len(values)-1) for values in observations.values()),
             observations={mid: [dict(created_ms=created,event_id=event) for created,event in sorted(values)]
                           for mid,values in sorted(observations.items()) if len(values)>1})
     return {"pending": tuple(sorted(pending, key=lambda s: s.key)),

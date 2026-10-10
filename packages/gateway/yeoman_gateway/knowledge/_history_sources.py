@@ -175,7 +175,11 @@ def principal_identifier(principal: str) -> str | None:
 def _proof(queries: HistoryQueries, message_id: str, *, legacy_alias: bool = False) -> tuple[dict[str, Any], str, str, EvidenceAudience] | None:
     row = queries.message(message_id)
     if (row is None or row['sent_ms'] is None or row['time_certainty'] not in ('native', 'provider_timestamp')
-            or row['direction'] != 'in' or row['sender_basis'] not in ('native_identifier', 'owner_attested')):
+            or row['direction'] != 'in'
+            or row['sender_basis'] not in ('native_identifier', 'owner_attested',
+                                           # Legacy aliases additionally require the issued legacy
+                                           # author to resolve to this same contact.
+                                           *(('numeric_match',) if legacy_alias else ()))):
         return None
     principal = _principal(row['sender_identifier'] or '')
     contact = queries.resolve_identifier(row['sender_identifier'] or '', at_ms=row['sent_ms'], time_basis=row['time_certainty'])

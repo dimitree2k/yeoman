@@ -42,7 +42,7 @@ _ARGUMENTS = ("snapshot_home", "history_db", "knowledge_source", "knowledge_targ
               "policy_snapshot", "output_root")
 _COUNTS = ("total", "mapped", "missing", "ambiguous", "changed", "purged_revoked",
            "other_channel", "legacy_node", "no_legacy_row_pending", "candidate_copies", "statements", "jobs", "withheld_statements",
-           "affected_jobs", "duplicate_observations", "unmapped_terminal_job_refs",
+           "affected_jobs", "duplicate_observations", "duplicate_mapped_sources", "historical_backfill_aliases", "unmapped_terminal_job_refs",
            "cited_reason_counts", "uncited_reason_counts", "author_unresolved", "author_different_contact")
 
 
@@ -159,6 +159,8 @@ def prepare(args: argparse.Namespace) -> dict[str, Any]:
                 permanent_reason=producer._permanent_reason)
             counts["no_legacy_row_pending"] = capture_summary["no_legacy_row_pending"]
             counts["duplicate_observations"] = capture_summary["duplicate_observations"]
+            counts["duplicate_mapped_sources"] = capture_summary["duplicate_mapped_sources"]
+            counts["historical_backfill_aliases"] = capture_summary["historical_backfill_aliases"]
             counts["unmapped_terminal_job_refs"] = capture_summary["unmapped_terminal_job_refs"]
             for cited,label in ((True,"cited_reason_counts"),(False,"uncited_reason_counts")):
                 counts[label] = dict(sorted(Counter(row['cutover_reason'] for row in rows
