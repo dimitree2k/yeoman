@@ -1722,6 +1722,17 @@ def test_restore_never_skips_even_when_the_preconditions_hold(tmp_path):
     assert calls == [restore['argv']]
 
 
+def test_restore_never_skips_the_accepted_gap_either(tmp_path):
+    """A restore runs the CLI even where the narrowed proof would accept the gap."""
+    raw, staged, manifest, _ = imported_package(tmp_path, grown=[skip_backfill('lost', 'm9')])
+    before = skip_tree(raw)
+    control, payload, calls = skip_control(tmp_path, raw, staged, manifest, operation='restore')
+    with pytest.raises(ValueError, match='command_failed_exit_2'):
+        control('import', payload)
+    assert calls == [payload['argv']]
+    assert skip_tree(raw) == before
+
+
 def test_import_preview_skip_writes_nothing_at_all(tmp_path):
     """Witness 7: the preview skip leaves every byte of the archive identical."""
     raw, staged, manifest, _ = imported_package(tmp_path, grown=[skip_backfill('c', 'm5')],
