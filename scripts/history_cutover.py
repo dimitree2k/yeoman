@@ -17,6 +17,7 @@ import re
 import shutil
 import sqlite3
 import time
+import traceback
 from collections import Counter
 from collections.abc import Callable, Mapping, Sequence
 from contextlib import closing, contextmanager
@@ -117,6 +118,26 @@ def _private_json(path: Path, value: Any) -> None:
         stream.flush()
         os.fsync(stream.fileno())
     _fsync_dir(path.parent)
+
+
+def _write_refusal(exc: Exception, *, receipts: Path | None, record_dir: Path) -> None:
+    """Private diagnostics must neither overwrite evidence nor mask the refusal."""
+    for directory in (receipts, record_dir):
+        if directory is None:
+            continue
+        try:
+            _paths(directory)
+            directory.mkdir(parents=True, mode=0o700, exist_ok=True)
+            path = directory / f'refusal-{time.time_ns()}.txt'
+            fd = os.open(path, os.O_WRONLY | os.O_CREAT | os.O_EXCL, 0o600)
+            with os.fdopen(fd, 'w') as stream:
+                stream.write(''.join(traceback.format_exception(exc)))
+                stream.flush()
+                os.fsync(stream.fileno())
+            _fsync_dir(directory)
+            return
+        except (OSError, ValueError):
+            continue
 
 
 def _fsync_dir(path: Path) -> None:
@@ -581,7 +602,7 @@ def _execute(action: str, payload: dict[str, Any]) -> dict[str, Any]:
 
 
 def _run(value: dict[str, Any], home: Path, actions: list[str], *, restore: bool = False,
-         failed_snapshot: Path | None = None) -> dict[str, Any]:
+         failed_snapshot: Path | None = None, record_dir: Path) -> dict[str, Any]:
     receipt_root = Path(value['receipts'])
     receipt_path = receipt_root / ('restore.json' if restore else 'cutover.json')
     if receipt_path.exists() or any(receipt_root.glob(('restore' if restore else 'cutover') + '-*.json')):
@@ -623,6 +644,7 @@ def _run(value: dict[str, Any], home: Path, actions: list[str], *, restore: bool
                 journal['fenced'] = False
         journal['ok'] = True
     except Exception as exc:
+        _write_refusal(exc, receipts=receipt_root, record_dir=record_dir)
         journal['failed_phase'] = action
         journal['error_code'] = str(exc) if isinstance(exc, ValueError) and re.fullmatch(r'[a-z0-9_]+', str(exc)) else f'unexpected_{type(exc).__name__}'
         journal['fenced'] = True
@@ -644,7 +666,7 @@ def run_cutover(*, record: Path, home: Path, apply: bool = False) -> dict[str, A
     actions = _sequence(value)
     if not apply:
         return dict(ok=True, planned=True, actions=[dict(action=a, argv=command_for(a, value)) for a in actions])
-    return _run(value, home, actions)
+    return _run(value, home, actions, record_dir=record.parent)
 
 
 def _restore_files(value: Mapping[str, Any], home: Path) -> dict[str, Any]:
@@ -726,7 +748,7 @@ def restore_prior_set(*, record: Path, home: Path, failed_snapshot: Path,
                'start-bridge', 'start-gateway', 'health', 'release-fence', 'resume-vetted-manual-routes', 'start-overseer', 'start-timers']
     if not apply:
         return dict(ok=True, planned=True, actions=[dict(action=a, argv=command_for(a, value)) for a in actions])
-    return _run(value, home, actions, restore=True, failed_snapshot=failed_snapshot)
+    return _run(value, home, actions, restore=True, failed_snapshot=failed_snapshot, record_dir=record.parent)
 
 
 def main() -> int:
@@ -738,6 +760,7 @@ def main() -> int:
     parser.add_argument('--apply', action='store_true')
     parser.add_argument('--controls', choices=('rehearsal', 'live'))
     args = parser.parse_args()
+    value = None
     try:
         value = _load(args.record, args.home, apply=False)
         if value['mode'] == 'rehearsal':
@@ -767,6 +790,7 @@ def main() -> int:
         print(canonical_json(dict(ok=result['ok'], planned=result.get('planned', False), fenced=result.get('fenced', False), fence_verified=result.get('fence_verified', False), phases=len(result.get('actions', [])))))
         return 0 if result['ok'] else 1
     except Exception as exc:
+        _write_refusal(exc, receipts=Path(value['receipts']) if value else None, record_dir=args.record.parent)
         error = str(exc) if isinstance(exc, ValueError) and re.fullmatch(r'missing_inventory_key:[a-z_]+',str(exc)) else 'cutover_refused'
         print(canonical_json(dict(ok=False,error=error)))
         return 1

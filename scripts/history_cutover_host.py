@@ -52,6 +52,21 @@ ACK_ACTIONS = {'functional-smoke'}
 COMMAND_ACTIONS = {'import-preview', 'import', 'owner-preview', 'owner-append'}
 
 
+def _raw_writer(raw: Any) -> dict:
+    """Only the CLI status envelope supplies writer-state/counter proof."""
+    if not isinstance(raw, dict) or not {'files', 'lines', 'root', 'started_ms', 'writer'} <= raw.keys():
+        raise ValueError('invalid_raw_status')
+    writer = raw['writer']
+    if (not isinstance(writer, dict)
+            or not {'state', 'spooled', 'pending_in_memory', 'last_error', 'updated_ms'} <= writer.keys()
+            or not isinstance(raw['root'], str)
+            or not isinstance(writer['state'], str) or not isinstance(writer['last_error'], str)
+            or any(type(raw[k]) is not int or raw[k] < 0 for k in ('files', 'lines', 'started_ms'))
+            or any(type(writer[k]) is not int or writer[k] < 0 for k in ('spooled', 'pending_in_memory', 'updated_ms'))):
+        raise ValueError('invalid_raw_status')
+    return writer
+
+
 def _subprocess(argv: list[str]) -> subprocess.CompletedProcess:
     return subprocess.run(argv, capture_output=True, text=True, check=False)
 
@@ -362,7 +377,7 @@ def live_host_controls(*, inventory: Mapping[str, Any],
         # The response is health-only; persisted vector and a reopened lease supply the rest.
         raw = json.loads(run([payload['record']['python'], '-m', 'yeoman_gateway', 'raw', 'status', '--json'], payload).stdout)
         bridge_health = probe_bridge()
-        writer = raw['writer']
+        writer = _raw_writer(raw)
         proof = _boundary(payload)
         proof.update(raw_deferred=writer['spooled'] + writer['pending_in_memory'], bridge_pending=bridge_health['outbox']['pending'], bridge_inflight=bridge_health['queue']['inflight'], capture_ready=_capture_ready(payload))
         h = health.get('health', {})
@@ -443,8 +458,9 @@ def live_host_controls(*, inventory: Mapping[str, Any],
             from yeoman_shared.whatsapp_protocol import PROTOCOL_VERSION
             health = probe_bridge()
             raw = json.loads(run([payload['record']['python'], '-m', 'yeoman_gateway', 'raw', 'status', '--json'], payload).stdout)
-            ready = health['whatsapp']['connected'] is True and health['protocolVersion'] == PROTOCOL_VERSION and raw['writer']['state'] == 'ok'
-            result = dict(ok=ready, connected=health['whatsapp']['connected'], protocol=health['protocolVersion'], bridge_pending=health['outbox']['pending'], bridge_inflight=health['queue']['inflight'], writer_ok=raw['writer']['state'] == 'ok')
+            writer = _raw_writer(raw)
+            ready = health['whatsapp']['connected'] is True and health['protocolVersion'] == PROTOCOL_VERSION and writer['state'] == 'ok'
+            result = dict(ok=ready, connected=health['whatsapp']['connected'], protocol=health['protocolVersion'], bridge_pending=health['outbox']['pending'], bridge_inflight=health['queue']['inflight'], writer_ok=writer['state'] == 'ok')
         elif action == 'verify-effect-deduplication':
             result = _effects(payload, inventory)
         elif action == 'frozen-watermarks':
@@ -635,8 +651,9 @@ def rehearsal_host_controls(*, copy_home: Path, inventory: Mapping[str, Any], re
             if any(copy_home not in p.resolve().parents for p in status_paths):
                 raise ValueError('rehearsal_status_outside_copy')
             raw, bridge = (json.loads(p.read_bytes()) for p in status_paths)
-            result.update(raw_deferred=raw['spooled'] + raw['pending_in_memory'], bridge_pending=bridge['outbox']['pending'], bridge_inflight=bridge['queue']['inflight'], capture_ready=_capture_ready(payload))
-            result['ok'] = result['all_committed'] and result['capture_ready'] and raw['state'] == 'ok' and result['raw_deferred'] == result['bridge_pending'] == result['bridge_inflight'] == 0
+            writer = _raw_writer(raw)
+            result.update(raw_deferred=writer['spooled'] + writer['pending_in_memory'], bridge_pending=bridge['outbox']['pending'], bridge_inflight=bridge['queue']['inflight'], capture_ready=_capture_ready(payload))
+            result['ok'] = result['all_committed'] and result['capture_ready'] and writer['state'] == 'ok' and result['raw_deferred'] == result['bridge_pending'] == result['bridge_inflight'] == 0
         elif action == 'verify-effect-deduplication':
             result = _effects(payload, local)
         elif action == 'configure-retirement' or action in SELECT_ACTIONS:

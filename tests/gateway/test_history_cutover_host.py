@@ -185,6 +185,49 @@ def data_home(tmp_path):
     return home, p
 
 
+def raw_status(*, spooled=0, state='ok'):
+    return dict(files=0, lines=0, root='/synthetic/raw', started_ms=1,
+        writer=dict(state=state, spooled=spooled, pending_in_memory=0, last_error='', updated_ms=1))
+
+
+@pytest.mark.parametrize('mode', ['live', 'rehearsal'])
+@pytest.mark.parametrize('action', ['health', 'drain-durable-tails', 'all-committed-barrier'])
+@pytest.mark.parametrize('malformed', [False, 'flat', 'counter', 'missing'])
+def test_raw_status_real_shape_required(tmp_path, mode, action, malformed):
+    from yeoman_shared.whatsapp_protocol import PROTOCOL_VERSION
+    home, p = data_home(tmp_path)
+    raw = raw_status()
+    if malformed == 'flat':
+        raw = raw['writer']
+    elif malformed == 'counter':
+        raw['writer']['spooled'] = True
+    elif malformed == 'missing':
+        del raw['writer']['pending_in_memory']
+    bridge = dict(outbox=dict(pending=0), queue=dict(inflight=0), whatsapp=dict(connected=True),
+        protocolVersion=PROTOCOL_VERSION, persistenceFailure=None)
+    calls = []
+    def runner(argv):
+        calls.append(argv)
+        return CompletedProcess(argv, 0, json.dumps(raw), '')
+    module = host_module()
+    if mode == 'live':
+        control = module.live_host_controls(inventory=inventory(), runner=runner,
+            ipc=lambda _: dict(status='ok',health=dict(status='ready',generation=3,lag_lines=0,lag_bytes=0)),
+            bridge_probe=lambda: bridge)
+    else:
+        (home/'raw.json').write_text(json.dumps(raw))
+        (home/'bridge.json').write_text(json.dumps(bridge))
+        control = module.rehearsal_host_controls(copy_home=home, runner=runner,
+            inventory=dict(inventory(),raw_status_path='raw.json',bridge_status_path='bridge.json'))
+    if malformed:
+        with pytest.raises(ValueError, match='invalid_raw_status'):
+            control(action, p)
+    else:
+        assert control(action, p)['ok']
+    if mode == 'rehearsal':
+        assert calls == []
+
+
 def test_live_barrier_uses_observed_stores_and_counters(tmp_path):
     home, p = data_home(tmp_path)
     runner = Runner()
@@ -192,7 +235,7 @@ def test_live_barrier_uses_observed_stores_and_counters(tmp_path):
     def run(argv):
         if argv[1:] == ['-m', 'yeoman_gateway', 'raw', 'status', '--json']:
             runner.calls.append(argv)
-            return CompletedProcess(argv, 0, json.dumps(dict(writer=dict(state='ok', spooled=0, pending_in_memory=0))), '')
+            return CompletedProcess(argv, 0, json.dumps(raw_status()), '')
         return original(argv)
     from yeoman_shared.whatsapp_protocol import PROTOCOL_VERSION
     bridge = dict(outbox=dict(pending=0), queue=dict(inflight=0), whatsapp=dict(connected=True), protocolVersion=PROTOCOL_VERSION)
@@ -214,11 +257,11 @@ def test_rehearsal_barrier_reads_copy_and_refuses_external_layout(tmp_path):
     home, p = data_home(tmp_path)
     runner = Runner()
     inv = dict(inventory(), raw_status_path='raw-state.json', bridge_status_path='bridge-state.json')
-    (home/'raw-state.json').write_text(json.dumps(dict(state='ok', spooled=0, pending_in_memory=0)))
+    (home/'raw-state.json').write_text(json.dumps(raw_status()))
     (home/'bridge-state.json').write_text(json.dumps(dict(outbox=dict(pending=0), queue=dict(inflight=0))))
     control = host_module().rehearsal_host_controls(copy_home=home, inventory=inv, runner=runner)
     assert control('all-committed-barrier', p)['ok']
-    (home/'raw-state.json').write_text(json.dumps(dict(state='ok', spooled=1, pending_in_memory=0)))
+    (home/'raw-state.json').write_text(json.dumps(raw_status(spooled=1)))
     assert not control('all-committed-barrier', p)['ok']
     p['record']['layout']['raw'] = str(tmp_path/'outside')
     with pytest.raises(ValueError, match='outside_root'):
@@ -385,7 +428,7 @@ def test_raw_health_and_capture_check_exact_argv(tmp_path):
     calls = []
     def runner(argv):
         calls.append(argv)
-        output = json.dumps(dict(writer=dict(state='ok'))) if argv[-2:] == ['status','--json'] else 'status=ok'
+        output = json.dumps(raw_status()) if argv[-2:] == ['status','--json'] else 'status=ok'
         return CompletedProcess(argv, 0, output, '')
     bridge = dict(whatsapp=dict(connected=True), protocolVersion=PROTOCOL_VERSION, outbox=dict(pending=0), queue=dict(inflight=0))
     c = host_module().live_host_controls(inventory=inventory(), runner=runner, bridge_probe=lambda: bridge)

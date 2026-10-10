@@ -22,6 +22,7 @@ from yeoman_gateway.processing.store import ProcessingStore
 from yeoman_shared.raw_archive.records import dumps, enumerate_committed
 
 from tests.gateway.test_history_cutover import Controls, procedure, record
+from tests.gateway.test_history_cutover_host import raw_status
 
 
 def bridge_package(tmp_path):
@@ -61,6 +62,12 @@ def test_failure_receipt_contains_only_safe_code(tmp_path,exception,expected):
     receipt = json.loads(Path(result['receipt']).read_text())
     assert receipt['error_code'] == expected
     assert 'synthetic private detail' not in json.dumps(receipt)
+    diagnostics = list(Path(value['receipts']).glob('refusal-*.txt'))
+    assert len(diagnostics) == 1
+    diagnostic = diagnostics[0]
+    assert diagnostic.stat().st_mode & 0o777 == 0o600
+    assert 'Traceback (most recent call last)' in diagnostic.read_text()
+    assert f'{type(exception).__name__}: {exception}' in diagnostic.read_text()
 
 
 def test_builder_accepts_only_executable_interpreter_symlink(tmp_path):
@@ -96,7 +103,11 @@ def test_cli_refuses_unsafe_rehearsal_environment(tmp_path,monkeypatch,environme
         m._rehearsal_environment(home)
     assert m.main()==1
     assert json.loads(capsys.readouterr().out)['ok'] is False
-    assert not Path(value['receipts']).exists()
+    receipts = Path(value['receipts'])
+    assert not list(receipts.glob('*.json'))
+    diagnostics = list(receipts.glob('refusal-*.txt')) + list(path.parent.glob('refusal-*.txt'))
+    assert len(diagnostics) == 1
+    assert diagnostics[0].stat().st_mode & 0o777 == 0o600
 
 
 
@@ -122,7 +133,11 @@ def test_cli_refuses_unusable_decoder_before_any_phase(tmp_path, monkeypatch, ca
     monkeypatch.setattr(sys, 'argv', ['cutover','cutover','--record',str(path),'--home',str(home),'--controls','rehearsal','--apply'])
     assert m.main() == 1
     assert json.loads(capsys.readouterr().out)['ok'] is False
-    assert not Path(value['receipts']).exists()
+    receipts = Path(value['receipts'])
+    assert not list(receipts.glob('*.json'))
+    diagnostics = list(receipts.glob('refusal-*.txt')) + list(path.parent.glob('refusal-*.txt'))
+    assert len(diagnostics) == 1
+    assert diagnostics[0].stat().st_mode & 0o777 == 0o600
 
 @pytest.mark.parametrize('file_invocation',[False,True])
 def test_cli_operator_contract_real_sequence(tmp_path,monkeypatch,capsys,file_invocation):
@@ -231,7 +246,7 @@ def test_cli_operator_contract_real_sequence(tmp_path,monkeypatch,capsys,file_in
         reader_smoke=dict(workspace_id='synthetic',channel='whatsapp',chat_id=chat,principal='whatsapp:10001',phone=phone,
             message_id=f'whatsapp:{chat}:source',source_event_id='source',statement_id=statement,query='Curated',text='Synthetic',
             curated_text='Curated synthetic statement',at_ms=ts,owner_scope=True,rights=dict(knowledge_read=True,tools_read=True,owner_export=True)))
-    (home/'raw-status.json').write_text(dumps(dict(state='ok',spooled=0,pending_in_memory=0)))
+    (home/'raw-status.json').write_text(dumps(raw_status()))
     (home/'bridge-status.json').write_text(dumps(dict(outbox=dict(pending=0),queue=dict(inflight=0))))
     inventory,layout_file,record_file = root/'inventory.json',root/'layout.json',root/'record.json'
     inventory.write_text(dumps(inv))
@@ -311,3 +326,64 @@ def test_missing_live_host_inputs_refused_before_first_phase(tmp_path,key):
     with pytest.raises(ValueError,match=f'missing_inventory_key:{key}'):
         m._load(path,home,apply=False)
     assert not Path(value['receipts']).exists()
+
+
+@pytest.mark.parametrize('blocked_receipts', [False, True])
+def test_cli_refusal_private_traceback_and_fallback(tmp_path, monkeypatch, capsys, blocked_receipts):
+    m = procedure()
+    path, home, value = record(tmp_path)
+    receipts = Path(value['receipts'])
+    if blocked_receipts:
+        receipts.write_text('synthetic occupied path')
+    monkeypatch.setattr(m, '_cli_run', lambda _: (_ for _ in ()).throw(KeyError('synthetic private detail')))
+    monkeypatch.setattr(sys, 'argv', ['cutover', 'cutover', '--record', str(path), '--home', str(home)])
+    assert m.main() == 1
+    assert json.loads(capsys.readouterr().out) == dict(ok=False,error='cutover_refused')
+    directory = path.parent if blocked_receipts else receipts
+    diagnostics = list(directory.glob('refusal-*.txt'))
+    assert len(diagnostics) == 1
+    assert diagnostics[0].stat().st_mode & 0o777 == 0o600
+    assert "KeyError: 'synthetic private detail'" in diagnostics[0].read_text()
+    assert 'Traceback (most recent call last)' in diagnostics[0].read_text()
+    assert m.main() == 1
+    capsys.readouterr()
+    assert len(list(directory.glob('refusal-*.txt'))) == 2
+
+
+def test_record_create_approve_immediate_apply_in_subprocess(tmp_path):
+    import subprocess
+    code = """
+import json, sys, time, subprocess
+from pathlib import Path
+from tests.gateway.test_history_cutover import record
+from scripts import history_cutover as m, history_cutover_probes as probes
+from yeoman_gateway.history.convert import bridge_refs
+from scripts.history_cutover_inputs import build_cutover_record
+root = Path(sys.argv[1])
+path, home, old = record(root)
+inventory = json.loads((Path.cwd()/'scripts/history_cutover_inventory.example.json').read_text())
+inventory.update(home=str(home),output=old['output'],receipts=old['receipts'],python=sys.executable,rehearsal_root=str(root))
+inventory['inventory'].update(old['inventory'],bridge_package_dir=old['bridge_package_dir'])
+inventory['inventory']['host_crontab']['danger_minutes'] = []
+source = root/'inventory.json'
+source.write_text(json.dumps(inventory))
+now = int(time.time()*1000)
+value = build_cutover_record(inventory=source,layout={},mode='rehearsal',window=(now,now+60000),expected_gateway_jobs=0)
+assert value['approved'] is False
+path.write_text(json.dumps(value))
+value.update(approved=True,approval='synthetic-immediate-owner')
+value['digest'] = m.record_digest(value)
+path.write_text(json.dumps(value))
+m._sequence = lambda _: ['acquire','stop-overseer-clean','start-timers']
+probes.build_probes = lambda **_: {}
+bridge_refs.node_batch_decoder = lambda _: lambda rows: {}
+def refuse(argv, **kwargs):
+    raise AssertionError('host subprocess forbidden')
+subprocess.run = refuse
+sys.argv = ['cutover','cutover','--record',str(path),'--home',str(home),'--controls','rehearsal','--apply']
+assert m.main() == 0
+receipt = json.loads((Path(value['receipts'])/'cutover.json').read_text())
+assert receipt['ok'] and receipt['phases'][-1]['action'] == 'start-timers'
+"""
+    result = subprocess.run([sys.executable,'-c',code,str(tmp_path)],capture_output=True,text=True,timeout=180)
+    assert result.returncode == 0, result.stdout + result.stderr
