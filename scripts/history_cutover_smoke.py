@@ -32,6 +32,25 @@ except ModuleNotFoundError:
     from history_cutover_host import _path, _read_db, _write
 
 
+def _turn_source_link(db, effect, event) -> bool:
+    """Whether the effect's turn recorded this exact inbound revision as a live source.
+
+    This is the store's real reply causality: the join is written when the event enters
+    the turn, before that turn's generation and the effect it produced. A store that
+    predates turn_sources has no such link; that is a refusal, not an error.
+    """
+    if not effect['turn_id']:
+        return False
+    if db.execute("SELECT 1 FROM sqlite_master WHERE type='table' AND name='turn_sources' LIMIT 1").fetchone() is None:
+        return False
+    return db.execute(
+        'SELECT 1 FROM turn_sources ts WHERE ts.turn_id=? AND ts.event_id=? AND ts.revision_at_join=? '
+        "AND ts.role IN ('trigger','context') AND ts.removed_ms IS NULL "
+        'AND ts.added_ms>=? AND ts.added_ms<=? LIMIT 1',
+        (effect['turn_id'], event['event_id'], event['revision'],
+         event['created_ms'], effect['created_ms'])).fetchone() is not None
+
+
 def _ready_boundary(record: dict) -> HistoryBoundary:
     raw, history = (_path(record['layout'][k]) for k in ('raw', 'history'))
     for sub in ('whatsapp', 'backfill', 'derived', 'owner'):
@@ -188,6 +207,8 @@ def publish_ack(*, record: Path, inputs: Path, owner_confirmed_arrival: bool,
                 'WHERE g.turn_id=? AND g.revision=? AND s.event_id=? AND s.revision_at_join=? '
                 "AND s.role IN ('trigger','context') AND g.created_ms>=? AND g.created_ms<=? LIMIT 1",
                 (e['turn_id'],e['turn_revision'],event['event_id'],event['revision'],event['created_ms'],e['created_ms'])).fetchone() is not None
+        if not causal and e is not None:
+            causal = _turn_source_link(db, e, event)
         if (e is None or e['state'] != 'sent' or e['payload_kind'] != 'text'
                 or target.get('channel') != 'whatsapp' or target.get('chat_id') != chat
                 or not released < event['created_ms'] <= e['created_ms'] <= now

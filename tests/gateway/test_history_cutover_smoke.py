@@ -306,6 +306,114 @@ def test_helper_uses_frozen_source_for_turn_bound_reply(tmp_path, role, causal):
             publish_ack(record=path,inputs=inputs,owner_confirmed_arrival=True,runner=runner,clock=FakeClock())
 
 
+# The live store records the cause of an ordinary reply in turn_sources, not in a trace
+# shared with the inbound and not in a generation. These witnesses drive the whole proof
+# chain through publish_ack.
+
+EVENT_MS, JOIN_MS, EFFECT_MS = 2000, 2500, 3000
+FOREIGN_TRACE = 'synthetic-trace-elsewhere'
+
+
+def run_smoke(path, inputs, runner):
+    from scripts.history_cutover_smoke import publish_ack
+    return publish_ack(record=path,inputs=inputs,owner_confirmed_arrival=True,runner=runner,clock=FakeClock())
+
+
+def turn_source_case(tmp_path, *, role='trigger', revision_at_join=1, removed=False, with_source=True,
+                     source_event='synthetic-event', added_ms=JOIN_MS, table=True):
+    """A reply whose only possible cause is a live turn_sources row.
+
+    The effect's trace_id matches neither the inbound's trace nor its own turn_id and no
+    generation exists, so the direct and frozen-source paths cannot apply - the shape the
+    live store shows for an ordinary reply.
+    """
+    from yeoman_gateway.processing.store import ProcessingStore
+    path, value, inputs, runner, _ = smoke_case(tmp_path)
+    processing = Path(value['inventory']['processing_db'])
+    store = ProcessingStore(processing)
+    try:
+        thread = store.open_thread(channel='whatsapp',chat_id='synthetic-chat',
+            root_principal='synthetic-principal',kind='dm',trigger_event_id='synthetic-event',now_ms=2400)
+        turn = store.open_turn(thread_id=thread,principal='synthetic-principal',
+            trigger_event_id='synthetic-event',now_ms=2400)
+        if with_source:
+            store.add_turn_source(turn_id=turn,event_id=source_event,source_message_id='synthetic-in',
+                role=role,revision_at_join=revision_at_join,now_ms=added_ms)
+            if removed:
+                store.mark_turn_source_removed(turn_id=turn,event_id=source_event,now_ms=added_ms+50)
+    finally:
+        store.close()
+    with sqlite3.connect(processing) as db:
+        if not table:
+            db.execute('DROP TABLE turn_sources')
+        db.execute("UPDATE effects SET trace_id=?,turn_id=? WHERE effect_id='synthetic-effect'",(FOREIGN_TRACE,turn))
+    return path, value, inputs, runner, turn
+
+
+@pytest.mark.parametrize('role', ['trigger', 'context'])
+def test_helper_accepts_live_turn_source_as_reply_proof(tmp_path, role):
+    path, value, inputs, runner, _ = turn_source_case(tmp_path, role=role)
+    assert run_smoke(path, inputs, runner) == dict(ok=True)
+    ack = json.loads((Path(value['receipts'])/'functional-smoke.owner_ack.json').read_text())
+    assert ack['owner_ack'] is True and ack['action'] == 'functional-smoke'
+
+
+def test_helper_accepts_turn_source_when_generation_path_misses(tmp_path):
+    """The third path is additive: a dead-end generation must not shadow a real link."""
+    path, value, inputs, runner, turn = turn_source_case(tmp_path)
+    with sqlite3.connect(value['inventory']['processing_db']) as db:
+        db.execute("UPDATE effects SET trace_id=? WHERE effect_id='synthetic-effect'", (turn,))
+        db.execute("INSERT INTO generations(generation_id,turn_id,thread_id,revision,context_version,snapshot_hash,created_ms) "
+            "VALUES ('synthetic-generation',?,'synthetic-thread',1,1,'synthetic-hash',2500)", (turn,))
+    assert run_smoke(path, inputs, runner) == dict(ok=True)
+
+
+@pytest.mark.parametrize('defect', ['no-source', 'foreign-turn', 'foreign-event'])
+def test_helper_refuses_when_no_trace_generation_or_turn_source_link(tmp_path, defect):
+    path, value, inputs, runner, _ = turn_source_case(tmp_path, with_source=defect != 'no-source',
+        source_event='other-event' if defect == 'foreign-event' else 'synthetic-event')
+    if defect == 'foreign-turn':
+        with sqlite3.connect(value['inventory']['processing_db']) as db:
+            db.execute("UPDATE effects SET turn_id='other-turn' WHERE effect_id='synthetic-effect'")
+    with pytest.raises(ValueError, match='causal_reply'):
+        run_smoke(path, inputs, runner)
+    assert not (Path(value['receipts'])/'functional-smoke.owner_ack.json').exists()
+
+
+@pytest.mark.parametrize('defect', ['removed', 'revision'])
+def test_helper_refuses_dead_or_revision_mismatched_turn_source(tmp_path, defect):
+    path, value, inputs, runner, _ = turn_source_case(tmp_path, removed=defect == 'removed',
+        revision_at_join=2 if defect == 'revision' else 1)
+    with pytest.raises(ValueError, match='causal_reply'):
+        run_smoke(path, inputs, runner)
+
+
+@pytest.mark.parametrize('added_ms', [EVENT_MS, EFFECT_MS])
+def test_helper_accepts_turn_source_at_inclusive_join_bounds(tmp_path, added_ms):
+    path, value, inputs, runner, _ = turn_source_case(tmp_path, added_ms=added_ms)
+    assert run_smoke(path, inputs, runner) == dict(ok=True)
+
+
+@pytest.mark.parametrize('added_ms', [EVENT_MS-1, EFFECT_MS+1])
+def test_helper_refuses_turn_source_joined_outside_event_effect_window(tmp_path, added_ms):
+    path, value, inputs, runner, _ = turn_source_case(tmp_path, added_ms=added_ms)
+    with pytest.raises(ValueError, match='causal_reply'):
+        run_smoke(path, inputs, runner)
+
+
+def test_helper_accepts_direct_trace_when_store_predates_turn_sources(tmp_path):
+    path, value, inputs, runner, _ = smoke_case(tmp_path)
+    with sqlite3.connect(value['inventory']['processing_db']) as db:
+        db.execute('DROP TABLE turn_sources')
+    assert run_smoke(path, inputs, runner) == dict(ok=True)
+
+
+def test_helper_refuses_without_turn_sources_table_instead_of_crashing(tmp_path):
+    path, value, inputs, runner, _ = turn_source_case(tmp_path, table=False)
+    with pytest.raises(ValueError, match='causal_reply'):
+        run_smoke(path, inputs, runner)
+
+
 def test_helper_rejects_old_provider_timestamp_even_if_newly_received(tmp_path):
     from yeoman_shared.raw_archive.records import enumerate_committed
 
