@@ -18,6 +18,29 @@ def package(tmp_path, min_bytes=0):
     return path, hashlib.sha256(path.read_bytes()).hexdigest(), records
 
 
+def conversion_fixture(tmp_path, *, rows=2, pad=0):
+    """A real staged root and the manifest the conversion phase writes beside it."""
+    from hist_fixtures import _bf, write_jsonl
+    from yeoman_gateway.history.convert.run import prepare_import_manifest
+    staged = tmp_path / 'staged'
+    write_jsonl(staged / 'backfill/synthetic.jsonl',
+                [_bf('journal', 'message', {'text': f'synthetic {i}', 'chat_id': 'synthetic@g.us',
+                                            'messageId': f'M{i}'}) for i in range(rows)])
+    prepared = prepare_import_manifest(staged)
+    manifest = tmp_path / 'manifest.json'
+    # Trailing whitespace keeps json.loads identical while growing the artifact.
+    manifest.write_bytes(json.dumps(prepared).encode() + b' ' * pad)
+    assert json.loads(manifest.read_bytes()) == prepared
+    return staged, manifest, prepared
+
+
+def sparse(path, size):
+    """A file of *size* bytes that costs no disk; the size guard refuses before reading."""
+    with path.open('wb') as stream:
+        stream.truncate(size)
+    return path
+
+
 @asynccontextmanager
 async def server_fixture(tmp_path):
     root, db, archive, p = projector_fixture(tmp_path)
@@ -333,3 +356,115 @@ async def test_control_package_preflight_does_not_block_intake_or_status(tmp_pat
         finally:
             release.set()
             await task
+
+
+def test_conversion_manifest_limits_are_distinct_and_the_owner_limit_is_unchanged():
+    from yeoman_gateway.history.control import (
+        MAX_CONVERSION_MANIFEST_BYTES,
+        MAX_OWNER_PACKAGE_BYTES,
+    )
+    observed_reviewed_manifest = 108_893_179
+    assert MAX_OWNER_PACKAGE_BYTES == 16 * 1024 * 1024
+    # Headroom over the reviewed artifact, and still a bound: about twice its size.
+    assert observed_reviewed_manifest < MAX_CONVERSION_MANIFEST_BYTES <= 2 * observed_reviewed_manifest
+
+
+def test_owner_limit_is_injectable_and_never_sized_by_the_manifest_limit(tmp_path, monkeypatch):
+    from yeoman_gateway.history import control
+    monkeypatch.setattr(control, 'MAX_OWNER_PACKAGE_BYTES', 4096)
+    path, digest, _ = package(tmp_path, 8192)
+    with pytest.raises(ValueError, match='PACKAGE_TOO_LARGE'):
+        control.load_pinned_owner_package(path, digest)
+    assert control.MAX_CONVERSION_MANIFEST_BYTES == 192 * 1024 * 1024
+
+
+def test_cli_import_backfill_accepts_a_manifest_above_the_owner_package_limit(tmp_path, monkeypatch):
+    from typer.testing import CliRunner
+    from yeoman_gateway.cli.commands import app
+    from yeoman_gateway.history import control
+    monkeypatch.setenv('YEOMAN_HOME', str(_home(tmp_path)))
+    monkeypatch.setattr(control, 'MAX_OWNER_PACKAGE_BYTES', 1024)
+    monkeypatch.setattr(control, 'MAX_CONVERSION_MANIFEST_BYTES', 1 << 20)
+    staged, manifest, prepared = conversion_fixture(tmp_path, pad=8192)
+    assert manifest.stat().st_size > 1024
+    result = CliRunner().invoke(app, ['history', 'import-backfill', '--staged', str(staged),
+                                      '--manifest', str(manifest), '--dry-run'])
+    assert result.exit_code == 0, result.output
+    emitted = json.loads(result.output)
+    assert emitted['status'] == 'dry-run'
+    assert emitted['files'] == len(prepared['files'])
+
+
+def test_cli_import_backfill_refuses_above_the_conversion_manifest_limit(tmp_path, monkeypatch):
+    from typer.testing import CliRunner
+    from yeoman_gateway.cli.commands import app
+    from yeoman_gateway.history import control
+    monkeypatch.setenv('YEOMAN_HOME', str(_home(tmp_path)))
+    monkeypatch.setattr(control, 'MAX_OWNER_PACKAGE_BYTES', 1024)
+    monkeypatch.setattr(control, 'MAX_CONVERSION_MANIFEST_BYTES', 1 << 20)
+    staged, manifest, _ = conversion_fixture(tmp_path, pad=(1 << 20))
+    assert manifest.stat().st_size > (1 << 20)
+    result = CliRunner().invoke(app, ['history', 'import-backfill', '--staged', str(staged),
+                                      '--manifest', str(manifest), '--dry-run'])
+    assert result.exit_code != 0
+    assert not (tmp_path / 'home/data/raw/import-receipts.jsonl').exists()
+
+
+def test_cli_import_backfill_refuses_above_the_real_manifest_default_without_reading_it(tmp_path, monkeypatch):
+    from typer.testing import CliRunner
+    from yeoman_gateway.cli.commands import app
+    from yeoman_gateway.history import control
+    monkeypatch.setenv('YEOMAN_HOME', str(_home(tmp_path)))
+    staged = tmp_path / 'staged'
+    staged.mkdir()
+    manifest = sparse(tmp_path / 'manifest.json', control.MAX_CONVERSION_MANIFEST_BYTES + 1)
+    assert manifest.stat().st_blocks * 512 < 1 << 20
+    result = CliRunner().invoke(app, ['history', 'import-backfill', '--staged', str(staged),
+                                      '--manifest', str(manifest), '--dry-run'])
+    assert result.exit_code == 2
+    # The bounded CLI refusal, exactly as the failed live attempt reported it.
+    assert 'import package validation or publication failed' in result.output
+
+
+def test_cli_attest_still_refuses_a_package_above_the_owner_limit(tmp_path, monkeypatch):
+    from typer.testing import CliRunner
+    from yeoman_gateway.cli.commands import app
+    from yeoman_gateway.history.control import MAX_OWNER_PACKAGE_BYTES
+    home = _home(tmp_path)
+    monkeypatch.setenv('YEOMAN_HOME', str(home))
+    path = sparse(tmp_path / 'owner.jsonl', MAX_OWNER_PACKAGE_BYTES + 1)
+    result = CliRunner().invoke(app, ['history', 'attest', '--file', str(path), '--dry-run'])
+    assert result.exit_code != 0
+    assert not (home / 'data/raw/owner/attestations.jsonl').exists()
+
+
+def _home(tmp_path):
+    home = tmp_path / 'home'
+    (home / 'data/raw').mkdir(parents=True, exist_ok=True)
+    return home
+
+
+@pytest.mark.asyncio
+async def test_projector_ipc_import_backfill_accepts_a_manifest_above_the_owner_limit(tmp_path, monkeypatch):
+    from yeoman_gateway.history import control
+    async with server_fixture(tmp_path) as (root, db, p, server):
+        monkeypatch.setattr(control, 'MAX_OWNER_PACKAGE_BYTES', 1024)
+        monkeypatch.setattr(control, 'MAX_CONVERSION_MANIFEST_BYTES', 1 << 20)
+        staged, manifest, prepared = conversion_fixture(tmp_path, pad=8192)
+        assert manifest.stat().st_size > 1024
+        response = await request(server, 'import-backfill', confirm=True, staged_path=str(staged),
+                                 package_path=str(manifest),
+                                 package_sha256=hashlib.sha256(manifest.read_bytes()).hexdigest())
+        assert response == {'status': 'ok', 'files': len(prepared['files'])}, response
+
+
+@pytest.mark.asyncio
+async def test_projector_ipc_import_backfill_refuses_above_the_real_manifest_default(tmp_path):
+    from yeoman_gateway.history.control import MAX_CONVERSION_MANIFEST_BYTES
+    async with server_fixture(tmp_path) as (root, db, p, server):
+        staged = tmp_path / 'staged'
+        staged.mkdir()
+        manifest = sparse(tmp_path / 'manifest.json', MAX_CONVERSION_MANIFEST_BYTES + 1)
+        response = await request(server, 'import-backfill', confirm=True, staged_path=str(staged),
+                                 package_path=str(manifest), package_sha256='a' * 64)
+        assert response == {'status': 'error', 'code': 'PACKAGE_TOO_LARGE'}, response

@@ -159,15 +159,15 @@ def history_import_backfill(
         import hashlib
 
         from yeoman_gateway.history.control import (
-            _load_pinned_bytes,
-            _read_package_bytes,
+            _load_conversion_manifest_bytes,
+            _read_conversion_manifest_bytes,
             cli_control,
             projection_owned,
         )
         path = manifest.expanduser().absolute()
-        data = _read_package_bytes(path)
+        data = _read_conversion_manifest_bytes(path)
         digest = hashlib.sha256(data).hexdigest()
-        package = json.loads(_load_pinned_bytes(path, digest))
+        package = json.loads(_load_conversion_manifest_bytes(path, digest))
         source = staged.expanduser()
         if package != prepare_import_manifest(source):
             raise ValueError('manifest does not bind the validated staged records')

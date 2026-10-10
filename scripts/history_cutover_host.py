@@ -29,16 +29,15 @@ from yeoman_shared.raw_archive.records import (
     _import_receipt,
     copy_committed,
     enumerate_committed,
-    import_backfill,
     preview_import,
 )
 
 try:
     from scripts.history_cutover import _attempt_pause_digests
-    from scripts.history_maintenance_guard import preflight_isolated_paths
+    from scripts.history_maintenance_guard import preflight_isolated_paths, runtime_homes
 except ModuleNotFoundError:
     from history_cutover import _attempt_pause_digests
-    from history_maintenance_guard import preflight_isolated_paths
+    from history_maintenance_guard import preflight_isolated_paths, runtime_homes
 
 SHOW = '--property=ActiveState,Result,UnitFileState,Restart,ActiveEnterTimestampMonotonic,InactiveEnterTimestampMonotonic,ExecMainStartTimestampMonotonic,ExecMainExitTimestampMonotonic,LoadState,NeedDaemonReload,DropInPaths'
 SERVICE_ACTIONS = {
@@ -157,6 +156,52 @@ def _write(path: Path, data: bytes, *, exclusive: bool = False) -> None:
         os.fsync(fd)
     finally:
         os.close(fd)
+
+
+def _command_failure_code(response: subprocess.CompletedProcess) -> str:
+    """Bounded, journal-safe code for a refused CLI child; the status stays visible."""
+    return f'command_failed_exit_{response.returncode}' if response.returncode > 0 else 'command_failed'
+
+
+def _persist_command_output(action: str, payload: Mapping[str, Any],
+                            response: subprocess.CompletedProcess) -> None:
+    """Keep the child's own diagnostic privately; a bounded name, never the argv."""
+    if action not in COMMAND_ACTIONS:
+        raise ValueError('unknown_host_action')
+    root = _path(str(payload['record']['receipts']))
+    for stream, suffix, always in ((response.stderr, 'stderr', True), (response.stdout, 'stdout', False)):
+        if stream is None or (not always and not stream.strip()):
+            continue
+        _write(root / f'command-{action}.{suffix}.txt', str(stream).encode('utf-8', 'replace'))
+
+
+def _command_result(action: str, payload: Mapping[str, Any],
+                    response: subprocess.CompletedProcess) -> dict:
+    """Interpret one CLI child; live and rehearsal must call this same function."""
+    if action not in COMMAND_ACTIONS:
+        raise ValueError('unknown_host_action')
+    if response.returncode != 0:
+        _persist_command_output(action, payload, response)
+        raise ValueError(_command_failure_code(response))
+    if not response.stdout.strip():
+        raise ValueError('command_empty_output')
+    try:
+        result = json.loads(response.stdout)
+    except json.JSONDecodeError:
+        _persist_command_output(action, payload, response)
+        raise ValueError('command_output_not_json') from None
+    if not isinstance(result, dict):
+        _persist_command_output(action, payload, response)
+        raise ValueError('command_output_not_object')
+    if action == 'import':
+        result = _import_proof(payload, result)
+    elif action == 'import-preview':
+        result['ok'] = result.get('status') == 'dry-run'
+    else:
+        count = len(_path(payload['record']['layout']['owner_package']).read_text().splitlines())
+        complete = result.get('validated') == count and result.get('committed', -1) + result.get('suppressed', -1) == (count if action == 'owner-append' else 0)
+        result.update(ok=complete, complete=complete)
+    return result
 
 
 def _read_db(path: Path):
@@ -904,15 +949,7 @@ def live_host_controls(*, inventory: Mapping[str, Any],
             result = dict(ok=verified, pins_verified=verified)
         elif action in COMMAND_ACTIONS:
             response = run(payload['argv'], payload)
-            result = json.loads(response.stdout)
-            if action == 'import':
-                result = _import_proof(payload, result)
-            elif action == 'import-preview':
-                result['ok'] = result.get('status') == 'dry-run'
-            else:
-                count = len(_path(payload['record']['layout']['owner_package']).read_text().splitlines())
-                complete = result.get('validated') == count and result.get('committed', -1) + result.get('suppressed', -1) == (count if action == 'owner-append' else 0)
-                result.update(ok=complete, complete=complete)
+            result = _command_result(action, payload, response)
             result['ok'] &= response.returncode == 0
         elif action == 'prepare-input-bundle':
             result = _prepare_inputs(payload, inventory)
@@ -946,8 +983,15 @@ def _suppression_delta(action: str, payload: dict, inventory: Mapping) -> dict:
     processing = _path(inventory['processing_db']) if 'processing_db' in inventory else None
     if action == 'capture-suppression-delta':
         with closing(_read_db(path)) as db:
-            delta = dict(sources=db.execute("SELECT event_id,revision,reason FROM knowledge_history_sources WHERE revoked=1").fetchall(),
-                         statements=db.execute("SELECT statement_id,status,revoked_at_ms FROM knowledge_statements WHERE revoked_at_ms IS NOT NULL").fetchall())
+            tables = {row[0] for row in db.execute("SELECT name FROM sqlite_master WHERE type='table'")}
+            # knowledge_history_sources is created by the v3 upgrade: a cutover that failed
+            # before publish-v3 leaves the prior schema, whose correct capture is no v3
+            # sources at all (the prior statements below carry the rest of the delta).
+            sources = (db.execute("SELECT event_id,revision,reason FROM knowledge_history_sources WHERE revoked=1").fetchall()
+                       if 'knowledge_history_sources' in tables else [])
+            statements = (db.execute("SELECT statement_id,status,revoked_at_ms FROM knowledge_statements WHERE revoked_at_ms IS NOT NULL").fetchall()
+                          if 'knowledge_statements' in tables else [])
+            delta = dict(sources=sources, statements=statements)
         if processing is not None:
             saved = root / 'processing-current.db'
             _path(str(saved))
@@ -1018,8 +1062,54 @@ def _suppression_delta(action: str, payload: dict, inventory: Mapping) -> dict:
     return dict(ok=current, delta_applied=current, current_denials=current)
 
 
+def _rehearsal_command_argv(argv: Any, *, root: Path, interpreter: Any) -> None:
+    """A rehearsal command may name only the pinned interpreter and the rehearsal root.
+
+    Containment is decided lexically before any path is opened, so a command that
+    names the live home is refused without touching it.
+    """
+    if (not isinstance(argv, list) or not argv
+            or any(not isinstance(a, str) or not a for a in argv)):
+        raise ValueError('invalid_command_argv')
+    if interpreter is not None and argv[0] != interpreter:
+        raise ValueError('rehearsal_command_interpreter')
+    for argument in argv[1:]:
+        if not argument.startswith('/'):
+            continue
+        candidate = Path(os.path.abspath(argument))
+        if candidate != root and root not in candidate.parents:
+            raise ValueError('rehearsal_command_outside_root')
+        preflight_isolated_paths(candidate)
+
+
+def _rehearsal_source_dir(inventory: Mapping[str, Any], source_dir: Any = None) -> Path:
+    """The pinned checkout a rehearsal command runs from, or one bounded refusal.
+
+    A runtime home is refused lexically before any path is stat'ed, so a source_dir
+    that names the live home is never opened; every other shape (relative, not a
+    directory, symlinked, or refused by the shared guard) gets the same bounded code.
+    """
+    source = Path(str(source_dir or inventory.get('source_dir') or ''))
+    candidate = Path(os.path.abspath(str(source)))
+    if (not source.is_absolute()
+            or any(candidate == home or home in candidate.parents for home in runtime_homes())
+            or not source.is_dir()
+            or any(p.is_symlink() for p in (source, *source.parents))):
+        raise ValueError('rehearsal_source_dir_unusable')
+    try:
+        preflight_isolated_paths(source)
+    except ValueError:
+        raise ValueError('rehearsal_source_dir_unusable') from None
+    return source
+
+
 def rehearsal_host_controls(*, copy_home: Path, inventory: Mapping[str, Any], rehearsal_root: Path | None = None, runner=None, **_):
-    """Simulate service actions; data proofs come exclusively from the isolated copy."""
+    """Simulate service actions; data proofs come exclusively from the isolated copy.
+
+    Commands are executed, never re-implemented: a rehearsal phase runs the same
+    ``payload['argv']`` as live, through a runner that pins the copy home, the pinned
+    source checkout and the rehearsal root.
+    """
     preflight_isolated_paths(copy_home)
     require_isolated_paths(copy_home)
     copy_home = copy_home.resolve()
@@ -1034,6 +1124,21 @@ def rehearsal_host_controls(*, copy_home: Path, inventory: Mapping[str, Any], re
             path = _path(local[key])
             if copy_home not in path.parents:
                 raise ValueError('rehearsal_input_outside_copy')
+
+    def run(argv, payload, *, source_dir=None):
+        interpreter = payload['record'].get('python')
+        _rehearsal_command_argv(argv, root=root, interpreter=interpreter)
+        # The pinned checkout is validated for every runner, so an unusable source_dir is
+        # a bounded control refusal instead of a late failure inside a live-like child.
+        source = _rehearsal_source_dir(inventory, source_dir)
+        if runner is None or runner is _subprocess:
+            env = dict(os.environ, YEOMAN_HOME=str(copy_home), YEOMAN_SOURCE_DIR=str(source))
+            env.pop('PYTHONPATH', None)
+            if argv[:3] == [interpreter, '-m', 'yeoman_gateway']:
+                env['PYTHONPATH'] = ':'.join(str(source / 'packages' / p) for p in ('gateway', 'shared', 'overseer'))
+            return subprocess.run(argv, cwd=source, env=env, capture_output=True, text=True, check=False)
+        return runner(argv)
+
     def execute(action: str, payload: dict) -> dict:
         if _path(payload['home']).resolve() != copy_home:
             raise ValueError('rehearsal_home_mismatch')
@@ -1096,32 +1201,10 @@ def rehearsal_host_controls(*, copy_home: Path, inventory: Mapping[str, Any], re
             result = _capture_frozen_baseline(payload)
         elif action == 'frozen-watermarks':
             result = _verify_frozen_baseline(payload)
-        elif action in ('import', 'import-preview'):
-            layout = payload['record']['layout']
-            manifest = json.loads(_path(layout['conversion_manifest']).read_bytes())
-            operation = import_backfill if action == 'import' else preview_import
-            result = operation(_path(layout['raw']), _path(layout['staged']), manifest)
-            result.update(ok=True, complete=action == 'import')
-        elif action in ('owner-preview', 'owner-append'):
-            from yeoman_gateway.history.attestations import validate_owner_package
-            from yeoman_gateway.history.control import _parse_owner_package
-            from yeoman_shared.raw_archive.records import (
-                PURGE_DISPOSITION_LOCK,
-                append_owner_record_locked,
-                lock_file,
-            )
-            layout = payload['record']['layout']
-            raw = _path(layout['raw'])
-            records = _parse_owner_package(_path(layout['owner_package']).read_bytes())
-            validate_owner_package(raw, records)
-            if action == 'owner-append':
-                fd = lock_file(raw / PURGE_DISPOSITION_LOCK, create=True)
-                try:
-                    for record in records:
-                        append_owner_record_locked(raw, record)
-                finally:
-                    os.close(fd)
-            result = dict(ok=True, complete=True, validated=len(records))
+        elif action in COMMAND_ACTIONS:
+            # Same argv, same interpreter and the same result interpretation as live;
+            # only the pinned home and source differ, so a refusal is reproducible.
+            result = _command_result(action, payload, run(payload['argv'], payload))
         elif action == 'prepare-input-bundle':
             result = _prepare_inputs(payload, local)
         elif action in ACK_ACTIONS:

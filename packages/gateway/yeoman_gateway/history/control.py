@@ -24,9 +24,20 @@ if TYPE_CHECKING:
 
 MAX_IPC_REQUEST_BYTES = 64 * 1024
 MAX_OWNER_PACKAGE_BYTES = 16 * 1024 * 1024
+# A conversion manifest binds every staged row of a whole history and is a different
+# artifact from a validated owner package. The largest reviewed artifact is 108,893,179
+# bytes (103.8 MiB), so the owner-package guard cannot size it. 192 MiB is 1.85x that
+# artifact: it still refuses a manifest about twice the reviewed size, while the read
+# costs about 5x the artifact transiently (chunk list + joined bytes + decoded graph).
+MAX_CONVERSION_MANIFEST_BYTES = 192 * 1024 * 1024
 
 
-def _read_package_bytes(package_path: Path) -> bytes:
+def _read_package_bytes(package_path: Path, *, max_bytes: int | None = None) -> bytes:
+    # None resolves the module constant at call time, so a caller can tighten or widen
+    # the limit per artifact kind without rebinding this function's default.
+    limit = MAX_OWNER_PACKAGE_BYTES if max_bytes is None else max_bytes
+    if type(limit) is not int or limit < 1:
+        raise ValueError('INVALID_PACKAGE_LIMIT')
     if (not package_path.is_absolute() or len(str(package_path).encode('utf-8')) > 4096):
         raise ValueError('INVALID_PACKAGE_LOCATOR')
     fd = os.open(package_path, os.O_RDONLY | os.O_NOFOLLOW | os.O_NONBLOCK | os.O_CLOEXEC)
@@ -34,16 +45,16 @@ def _read_package_bytes(package_path: Path) -> bytes:
         before = os.fstat(fd)
         if not stat.S_ISREG(before.st_mode):
             raise ValueError('INVALID_PACKAGE_LOCATOR')
-        if before.st_size > MAX_OWNER_PACKAGE_BYTES:
+        if before.st_size > limit:
             raise ValueError('PACKAGE_TOO_LARGE')
         chunks, total = [], 0
-        while total <= MAX_OWNER_PACKAGE_BYTES:
-            part = os.read(fd, min(65536, MAX_OWNER_PACKAGE_BYTES + 1 - total))
+        while total <= limit:
+            part = os.read(fd, min(65536, limit + 1 - total))
             if not part:
                 break
             chunks.append(part)
             total += len(part)
-        if total > MAX_OWNER_PACKAGE_BYTES:
+        if total > limit:
             raise ValueError('PACKAGE_TOO_LARGE')
         after = os.fstat(fd)
         if (before.st_size, before.st_mtime_ns, before.st_ctime_ns) != (after.st_size, after.st_mtime_ns, after.st_ctime_ns) or total != after.st_size:
@@ -54,13 +65,24 @@ def _read_package_bytes(package_path: Path) -> bytes:
         os.close(fd)
 
 
-def _load_pinned_bytes(package_path: Path, package_sha256: str) -> bytes:
+def _load_pinned_bytes(package_path: Path, package_sha256: str, *,
+                       max_bytes: int | None = None) -> bytes:
     if not isinstance(package_sha256, str) or not re.fullmatch('[0-9a-f]{64}', package_sha256):
         raise ValueError('INVALID_PACKAGE_LOCATOR')
-    data = _read_package_bytes(package_path)
+    data = _read_package_bytes(package_path, max_bytes=max_bytes)
     if hashlib.sha256(data).hexdigest() != package_sha256:
         raise ValueError('PACKAGE_DIGEST_MISMATCH')
     return data
+
+
+def _read_conversion_manifest_bytes(package_path: Path) -> bytes:
+    """The internal conversion manifest; never the 16 MiB owner-package artifact."""
+    return _read_package_bytes(package_path, max_bytes=MAX_CONVERSION_MANIFEST_BYTES)
+
+
+def _load_conversion_manifest_bytes(package_path: Path, package_sha256: str) -> bytes:
+    return _load_pinned_bytes(package_path, package_sha256,
+                              max_bytes=MAX_CONVERSION_MANIFEST_BYTES)
 
 
 def _parse_owner_package(data: bytes) -> list[dict[str, Any]]:
@@ -202,11 +224,11 @@ async def control_projector(projector: HistoryProjector, operation: str,
             from .convert.run import prepare_import_manifest
             source = Path(args['staged_path'])
             path, digest = Path(args['package_path']), args['package_sha256']
-            manifest = json.loads(await projector._submit(_load_pinned_bytes, path, digest))
+            manifest = json.loads(await projector._submit(_load_conversion_manifest_bytes, path, digest))
             if manifest != await projector._submit(prepare_import_manifest, source):
                 raise ValueError('INVALID_PACKAGE')
             def import_mutation(fd: int) -> None:
-                captured = json.loads(_load_pinned_bytes(path, digest))
+                captured = json.loads(_load_conversion_manifest_bytes(path, digest))
                 if captured != prepare_import_manifest(source):
                     raise ValueError('INVALID_PACKAGE')
                 result = import_backfill(projector.raw_root, source, captured,

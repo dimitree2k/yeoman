@@ -759,3 +759,268 @@ def test_whole_restore_reaches_timers_with_prior_health(tmp_path, leave_v3):
         assert health['prior_ready'] and health['knowledge_schema_version'] == '2'
         assert health['prior_selection_matches'] and 'capture_ready' not in health
     assert runner_calls == []
+
+
+def command_layout(tmp_path):
+    staged = tmp_path / 'staged'
+    staged.mkdir()
+    manifest = tmp_path / 'conversion.json'
+    manifest.write_text(json.dumps(dict(package_digest='a' * 64, files={})))
+    owner = tmp_path / 'owners.jsonl'
+    owner.write_text('{}\n{}\n')
+    raw = tmp_path / 'data/raw'
+    raw.mkdir(parents=True)
+    return dict(staged=str(staged), conversion_manifest=str(manifest), owner_package=str(owner), raw=str(raw))
+
+
+def live_command_payload(tmp_path, action, value):
+    argv = procedure().command_for(action, value)
+    return dict(home=str(tmp_path / 'live-home'), record=value, argv=argv, receipts=[])
+
+
+@pytest.mark.parametrize(('returncode', 'stdout', 'stderr', 'code', 'diagnostic'), [
+    (2, '', 'Error: import package validation or publication failed\n', 'command_failed_exit_2', 'stderr'),
+    (0, '', '', 'command_empty_output', None),
+    (0, 'not json at all', '', 'command_output_not_json', 'stdout'),
+    (0, '[]', '', 'command_output_not_object', 'stdout'),
+])
+def test_live_cli_failure_surface_is_bounded(tmp_path, monkeypatch, returncode, stdout, stderr, code, diagnostic):
+    import re
+    module = host_module()
+    value = dict(python=sys.executable, receipts=str(tmp_path / 'receipts'), layout=command_layout(tmp_path))
+    payload = live_command_payload(tmp_path, 'import-preview', value)
+    monkeypatch.setattr(module.subprocess, 'run',
+                        lambda argv, **options: CompletedProcess(argv, returncode, stdout, stderr))
+    control = module.live_host_controls(inventory=dict(inventory(), source_dir=str(tmp_path)), clock=Clock())
+    with pytest.raises(ValueError) as failure:
+        control('import-preview', payload)
+    assert str(failure.value) == code
+    assert re.fullmatch(r'[a-z0-9_]+', str(failure.value))
+    assert 'JSONDecode' not in str(failure.value)
+    receipts = tmp_path / 'receipts'
+    if diagnostic is None:
+        assert not list(receipts.glob('command-*'))
+    else:
+        path = receipts / f'command-import-preview.{diagnostic}.txt'
+        assert path.stat().st_mode & 0o777 == 0o600
+        assert path.read_text() == (stderr if diagnostic == 'stderr' else stdout)
+
+
+def test_live_cli_failure_is_journalled_as_a_bounded_code_and_keeps_stderr(tmp_path, monkeypatch):
+    m, module = procedure(), host_module()
+    path, home, value = record(tmp_path)
+    value.update(mode='live', python=sys.executable, layout=command_layout(tmp_path))
+    value['digest'] = m.record_digest(value)
+    path.write_text(json.dumps(value))
+    monkeypatch.setattr(module.subprocess, 'run', lambda argv, **options: CompletedProcess(
+        argv, 2, '', 'Error: import package validation or publication failed\n'))
+    control = module.live_host_controls(inventory=value['inventory'], clock=Clock())
+    with m.injected_controls(control):
+        result = m._run(value, home, ['import-preview'], record_dir=path.parent)
+    assert not result['ok'] and result['failed_phase'] == 'import-preview'
+    journal = json.loads((Path(value['receipts']) / 'cutover.json').read_text())
+    assert journal['error_code'] == 'command_failed_exit_2'
+    diagnostic = Path(value['receipts']) / 'command-import-preview.stderr.txt'
+    assert diagnostic.stat().st_mode & 0o777 == 0o600
+    assert 'import package validation or publication failed' in diagnostic.read_text()
+
+
+@pytest.mark.parametrize(('action', 'response'), [
+    ('import-preview', dict(status='dry-run', files=1, records=2, suppressed=0)),
+    ('import', dict(status='complete', files=1, records=2, suppressed=0)),
+    ('owner-preview', dict(validated=2, committed=0, suppressed=0)),
+    ('owner-append', dict(validated=2, committed=2, suppressed=0)),
+])
+def test_rehearsal_and_live_execute_the_same_command_argv(tmp_path, monkeypatch, action, response):
+    module = host_module()
+    root, copy = tmp_path / 'rehearsal', tmp_path / 'rehearsal/copy'
+    copy.mkdir(parents=True)
+    source = tmp_path / 'source'
+    (source / 'packages/gateway').mkdir(parents=True)
+    value = dict(python=sys.executable, mode='rehearsal', rehearsal_root=str(root), home=str(copy),
+                 receipts=str(root / 'receipts'), output=str(root / 'acquisition'), layout=command_layout(root))
+    argv = procedure().command_for(action, value)
+    calls = []
+    def runner(executed, **options):
+        calls.append((executed, options))
+        return CompletedProcess(executed, 0, json.dumps(response), '')
+    monkeypatch.setattr(module.subprocess, 'run', runner)
+    inv = dict(inventory(), source_dir=str(source))
+    live = module.live_host_controls(inventory=inv, clock=Clock())
+    rehearsal = module.rehearsal_host_controls(copy_home=copy, rehearsal_root=root, inventory=inv)
+    live_result = live(action, live_command_payload(tmp_path, action, value))
+    rehearsal_result = rehearsal(action, dict(home=str(copy), record=value, argv=argv, receipts=[]))
+    assert [call[0] for call in calls] == [argv, argv]
+    assert Path(calls[0][1]['cwd']) == Path(calls[1][1]['cwd']) == source
+    assert calls[1][1]['env']['YEOMAN_HOME'] == str(copy)
+    assert calls[0][1]['env']['YEOMAN_HOME'] == str(tmp_path / 'live-home')
+    assert calls[1][1]['env']['YEOMAN_SOURCE_DIR'] == str(source)
+    assert str(source / 'packages/gateway') in calls[1][1]['env']['PYTHONPATH']
+    assert {k: v for k, v in live_result.items() if k != 'mode'} == \
+           {k: v for k, v in rehearsal_result.items() if k != 'mode'}
+
+
+def test_rehearsal_command_never_addresses_the_live_home_or_leaves_the_root(tmp_path, monkeypatch):
+    module = host_module()
+    root, copy = tmp_path / 'rehearsal', tmp_path / 'rehearsal/copy'
+    copy.mkdir(parents=True)
+    source = tmp_path / 'source'
+    source.mkdir()
+    value = dict(python=sys.executable, rehearsal_root=str(root), home=str(copy),
+                 receipts=str(root / 'receipts'), layout=command_layout(root))
+    executed = []
+    rehearsal = module.rehearsal_host_controls(copy_home=copy, rehearsal_root=root,
+                                               inventory=dict(inventory(), source_dir=str(source)),
+                                               runner=executed.append)
+    payload = dict(home=str(copy), record=value, receipts=[], argv=[
+        sys.executable, '-m', 'yeoman_gateway', 'history', 'import-backfill',
+        '--staged', '/home/dm/.yeoman/data/raw', '--manifest', value['layout']['conversion_manifest'], '--confirm'])
+    with pytest.raises(ValueError, match='rehearsal_command_outside_root'):
+        rehearsal('import', payload)
+    payload['argv'][-3] = str(tmp_path / 'elsewhere')
+    with pytest.raises(ValueError, match='rehearsal_command_outside_root'):
+        rehearsal('import', payload)
+    payload['argv'] = ['/synthetic/python', *payload['argv'][1:]]
+    with pytest.raises(ValueError, match='rehearsal_command_interpreter'):
+        rehearsal('import', payload)
+    assert executed == []
+    # The live control passes the same argv straight through: this refusal is rehearsal-only.
+    live_argv = [sys.executable, '-m', 'yeoman_gateway', 'history', 'import-backfill',
+                 '--staged', '/home/dm/.yeoman/data/raw',
+                 '--manifest', value['layout']['conversion_manifest'], '--dry-run']
+    live_calls = []
+    monkeypatch.setattr(module.subprocess, 'run', lambda argv, **options: (
+        live_calls.append(argv), CompletedProcess(argv, 0, json.dumps(dict(status='dry-run')), ''))[1])
+    live = module.live_host_controls(inventory=dict(inventory(), source_dir=str(source)), clock=Clock())
+    assert live('import-preview', dict(home=str(tmp_path / 'live-home'), record=value,
+                                       argv=live_argv, receipts=[]))['ok']
+    assert live_calls == [live_argv]
+
+
+@pytest.mark.parametrize('unusable', ['not_a_directory', 'symlinked', 'runtime_home', 'live_home_literal'])
+def test_rehearsal_refuses_an_unusable_source_dir_through_the_controls(tmp_path, unusable):
+    import os
+    module = host_module()
+    root, copy = tmp_path / 'rehearsal', tmp_path / 'rehearsal/copy'
+    copy.mkdir(parents=True)
+    value = dict(python=sys.executable, rehearsal_root=str(root), home=str(copy),
+                 receipts=str(root / 'receipts'), layout=command_layout(root))
+    if unusable == 'not_a_directory':
+        source = tmp_path / 'source-file'
+        source.write_text('not a checkout')
+    elif unusable == 'symlinked':
+        (tmp_path / 'real-source').mkdir()
+        source = tmp_path / 'source-link'
+        source.symlink_to(tmp_path / 'real-source')
+    elif unusable == 'runtime_home':
+        # The session's isolated YEOMAN_HOME is a protected runtime home; the live one is
+        # the same protected set and is never opened by this witness.
+        source = Path(os.environ['YEOMAN_HOME']) / 'source'
+        source.mkdir()
+    else:
+        source = Path('/home/dm/.yeoman/data/raw')
+    executed = []
+    control = module.rehearsal_host_controls(copy_home=copy, rehearsal_root=root,
+                                             inventory=dict(inventory(), source_dir=str(source)),
+                                             runner=executed.append)
+    payload = dict(home=str(copy), record=value, receipts=[],
+                   argv=procedure().command_for('import-preview', value))
+    with pytest.raises(ValueError, match='rehearsal_source_dir_unusable'):
+        control('import-preview', payload)
+    assert executed == []
+
+
+@pytest.mark.parametrize('v3_tables', [False, True])
+def test_whole_restore_completes_from_a_store_without_v3_tables(tmp_path, v3_tables):
+    """A cutover that failed before publish-v3 leaves a schema-2 store; restore must still run."""
+    import sqlite3
+
+    from yeoman_shared.whatsapp_protocol import PROTOCOL_VERSION
+    m = procedure()
+    path, home, value = record(tmp_path)
+    knowledge = home / 'knowledge.db'
+    knowledge.unlink()
+    with sqlite3.connect(knowledge) as db:
+        db.executescript("CREATE TABLE knowledge_meta(key TEXT,value TEXT); "
+                         "INSERT INTO knowledge_meta VALUES ('schema_version','2'); "
+                         "CREATE TABLE knowledge_statements(statement_id TEXT,status TEXT,revoked_at_ms INTEGER); "
+                         "CREATE TABLE knowledge_statement_sources(event_id TEXT,revision INTEGER,status TEXT);")
+        db.execute("INSERT INTO knowledge_statements VALUES ('prior-revoked','revoked',11)")
+        if v3_tables:
+            db.execute('CREATE TABLE knowledge_history_sources(event_id TEXT,revision INTEGER,reason TEXT,revoked INTEGER)')
+            db.execute("INSERT INTO knowledge_history_sources VALUES ('prior-source',1,'purged',1)")
+    from yeoman_gateway.processing.store import ProcessingStore
+    ProcessingStore(home / 'processing.db').close()
+    prior_selection = dict(legacyWritersDisabled=False, liveProjectionEnabled=False, readers={})
+    (home / 'config.json').write_text(json.dumps(dict(history=prior_selection)))
+    value['layout'] = dict(knowledge_live=str(knowledge), raw=str(home / 'raw'), history=str(home / 'no-history.db'))
+    for entry in value['inventory']['members']:
+        if entry['path'] == 'knowledge.db':
+            entry['kind'] = 'sqlite'
+    value['inventory']['members'].extend([dict(path='config.json', kind='file', restore=True),
+                                          dict(path='processing.db', kind='sqlite', restore=True)])
+    value['digest'] = m.record_digest(value)
+    path.write_text(json.dumps(value))
+    m.acquire_cutover_snapshot(home=home, output=Path(value['output']), inventory=value['inventory'])
+    # The failed attempt mutated the live store without ever publishing v3.
+    with sqlite3.connect(knowledge) as db:
+        if v3_tables:
+            db.execute("UPDATE knowledge_meta SET value='3' WHERE key='schema_version'")
+        db.execute("UPDATE knowledge_statements SET status='revoked',revoked_at_ms=99 WHERE statement_id='prior-revoked'")
+    (home / 'config.json').write_text(json.dumps(dict(history=dict(legacyWritersDisabled=True, liveProjectionEnabled=True))))
+    (home / 'raw-status.json').write_text(json.dumps(raw_status()))
+    (home / 'bridge-status.json').write_text(json.dumps(dict(outbox=dict(pending=0), queue=dict(inflight=0),
+        whatsapp=dict(connected=True), protocolVersion=PROTOCOL_VERSION, persistenceFailure=False)))
+    runner_calls = []
+    def runner(argv):
+        runner_calls.append(argv)
+        raise AssertionError('host subprocess forbidden')
+    control = host_module().rehearsal_host_controls(copy_home=home, rehearsal_root=tmp_path,
+                                                    inventory=value['inventory'], runner=runner)
+    with m.injected_controls(control):
+        result = m.restore_prior_set(record=path, home=home, failed_snapshot=tmp_path / 'failed', apply=True)
+    receipt = json.loads(Path(result['receipt']).read_text())
+    assert result['ok'], receipt.get('error_code')
+    assert 'error_code' not in receipt and result['failed_phase'] is None
+    actions = [p['action'] for p in receipt['phases']]
+    assert actions[-1] == 'start-timers'
+    assert (actions.index('capture-suppression-delta') < actions.index('restore-files')
+            < actions.index('reapply-suppression-delta') < actions.index('verify-current-denials')
+            < actions.index('start-bridge'))
+    delta = json.loads((Path(value['receipts']) / 'suppression-delta.json').read_text())
+    assert delta['sources'] == ([['prior-source', 1, 'purged']] if v3_tables else [])
+    assert delta['statements'] == [['prior-revoked', 'revoked', 99]]
+    assert next(p['receipt'] for p in receipt['phases'] if p['action'] == 'verify-current-denials')['current_denials']
+    health = next(p['receipt'] for p in receipt['phases'] if p['action'] == 'health')
+    assert health['prior_ready'] and health['knowledge_schema_version'] == '2'
+    with sqlite3.connect(knowledge) as db:
+        names = {row[0] for row in db.execute("SELECT name FROM sqlite_master WHERE type='table'")}
+        assert ('knowledge_history_sources' in names) is v3_tables
+        assert db.execute("SELECT status,revoked_at_ms FROM knowledge_statements "
+                          "WHERE statement_id='prior-revoked'").fetchone() == ('revoked', 11)
+    assert runner_calls == []
+
+
+def test_verify_current_denials_still_refuses_an_unprovable_delta_without_v3_tables(tmp_path):
+    import sqlite3
+    module = host_module()
+    home = tmp_path / 'copy'
+    receipts = home / 'receipts'
+    receipts.mkdir(parents=True)
+    knowledge = home / 'knowledge.db'
+    with sqlite3.connect(knowledge) as db:
+        db.executescript("CREATE TABLE knowledge_meta(key TEXT,value TEXT); "
+                         "INSERT INTO knowledge_meta VALUES ('schema_version','2'); "
+                         "CREATE TABLE knowledge_statements(statement_id TEXT,status TEXT,revoked_at_ms INTEGER);")
+    processing = home / 'processing.db'
+    with sqlite3.connect(processing) as db:
+        db.execute('CREATE TABLE event_source_authority(event_id TEXT,revision INTEGER,revoked_at_ms INTEGER)')
+        db.execute("INSERT INTO event_source_authority VALUES ('synthetic-event',1,NULL)")
+    (receipts / 'suppression-delta.json').write_text(json.dumps(dict(sources=[['synthetic-event', 1, 'purged']],
+                                                                    statements=[])))
+    control = module.rehearsal_host_controls(copy_home=home, rehearsal_root=home,
+                                             inventory=dict(inventory(), knowledge_db=str(knowledge),
+                                                            processing_db=str(processing)))
+    payload = dict(home=str(home), record=dict(receipts=str(receipts), layout={}), receipts=[])
+    result = control('verify-current-denials', payload)
+    assert result['current_denials'] is False and result['ok'] is False

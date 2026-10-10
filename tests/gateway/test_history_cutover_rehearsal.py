@@ -90,6 +90,63 @@ def test_builder_accepts_only_executable_interpreter_symlink(tmp_path):
         build_cutover_record(**kwargs)
 
 
+def test_rehearsal_record_requires_source_dir_at_build_time(tmp_path):
+    """A rehearsal record without source_dir must refuse before the fence, not inside it."""
+    from jsonschema import Draft202012Validator
+
+    from scripts.history_cutover import validate_host_inventory
+    from scripts.history_cutover_inputs import build_cutover_record
+    _,home,value = record(tmp_path)
+    scripts = Path(__file__).parents[2]/'scripts'
+    schema = json.loads((scripts/'history_cutover_inventory.schema.json').read_text())
+    example = json.loads((scripts/'history_cutover_inventory.example.json').read_text())
+    # The shipped example document stays schema-valid for both modes.
+    assert Draft202012Validator(schema).is_valid(example)
+    example.update(home=str(home),output=value['output'],receipts=value['receipts'],rehearsal_root=str(tmp_path))
+    example['inventory'].update(value['inventory'],bridge_package_dir=str(bridge_package(tmp_path)))
+    interpreter = tmp_path/'python'
+    interpreter.symlink_to(sys.executable)
+    example['python'] = str(interpreter)
+    source = tmp_path/'inventory.json'
+    source.write_text(dumps(example))
+    kwargs = dict(inventory=source,layout={},mode='rehearsal',window=(1791532800000,1791534600000),expected_gateway_jobs=0)
+    built = build_cutover_record(**kwargs)
+    assert built['inventory']['source_dir'] == example['inventory']['source_dir']
+    validate_host_inventory(built['inventory'],mode='rehearsal')
+    validate_host_inventory(built['inventory'],mode='live')
+    del example['inventory']['source_dir']
+    source.write_text(dumps(example))
+    with pytest.raises(ValueError,match='missing_inventory_key:source_dir'):
+        build_cutover_record(**kwargs)
+    stripped = {k:v for k,v in built['inventory'].items() if k!='source_dir'}
+    with pytest.raises(ValueError,match='missing_inventory_key:source_dir'):
+        validate_host_inventory(stripped,mode='rehearsal')
+    with pytest.raises(ValueError,match='missing_inventory_key:source_dir'):
+        validate_host_inventory(stripped,mode='live')
+    assert not Path(value['receipts']).exists()
+
+
+def test_rehearsal_schema_requires_source_dir_and_leaves_live_requirements_alone():
+    scripts = Path(__file__).parents[2]/'scripts'
+    schema = json.loads((scripts/'history_cutover_inventory.schema.json').read_text())
+    # The pinned pre-change requirement sets: only source_dir may be added to rehearsal.
+    live_required = ['members','raw_path','bridge','gateway_jobs','units','timers','manual_routes',
+        'host_crontab','overseer_jobs','external_text_targets','forward_start_evidence_member',
+        'reader_smoke','bridge_package_dir','config_path','pause_path','knowledge_db','processing_db',
+        'frozen_files','frozen_watermarks','prepared_text_manifest','prepared_text_manifest_sha256',
+        'original_home','pinned_files','prior_pinned_files','source_dir','prior_source_dir','tool_python',
+        'yeoman','prior_yeoman','gateway_socket','systemd_runtime_dir','owner_uid','timer_services']
+    rehearsal_before = ['members','raw_path','bridge','gateway_jobs','units','timers','manual_routes',
+        'host_crontab','overseer_jobs','external_text_targets','forward_start_evidence_member',
+        'reader_smoke','bridge_package_dir','config_path','pause_path','knowledge_db','processing_db',
+        'frozen_files','frozen_watermarks','prepared_text_manifest','prepared_text_manifest_sha256',
+        'original_home','raw_status_path','bridge_status_path','timer_services']
+    assert schema['$defs']['live']['required'] == live_required
+    expected_rehearsal = list(rehearsal_before)
+    expected_rehearsal.insert(expected_rehearsal.index('original_home')+1,'source_dir')
+    assert schema['$defs']['rehearsal']['required'] == expected_rehearsal
+
+
 @pytest.mark.parametrize('environment',['unset','live','copy','child'])
 def test_cli_refuses_unsafe_rehearsal_environment(tmp_path,monkeypatch,environment,capsys):
     m = procedure()
@@ -236,6 +293,9 @@ def test_cli_operator_contract_real_sequence(tmp_path,monkeypatch,capsys,file_in
     inv = json.loads((Path(__file__).parents[2]/'scripts/history_cutover_inventory.example.json').read_text())
     inv.update(home=str(home),output=str(acquisition),receipts=str(root/'receipts'),python=sys.executable,rehearsal_root=str(root))
     inv['inventory'].update(original_home=str(home),bridge_package_dir=str(package),raw_path='data/raw',forward_start_evidence_member='inputs/forward.json',
+        # Rehearsal executes the real CLI, so it needs the checkout under test, not a placeholder.
+        source_dir=str(Path(history_cutover.__file__).parents[1]),
+        prior_source_dir=str(Path(history_cutover.__file__).parents[1]),
         members=[dict(path=path,kind=kind,restore=restore) for path,kind,restore in (
             ('data/knowledge/knowledge.db','sqlite',True),('data/ops/processing.db','sqlite',True),('data/raw','tree',False),
             ('data/ops/bridge-message-references','tree',False),('inputs/forward.json','file',False),('cron.json','file',True))],
@@ -263,6 +323,9 @@ def test_cli_operator_contract_real_sequence(tmp_path,monkeypatch,capsys,file_in
     receipts.mkdir()
     (receipts/'functional-smoke.owner_ack.json').write_text(dumps(dict(action='functional-smoke',record_digest=value['digest'],owner_ack=True,proof=dict(inbound_message_id_hash='a'*64,outbound_receipt_hash='b'*64,observed_ms=1))))
     monkeypatch.setattr(sys,'argv',['cutover','cutover','--record',str(record_file),'--home',str(home),'--controls','rehearsal','--apply'])
+    commands = ('import-preview','import','owner-preview','owner-append')
+    expected_argv = [history_cutover.command_for(action,value) for action in commands]
+    executed = []
     if file_invocation:
         import os
         import subprocess
@@ -285,11 +348,29 @@ def test_cli_operator_contract_real_sequence(tmp_path,monkeypatch,capsys,file_in
             cwd=work,env=env,capture_output=True,text=True,timeout=180)
         assert completed.returncode==0, completed.stdout+completed.stderr
     else:
+        import subprocess
+        original_run = subprocess.run
+        def recording_run(argv, **kwargs):
+            executed.append(list(argv) if isinstance(argv,list) else argv)
+            return original_run(argv, **kwargs)
+        monkeypatch.setattr(subprocess,'run',recording_run)
         assert history_cutover.main()==0, (receipts/'cutover.json').read_text() if (receipts/'cutover.json').exists() else capsys.readouterr().out
+        # The rehearsal really executed the CLI argv the live host would execute.
+        assert [argv for argv in executed if argv[1:4]==['-m','yeoman_gateway','history']] == expected_argv
     journal = json.loads((receipts/'cutover.json').read_text())
     assert journal['ok'] and 'error_code' not in journal
     actions = [p['action'] for p in journal['phases']]
     assert actions == history_cutover._sequence(value)
+    # "dry-run" is the CLI's own status literal; the direct preview API never emits it.
+    preview = next(p['receipt'] for p in journal['phases'] if p['action']=='import-preview')
+    assert preview['status']=='dry-run'
+    imported = next(p['receipt'] for p in journal['phases'] if p['action']=='import')
+    assert imported['status']=='complete' and imported['complete']
+    assert (raw/'.import-receipts.jsonl').is_file()
+    # The direct API never emitted these CLI-only counters.
+    for action in ('owner-preview','owner-append'):
+        receipt = next(p['receipt'] for p in journal['phases'] if p['action']==action)
+        assert {'validated','committed','suppressed'} <= receipt.keys()
     assert all(p['receipt']['complete'] for p in journal['phases'] if p['action'] in ('prepare-v3','publish-v3'))
     prepared = next(p['receipt'] for p in journal['phases'] if p['action']=='prepare-v3')
     capture_summary=json.loads((work/'aliases/legacy-alias-manifest.json').read_text())['capture_summary']
@@ -302,7 +383,7 @@ def test_cli_operator_contract_real_sequence(tmp_path,monkeypatch,capsys,file_in
 
 
 @pytest.mark.parametrize('mode',['rehearsal','live'])
-@pytest.mark.parametrize('key','config_path pause_path knowledge_db processing_db frozen_files frozen_watermarks prepared_text_manifest prepared_text_manifest_sha256 original_home'.split())
+@pytest.mark.parametrize('key','config_path pause_path knowledge_db processing_db frozen_files frozen_watermarks prepared_text_manifest prepared_text_manifest_sha256 original_home source_dir'.split())
 def test_missing_host_inputs_refused_before_first_phase(tmp_path,mode,key):
     from scripts import history_cutover as m
     path,home,value = record(tmp_path)
