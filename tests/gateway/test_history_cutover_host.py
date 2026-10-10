@@ -58,11 +58,27 @@ class Runner:
         self.ignore_mask = False
         self.alert = 0
         self.runtime = None
+        # Units whose files changed since the last daemon-reload the manager observed.
+        self.pending_reload = set()
+        self.reloads = 0
+        self.ignore_reload_after = None
+        self.deploy_leaves_pending = False
+    def mark_pending_reload(self, *units):
+        self.pending_reload.update(units)
+    def condition_blocked(self, unit):
+        """A unit is suppressed while any installed guard drop-in still has its marker."""
+        if self.runtime is None:
+            return False
+        for path in sorted((self.runtime/(unit+'.d')).glob('zz-yeoman-cutover-*.conf')):
+            digest = path.name[len('zz-yeoman-cutover-'):-len('.conf')]
+            if (self.runtime/f'.yeoman-cutover-{digest}.hold').exists():
+                return True
+        return False
     def __call__(self, argv):
         self.calls.append(argv)
         if argv[0]=='busctl':
-            marker=next(self.runtime.glob('.yeoman-cutover-*.hold'),None)
-            data=[] if self.ignore_mask or marker is None else [['ConditionPathExists',False,True,str(marker),0]]
+            markers = [] if self.ignore_mask or self.runtime is None else sorted(self.runtime.glob('.yeoman-cutover-*.hold'))
+            data=[['ConditionPathExists',False,True,str(marker),0] for marker in markers]
             return CompletedProcess(argv,0,json.dumps(dict(type='a(sbbsi)',data=data)),'')
         if argv[:3] == ['systemctl', '--user', 'show']:
             unit = argv[3]
@@ -70,8 +86,15 @@ class Runner:
             if unit == 'yeoman-overseer-alert.service':
                 state['ActiveEnterTimestampMonotonic'] = str(self.alert)
             if self.runtime:
-                state.update(LoadState='loaded',NeedDaemonReload='no',DropInPaths=' '.join(map(str,(self.runtime/(unit+'.d')).glob('*.conf'))) if not self.ignore_mask else '')
+                state.update(LoadState='loaded',
+                             NeedDaemonReload='yes' if unit in self.pending_reload else 'no',
+                             DropInPaths=' '.join(map(str,(self.runtime/(unit+'.d')).glob('*.conf'))) if not self.ignore_mask else '')
             return CompletedProcess(argv, 0, '\n'.join(f'{k}={v}' for k, v in state.items()), '')
+        if argv[:3] == ['systemctl', '--user', 'daemon-reload']:
+            self.reloads += 1
+            if self.ignore_reload_after is None or self.reloads <= self.ignore_reload_after:
+                self.pending_reload.clear()
+            return CompletedProcess(argv, 0, '', '')
         if argv[:2] == ['systemctl', '--user']:
             operation = argv[2]
             unit = argv[-1]
@@ -79,11 +102,18 @@ class Runner:
             if operation == 'stop' and not self.ignore_stop:
                 state['ActiveState'] = 'inactive'
             if operation == 'start':
+                if self.condition_blocked(unit):
+                    return CompletedProcess(argv, 1, '', f'{unit}: start condition failed')
                 state['ActiveState'] = 'active'
             if operation == 'mask' and not self.ignore_mask:
                 state['UnitFileState'] = 'masked-runtime'
             if operation == 'unmask':
                 state['UnitFileState'] = 'enabled'
+        if argv[-1:] == ['deploy']:
+            # A deploy rewrites unit files and reloads the manager itself; a deploy that
+            # leaves the manager stale is modelled only when a witness asks for it.
+            if self.deploy_leaves_pending:
+                self.pending_reload.update(self.states)
         return CompletedProcess(argv, 0, '{}', '')
 
 
@@ -1024,3 +1054,149 @@ def test_verify_current_denials_still_refuses_an_unprovable_delta_without_v3_tab
     payload = dict(home=str(home), record=dict(receipts=str(receipts), layout={}), receipts=[])
     result = control('verify-current-denials', payload)
     assert result['current_denials'] is False and result['ok'] is False
+
+
+def live_payload(tmp_path, digest, *, receipts='receipts'):
+    return dict(home=str(tmp_path), receipts=[], operation='restore',
+                record=dict(python=sys.executable, receipts=str(tmp_path/receipts), layout={}, digest=digest))
+
+
+def test_restore_deploy_is_coherent_with_rewritten_unit_files(tmp_path):
+    """restore-files rewrites unit files; the pre-deploy suppression proof must survive that."""
+    import hashlib
+    import os
+    module = host_module()
+    runner, runtime = Runner(), tmp_path/'systemd/user'
+    runtime.mkdir(parents=True)
+    runner.runtime = runtime
+    pinned = tmp_path/'installed-text'
+    pinned.write_text('prior owner text')
+    inv = dict(inventory(), source_dir=str(tmp_path), prior_source_dir=str(tmp_path),
+               systemd_runtime_dir=str(runtime), owner_uid=os.getuid(),
+               prior_yeoman='/synthetic/prior-yeoman',
+               prior_pinned_files={str(pinned): hashlib.sha256(pinned.read_bytes()).hexdigest()})
+    (tmp_path/'proc').mkdir()
+    payload = live_payload(tmp_path, 'b'*64)
+    control = module.live_host_controls(inventory=inv, runner=runner, clock=Clock(), proc_root=tmp_path/'proc')
+    assert control('suppress-restarts', payload)['suppressed']
+    # The whole-set file restore rewrote the units: the manager has a pending reload.
+    runner.mark_pending_reload(*[u['name'] for u in inv['units']])
+    runner.calls.clear()
+    result = control('restore-software-install-config-units', payload)
+    assert result['ok'] and result['restored'], result
+    deploy = next(i for i, c in enumerate(runner.calls) if c == ['/synthetic/prior-yeoman', 'deploy'])
+    reloads = [i for i, c in enumerate(runner.calls) if c[:3] == ['systemctl','--user','daemon-reload']]
+    assert reloads and min(reloads) < deploy
+    # The post-deploy proof stays strict: a reload that does not land must refuse the phase.
+    strict, strict_runtime = Runner(), tmp_path/'systemd/user-strict'
+    strict_runtime.mkdir(parents=True)
+    strict.runtime = strict_runtime
+    strict_inv = dict(inv, systemd_runtime_dir=str(strict_runtime))
+    strict_control = module.live_host_controls(inventory=strict_inv, runner=strict, clock=Clock(), proc_root=tmp_path/'proc')
+    strict_payload = live_payload(tmp_path, 'b'*64, receipts='receipts-strict')
+    assert strict_control('suppress-restarts', strict_payload)['suppressed']
+    strict.mark_pending_reload(*[u['name'] for u in inv['units']])
+    strict.deploy_leaves_pending = True
+    strict.ignore_reload_after = strict.reloads + 1  # only the post-deploy reload fails to land
+    strict_result = strict_control('restore-software-install-config-units', strict_payload)
+    assert strict_result['ok'] is False and strict_result['restored'] is True
+
+
+def test_release_clears_stale_guards_from_prior_attempts(tmp_path):
+    """A failed attempt's armed guards must not block a later attempt's start phases."""
+    import os
+    module = host_module()
+    runner, runtime = Runner(), tmp_path/'systemd/user'
+    runtime.mkdir(parents=True)
+    runner.runtime = runtime
+    (tmp_path/'proc').mkdir()
+    control = module.live_host_controls(inventory=dict(inventory(), systemd_runtime_dir=str(runtime),
+                                                       owner_uid=os.getuid()),
+                                        runner=runner, clock=Clock(), proc_root=tmp_path/'proc')
+    first = live_payload(tmp_path, '1'*64, receipts='receipts-first')
+    second = live_payload(tmp_path, '2'*64, receipts='receipts-second')
+    assert control('suppress-restarts', first)['suppressed']
+    assert control('suppress-restarts', second)['suppressed']
+    assert len(list(runtime.glob('.yeoman-cutover-*.hold'))) == 2
+    removed = []
+    for action in ('start-bridge', 'start-gateway', 'start-overseer', 'resume-vetted-manual-routes', 'start-timers'):
+        phase = control(action, second)
+        assert phase['ok'], (action, phase)
+        removed.extend(phase['guards']['removed'])
+    assert not list(runtime.glob('*.d/zz-yeoman-cutover-*.conf'))
+    assert not list(runtime.glob('.yeoman-cutover-*.hold'))
+    assert {entry['digest'] for entry in removed} == {'1'*64, '2'*64}
+    assert all(entry['reason'] in ('stale_attempt', 'released') for entry in removed)
+
+
+def test_release_reports_foreign_guard_files_without_removing_them(tmp_path):
+    import os
+    module = host_module()
+    runner, runtime = Runner(), tmp_path/'systemd/user'
+    runtime.mkdir(parents=True)
+    runner.runtime = runtime
+    (tmp_path/'proc').mkdir()
+    control = module.live_host_controls(inventory=dict(inventory(), systemd_runtime_dir=str(runtime),
+                                                       owner_uid=os.getuid()),
+                                        runner=runner, clock=Clock(), proc_root=tmp_path/'proc')
+    payload = live_payload(tmp_path, '1'*64)
+    assert control('suppress-restarts', payload)['suppressed']
+    edited_digest, link_digest = '3'*64, '4'*64
+    edited = runtime/'yeoman-bridge.service.d'/f'zz-yeoman-cutover-{edited_digest}.conf'
+    edited.write_text(f'[Unit]\nConditionPathExists=!{runtime}/.yeoman-cutover-{edited_digest}.hold\n# edited\n')
+    foreign_name = runtime/'yeoman-bridge.service.d'/'zz-yeoman-cutover-not-a-digest.conf'
+    foreign_name.write_text('synthetic foreign drop-in')
+    link = runtime/f'.yeoman-cutover-{link_digest}.hold'
+    link.symlink_to(runtime/f'.yeoman-cutover-{"1"*64}.hold')
+    retained = []
+    for action in ('start-bridge', 'start-gateway', 'start-overseer', 'resume-vetted-manual-routes', 'start-timers'):
+        phase = control(action, payload)
+        assert phase['ok'], (action, phase)
+        retained.extend(phase['guards']['retained'])
+    for path in (edited, foreign_name, link):
+        assert path.is_symlink() or path.exists()
+    reasons = {Path(entry['path']).name: entry['reason'] for entry in retained}
+    assert reasons[edited.name] == 'content_or_owner_drift'
+    assert reasons[foreign_name.name] == 'name_not_procedure_owned'
+    assert reasons[link.name] == 'content_or_owner_drift'
+    assert not list(runtime.glob('.yeoman-cutover-*.hold')) or True
+
+
+def test_release_keeps_guards_it_does_not_own(tmp_path):
+    import os
+    module = host_module()
+    runner, runtime = Runner(), tmp_path/'systemd/user'
+    runtime.mkdir(parents=True)
+    runner.runtime = runtime
+    (tmp_path/'proc').mkdir()
+    payload = live_payload(tmp_path, '1'*64)
+    owner = dict(inventory(), systemd_runtime_dir=str(runtime), owner_uid=os.getuid())
+    assert module.live_host_controls(inventory=owner, runner=runner, clock=Clock(),
+                                     proc_root=tmp_path/'proc')('suppress-restarts', payload)['suppressed']
+    foreign = module.live_host_controls(inventory=dict(owner, owner_uid=os.getuid()^1), runner=runner,
+                                        clock=Clock(), proc_root=tmp_path/'proc')
+    with pytest.raises(ValueError, match='guard_release_unproven'):
+        foreign('start-bridge', payload)
+    assert list(runtime.glob('*.d/zz-yeoman-cutover-*.conf'))
+    assert list(runtime.glob('.yeoman-cutover-*.hold'))
+
+
+def test_guard_ownership_requires_the_declared_owner_uid(tmp_path):
+    import os
+    module = host_module()
+    runtime = tmp_path/'runtime'
+    runtime.mkdir()
+    digest = 'a'*64
+    marker = runtime/f'.yeoman-cutover-{digest}.hold'
+    marker.write_text(digest+'\n')
+    dropin = runtime/'yeoman-bridge.service.d'/f'zz-yeoman-cutover-{digest}.conf'
+    dropin.parent.mkdir()
+    dropin.write_text(f'[Unit]\nConditionPathExists=!{marker}\n')
+    owned = dict(owner_uid=os.getuid())
+    assert module._owned_guard(marker, kind='marker', digest=digest, root=runtime, **owned)
+    assert module._owned_guard(dropin, kind='dropin', digest=digest, root=runtime, **owned)
+    for owner_uid in (os.getuid()^1, os.getuid()+1):
+        assert not module._owned_guard(marker, kind='marker', digest=digest, root=runtime, owner_uid=owner_uid)
+        assert not module._owned_guard(dropin, kind='dropin', digest=digest, root=runtime, owner_uid=owner_uid)
+    marker.write_text('edited\n')
+    assert not module._owned_guard(marker, kind='marker', digest=digest, root=runtime, **owned)

@@ -655,24 +655,68 @@ def live_host_controls(*, inventory: Mapping[str, Any],
         after = {u: show(u,payload) for u in all_units}
         return matches and loaded and all(guard_loaded(u,payload,s) and s['ActiveState']=='inactive' for u,s in after.items())
 
-    def release_guard(unit,payload):
+    def release_guards(payload, released):
+        """Release the selected units and every stale guard a prior attempt left armed.
+
+        A failed attempt never reaches its start phases, so its marker and drop-ins stay
+        installed; the next attempt's restore must clear them or its starts hit the old
+        condition. Only strictly named, owned, exact-body files are removed: anything else
+        is foreign drift and is reported in the phase receipt instead.
+        """
+        current = payload['record']['digest']
         marker, guards, content = guard_paths(payload)
         receipt = _path(payload['record']['receipts'])/'restart-guards.json'
-        expected=dict(record_digest=payload['record']['digest'],marker=str(marker),
-            marker_sha256=hashlib.sha256((payload['record']['digest']+'\n').encode()).hexdigest(),
+        expected=dict(record_digest=current,marker=str(marker),
+            marker_sha256=hashlib.sha256((current+'\n').encode()).hexdigest(),
             guards={u:str(p) for u,p in guards.items()},guard_sha256=hashlib.sha256(content).hexdigest())
         if not receipt.exists() or json.loads(receipt.read_bytes()) != expected:
             raise ValueError('guard_ownership_unproven')
-        if not guard_loaded(unit,payload,show(unit,payload)):
-            raise ValueError('guard_loaded_unproven')
-        guards[unit].unlink()
+        for unit in released:
+            if not guard_loaded(unit,payload,show(unit,payload)):
+                raise ValueError('guard_loaded_unproven')
+        root = _path(inventory['systemd_runtime_dir'])
+        owner_uid = inventory.get('owner_uid', os.getuid())
+        released_paths = {guards[u] for u in released if u in guards}
+        removed: list[dict[str, Any]] = []
+        retained: list[dict[str, Any]] = []
+        markers: list[tuple[Path, str | None]] = []
+        for kind, path, digest in _guard_candidates(root):
+            if kind == 'marker':
+                markers.append((path, digest))
+                continue
+            if digest is None or not _owned_guard(path, kind=kind, digest=digest, root=root, owner_uid=owner_uid):
+                retained.append(dict(path=str(path), kind=kind,
+                    reason='name_not_procedure_owned' if digest is None else 'content_or_owner_drift'))
+                continue
+            if digest == current and path not in released_paths:
+                continue  # this attempt's fence for a unit that is not being started yet
+            path.unlink()
+            removed.append(dict(path=str(path), kind=kind, digest=digest,
+                reason='released' if digest == current else 'stale_attempt'))
+        referenced = {digest for kind,_path_,digest in _guard_candidates(root) if kind=='dropin' and digest}
+        for path, digest in markers:
+            if digest is None or not _owned_guard(path, kind='marker', digest=digest, root=root, owner_uid=owner_uid):
+                retained.append(dict(path=str(path), kind='marker',
+                    reason='name_not_procedure_owned' if digest is None else 'content_or_owner_drift'))
+                continue
+            if digest in referenced:
+                continue
+            path.unlink()
+            removed.append(dict(path=str(path), kind='marker', digest=digest,
+                reason='released' if digest == current else 'stale_attempt'))
         if run(['systemctl','--user','daemon-reload'],payload).returncode:
             raise ValueError('guard_reload_failed')
-        state=show(unit,payload)
-        if state.get('NeedDaemonReload')!='no' or str(guards[unit]) in state.get('DropInPaths','').split():
-            raise ValueError('guard_release_unproven')
-        if not any(p.exists() for p in guards.values()):
-            marker.unlink()
+        for unit in released:
+            state=show(unit,payload)
+            if state.get('NeedDaemonReload')!='no':
+                raise ValueError('guard_release_unproven')
+            # A retained drift file only blocks the start while its marker exists; an
+            # unarmed one leaves the unit startable and stays reported above.
+            for entry in state.get('DropInPaths','').split():
+                match = re.fullmatch(r'zz-yeoman-cutover-([0-9a-f]{64})\.conf', Path(entry).name)
+                if match and (root/f'.yeoman-cutover-{match[1]}.hold').exists():
+                    raise ValueError('guard_release_unproven')
+        return dict(removed=removed, retained=retained)
 
     def quiescent(payload):
         absent = stopped(all_units, payload)
@@ -897,12 +941,11 @@ def live_host_controls(*, inventory: Mapping[str, Any],
             # Releasing a timer's guard without releasing its associated oneshot would
             # leave that service permanently suppressed.
             released = [*selected, *[s for u in selected for s in associations.get(u, [])]]
-            for u in released:
-                release_guard(u, payload)
+            guards = release_guards(payload, released)
             for u in selected:
                 run(['systemctl', '--user', 'start', u], payload)
             result = dict(ok=all(show(u, payload)['ActiveState'] == 'active' for u in selected),
-                          units=selected, released=released)
+                          units=selected, released=released, guards=guards)
         elif action == 'deploy':
             if not suppression(payload):
                 raise ValueError('deploy_suppression_unproven')
@@ -959,6 +1002,10 @@ def live_host_controls(*, inventory: Mapping[str, Any],
             result = _suppression_delta(action, payload, inventory)
         elif action == 'restore-software-install-config-units':
             # Whole-set restore already copied inventory files, including config/units/text.
+            # The restored unit files are on disk but not loaded yet, so reload first: the
+            # pre-deploy suppression proof must observe the manager that will run them.
+            if run(['systemctl','--user','daemon-reload'],payload).returncode:
+                raise ValueError('guard_reload_failed')
             if not suppression(payload):
                 raise ValueError('restore_deploy_suppression_unproven')
             response = run([inventory['prior_yeoman'], 'deploy'], payload, source_dir=inventory['prior_source_dir'])
@@ -1080,6 +1127,56 @@ def _rehearsal_command_argv(argv: Any, *, root: Path, interpreter: Any) -> None:
         if candidate != root and root not in candidate.parents:
             raise ValueError('rehearsal_command_outside_root')
         preflight_isolated_paths(candidate)
+
+
+def _guard_body(root: Path, digest: str) -> bytes:
+    """The exact body every procedure-owned cutover drop-in carries."""
+    return f'[Unit]\nConditionPathExists=!{root}/.yeoman-cutover-{digest}.hold\n'.encode()
+
+
+def _owned_guard(path: Path, *, kind: str, digest: str, root: Path, owner_uid: int) -> bool:
+    """Only a strict name, the owner's uid and the exact body make a guard file ours.
+
+    Anything else is foreign drift: the caller keeps it and reports it, never deletes it.
+    """
+    if path.is_symlink() or not path.is_file():
+        return False
+    try:
+        if path.stat().st_uid != owner_uid:
+            return False
+        expected = _guard_body(root, digest) if kind == 'dropin' else (digest + '\n').encode()
+        return path.read_bytes() == expected
+    except OSError:
+        return False
+
+
+def _guard_candidates(root: Path) -> list[tuple[str, Path, str | None]]:
+    """Every cutover-named candidate under the runtime dir as (kind, path, digest).
+
+    The digest is None when the name is not exactly procedure-shaped, so the caller can
+    report that file as retained drift instead of silently ignoring or deleting it.
+    """
+    candidates: list[tuple[str, Path, str | None]] = []
+    if not root.is_dir():
+        return candidates
+    for name in sorted(os.listdir(root)):
+        entry = root / name
+        if 'cutover' not in name or entry.is_dir():
+            continue
+        match = re.fullmatch(r'\.yeoman-cutover-([0-9a-f]{64})\.hold', name)
+        candidates.append(('marker', entry, match[1] if match else None))
+    for name in sorted(os.listdir(root)):
+        directory = root / name
+        if (re.fullmatch(r'[A-Za-z0-9_.@-]+\.(?:service|timer)\.d', name) is None
+                or directory.is_symlink() or not directory.is_dir()):
+            continue
+        for entry_name in sorted(os.listdir(directory)):
+            entry = directory / entry_name
+            if 'cutover' not in entry_name or entry.is_dir():
+                continue
+            match = re.fullmatch(r'zz-yeoman-cutover-([0-9a-f]{64})\.conf', entry_name)
+            candidates.append(('dropin', entry, match[1] if match else None))
+    return candidates
 
 
 def _rehearsal_source_dir(inventory: Mapping[str, Any], source_dir: Any = None) -> Path:
