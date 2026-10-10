@@ -1031,19 +1031,40 @@ def validate_import_manifest(staged_root: Path, manifest: Mapping[str, Any]) -> 
     return result
 
 
-def _import_receipt(raw_root: Path, digest: str) -> dict[str, Any] | None:
+def _import_receipts(raw_root: Path) -> list[dict[str, Any]]:
+    """Latest receipt per package digest, ordered by each digest's final journal position."""
     path = raw_root / IMPORT_RECEIPTS
     _no_symlinks(path)
     if not path.exists():
-        return None
-    latest = {}
+        return []
+    latest: dict[str, dict[str, Any]] = {}
     for _, row, _ in iter_records(path):
         if row is None or row.get('version') != 1 or row.get('status') not in ('partial', 'complete'):
             raise ValueError('invalid import receipt journal')
+        latest.pop(row['package_digest'], None)
         latest[row['package_digest']] = row
-    if any(key != digest and row['status'] == 'partial' for key, row in latest.items()):
+    return list(latest.values())
+
+
+def _import_receipt(raw_root: Path, digest: str) -> dict[str, Any] | None:
+    latest = _import_receipts(raw_root)
+    if any(row['package_digest'] != digest and row['status'] == 'partial' for row in latest):
         raise ValueError('another partial import must be completed first')
-    return latest.get(digest)
+    return next((row for row in latest if row['package_digest'] == digest), None)
+
+
+def _import_prior_post_image(raw_root: Path, relative: str) -> dict[str, Any] | None:
+    """Plan of *relative* in the most recent complete receipt that already covers it.
+
+    Newest first: an older receipt is stale evidence about the path, so it is never a
+    fallback once a later import recorded the same destination. ``_import_receipt`` has
+    already refused a partial receipt for another package before the plan is built.
+    """
+    for row in reversed(_import_receipts(raw_root)):
+        files = row.get('files')
+        if row['status'] == 'complete' and isinstance(files, dict) and relative in files:
+            return files[relative]
+    return None
 
 
 def _import_render(raw_root: Path, record: dict[str, Any], line: bytes) -> tuple[bytes, bool]:
@@ -1088,6 +1109,10 @@ def _import_plan(raw_root: Path, blobs: Mapping[str, bytes], manifest: Mapping[s
         _no_symlinks(pending)
         current = path.read_bytes() if path.exists() else b''
         previous = receipt['files'].get(relative) if receipt else None
+        # A destination this package does not create is planable only as the exact post-image
+        # an earlier complete import recorded for that path.
+        preexisting = bool(relative.startswith('backfill/') and previous
+                           and previous.get('preexisting'))
         if previous is not None:
             base_size = previous['base_bytes']
             base = current[:base_size]
@@ -1095,7 +1120,12 @@ def _import_plan(raw_root: Path, blobs: Mapping[str, bytes], manifest: Mapping[s
                 raise ValueError('import destination prefix changed')
         else:
             if relative.startswith('backfill/') and path.exists():
-                raise FileExistsError('backfill destination already exists without import receipt')
+                prior = _import_prior_post_image(raw_root, relative)
+                if prior is None:
+                    raise FileExistsError('backfill destination already exists without import receipt')
+                if len(current) != prior['bytes'] or hashlib.sha256(current).hexdigest() != prior['sha256']:
+                    raise ValueError('import destination prefix changed')
+                preexisting = True
             base = current
         if base and not base.endswith(b'\n'):
             raise ValueError('import destination has an incomplete physical line')
@@ -1105,20 +1135,34 @@ def _import_plan(raw_root: Path, blobs: Mapping[str, bytes], manifest: Mapping[s
         if relative.startswith('derived/'):
             for number, line in enumerate(base.splitlines(keepends=True), 1):
                 existing.setdefault(line, number)
+        # A recognised destination keeps every staged row in the slot that already holds it.
+        slots: dict[bytes, list[int]] = {}
+        if preexisting:
+            for number, line in enumerate(base.splitlines(keepends=True), 1):
+                slots.setdefault(line, []).append(number)
         added = []
         row_hashes = []
         suppressed = 0
         for number, line in enumerate(blob.splitlines(keepends=True), 1):
             record = json.loads(line)
             rendered, disposed = _import_render(raw_root, record, line)
-            suppressed += int(disposed)
-            # Each suppressed source retains a distinct tombstone slot, never compact refs.
-            final_number = existing.get(rendered) if not disposed else None
-            if final_number is None:
-                added.append(rendered)
-                final_number = base_lines + len(added)
-                if not disposed and relative.startswith('derived/'):
-                    existing.setdefault(rendered, final_number)
+            if preexisting:
+                # Each row must claim its own destination slot with identical bytes; a row the
+                # earlier import never wrote is refused rather than silently counted as present.
+                available = slots.get(rendered)
+                if not available:
+                    raise ValueError('backfill destination does not contain the planned rows')
+                final_number = available.pop()
+                suppressed += 1
+            else:
+                suppressed += int(disposed)
+                # Each suppressed source retains a distinct tombstone slot, never compact refs.
+                final_number = existing.get(rendered) if not disposed else None
+                if final_number is None:
+                    added.append(rendered)
+                    final_number = base_lines + len(added)
+                    if not disposed and relative.startswith('derived/'):
+                        existing.setdefault(rendered, final_number)
             source_ref = f'{relative}#{number}'
             final_ref = f'{relative}#{final_number}'
             ref_map[source_ref] = final_ref
@@ -1131,6 +1175,8 @@ def _import_plan(raw_root: Path, blobs: Mapping[str, bytes], manifest: Mapping[s
         info = {'base_bytes': len(base), 'base_sha256': hashlib.sha256(base).hexdigest(),
                 'bytes': len(base) + len(addition), 'sha256': hashlib.sha256(base + addition).hexdigest(),
                 'lines': base_lines + len(added), 'row_hashes': row_hashes, 'suppressed': suppressed}
+        if preexisting:
+            info['preexisting'] = True
         if previous is not None and info != previous:
             raise ValueError('import disposition or plan changed')
         tail = current[len(base):]

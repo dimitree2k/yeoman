@@ -1,4 +1,5 @@
 """Synthetic protected-import witnesses; no provider sockets or production paths."""
+import hashlib
 import json
 
 import pytest
@@ -367,3 +368,310 @@ def test_self_consistent_traversal_manifest_reaches_path_guard(tmp_path, monkeyp
     with pytest.raises(ValueError, match='unsupported import destination'):
         records.import_backfill(root, staged, manifest)
     assert not root.exists()
+
+
+def backfill_row(name, *, text='synthetic'):
+    return backfill_line(channel='whatsapp', kind='message', provenance='native',
+                         time_certainty='native', occurred_ms=100, direction='in', chat_id='c1',
+                         payload={'messageId': name, 'text': text},
+                         origin=Origin('snapshot', 'source.db', 'messages', name),
+                         original={'uuid': name, 'received_ms': 100})
+
+
+def derived_row(text):
+    return {'derived_version': 1, 'kind': 'media_description', 'channel': 'whatsapp',
+            'chat_id': 'c1', 'native_message_id': 'm1', 'generated_ms': 200, 'text': text}
+
+
+def stage(root, files):
+    """Write one staged package; every value is physical rows for that relative path."""
+    for relative, rows in files.items():
+        path = root / relative
+        path.parent.mkdir(parents=True, exist_ok=True)
+        path.write_text(''.join(canonical_json(item) + '\n' for item in rows))
+    return root
+
+
+def digests(root):
+    """Byte-level tree digest, so 'unchanged' covers content, not just the file list."""
+    if not root.exists():
+        return {}
+    return {p.relative_to(root).as_posix(): hashlib.sha256(p.read_bytes()).hexdigest()
+            for p in sorted(root.rglob('*')) if p.is_file()}
+
+
+def imported(tmp_path, root, name, files):
+    """A first, complete protected import of *files*; returns its manifest digest."""
+    source = stage(tmp_path / name, files)
+    manifest = prepare_import_manifest(source)
+    assert records.import_backfill(root, source, manifest)['status'] == 'complete'
+    return manifest['package_digest']
+
+
+def assert_cutover_refs_bind(root, receipt, relative):
+    """The exact binding prepare_final_owner_package applies to every completed row."""
+    lines = (root / relative).read_bytes().splitlines(keepends=True)
+    for number, expected in enumerate(receipt['files'][relative]['row_hashes'], 1):
+        base, final = receipt['ref_map'][f'{relative}#{number}'].split('#')
+        assert base == relative
+        assert hashlib.sha256(lines[int(final) - 1]).hexdigest() == expected
+
+
+def test_import_suppresses_destination_of_an_earlier_complete_import(tmp_path, monkeypatch):
+    """Witness 1: earlier complete receipt pins the destination; rows are suppressed."""
+    monkeypatch.setenv('YEOMAN_HOME', str(tmp_path / 'home'))
+    root = raw_root()
+    earlier = imported(tmp_path, root, 'first', {'backfill/a.jsonl': [backfill_row('m1')]})
+    destination = root / 'backfill/a.jsonl'
+    pinned = destination.read_bytes()
+    # The later acquisition still stages the same legacy rows; only the derived snapshot moved on.
+    source = stage(tmp_path / 'second', {'backfill/a.jsonl': [backfill_row('m1')],
+                                         'derived/media-descriptions.jsonl': [derived_row('new')]})
+    manifest = prepare_import_manifest(source)
+    assert manifest['package_digest'] != earlier
+    assert records._import_receipt(root, earlier)['status'] == 'complete'
+    before = digests(root)
+    preview = records.preview_import(root, source, manifest)
+    assert digests(root) == before and destination.read_bytes() == pinned
+    planned = preview['files']['backfill/a.jsonl']
+    assert planned['preexisting'] is True and planned['suppressed'] == 1
+    assert planned['bytes'] == len(pinned) and planned['base_sha256'] == hashlib.sha256(pinned).hexdigest()
+    result = records.import_backfill(root, source, manifest)
+    assert result['status'] == 'complete'
+    assert destination.read_bytes() == pinned
+    assert result['files']['backfill/a.jsonl'] == planned
+    assert result['ref_map']['backfill/a.jsonl#1'] == 'backfill/a.jsonl#1'
+    receipt = records._import_receipt(root, manifest['package_digest'])
+    assert receipt['status'] == 'complete' and receipt['files'] == result['files']
+    assert_cutover_refs_bind(root, receipt, 'backfill/a.jsonl')
+    assert_cutover_refs_bind(root, receipt, 'derived/media-descriptions.jsonl')
+    assert digests(root)['backfill/a.jsonl'] == before['backfill/a.jsonl']
+    assert digests(root)['derived/media-descriptions.jsonl'] == result['files']['derived/media-descriptions.jsonl']['sha256']
+
+
+def test_import_still_refuses_destination_without_any_receipt(tmp_path, monkeypatch):
+    """Witness 2: no covering receipt anywhere keeps the FileExistsError refusal."""
+    monkeypatch.setenv('YEOMAN_HOME', str(tmp_path / 'home'))
+    root = raw_root()
+    destination = root / 'backfill/a.jsonl'
+    destination.parent.mkdir(parents=True)
+    destination.write_bytes((canonical_json(backfill_row('m1')) + '\n').encode())
+    source = stage(tmp_path / 'staged', {'backfill/a.jsonl': [backfill_row('m1')]})
+    manifest = prepare_import_manifest(source)
+    before = digests(root)
+    with pytest.raises(FileExistsError, match='without import receipt'):
+        records.preview_import(root, source, manifest)
+    assert digests(root) == before
+    with pytest.raises(FileExistsError, match='without import receipt'):
+        records.import_backfill(root, source, manifest)
+    assert digests(root) == before
+    assert records._import_receipt(root, manifest['package_digest']) is None
+
+
+def test_import_refuses_when_recorded_post_image_no_longer_matches(tmp_path, monkeypatch):
+    """Witness 3: a receipt covers the path but the file diverged from its post-image."""
+    monkeypatch.setenv('YEOMAN_HOME', str(tmp_path / 'home'))
+    root = raw_root()
+    imported(tmp_path, root, 'first', {'backfill/a.jsonl': [backfill_row('m1')]})
+    destination = root / 'backfill/a.jsonl'
+    destination.write_bytes(destination.read_bytes() + b'{"tampered":true}\n')
+    source = stage(tmp_path / 'second', {'backfill/a.jsonl': [backfill_row('m1')],
+                                         'derived/media-descriptions.jsonl': [derived_row('new')]})
+    manifest = prepare_import_manifest(source)
+    before = digests(root)
+    with pytest.raises(ValueError, match='import destination prefix changed'):
+        records.preview_import(root, source, manifest)
+    with pytest.raises(ValueError, match='import destination prefix changed'):
+        records.import_backfill(root, source, manifest)
+    assert digests(root) == before
+
+
+def test_import_refuses_when_destination_lacks_the_planned_rows(tmp_path, monkeypatch):
+    """A divergent package is refused, never silently marked suppressed."""
+    monkeypatch.setenv('YEOMAN_HOME', str(tmp_path / 'home'))
+    root = raw_root()
+    imported(tmp_path, root, 'first', {'backfill/a.jsonl': [backfill_row('m1')]})
+    destination = root / 'backfill/a.jsonl'
+    pinned = destination.read_bytes()
+    source = stage(tmp_path / 'second', {'backfill/a.jsonl': [backfill_row('m1'), backfill_row('m2')]})
+    manifest = prepare_import_manifest(source)
+    before = digests(root)
+    with pytest.raises(ValueError, match='does not contain the planned rows'):
+        records.preview_import(root, source, manifest)
+    with pytest.raises(ValueError, match='does not contain the planned rows'):
+        records.import_backfill(root, source, manifest)
+    assert digests(root) == before and destination.read_bytes() == pinned
+
+
+def test_import_uses_the_latest_covering_receipt_without_stale_fallback(tmp_path, monkeypatch):
+    """Several receipts cover one path: the newest post-image decides, older ones are stale."""
+    monkeypatch.setenv('YEOMAN_HOME', str(tmp_path / 'home'))
+    root = raw_root()
+    first = {'backfill/a.jsonl': [backfill_row('m1')]}
+    imported(tmp_path, root, 'first', first)
+    destination = root / 'backfill/a.jsonl'
+    rewound = destination.read_bytes()
+    destination.unlink()
+    later = imported(tmp_path, root, 'second', {'backfill/a.jsonl': [backfill_row('m1', text='later')]})
+    assert records._import_receipt(root, later)['files']['backfill/a.jsonl']['sha256'] == hashlib.sha256(
+        destination.read_bytes()).hexdigest()
+    destination.write_bytes(rewound)  # a rewound destination still matching the older receipt
+    source = stage(tmp_path / 'third', {'backfill/a.jsonl': [backfill_row('m1')],
+                                        'derived/media-descriptions.jsonl': [derived_row('new')]})
+    manifest = prepare_import_manifest(source)
+    before = digests(root)
+    with pytest.raises(ValueError, match='import destination prefix changed'):
+        records.preview_import(root, source, manifest)
+    with pytest.raises(ValueError, match='import destination prefix changed'):
+        records.import_backfill(root, source, manifest)
+    assert digests(root) == before
+
+
+def test_fresh_import_plan_and_receipt_are_unchanged(tmp_path, monkeypatch):
+    """Witness 4: no file and no receipt still appends, records, and re-runs idempotently."""
+    monkeypatch.setenv('YEOMAN_HOME', str(tmp_path / 'home'))
+    root = raw_root()
+    source = stage(tmp_path / 'staged', {'backfill/a.jsonl': [backfill_row('m1')]})
+    manifest = prepare_import_manifest(source)
+    preview = records.preview_import(root, source, manifest)
+    info = preview['files']['backfill/a.jsonl']
+    assert preview['status'] == 'partial' and 'preexisting' not in info
+    assert info['suppressed'] == 0 and info['base_bytes'] == 0
+    assert info['bytes'] == (source / 'backfill/a.jsonl').stat().st_size
+    assert not root.exists()
+    result = records.import_backfill(root, source, manifest)
+    assert result['status'] == 'complete' and result['files'] == preview['files']
+    assert (root / 'backfill/a.jsonl').read_bytes() == (source / 'backfill/a.jsonl').read_bytes()
+    receipt = records._import_receipt(root, manifest['package_digest'])
+    assert receipt['status'] == 'complete' and receipt['files'] == result['files']
+    complete = digests(root)
+    assert records.import_backfill(root, source, manifest) == result
+    assert digests(root) == complete
+
+
+def test_import_suppresses_old_destination_and_appends_new_one(tmp_path, monkeypatch):
+    """Witness 5: one already-imported destination and one genuinely new one in a package."""
+    monkeypatch.setenv('YEOMAN_HOME', str(tmp_path / 'home'))
+    root = raw_root()
+    imported(tmp_path, root, 'first', {'backfill/a.jsonl': [backfill_row('m1')]})
+    destination = root / 'backfill/a.jsonl'
+    pinned = destination.read_bytes()
+    source = stage(tmp_path / 'second', {'backfill/a.jsonl': [backfill_row('m1')],
+                                         'backfill/c.jsonl': [backfill_row('m3')]})
+    manifest = prepare_import_manifest(source)
+    before = digests(root)
+    preview = records.preview_import(root, source, manifest)
+    assert digests(root) == before
+    assert preview['files']['backfill/a.jsonl']['suppressed'] == 1
+    assert preview['files']['backfill/c.jsonl']['suppressed'] == 0
+    result = records.import_backfill(root, source, manifest)
+    assert result['status'] == 'complete' and result['files'] == preview['files']
+    assert destination.read_bytes() == pinned
+    assert (root / 'backfill/c.jsonl').read_bytes() == (source / 'backfill/c.jsonl').read_bytes()
+    receipt = records._import_receipt(root, manifest['package_digest'])
+    assert set(receipt['files']) == {'backfill/a.jsonl', 'backfill/c.jsonl'}
+    assert receipt['files']['backfill/a.jsonl']['preexisting'] is True
+    assert 'preexisting' not in receipt['files']['backfill/c.jsonl']
+    assert receipt['files']['backfill/c.jsonl'] == result['files']['backfill/c.jsonl']
+    assert receipt['ref_map']['backfill/a.jsonl#1'] == 'backfill/a.jsonl#1'
+    assert receipt['ref_map']['backfill/c.jsonl#1'] == 'backfill/c.jsonl#1'
+    assert_cutover_refs_bind(root, receipt, 'backfill/a.jsonl')
+    assert_cutover_refs_bind(root, receipt, 'backfill/c.jsonl')
+
+
+def test_preview_import_never_mutates_the_archive(tmp_path, monkeypatch):
+    """Witness 6: preview hashes the same before and after in every destination state."""
+    monkeypatch.setenv('YEOMAN_HOME', str(tmp_path / 'home'))
+    root = raw_root()
+    fresh = stage(tmp_path / 'fresh', {'backfill/a.jsonl': [backfill_row('m1')]})
+    assert records.preview_import(root, fresh, prepare_import_manifest(fresh))['status'] == 'partial'
+    assert not root.exists()
+    assert records.import_backfill(root, fresh, prepare_import_manifest(fresh))['status'] == 'complete'
+    covered = stage(tmp_path / 'covered', {'backfill/a.jsonl': [backfill_row('m1')],
+                                           'derived/media-descriptions.jsonl': [derived_row('new')]})
+    manifest = prepare_import_manifest(covered)
+    before = digests(root)
+    preview = records.preview_import(root, covered, manifest)
+    assert preview['files']['backfill/a.jsonl']['suppressed'] == 1
+    assert digests(root) == before
+    destination = root / 'backfill/a.jsonl'
+    pinned = destination.read_bytes()
+    destination.write_bytes(pinned + b'{"tampered":true}\n')
+    before = digests(root)
+    with pytest.raises(ValueError):
+        records.preview_import(root, covered, manifest)
+    assert digests(root) == before
+    destination.write_bytes(pinned)
+    foreign = stage(tmp_path / 'foreign', {'backfill/z.jsonl': [backfill_row('z1')]})
+    (root / 'backfill/z.jsonl').write_bytes((canonical_json(backfill_row('z1')) + '\n').encode())
+    before = digests(root)
+    with pytest.raises(FileExistsError):
+        records.preview_import(root, foreign, prepare_import_manifest(foreign))
+    assert digests(root) == before
+
+
+def test_suppressed_destination_resumes_after_a_partial_publication(tmp_path, monkeypatch):
+    """A crash after the pinned partial receipt resumes without touching the suppressed file."""
+    monkeypatch.setenv('YEOMAN_HOME', str(tmp_path / 'home'))
+    root = raw_root()
+    imported(tmp_path, root, 'first', {'backfill/a.jsonl': [backfill_row('m1')]})
+    destination = root / 'backfill/a.jsonl'
+    pinned = destination.read_bytes()
+    source = stage(tmp_path / 'second', {'backfill/a.jsonl': [backfill_row('m1')],
+                                         'backfill/c.jsonl': [backfill_row('m3')]})
+    manifest = prepare_import_manifest(source)
+    real = records._publish_import_file
+    published = []
+
+    def crash(path, addition, **kwargs):
+        result = real(path, addition, **kwargs)
+        published.append(path.name)
+        if path.name == 'c.jsonl':
+            raise OSError('synthetic crash after the new publication')
+        return result
+
+    monkeypatch.setattr(records, '_publish_import_file', crash)
+    with pytest.raises(OSError):
+        records.import_backfill(root, source, manifest)
+    partial = records._import_receipt(root, manifest['package_digest'])
+    assert published == ['a.jsonl', 'c.jsonl']
+    assert partial['status'] == 'partial' and partial['files']['backfill/a.jsonl']['preexisting'] is True
+    assert destination.read_bytes() == pinned
+    monkeypatch.setattr(records, '_publish_import_file', real)
+    before = digests(root)
+    assert records.preview_import(root, source, manifest)['files']['backfill/a.jsonl']['suppressed'] == 1
+    assert digests(root) == before
+    result = records.import_backfill(root, source, manifest)
+    assert result['status'] == 'complete'
+    assert destination.read_bytes() == pinned
+    assert records._import_receipt(root, manifest['package_digest'])['status'] == 'complete'
+
+
+def test_suppressed_rows_claim_distinct_identical_slots_only(tmp_path, monkeypatch):
+    """Byte-identical rows each claim their own slot; a row without one is refused."""
+    monkeypatch.setenv('YEOMAN_HOME', str(tmp_path / 'home'))
+    root = raw_root()
+    repeated = [backfill_row('m1'), backfill_row('m1')]
+    imported(tmp_path, root, 'first', {'backfill/a.jsonl': repeated})
+    destination = root / 'backfill/a.jsonl'
+    pinned = destination.read_bytes()
+    source = stage(tmp_path / 'second', {'backfill/a.jsonl': repeated,
+                                         'derived/media-descriptions.jsonl': [derived_row('new')]})
+    manifest = prepare_import_manifest(source)
+    before = digests(root)
+    result = records.import_backfill(root, source, manifest)
+    assert digests(root)['backfill/a.jsonl'] == before['backfill/a.jsonl'] == hashlib.sha256(pinned).hexdigest()
+    assert result['files']['backfill/a.jsonl']['suppressed'] == 2
+    refs = {result['ref_map'][f'backfill/a.jsonl#{n}'] for n in (1, 2)}
+    assert refs == {'backfill/a.jsonl#1', 'backfill/a.jsonl#2'}
+    assert destination.read_bytes() == pinned
+    # One further identical row has no unclaimed destination slot: refused, not double-counted.
+    extra = stage(tmp_path / 'third', {'backfill/a.jsonl': [*repeated, backfill_row('m1')],
+                                       'derived/media-descriptions.jsonl': [derived_row('new')]})
+    extra_manifest = prepare_import_manifest(extra)
+    before = digests(root)
+    with pytest.raises(ValueError, match='does not contain the planned rows'):
+        records.preview_import(root, extra, extra_manifest)
+    with pytest.raises(ValueError, match='does not contain the planned rows'):
+        records.import_backfill(root, extra, extra_manifest)
+    assert digests(root) == before
