@@ -239,3 +239,45 @@ async def test_knowledge_probe_multiple_readable_statements(statement_case,tmp_p
         error='reader_smoke_unauthorized_disclosure' if outcome=='unauthorized_leak' else 'reader_smoke_curated_disclosure_failed'
         with pytest.raises(ValueError,match='^'+error+'$'):
             await asyncio.to_thread(invoke)
+
+
+@pytest.mark.parametrize('outcome',['pass','missing_admin','non_owner_leak'])
+async def test_secondary_probe_uses_policy_admin_and_refuses_member_export(statement_case,tmp_path,monkeypatch,outcome):
+    from yeoman_gateway.history import export
+
+    from scripts.history_cutover_probes import build_probes
+
+    case=statement_case
+    await case.publish(old=True,author_only=False)
+    await case.curate()
+    policy_path=tmp_path/'policy.json'
+    policy=case.policy.engine.policy.model_dump(mode='json')
+    policy['owners']={'telegram':['synthetic-owner'],'whatsapp':[]} if outcome!='missing_admin' else {}
+    policy_path.write_text(json.dumps(policy))
+    record=_probe_record(case,policy_path)
+    record['inventory']['reader_smoke']['owner_scope']=False
+    original=export.read_history_turn
+    calls=[]
+    def read(snapshot,**kwargs):
+        context=kwargs['context']
+        calls.append((context,kwargs))
+        if outcome=='non_owner_leak' and context.owner and context.principal_id==case.author:
+            return {'count':0}
+        return original(snapshot,**kwargs)
+    monkeypatch.setattr(export,'read_history_turn',read)
+    probes=build_probes(record=record,home=tmp_path/'secondary-home')
+    def invoke():
+        with case.snapshot() as snapshot:
+            return probes['secondary'](snapshot)
+    if outcome=='pass':
+        result=await asyncio.to_thread(invoke)
+        assert result['bounded_owner_export'] and result['non_owner_refused'] and result['in_turn_subprocess_refusal']
+        assert len(calls)==2
+        assert calls[0][0].principal_id=='telegram:synthetic-owner' and calls[0][0].owner
+        assert calls[0][0].recipient_principals==frozenset({'telegram:synthetic-owner'})
+        assert calls[1][0].principal_id==case.author and calls[1][0].owner
+        assert all(kwargs['chat_ids']==(case.chat,) and kwargs['limit']==10 and 'aggregate' not in kwargs for _,kwargs in calls)
+    else:
+        error='reader_smoke_admin_actor_unavailable' if outcome=='missing_admin' else 'reader_smoke_non_owner_export_allowed'
+        with pytest.raises(ValueError,match='^'+error+'$'):
+            await asyncio.to_thread(invoke)

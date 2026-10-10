@@ -260,11 +260,25 @@ async def _compose(family: str, snapshot: Any, d: Mapping[str, Any], home: Path,
             raise ValueError("reader_smoke_participation_failed")
         result.update(ambient=True, audience_generation=True)
     else:
-        owner_context = replace(context, owner=True)
+        from yeoman_gateway.knowledge.models import KnowledgeError
+        admin = policy.admin_actor()
+        if not isinstance(admin, str) or not admin:
+            raise ValueError("reader_smoke_admin_actor_unavailable")
+        owner_context = replace(context, principal_id=admin, recipient_principals=frozenset({admin}), owner=True)
         value = read_history_turn(snapshot, context=owner_context, chat_ids=(d["chat_id"],),
                                   after_ms=0, limit=10)
         if value["count"] > 10 or "messages" in value:
             raise ValueError("reader_smoke_owner_export_unbounded")
+        if context.principal_id != admin:
+            try:
+                read_history_turn(snapshot, context=replace(context, owner=True),
+                                  chat_ids=(d["chat_id"],), after_ms=0, limit=10)
+            except KnowledgeError as exc:
+                if exc.code != "unauthorized":
+                    raise
+                result["non_owner_refused"] = True
+            else:
+                raise ValueError("reader_smoke_non_owner_export_allowed")
         try:
             from yeoman_gateway.history.export import read_history_export
             await read_history_export(_offline(snapshot), context=context, chat_ids=(d["chat_id"],),
