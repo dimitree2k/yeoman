@@ -39,6 +39,8 @@ def _inputs(record: Mapping[str, Any]) -> tuple[dict[str, Any], Path, Path]:
         raise ValueError("reader_smoke_inputs_invalid")
     if diagnostics["channel"] != "whatsapp" or type(diagnostics["at_ms"]) is not int:
         raise ValueError("reader_smoke_inputs_invalid")
+    if not diagnostics["principal"].startswith("whatsapp:") or not diagnostics["principal"].removeprefix("whatsapp:"):
+        raise ValueError("reader_smoke_inputs_invalid")
     if type(diagnostics["owner_scope"]) is not bool:
         raise ValueError("reader_smoke_inputs_invalid")
     rights = diagnostics["rights"]
@@ -140,13 +142,20 @@ async def _compose(family: str, snapshot: Any, d: Mapping[str, Any], home: Path,
 
     if family == "knowledge":
         _source_for(knowledge, snapshot, d)
-        recall = knowledge.recall(
-            __import__("yeoman_gateway.knowledge.models", fromlist=["RecallQuery"]).RecallQuery(d["query"]),
-            context=context,
-        )
-        if recall.statement_ids != (d["statement_id"],) or d["curated_text"] not in recall.text:
+        query = __import__("yeoman_gateway.knowledge.models", fromlist=["RecallQuery"]).RecallQuery(d["query"])
+        recall = knowledge.recall(query, context=context)
+        if recall.statement_ids[:1] != (d["statement_id"],) or d["curated_text"] not in recall.text:
             raise ValueError("reader_smoke_curated_disclosure_failed")
-        result.update(mapped_source=True, curated_disclosure=True)
+        principal = "whatsapp:0"
+        # Choose a reader with no temporal identity, hence no membership/source authority.
+        while principal == policy.admin_actor() or q.resolve_identifier(
+                principal.removeprefix("whatsapp:") + "@s.whatsapp.net", at_ms=d["at_ms"], time_basis="native") is not None:
+            principal += "0"
+        denied = knowledge.recall(query, context=replace(context, principal_id=principal,
+            recipient_principals=frozenset({principal}), owner=False))
+        if d["statement_id"] in denied.statement_ids or d["curated_text"] in denied.text:
+            raise ValueError("reader_smoke_unauthorized_disclosure")
+        result.update(mapped_source=True, curated_disclosure=True, unauthorized_denial=True)
     elif family == "whatsapp":
         message = archive.lookup_message(d["channel"], d["chat_id"], d["source_event_id"])
         if message is None or q.mention(d["phone"], chat_id=d["chat_id"], at_ms=d["at_ms"]) != d["phone"]:

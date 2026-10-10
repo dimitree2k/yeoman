@@ -138,7 +138,8 @@ def test_build_probes_refuses_missing_or_unknown_diagnostics(tmp_path, reader_sm
         build_probes(record={"inventory": {"reader_smoke": reader_smoke}}, home=tmp_path)
 
 
-def test_build_probes_defers_store_reads_until_callback(tmp_path):
+@pytest.mark.parametrize("principal", ["whatsapp:10001", "10001", "telegram:10001", "whatsapp:"])
+def test_build_probes_defers_store_reads_and_requires_canonical_principal(tmp_path, principal):
     from scripts.history_cutover_probes import build_probes
 
     record = {
@@ -150,7 +151,7 @@ def test_build_probes_defers_store_reads_until_callback(tmp_path):
             "workspace_id": "synthetic",
             "channel": "whatsapp",
             "chat_id": "synthetic@g.us",
-            "principal": "whatsapp:10001",
+            "principal": principal,
             "phone": "10001",
             "message_id": "synthetic-message",
             "source_event_id": "synthetic-native-id",
@@ -163,9 +164,78 @@ def test_build_probes_defers_store_reads_until_callback(tmp_path):
             "rights": {"knowledge_read": True, "tools_read": True, "owner_export": True},
         }},
     }
+    if principal != "whatsapp:10001":
+        with pytest.raises(ValueError, match="reader_smoke_inputs_invalid"):
+            build_probes(record=record, home=tmp_path / "deferred-home")
+        return
     probes = build_probes(record=record, home=tmp_path / "deferred-home")
     assert tuple(probes) == (
         "knowledge", "whatsapp", "responder", "tools", "participation", "secondary"
     )
     with pytest.raises(ValueError, match="reader_smoke_path_missing"):
         probes["knowledge"](None)
+
+
+@pytest.mark.parametrize('outcome',['pass','not_first','not_disclosed','missing_text','unauthorized_leak'])
+async def test_knowledge_probe_multiple_readable_statements(statement_case,tmp_path,monkeypatch,outcome):
+    from dataclasses import replace
+
+    from yeoman_gateway.history.context import history_knowledge_scope, history_turn
+    from yeoman_gateway.knowledge.models import (
+        RecallQuery,
+        StatementCandidate,
+        TrustedCaptureContext,
+    )
+
+    from scripts.history_cutover_probes import build_probes
+
+    case=statement_case
+    await case.publish(old=True,author_only=False)
+    await case.curate()
+    async with history_turn(case.projector) as snapshot:
+        with history_knowledge_scope(snapshot,case.knowledge):
+            case.knowledge.capture(StatementCandidate('Another readable statement',(case.source,)),
+                context=TrustedCaptureContext('synthetic-extra',case.knowledge.policy_revision,'native',(case.source,)))
+            ranked=case.knowledge.recall(RecallQuery('Curated'),context=case.read_context(case.author))
+            assert len(ranked.statement_ids)>1 and ranked.statement_ids[0]==case.statement_id
+            other=case.knowledge.recall(RecallQuery('Another'),context=case.read_context(case.author))
+            assert other.statement_ids[0]!=case.statement_id and case.statement_id in other.statement_ids
+            assert not case.knowledge.recall(RecallQuery('Curated'),context=case.read_context(case.later)).statement_ids
+    policy_path=tmp_path/'policy.json'
+    policy=case.policy.engine.policy.model_dump(mode='json')
+    policy['owners']={'telegram':['synthetic-owner'],'whatsapp':[]}
+    policy_path.write_text(json.dumps(policy))
+    record=_probe_record(case,policy_path)
+    diagnostics=record['inventory']['reader_smoke']
+    diagnostics['owner_scope']=False
+    if outcome=='not_first':
+        diagnostics['query']='Another'
+    elif outcome=='not_disclosed':
+        diagnostics['principal']=case.later
+    elif outcome=='missing_text':
+        diagnostics['curated_text']='Absent curated text'
+    observed=[]
+    original=type(case.knowledge).recall
+    def recall(service,query,*,context,**kwargs):
+        result=original(service,query,context=context,**kwargs)
+        observed.append((context,result))
+        if outcome=='unauthorized_leak' and context.principal_id!=case.author:
+            return replace(result,statement_ids=(case.statement_id,),text=diagnostics['curated_text'])
+        return result
+    monkeypatch.setattr(type(case.knowledge),'recall',recall)
+    probes=build_probes(record=record,home=tmp_path/'probe-home')
+    def invoke():
+        with case.snapshot() as snapshot:
+            return probes['knowledge'](snapshot)
+    if outcome=='pass':
+        result=await asyncio.to_thread(invoke)
+        assert result['mapped_source'] and result['curated_disclosure'] and result['unauthorized_denial']
+        assert len(observed)==2
+        denied_context,denied=observed[-1]
+        assert denied_context.principal_id.startswith('whatsapp:')
+        assert denied_context.principal_id!=case.author and not denied_context.owner
+        assert case.statement_id not in denied.statement_ids
+    else:
+        error='reader_smoke_unauthorized_disclosure' if outcome=='unauthorized_leak' else 'reader_smoke_curated_disclosure_failed'
+        with pytest.raises(ValueError,match='^'+error+'$'):
+            await asyncio.to_thread(invoke)
