@@ -605,3 +605,121 @@ def test_configure_uses_loader_migration_preserving_raw_profile_keys(tmp_path,mo
     assert loaded.history.legacy_writers_disabled and loaded.history.live_projection_enabled
     assert loaded.history.readers.knowledge
     assert loaded.models.routes['assistant.reply']=='synthetic_fast'
+
+
+@pytest.mark.parametrize('mode', ['live', 'rehearsal'])
+@pytest.mark.parametrize('action', ['health', 'drain-durable-tails', 'all-committed-barrier'])
+@pytest.mark.parametrize('drift', [None, 'schema', 'selection', 'bridge', 'raw'])
+def test_restore_health_observes_prior_dormant_set(tmp_path, mode, action, drift):
+    import sqlite3
+
+    from yeoman_shared.whatsapp_protocol import PROTOCOL_VERSION
+    m = procedure()
+    home, p = data_home(tmp_path)
+    knowledge = Path(p['record']['layout']['knowledge_live'])
+    with sqlite3.connect(knowledge) as db:
+        db.execute("UPDATE knowledge_meta SET value='2' WHERE key='schema_version'")
+        db.execute('DROP TABLE knowledge_history_capture_state')
+    config = home/'config.json'
+    prior_selection = dict(legacyWritersDisabled=False,liveProjectionEnabled=False,readers={})
+    config.write_text(json.dumps(dict(history=prior_selection)))
+    inv = dict(inventory(),knowledge_db=str(knowledge),config_path=str(config),
+        members=[dict(path='knowledge.db',kind='sqlite',restore=True),dict(path='config.json',kind='file',restore=True)],
+        bridge=dict(mode='stopped'),raw_status_path='raw.json',bridge_status_path='bridge.json')
+    snapshot = tmp_path/'prior'
+    m.acquire_cutover_snapshot(home=home,output=snapshot,inventory=inv)
+    p['record'].update(output=str(snapshot),inventory=inv)
+    p['operation'] = 'restore'
+    # Dormant health must not open any history/capture tables.
+    Path(p['record']['layout']['history']).unlink()
+    if drift == 'schema':
+        with sqlite3.connect(knowledge) as db:
+            db.execute("UPDATE knowledge_meta SET value='3' WHERE key='schema_version'")
+    elif drift == 'selection':
+        config.write_text(json.dumps(dict(history=dict(legacyWritersDisabled=True))))
+    raw = raw_status(spooled=1 if drift == 'raw' else 0)
+    bridge = dict(outbox=dict(pending=1 if drift == 'bridge' else 0),queue=dict(inflight=0),
+        whatsapp=dict(connected=True),protocolVersion=PROTOCOL_VERSION,persistenceFailure=False)
+    calls = []
+    def runner(argv):
+        calls.append(argv)
+        return CompletedProcess(argv,0,json.dumps(raw),'')
+    def ipc(_):
+        raise AssertionError('dormant restore must not request history_control')
+    module = host_module()
+    if mode == 'live':
+        control = module.live_host_controls(inventory=inv,runner=runner,ipc=ipc,bridge_probe=lambda: bridge)
+    else:
+        (home/'raw.json').write_text(json.dumps(raw))
+        (home/'bridge.json').write_text(json.dumps(bridge))
+        control = module.rehearsal_host_controls(copy_home=home,rehearsal_root=tmp_path,inventory=inv,runner=runner)
+    proof = control(action,p)
+    assert proof['ok'] is (drift is None)
+    assert proof['prior_schema_version'] == '2'
+    assert proof['knowledge_schema_version'] == ('3' if drift == 'schema' else '2')
+    assert proof['integrity_ok']
+    assert proof['prior_selection_matches'] is (drift != 'selection')
+    assert 'capture_ready' not in proof
+    if mode == 'rehearsal':
+        assert calls == []
+
+
+@pytest.mark.parametrize('leave_v3', [False, True])
+def test_whole_restore_reaches_timers_with_prior_health(tmp_path, leave_v3):
+    import sqlite3
+
+    from yeoman_shared.whatsapp_protocol import PROTOCOL_VERSION
+    m = procedure()
+    path, home, value = record(tmp_path)
+    knowledge = home/'knowledge.db'
+    knowledge.unlink()
+    with sqlite3.connect(knowledge) as db:
+        db.executescript("CREATE TABLE knowledge_meta(key TEXT,value TEXT); INSERT INTO knowledge_meta VALUES ('schema_version','2'); "
+            "CREATE TABLE knowledge_statements(statement_id TEXT,status TEXT,revoked_at_ms INTEGER); "
+            "CREATE TABLE knowledge_statement_sources(event_id TEXT,revision INTEGER,status TEXT);")
+    processing = home/'processing.db'
+    from yeoman_gateway.processing.store import ProcessingStore
+    ProcessingStore(processing).close()
+    prior_selection = dict(legacyWritersDisabled=False,liveProjectionEnabled=False,readers={})
+    config = home/'config.json'
+    config.write_text(json.dumps(dict(history=prior_selection)))
+    value['layout'] = dict(knowledge_live=str(knowledge),raw=str(home/'raw'),history=str(home/'no-history.db'))
+    for entry in value['inventory']['members']:
+        if entry['path'] == 'knowledge.db':
+            entry['kind'] = 'sqlite'
+    value['inventory']['members'].extend([dict(path='config.json',kind='file',restore=True),dict(path='processing.db',kind='sqlite',restore=True)])
+    value['digest'] = m.record_digest(value)
+    path.write_text(json.dumps(value))
+    m.acquire_cutover_snapshot(home=home,output=Path(value['output']),inventory=value['inventory'])
+    with sqlite3.connect(knowledge) as db:
+        db.execute("UPDATE knowledge_meta SET value='3' WHERE key='schema_version'")
+        db.execute('CREATE TABLE knowledge_history_sources(event_id TEXT,revision INTEGER,reason TEXT,revoked INTEGER)')
+    config.write_text(json.dumps(dict(history=dict(legacyWritersDisabled=True,liveProjectionEnabled=True))))
+    (home/'raw-status.json').write_text(json.dumps(raw_status()))
+    (home/'bridge-status.json').write_text(json.dumps(dict(outbox=dict(pending=0),queue=dict(inflight=0),
+        whatsapp=dict(connected=True),protocolVersion=PROTOCOL_VERSION,persistenceFailure=False)))
+    runner_calls = []
+    def runner(argv):
+        runner_calls.append(argv)
+        raise AssertionError('host subprocess forbidden')
+    control = host_module().rehearsal_host_controls(copy_home=home,rehearsal_root=tmp_path,inventory=value['inventory'],runner=runner)
+    def execute(action,payload):
+        assert payload['operation'] == 'restore'
+        if leave_v3 and action == 'health':
+            with sqlite3.connect(knowledge) as db:
+                db.execute("UPDATE knowledge_meta SET value='3' WHERE key='schema_version'")
+        return control(action,payload)
+    execute.mode = 'rehearsal'
+    with m.injected_controls(execute):
+        result = m.restore_prior_set(record=path,home=home,failed_snapshot=tmp_path/'failed',apply=True)
+    receipt = json.loads(Path(result['receipt']).read_text())
+    assert result['ok'] is (not leave_v3)
+    if leave_v3:
+        assert receipt['failed_phase'] == 'health'
+        assert receipt['error_code'] == 'phase_proof_failed'
+    else:
+        assert receipt['phases'][-1]['action'] == 'start-timers'
+        health = next(p['receipt'] for p in receipt['phases'] if p['action'] == 'health')
+        assert health['prior_ready'] and health['knowledge_schema_version'] == '2'
+        assert health['prior_selection_matches'] and 'capture_ready' not in health
+    assert runner_calls == []

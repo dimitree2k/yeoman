@@ -577,6 +577,8 @@ def _execute(action: str, payload: dict[str, Any]) -> dict[str, Any]:
         'verify-effect-deduplication': ('no_duplicate_effects', 'unknown_effects_held'),
         'verify-import-origins': ('imports_verified',),
     }
+    if payload.get('operation') == 'restore' and action in ('health', 'drain-durable-tails', 'all-committed-barrier'):
+        required[action] = ('prior_ready',)
     if any(result.get(k) is not True for k in required.get(action, ())):
         raise ValueError('phase_proof_incomplete')
     if action == 'stop-overseer-clean' and result.get('alert_fired') is not False:
@@ -584,6 +586,8 @@ def _execute(action: str, payload: dict[str, Any]) -> dict[str, Any]:
     if action == 'all-committed-barrier':
         if any(result.get(k) != 0 for k in ('raw_deferred', 'bridge_pending', 'bridge_inflight')):
             raise ValueError('durable_tail_not_drained')
+        if payload.get('operation') == 'restore':
+            return result
         if type(result.get('generation')) is not int or result['generation'] < 1:
             raise ValueError('reader_generation_unproven')
         actual = {s['relative_path']: s for s in result.get('sources', [])}
@@ -620,7 +624,7 @@ def _run(value: dict[str, Any], home: Path, actions: list[str], *, restore: bool
             _private_json(receipt_root / f'{"restore" if restore else "cutover"}-{len(journal["phases"]):02}-started.json', phase)
             if action.startswith('select-'):
                 selection['readers'][action.removeprefix('select-')] = True
-            payload = dict(record=value, home=str(home), argv=command_for(action, value),
+            payload = dict(record=value, home=str(home), operation='restore' if restore else 'cutover', argv=command_for(action, value),
                            selection=json.loads(canonical_json(selection)), sources=sources, receipts=journal['phases'][:-1])
             if action == 'acquire':
                 result = acquire_cutover_snapshot(home=home, output=Path(value['output']), inventory=value['inventory'])

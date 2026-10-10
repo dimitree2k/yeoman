@@ -165,6 +165,57 @@ def _capture_ready(payload: dict) -> bool:
         return handover.get('version') == 1 and type(handover.get('generation')) is int and 0 < handover['generation'] <= proof['generation'] and covered
 
 
+def _knowledge_state(path: Path) -> tuple[str | None, bool]:
+    try:
+        with closing(_read_db(path)) as db:
+            integrity = db.execute('PRAGMA integrity_check').fetchall() == [('ok',)]
+            row = db.execute("SELECT value FROM knowledge_meta WHERE key='schema_version'").fetchone()
+            return row[0] if row else None, integrity
+    except sqlite3.DatabaseError:
+        return None, False
+
+
+def _restore_health(payload: dict, inventory: Mapping, raw: dict, bridge: dict) -> dict:
+    # The prior schema/selection are pinned by acquisition, not by the v3 handover.
+    try:
+        from scripts.history_cutover import record_digest
+    except ModuleNotFoundError:
+        from history_cutover import record_digest
+    record = payload['record']
+    snapshot = _path(record['output'])
+    manifest = json.loads(_path(str(snapshot/'manifest.json')).read_bytes())
+    if (manifest.get('digest') != record_digest(manifest) or manifest['home'] != payload['home']
+            or manifest.get('inventory_digest') != record_digest(record['inventory'])):
+        raise ValueError('prior_snapshot_pin_mismatch')
+    def prior_path(current: Path) -> Path:
+        for entry in manifest['members']:
+            target = Path(entry['source']) if entry.get('source') else Path(manifest['home'])/entry['path']
+            if target == current and entry['restore'] and entry['exists']:
+                prior = _path(str(snapshot/entry['path']))
+                if _hash(prior) != entry['sha256']:
+                    raise ValueError('prior_snapshot_changed')
+                return prior
+        raise ValueError('prior_health_member_missing')
+    knowledge, config = _path(inventory['knowledge_db']), _path(inventory['config_path'])
+    prior_version, prior_integrity = _knowledge_state(prior_path(knowledge))
+    if prior_version is None or not prior_integrity:
+        raise ValueError('prior_knowledge_unproven')
+    prior_selection = json.loads(prior_path(config).read_bytes()).get('history', {})
+    selection = json.loads(config.read_bytes()).get('history', {})
+    version, integrity = _knowledge_state(knowledge)
+    prior_ready = integrity and version == prior_version and selection == prior_selection
+    writer = _raw_writer(raw)
+    proof = dict(prior_ready=prior_ready, prior_schema_version=prior_version,
+        knowledge_schema_version=version, integrity_ok=integrity, prior_selection_matches=selection == prior_selection,
+        writer_ok=writer['state'] == 'ok', raw_deferred=writer['spooled'] + writer['pending_in_memory'],
+        connected=bridge['whatsapp']['connected'], protocol=bridge['protocolVersion'],
+        bridge_pending=bridge['outbox']['pending'], bridge_inflight=bridge['queue']['inflight'])
+    proof['ok'] = (prior_ready and proof['writer_ok'] and proof['connected'] is True
+        and proof['protocol'] == _protocol_version() and bridge.get('persistenceFailure') is False
+        and all(type(proof[k]) is int and proof[k] == 0 for k in ('raw_deferred', 'bridge_pending', 'bridge_inflight')))
+    return proof
+
+
 def _ack(action: str, payload: dict) -> dict:
     root = _path(payload['record']['receipts'])
     path = _path(str(root / f'{action}.owner_ack.json'))
@@ -371,6 +422,9 @@ def live_host_controls(*, inventory: Mapping[str, Any],
                 if bridge_probe is _bridge_probe else bridge_probe())
 
     def tails(payload):
+        if payload.get('operation') == 'restore':
+            raw = json.loads(run([payload['record']['python'], '-m', 'yeoman_gateway', 'raw', 'status', '--json'], payload).stdout)
+            return _restore_health(payload, inventory, raw, probe_bridge())
         request = {'cmd': 'history_control', 'args': {'operation': 'status'}}
         health = (gateway_socket_client(request, socket_path=_path(inventory['gateway_socket']))
                   if ipc is gateway_socket_client else ipc(request))
@@ -461,6 +515,8 @@ def live_host_controls(*, inventory: Mapping[str, Any],
             writer = _raw_writer(raw)
             ready = health['whatsapp']['connected'] is True and health['protocolVersion'] == PROTOCOL_VERSION and writer['state'] == 'ok'
             result = dict(ok=ready, connected=health['whatsapp']['connected'], protocol=health['protocolVersion'], bridge_pending=health['outbox']['pending'], bridge_inflight=health['queue']['inflight'], writer_ok=writer['state'] == 'ok')
+            if payload.get('operation') == 'restore':
+                result = _restore_health(payload, inventory, raw, health)
         elif action == 'verify-effect-deduplication':
             result = _effects(payload, inventory)
         elif action == 'frozen-watermarks':
@@ -645,12 +701,14 @@ def rehearsal_host_controls(*, copy_home: Path, inventory: Mapping[str, Any], re
             if action in ('fence-effects', 'release-fence'):
                 result.update(fenced=True, prior_pauses_preserved=True)
         elif action in ('all-committed-barrier', 'drain-durable-tails', 'health'):
-            result = _boundary(payload)
             # Rehearsal status snapshots must be acquired members, never host queries.
             status_paths = [_path(str(copy_home / inventory[k])) for k in ('raw_status_path', 'bridge_status_path')]
             if any(copy_home not in p.resolve().parents for p in status_paths):
                 raise ValueError('rehearsal_status_outside_copy')
             raw, bridge = (json.loads(p.read_bytes()) for p in status_paths)
+            if payload.get('operation') == 'restore':
+                return dict(_restore_health(payload, local, raw, bridge), mode='rehearsal')
+            result = _boundary(payload)
             writer = _raw_writer(raw)
             result.update(raw_deferred=writer['spooled'] + writer['pending_in_memory'], bridge_pending=bridge['outbox']['pending'], bridge_inflight=bridge['queue']['inflight'], capture_ready=_capture_ready(payload))
             result['ok'] = result['all_committed'] and result['capture_ready'] and writer['state'] == 'ok' and result['raw_deferred'] == result['bridge_pending'] == result['bridge_inflight'] == 0
