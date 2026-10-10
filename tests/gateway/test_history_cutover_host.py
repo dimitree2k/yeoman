@@ -7,7 +7,7 @@ from subprocess import CompletedProcess
 
 import pytest
 
-from tests.gateway.test_history_cutover import Controls, procedure, record
+from tests.gateway.test_history_cutover import PAUSE_CANONICAL, Controls, procedure, record
 
 
 def host_module():
@@ -20,12 +20,33 @@ def host_module():
     return module
 
 
+@pytest.fixture(autouse=True)
+def synthetic_runtime(tmp_path,monkeypatch):
+    original=host_module
+    def module():
+        result=original()
+        factory=result.live_host_controls
+        def controls(**kwargs):
+            inv=dict(kwargs['inventory'])
+            inv.setdefault('systemd_runtime_dir',str(tmp_path/'systemd/user'))
+            inv.setdefault('owner_uid',__import__('os').getuid())
+            kwargs['inventory']=inv
+            kwargs.setdefault('clock',Clock())
+            runner=kwargs.get('runner')
+            if isinstance(runner,Runner):
+                runner.runtime=Path(inv['systemd_runtime_dir'])
+            return factory(**kwargs)
+        result.live_host_controls=controls
+        return result
+    monkeypatch.setattr(__import__(__name__,fromlist=['host_module']),'host_module',module)
+
+
 class Clock:
     now = 100.0
     def monotonic(self):
         return self.now
     def sleep(self, seconds):
-        assert seconds >= 30
+        assert seconds > 0
         self.now += seconds
 
 
@@ -36,13 +57,20 @@ class Runner:
         self.ignore_stop = False
         self.ignore_mask = False
         self.alert = 0
+        self.runtime = None
     def __call__(self, argv):
         self.calls.append(argv)
+        if argv[0]=='busctl':
+            marker=next(self.runtime.glob('.yeoman-cutover-*.hold'),None)
+            data=[] if self.ignore_mask or marker is None else [['ConditionPathExists',False,True,str(marker),0]]
+            return CompletedProcess(argv,0,json.dumps(dict(type='a(sbbsi)',data=data)),'')
         if argv[:3] == ['systemctl', '--user', 'show']:
             unit = argv[3]
             state = self.states.setdefault(unit, {'ActiveState': 'inactive', 'Result': 'success', 'UnitFileState': 'enabled', 'Restart': 'always', 'ActiveEnterTimestampMonotonic': '0', 'ExecMainStartTimestampMonotonic': '0', 'ExecMainExitTimestampMonotonic': '0'})
             if unit == 'yeoman-overseer-alert.service':
                 state['ActiveEnterTimestampMonotonic'] = str(self.alert)
+            if self.runtime:
+                state.update(LoadState='loaded',NeedDaemonReload='no',DropInPaths=' '.join(map(str,(self.runtime/(unit+'.d')).glob('*.conf'))) if not self.ignore_mask else '')
             return CompletedProcess(argv, 0, '\n'.join(f'{k}={v}' for k, v in state.items()), '')
         if argv[:2] == ['systemctl', '--user']:
             operation = argv[2]
@@ -60,18 +88,18 @@ class Runner:
 
 
 def inventory():
-    return dict(units=[dict(name=f'yeoman-{name}.service', restart='always', executable=f'/synthetic/{name}') for name in ('overseer', 'gateway', 'bridge', 'a2a')], timers=['watch.timer'], manual_routes=['manual.service'], gateway_unit='yeoman-gateway.service', bridge_unit='yeoman-bridge.service')
+    return dict(units=[dict(name=f'yeoman-{name}.service', restart='always', executable=f'/synthetic/{name}') for name in ('overseer', 'gateway', 'bridge', 'a2a')], timers=['watch.timer'], timer_services={'watch.timer': ['watch.service']}, manual_routes=['manual.service'], gateway_unit='yeoman-gateway.service', bridge_unit='yeoman-bridge.service')
 
 
 def payload(tmp_path):
-    return dict(home=str(tmp_path), record=dict(receipts=str(tmp_path / 'receipts'), digest='synthetic', layout={}), sources=[], selection={})
+    return dict(home=str(tmp_path), record=dict(receipts=str(tmp_path / 'receipts'), digest='a'*64, layout={}), sources=[], selection={})
 
 
 @pytest.mark.parametrize(('action', 'units'), [
     ('stop-overseer-clean', ['yeoman-overseer.service']),
     ('stop-gateway', ['yeoman-gateway.service']),
     ('stop-bridge', ['yeoman-bridge.service']),
-    ('stop-timers-and-manual-routes', ['watch.timer', 'manual.service', 'yeoman-a2a.service']),
+    ('stop-timers-and-manual-routes', ['watch.timer', 'manual.service', 'yeoman-a2a.service', 'watch.service']),
     ('start-bridge', ['yeoman-bridge.service']),
     ('start-gateway', ['yeoman-gateway.service']),
     ('start-overseer', ['yeoman-overseer.service']),
@@ -81,10 +109,13 @@ def payload(tmp_path):
 def test_exact_service_argv(tmp_path, action, units):
     runner = Runner()
     control = host_module().live_host_controls(inventory=inventory(), runner=runner, clock=Clock())
+    if action.startswith('start-') or action=='resume-vetted-manual-routes':
+        control('suppress-restarts',payload(tmp_path))
+        runner.calls.clear()
     result = control(action, payload(tmp_path))
     assert result['ok'] and result['mode'] == 'live'
-    mutations = [a for a in runner.calls if a[2] != 'show']
-    expected = [['systemctl', '--user', 'stop', u] for u in units] if action.startswith('stop-') else [a for u in units for a in (['systemctl', '--user', 'unmask', '--runtime', u], ['systemctl', '--user', 'start', u])]
+    mutations = [a for a in runner.calls if a[0]=='systemctl' and a[2] in ('start','stop')]
+    expected = [['systemctl', '--user', 'stop', u] for u in units] if action.startswith('stop-') else [['systemctl','--user','start',u] for u in units]
     assert mutations == expected
 
 
@@ -110,8 +141,8 @@ def test_restart_suppression_observes_thirty_seconds(tmp_path):
     runner, clock = Runner(), Clock()
     control = host_module().live_host_controls(inventory=inventory(), runner=runner, clock=clock)
     assert control('suppress-restarts', payload(tmp_path))['suppressed']
-    masks = [a for a in runner.calls if a[2] == 'mask']
-    assert masks == [['systemctl', '--user', 'mask', '--runtime', u['name']] for u in inventory()['units']]
+    assert not any(a[0]=='systemctl' and a[2]=='mask' for a in runner.calls)
+    assert len(list(runner.runtime.glob('*/*.conf')))==7
     assert clock.now >= 130
     assert control('verify-restart-suppression', payload(tmp_path))['suppressed']
     assert clock.now >= 160
@@ -204,7 +235,7 @@ def test_raw_status_real_shape_required(tmp_path, mode, action, malformed):
     elif malformed == 'missing':
         del raw['writer']['pending_in_memory']
     bridge = dict(outbox=dict(pending=0), queue=dict(inflight=0), whatsapp=dict(connected=True),
-        protocolVersion=PROTOCOL_VERSION, persistenceFailure=None)
+        protocolVersion=PROTOCOL_VERSION, persistenceFailure=False)
     calls = []
     def runner(argv):
         calls.append(argv)
@@ -238,7 +269,7 @@ def test_live_barrier_uses_observed_stores_and_counters(tmp_path):
             return CompletedProcess(argv, 0, json.dumps(raw_status()), '')
         return original(argv)
     from yeoman_shared.whatsapp_protocol import PROTOCOL_VERSION
-    bridge = dict(outbox=dict(pending=0), queue=dict(inflight=0), whatsapp=dict(connected=True), protocolVersion=PROTOCOL_VERSION)
+    bridge = dict(outbox=dict(pending=0), queue=dict(inflight=0), whatsapp=dict(connected=True), protocolVersion=PROTOCOL_VERSION,persistenceFailure=False)
     requests = []
     def ipc(request):
         requests.append(request)
@@ -250,7 +281,8 @@ def test_live_barrier_uses_observed_stores_and_counters(tmp_path):
     assert requests == [dict(cmd='history_control', args=dict(operation='status'))]
     assert runner.calls == [['/synthetic/python', '-m', 'yeoman_gateway', 'raw', 'status', '--json']]
     bridge['outbox']['pending'] = 1
-    assert not control('drain-durable-tails', p)['ok']
+    with pytest.raises(ValueError,match='readiness_timeout'):
+        control('drain-durable-tails',p)
 
 
 def test_rehearsal_barrier_reads_copy_and_refuses_external_layout(tmp_path):
@@ -270,18 +302,17 @@ def test_rehearsal_barrier_reads_copy_and_refuses_external_layout(tmp_path):
 
 
 def test_owner_ack_is_pinned_and_never_auto_success(tmp_path):
-    p = payload(tmp_path)
-    c = host_module().live_host_controls(inventory=inventory(), runner=Runner())
-    with pytest.raises(FileNotFoundError):
+    from tests.gateway.test_history_cutover_smoke import FakeClock, publish, wait_payload
+    p = wait_payload(tmp_path)
+    c = host_module().live_host_controls(inventory=inventory(), runner=Runner(), clock=FakeClock())
+    with pytest.raises(ValueError, match='owner_ack_timeout'):
         c('functional-smoke', p)
-    root = Path(p['record']['receipts'])
-    root.mkdir()
-    file = root/'functional-smoke.owner_ack.json'
-    file.write_text(json.dumps(dict(action='functional-smoke', record_digest='wrong', owner_ack=True)))
+    publish(p, record_digest='wrong')
     with pytest.raises(ValueError, match='owner_ack'):
         c('functional-smoke', p)
-    file.write_text(json.dumps(dict(action='functional-smoke', record_digest='synthetic', owner_ack=True)))
+    publish(p)
     assert c('functional-smoke', p)['ok']
+
 
 
 def test_end_to_end_dry_plan_apply_fake_host_reaches_all_receipts(tmp_path):
@@ -289,8 +320,8 @@ def test_end_to_end_dry_plan_apply_fake_host_reaches_all_receipts(tmp_path):
     path, home, value = record(tmp_path)
     value['mode'] = 'live'
     value['confirmation_token'] = str(tmp_path/'confirmed')
-    value['inventory'].update(inventory(), pause_path=str(home/'pauses.json'))
-    (home/'pauses.json').write_text('{"synthetic":"owner pause"}')
+    value['inventory'].update(inventory(), pause_path=str(home/'data/ops/response-pauses.json'))
+    (home/'data/ops/response-pauses.json').write_text(PAUSE_CANONICAL)
     value['digest'] = m.record_digest(value)
     path.write_text(json.dumps(value))
     (tmp_path/'confirmed').write_text(value['digest'])
@@ -312,7 +343,7 @@ def test_end_to_end_dry_plan_apply_fake_host_reaches_all_receipts(tmp_path):
     assert all('receipt' in p for p in journal['phases'])
     assert len(list(Path(value['receipts']).glob('cutover-*-started.json'))) == len(journal['phases'])
     assert ['systemctl', '--user', 'start', 'watch.timer'] in runner.calls
-    assert (home/'pauses.json').read_text() == '{"synthetic":"owner pause"}'
+    assert (home/'data/ops/response-pauses.json').read_text() == PAUSE_CANONICAL
 
 
 def test_config_backup_and_retirement_selection(tmp_path):
@@ -430,13 +461,14 @@ def test_raw_health_and_capture_check_exact_argv(tmp_path):
         calls.append(argv)
         output = json.dumps(raw_status()) if argv[-2:] == ['status','--json'] else 'status=ok'
         return CompletedProcess(argv, 0, output, '')
-    bridge = dict(whatsapp=dict(connected=True), protocolVersion=PROTOCOL_VERSION, outbox=dict(pending=0), queue=dict(inflight=0))
+    bridge = dict(whatsapp=dict(connected=True), protocolVersion=PROTOCOL_VERSION, persistenceFailure=False, outbox=dict(pending=0), queue=dict(inflight=0))
     c = host_module().live_host_controls(inventory=inventory(), runner=runner, bridge_probe=lambda: bridge)
     assert c('health', p)['ok']
     assert c('validate-capture-handover', p)['ok']
     assert calls == [['/synthetic/python','-m','yeoman_gateway','raw','status','--json'], ['/synthetic/python','-m','yeoman_gateway','raw','check-capture']]
     bridge['whatsapp']['connected'] = False
-    assert not c('health', p)['ok']
+    with pytest.raises(ValueError,match='readiness_timeout'):
+        c('health',p)
 
 
 
@@ -653,6 +685,10 @@ def test_restore_health_observes_prior_dormant_set(tmp_path, mode, action, drift
         (home/'raw.json').write_text(json.dumps(raw))
         (home/'bridge.json').write_text(json.dumps(bridge))
         control = module.rehearsal_host_controls(copy_home=home,rehearsal_root=tmp_path,inventory=inv,runner=runner)
+    if mode=='live' and drift is not None:
+        with pytest.raises(ValueError,match='readiness_timeout' if drift in ('raw','bridge') else 'prior_readiness_mismatch'):
+            control(action,p)
+        return
     proof = control(action,p)
     assert proof['ok'] is (drift is None)
     assert proof['prior_schema_version'] == '2'

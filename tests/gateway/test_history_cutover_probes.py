@@ -112,8 +112,18 @@ async def test_all_six_probes_exercise_selected_adapters(statement_case, tmp_pat
     cli_record['inventory']['reader_smoke'] = record['inventory']['reader_smoke']
     cli_record['digest'] = operator.record_digest(cli_record)
     record_path.write_text(json.dumps(cli_record))
+    baseline_calls = []
     def fake_host(**kwargs):
         def control(action,payload):
+            if action == 'capture-frozen-baseline':
+                # Baseline behavior is covered separately; this witness exercises real readers.
+                acquisition = payload['acquisition']
+                assert acquisition['ok'] and acquisition['home'] == str(cli_home)
+                assert acquisition['digest'] == operator.record_digest(acquisition)
+                assert acquisition['inventory_digest'] == operator.record_digest(cli_record['inventory'])
+                baseline_calls.append(action)
+                return {'ok':True,'baseline_digest':operator.record_digest(dict(
+                    record_digest=cli_record['digest'],acquisition_digest=acquisition['digest']))}
             assert action.startswith('select-')
             return {'ok':True}
         control.mode = 'rehearsal'
@@ -125,6 +135,8 @@ async def test_all_six_probes_exercise_selected_adapters(statement_case, tmp_pat
     assert await asyncio.to_thread(operator.main) == 0
     assert json.loads(capsys.readouterr().out)['ok']
     receipt = json.loads((Path(cli_record['receipts'])/'cutover.json').read_text())
+    assert baseline_calls == ['capture-frozen-baseline']
+    assert receipt['phases'][0]['frozen_baseline_digest']
     assert sum(p['action'].startswith('smoke-reader-') for p in receipt['phases']) == 6
     assert all(p['receipt']['adapter'] for p in receipt['phases'] if p['action'].startswith('smoke-reader-'))
     assert case.seen == before_extractions

@@ -7,6 +7,7 @@ import json
 import re
 import sqlite3
 import uuid
+from collections.abc import Callable
 from dataclasses import dataclass, field
 from datetime import UTC, datetime, timedelta
 from pathlib import Path
@@ -201,6 +202,19 @@ class PersonaEvolutionLedger:
             (str(persona_file),),
         ).fetchone()
         return dict(row) if row else None
+
+    def pending_review_notifications(
+        self, *, global_pause_active: Callable[[], bool]
+    ) -> list[dict[str, Any]]:
+        """Proposed reviews that may be announced now, or none while the owner fences.
+
+        The owner's global response pause defers the announcement *without* touching the
+        ledger: no row is sent and none is marked notified, so the same rows are picked
+        up exactly once by the next unpaused invocation.
+        """
+        if global_pause_active():
+            return []
+        return [row for row in self.pending_proposals() if not row.get("notified_at")]
 
     def pending_proposals(self) -> list[dict[str, Any]]:
         rows = self._conn.execute(

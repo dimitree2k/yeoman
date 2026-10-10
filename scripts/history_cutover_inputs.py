@@ -33,7 +33,10 @@ try:
         _rehearsal_paths,
         check_window_timing,
         record_digest,
+        require_pause_restore_member,
+        validate_ack_timeout,
         validate_host_inventory,
+        validate_readiness_timeout,
     )
     from scripts.history_maintenance_guard import preflight_isolated_paths
 except ModuleNotFoundError:
@@ -46,7 +49,10 @@ except ModuleNotFoundError:
         _rehearsal_paths,
         check_window_timing,
         record_digest,
+        require_pause_restore_member,
+        validate_ack_timeout,
         validate_host_inventory,
+        validate_readiness_timeout,
     )
     from history_maintenance_guard import preflight_isolated_paths
 
@@ -462,7 +468,10 @@ def build_cutover_inputs(*, acquisition_home: Path, conversion_manifest: Path,
 
 
 def build_cutover_record(*, inventory: Path, layout: Mapping[str,str],
-    mode: Literal['rehearsal','live'], window: tuple[int,int],expected_gateway_jobs: int) -> dict:
+    mode: Literal['rehearsal','live'], window: tuple[int,int],expected_gateway_jobs: int,
+    owner_ack_timeout_seconds: int = 1200, readiness_timeout_seconds: int = 360) -> dict:
+    validate_ack_timeout(dict(owner_ack_timeout_seconds=owner_ack_timeout_seconds))
+    validate_readiness_timeout(dict(readiness_timeout_seconds=readiness_timeout_seconds))
     preflight_isolated_paths(inventory)
     source = json.loads(inventory.read_bytes())
     schema = json.loads(Path(__file__).with_name('history_cutover_inventory.schema.json').read_bytes())
@@ -496,6 +505,10 @@ def build_cutover_record(*, inventory: Path, layout: Mapping[str,str],
             raise ValueError('invalid_gateway_socket_path')
         inv['gateway_socket'] = socket
     validate_host_inventory(inv, mode=mode)
+    if mode == 'live':
+        # The canonical pause record has to be part of the restored whole set, so the
+        # prior startup can be brought back paused rather than unfenced.
+        require_pause_restore_member(inv, home)
     if type(expected_gateway_jobs) is not int or expected_gateway_jobs < 0 or inv['gateway_jobs'] != expected_gateway_jobs:
         raise ValueError('cron_inventory_drift')
     if any(not isinstance(u,dict) or not all(k in u for k in ('name','restart','executable')) for u in inv['units']):
@@ -510,7 +523,7 @@ def build_cutover_record(*, inventory: Path, layout: Mapping[str,str],
         if not source.get('rehearsal_root'):
             raise ValueError('rehearsal_root_required')
         _rehearsal_paths(Path(source['rehearsal_root']), Path(source['home']), *(Path(v) for v in (source['output'],source['receipts'],*layout.values())))
-    record = dict(version=1,mode=mode,approved=False,approval=None,
+    record = dict(version=1,mode=mode,approved=False,approval=None,owner_ack_timeout_seconds=owner_ack_timeout_seconds,readiness_timeout_seconds=readiness_timeout_seconds,
         **{k:source[k] for k in ('home','output','receipts','python','candidate','prior')},
         bridge_package_dir=inv['bridge_package_dir'],
         **({'rehearsal_root':source['rehearsal_root']} if mode=='rehearsal' else {}),
@@ -534,6 +547,8 @@ def main(argv=None) -> int:
     record.add_argument('--window-start-ms',type=int,required=True)
     record.add_argument('--window-end-ms',type=int,required=True)
     record.add_argument('--expected-gateway-jobs',type=int,required=True)
+    record.add_argument('--owner-ack-timeout-seconds',type=int,default=1200)
+    record.add_argument('--readiness-timeout-seconds',type=int,default=360)
     args = parser.parse_args(argv)
     try:
         if args.operation=='inputs':
@@ -545,7 +560,8 @@ def main(argv=None) -> int:
         else:
             preflight_isolated_paths(args.layout,args.output)
             value = build_cutover_record(inventory=args.inventory,layout=json.loads(args.layout.read_bytes()),
-                mode=args.mode,window=(args.window_start_ms,args.window_end_ms),expected_gateway_jobs=args.expected_gateway_jobs)
+                mode=args.mode,window=(args.window_start_ms,args.window_end_ms),expected_gateway_jobs=args.expected_gateway_jobs,
+                owner_ack_timeout_seconds=args.owner_ack_timeout_seconds,readiness_timeout_seconds=args.readiness_timeout_seconds)
             _private_json(args.output,value)
             result = dict(version=1,units=len(value['inventory']['units']),members=len(value['inventory']['members']))
         print(json.dumps(result,sort_keys=True))

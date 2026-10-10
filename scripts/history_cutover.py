@@ -44,6 +44,92 @@ def record_digest(value: Mapping[str, Any]) -> str:
     return hashlib.sha256(canonical_json({k: v for k, v in value.items() if k != 'digest'}).encode()).hexdigest()
 
 
+def _pause_indefinite() -> int:
+    """The canonical "until /start all" pause member, read from its owning module."""
+    from yeoman_gateway.adapters.policy_engine import _PAUSE_INDEFINITE
+
+    return int(_PAUSE_INDEFINITE)
+
+
+def pause_facts(path: Path, *, expectation: str = 'any') -> dict[str, Any]:
+    """The owner's persistent response-pause record, as the procedure authenticates it.
+
+    ``expectation='fenced'`` accepts only the canonical owner-stop state: an active
+    indefinite global pause with an empty unrelated-chat baseline. ``expectation=
+    'cleared'`` accepts only the verified intentional release. ``'any'`` reads the facts
+    without judging them. Absent, unreadable or drifted state refuses; it is never
+    repaired, merged or overwritten.
+    """
+    if expectation not in ('any', 'fenced', 'cleared'):
+        raise ValueError('invalid_pause_expectation')
+    path = Path(path)
+    raw = path.read_bytes() if path.is_file() else b''
+    if not raw:
+        if expectation == 'any':
+            return dict(path=str(path), sha256=hashlib.sha256(b'').hexdigest(), present=False,
+                        global_until_ms=0, chat_until_ms={}, chat_keys=[])
+        raise ValueError('pause_store_unreadable')
+    try:
+        data = json.loads(raw)
+    except (ValueError, UnicodeError) as exc:
+        raise ValueError('pause_store_unreadable') from exc
+    if not isinstance(data, dict):
+        raise ValueError('pause_store_unreadable')
+    global_until = data.get('global_until_ms')
+    chats = data.get('chat_until_ms')
+    if type(global_until) is not int or not isinstance(chats, dict):
+        raise ValueError('pause_store_unreadable')
+    normalized = {str(key): int(value) for key, value in chats.items() if type(value) is int and int(value) != 0}
+    facts = dict(path=str(path), sha256=hashlib.sha256(raw).hexdigest(), present=True,
+                 global_until_ms=int(global_until), chat_until_ms=normalized,
+                 chat_keys=sorted(normalized))
+    if expectation in ('fenced', 'cleared'):
+        if normalized:
+            raise ValueError('pause_store_chat_drift')
+        if expectation == 'fenced' and facts['global_until_ms'] != _pause_indefinite():
+            raise ValueError('pause_store_not_indefinite')
+        if expectation == 'cleared' and facts['global_until_ms'] != 0:
+            raise ValueError('pause_store_not_cleared')
+    return facts
+
+
+def require_pause_restore_member(inventory: Mapping[str, Any], home: Path) -> None:
+    """The canonical pause record must be a restored member of the whole set.
+
+    Without it the prior pause cannot be put back before a prior startup, so the
+    procedure refuses instead of leaving the window unfenced.
+    """
+    if 'pause_path' not in inventory:
+        raise ValueError('missing_inventory_key:pause_path')
+    pause = Path(str(inventory['pause_path']))
+    matches = [entry for entry in inventory.get('members', [])
+               if entry.get('restore') and not entry.get('source')
+               and _member(Path(home), entry) == pause]
+    if len(matches) != 1:
+        raise ValueError('pause_restore_member_required')
+
+
+def _attempt_pause_digests(value: Mapping[str, Any]) -> list[str]:
+    """Every pause digest this attempt authenticated, from its durable receipts."""
+    root = Path(str(value['receipts']))
+    digests: list[str] = []
+    for path in sorted(root.glob('*.json')) if root.is_dir() else []:
+        try:
+            phase = json.loads(path.read_bytes())
+        except (ValueError, UnicodeError, OSError):
+            continue
+        if not isinstance(phase, dict) or phase.get('record_digest') != value.get('digest'):
+            continue
+        acquire = phase.get('pause_baseline')
+        fence = phase.get('receipt', {}) if isinstance(phase.get('receipt'), dict) else {}
+        for candidate in (acquire.get('sha256') if isinstance(acquire, dict) else None,
+                          fence.get('pause_baseline_sha256'),
+                          fence.get('pause_restored_sha256')):
+            if isinstance(candidate, str) and re.fullmatch('[0-9a-f]{64}', candidate):
+                digests.append(candidate)
+    return sorted(set(digests))
+
+
 @contextmanager
 def injected_controls(control: Callable[[str, dict[str, Any]], dict[str, Any]]):
     token = _CONTROLS.set(control)
@@ -488,6 +574,34 @@ def validate_host_inventory(inventory: Mapping[str, Any], *, mode: str) -> None:
             raise ValueError(f'missing_inventory_key:{key}')
     if not Draft202012Validator({'$ref': f'#/$defs/{mode}', '$defs': document['$defs'], 'properties': document['properties']}).is_valid(inventory):
         raise ValueError('invalid_host_inventory')
+    if mode == 'live' and inventory['owner_uid'] != os.getuid():
+        raise ValueError('writer_owner_uid_mismatch')
+    if mode == 'live':
+        for unit in inventory['units']:
+            if re.fullmatch(r'(node(?:js)?|python(?:[0-9.]+)?|bash|sh|dash|zsh|env)', Path(unit['executable']).name):
+                raise ValueError('specific_writer_entrypoint_required')
+    # Stopping a timer does not stop the oneshot it already activated, so every timer
+    # must name the services it can trigger: those units are stopped, guarded and
+    # observed next to the timer itself. A missing association is a refusal.
+    associations = inventory.get('timer_services')
+    timers = inventory.get('timers', [])
+    if timers or associations is not None:
+        if not isinstance(associations, dict):
+            raise ValueError('timer_service_association_required')
+        for timer in timers:
+            services = associations.get(timer)
+            if not isinstance(services, list) or not services:
+                raise ValueError('timer_service_association_required')
+            for service in services:
+                if (not isinstance(service, str)
+                        or not re.fullmatch(r'[A-Za-z0-9_.@-]+\.service', service)
+                        or service in timers):
+                    raise ValueError('invalid_timer_service_association')
+        for timer, services in associations.items():
+            if timer not in timers:
+                raise ValueError('invalid_timer_service_association')
+            if not isinstance(services, list) or any(not isinstance(s, str) for s in services):
+                raise ValueError('invalid_timer_service_association')
 
 
 def _load(record: Path, home: Path, *, apply: bool) -> dict[str, Any]:
@@ -500,6 +614,8 @@ def _load(record: Path, home: Path, *, apply: bool) -> dict[str, Any]:
     mode = value.get('mode')
     if mode not in ('live', 'rehearsal'):
         raise ValueError('explicit_record_mode_required')
+    validate_ack_timeout(value)
+    validate_readiness_timeout(value)
     validate_host_inventory(value.get('inventory', {}), mode=mode)
     if mode == 'rehearsal':
         isolated = [home, Path(value['output']), Path(value['receipts'])]
@@ -517,12 +633,28 @@ def _load(record: Path, home: Path, *, apply: bool) -> dict[str, Any]:
         _paths(token)
         if not token.is_file() or token.read_text().strip() != value['digest']:
             raise ValueError('live_confirmation_token_required')
+    if mode == 'live':
+        require_pause_restore_member(value['inventory'], home)
     expected_jobs = value['inventory'].get('expected_gateway_jobs')
     if type(expected_jobs) is not int or expected_jobs < 0 or value['inventory'].get('gateway_jobs') != expected_jobs:
         raise ValueError('cron_inventory_drift')
     check_window_timing(value['inventory'])
     _paths(Path(value['output']), Path(value['receipts']))
     return value
+
+
+def validate_ack_timeout(value: Mapping[str, Any]) -> int:
+    timeout = value.get('owner_ack_timeout_seconds', 1200)
+    if type(timeout) is not int or not 1 <= timeout <= 1200:
+        raise ValueError('invalid_owner_ack_timeout')
+    return timeout
+
+
+def validate_readiness_timeout(value: Mapping[str, Any]) -> int:
+    timeout = value.get('readiness_timeout_seconds', 360)
+    if type(timeout) is not int or not 1 <= timeout <= 1200:
+        raise ValueError('invalid_readiness_timeout')
+    return timeout
 
 
 def command_for(action: str, record: Mapping[str, Any]) -> list[str]:
@@ -565,8 +697,10 @@ def _execute(action: str, payload: dict[str, Any]) -> dict[str, Any]:
         raise ValueError('phase_proof_failed')
     required = {
         'stop-overseer-clean': ('clean',), 'verify-restart-suppression': ('suppressed',),
-        'verify-deploy-suppression': ('suppressed',), 'fence-effects': ('fenced', 'prior_pauses_preserved'),
+        'verify-deploy-suppression': ('suppressed',),
+        'fence-effects': ('fenced', 'prior_pauses_preserved'),
         'verify-quiescent': ('writers_absent', 'bridge_stopped'),
+        'stop-timers-and-manual-routes': ('strictly_inactive',),
         'release-fence': ('prior_pauses_preserved',),
         'verify-no-writer-after-deploy': ('writers_absent', 'suppressed'),
         'import': ('complete',), 'owner-append': ('complete',),
@@ -581,6 +715,13 @@ def _execute(action: str, payload: dict[str, Any]) -> dict[str, Any]:
         required[action] = ('prior_ready',)
     if any(result.get(k) is not True for k in required.get(action, ())):
         raise ValueError('phase_proof_incomplete')
+    # The pause binding is a record digest, not a boolean flag: it must name the
+    # owner-stop state this attempt observed, never a placeholder.
+    for key in {'fence-effects': ('pause_baseline_sha256',),
+                'release-fence': ('prior_pauses_sha256',)}.get(action, ()):
+        bound = result.get(key)
+        if not isinstance(bound, str) or not re.fullmatch('[0-9a-f]{64}', bound):
+            raise ValueError('pause_binding_unproven')
     if action == 'stop-overseer-clean' and result.get('alert_fired') is not False:
         raise ValueError('planned_stop_triggered_alert')
     if action == 'all-committed-barrier':
@@ -605,6 +746,39 @@ def _execute(action: str, payload: dict[str, Any]) -> dict[str, Any]:
     return result
 
 
+def _journal_pause_digests(journal: Mapping[str, Any]) -> set[str]:
+    """Every pause digest this attempt authenticated, read from its own receipts."""
+    digests: set[str] = set()
+    for phase in journal.get('phases', []):
+        receipt = phase.get('receipt') if isinstance(phase.get('receipt'), dict) else {}
+        acquire = phase.get('pause_baseline')
+        candidates = [acquire.get('sha256') if isinstance(acquire, dict) else None,
+                      receipt.get('pause_baseline_sha256'), receipt.get('pause_restored_sha256')]
+        digests.update(c for c in candidates if isinstance(c, str) and re.fullmatch('[0-9a-f]{64}', c))
+    return digests
+
+
+def _verify_release_binding(journal: Mapping[str, Any], release: Mapping[str, Any], *,
+                            restore: bool) -> None:
+    """The release permission must name the fence this attempt authenticated.
+
+    A cutover release names the fence baseline exactly. A restore release names the
+    canonical pause the restore itself put back, which is authenticated by the same
+    attempt receipts (the restored member is checked against the recorded fence).
+    """
+    fenced = [phase for phase in journal.get('phases', [])
+              if phase.get('action') == 'fence-effects' and isinstance(phase.get('receipt'), dict)]
+    if not fenced:
+        raise ValueError('fence_receipt_required')
+    baseline = fenced[-1]['receipt'].get('pause_baseline_sha256')
+    named = release.get('prior_pauses_sha256')
+    if isinstance(baseline, str) and named == baseline:
+        return
+    if restore and isinstance(named, str) and named in _journal_pause_digests(journal):
+        return
+    raise ValueError('release_pause_unbound')
+
+
 def _run(value: dict[str, Any], home: Path, actions: list[str], *, restore: bool = False,
          failed_snapshot: Path | None = None, record_dir: Path) -> dict[str, Any]:
     receipt_root = Path(value['receipts'])
@@ -619,7 +793,7 @@ def _run(value: dict[str, Any], home: Path, actions: list[str], *, restore: bool
     try:
         for action in actions:
             started = time.time_ns()
-            phase: dict[str, Any] = dict(action=action, started_ns=started)
+            phase: dict[str, Any] = dict(action=action, started_ns=started, record_digest=value['digest'])
             journal['phases'].append(phase)
             _private_json(receipt_root / f'{"restore" if restore else "cutover"}-{len(journal["phases"]):02}-started.json', phase)
             if action.startswith('select-'):
@@ -629,12 +803,22 @@ def _run(value: dict[str, Any], home: Path, actions: list[str], *, restore: bool
             if action == 'acquire':
                 result = acquire_cutover_snapshot(home=home, output=Path(value['output']), inventory=value['inventory'])
                 sources = result['sources']
+                if value.get('mode') == 'live':
+                    # Bind the acquisition to the owner's actual persistent fence, so a
+                    # later restore can tell the authenticated window from foreign drift.
+                    phase['pause_baseline'] = pause_facts(Path(value['inventory']['pause_path']), expectation='fenced')
+                baseline = _execute('capture-frozen-baseline', dict(payload,acquisition=result))
+                phase['frozen_baseline_digest'] = baseline.get('baseline_digest')
             elif action == 'acquire-failed-state':
                 result = acquire_cutover_snapshot(home=home, output=failed_snapshot, inventory=value['inventory'])
             elif action == 'restore-files':
                 result = _restore_files(value, home)
             else:
+                if action == 'release-fence' and not restore:
+                    _execute('frozen-watermarks',payload)
                 result = _execute(action, payload)
+                if action == 'release-fence':
+                    _verify_release_binding(journal, result, restore=restore)
             if action.startswith('smoke-reader-'):
                 if generation is not None and result['generation'] != generation:
                     raise ValueError('offline_reader_generation_changed')
@@ -654,10 +838,10 @@ def _run(value: dict[str, Any], home: Path, actions: list[str], *, restore: bool
         journal['fenced'] = True
         if not any(p['action'] == 'fence-effects' and 'receipt' in p for p in journal['phases']):
             journal['fence_unverified'] = True
-        # A post-release failure must re-establish the same fence, never resume.
-        if any(p['action'] == 'release-fence' and 'receipt' in p for p in journal['phases']):
+        # A failed startup or post-release phase must stop writers again, never retry.
+        if any(p['action'] in ('start-bridge','start-gateway','release-fence') for p in journal['phases']):
             try:
-                journal['refence'] = _execute('fence-effects', dict(record=value, home=str(home), argv=command_for('fence-effects', value)))
+                journal['refence'] = _execute('fence-effects', dict(record=value, home=str(home), operation='restore' if restore else 'cutover', argv=command_for('fence-effects', value)))
             except Exception:
                 journal['fence_unverified'] = True
         journal['phases'][-1]['failed'] = True
@@ -673,11 +857,44 @@ def run_cutover(*, record: Path, home: Path, apply: bool = False) -> dict[str, A
     return _run(value, home, actions, record_dir=record.parent)
 
 
+def _restore_pause(value: Mapping[str, Any], home: Path, manifest: Mapping[str, Any],
+                   snapshot: Path) -> dict[str, Any]:
+    """Authenticate the pause member before it is restored over live state.
+
+    Only the recorded fence of this attempt, or the verified intentional release, may be
+    replaced. Anything else is foreign drift and refuses; the snapshot copy itself must
+    be the canonical owner-stop record, so a restored prior startup stays paused.
+    """
+    pause_path = Path(str(value['inventory']['pause_path']))
+    candidates = [entry for entry in manifest['members']
+                  if entry.get('restore') and not entry.get('source')
+                  and _member(home, entry) == pause_path]
+    if len(candidates) != 1 or not candidates[0].get('exists'):
+        raise ValueError('pause_restore_member_required')
+    entry = candidates[0]
+    authenticated = _attempt_pause_digests(value)
+    if not authenticated:
+        raise ValueError('acquisition_pause_unauthenticated')
+    current = pause_facts(pause_path)
+    if current['sha256'] not in authenticated:
+        # The only other permitted starting point is the owner's verified release.
+        try:
+            pause_facts(pause_path, expectation='cleared')
+        except ValueError as exc:
+            raise ValueError('foreign_pause_drift') from exc
+    restored = pause_facts(_member(snapshot, entry), expectation='fenced')
+    return dict(pause_target=str(pause_path), pause_authenticated=authenticated,
+                pause_before_sha256=current['sha256'], pause_restored_sha256=restored['sha256'],
+                pause_restored_global_until_ms=restored['global_until_ms'])
+
+
 def _restore_files(value: Mapping[str, Any], home: Path) -> dict[str, Any]:
     snapshot = Path(value['output'])
     manifest = json.loads((snapshot / 'manifest.json').read_bytes())
     if manifest.get('digest') != record_digest(manifest) or manifest['home'] != str(home) or manifest.get('inventory_digest') != record_digest(value['inventory']):
         raise ValueError('prior_snapshot_pin_mismatch')
+    # Authenticate the pause member before any member is replaced.
+    pause = _restore_pause(value, home, manifest, snapshot)
     # Verify the entire prior set before replacing its first member.
     preserved = [Path(e['source']) if e.get('source') else home / e['path'] for e in manifest['members'] if not e['restore']]
     for entry in manifest['members']:
@@ -731,7 +948,15 @@ def _restore_files(value: Mapping[str, Any], home: Path) -> dict[str, Any]:
                     Path(str(target) + suffix).unlink(missing_ok=True)
         os.replace(staging, target)
         _fsync_dir(target.parent)
-    return dict(ok=True, complete=True)
+    # Append-only preservation is retained, not rolled back: name that disposition
+    # explicitly instead of leaving the preserved members implicit.
+    preserved = [dict(path=str(_member(home, entry) if not entry.get('source') else Path(entry['source'])),
+                      disposition='retained') for entry in manifest['members'] if not entry['restore']]
+    restored = [dict(path=str(_member(home, entry) if not entry.get('source') else Path(entry['source'])),
+                     disposition='restored') for entry in manifest['members'] if entry['restore']]
+    if len(pause['pause_authenticated']) == 0:  # pragma: no cover - guarded above
+        raise ValueError('acquisition_pause_unauthenticated')
+    return dict(ok=True, complete=True, **pause, preserved=preserved, restored=restored)
 
 
 def restore_prior_set(*, record: Path, home: Path, failed_snapshot: Path,

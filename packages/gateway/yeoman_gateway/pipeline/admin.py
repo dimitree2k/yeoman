@@ -11,24 +11,35 @@ from typing import TYPE_CHECKING
 
 from yeoman_shared.reactions import SYSTEM_ORIGIN
 
+from yeoman_gateway.core.control_ack import APPLIED_CONTROL_OUTCOME, CONTROL_ACK_KEY
 from yeoman_gateway.core.intents import RecordMetricIntent, SendOutboundIntent, SendReactionIntent
 from yeoman_gateway.core.models import OutboundEvent
 from yeoman_gateway.core.pipeline import NextFn, PipelineContext
 
 if TYPE_CHECKING:
     from yeoman_gateway.core.admin_commands import AdminCommandResult
+    from yeoman_gateway.core.control_ack import OwnerControlAcknowledgements
     from yeoman_gateway.core.models import InboundEvent
 
 
 class AdminCommandMiddleware:
-    """Intercept admin commands before policy evaluation."""
+    """Intercept admin commands before policy evaluation.
+
+    When an acknowledgement registry is installed, the response to an *applied* admin
+    command is registered as an authenticated owner-control acknowledgement and carries
+    its single-use token. That is the only outbound message the global response fence
+    lets through, and the token cannot be produced by a model or a caller: it exists
+    only because the deterministic admin router returned ``outcome="applied"`` here.
+    """
 
     def __init__(
         self,
         *,
         handler: Callable[["InboundEvent"], "AdminCommandResult | str | None"] | None = None,
+        acknowledgements: "OwnerControlAcknowledgements | None" = None,
     ) -> None:
         self._handler = handler
+        self._acknowledgements = acknowledgements
 
     async def __call__(self, ctx: PipelineContext, next: NextFn) -> None:
         if self._handler is None:
@@ -82,12 +93,24 @@ class AdminCommandMiddleware:
             ctx.metric("policy_admin_command", labels=(("channel", ctx.event.channel),))
 
             if admin_result.response:
+                metadata: dict[str, object] = {}
+                if (
+                    self._acknowledgements is not None
+                    and admin_result.status == "handled"
+                    and admin_result.outcome == APPLIED_CONTROL_OUTCOME
+                ):
+                    metadata[CONTROL_ACK_KEY] = self._acknowledgements.register(
+                        channel=ctx.event.channel,
+                        chat_id=ctx.event.chat_id,
+                        content=admin_result.response,
+                    )
                 ctx.intents.append(
                     SendOutboundIntent(
                         event=OutboundEvent(
                             channel=ctx.event.channel,
                             chat_id=ctx.event.chat_id,
                             content=admin_result.response,
+                            metadata=metadata,
                         )
                     )
                 )

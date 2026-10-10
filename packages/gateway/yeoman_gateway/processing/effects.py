@@ -15,6 +15,7 @@ from yeoman_gateway.processing.models import (
     DecisionRecord,
     EffectEnvelope,
     EffectReceipt,
+    GlobalPauseRefused,
     ParticipationPreDispatchDenied,
     ProcessingError,
     TurnRef,
@@ -39,7 +40,7 @@ PRE_DISPATCH_ERROR_MARKERS: tuple[str, ...] = (
 
 def is_pre_dispatch_error(exc: BaseException) -> bool:
     """True when the transport clearly refused before dispatching."""
-    if isinstance(exc, ParticipationPreDispatchDenied):
+    if isinstance(exc, (ParticipationPreDispatchDenied, GlobalPauseRefused)):
         return True
     text = str(exc).lower()
     return any(marker in text for marker in PRE_DISPATCH_ERROR_MARKERS)

@@ -27,6 +27,7 @@ from yeoman_shared.reactions import SYSTEM_ORIGIN, allowed_reaction
 
 from yeoman_gateway.bus.events import OutboundMessage, ReactionMessage
 from yeoman_gateway.consciousness.log import DELIVERY_RESERVATION_TTL_MS
+from yeoman_gateway.core.control_ack import OwnerControlAcknowledgements
 from yeoman_gateway.core.intents import SendOutboundIntent, SendReactionIntent
 from yeoman_gateway.history.context import history_effect_metadata
 from yeoman_gateway.processing.budget import ChatBudget, ThreadBudget
@@ -131,6 +132,7 @@ class BusEffectExecutor:
         direct_reaction_sender: Callable[[ReactionMessage], Awaitable[None]] | None = None,
         participation_pre_dispatch: Callable[[EffectEnvelope], tuple[bool, str]] | None = None,
         reservation_pre_dispatch: Callable[[EffectEnvelope], tuple[bool, str]] | None = None,
+        pause_pre_dispatch: Callable[[EffectEnvelope], tuple[bool, str]] | None = None,
     ) -> None:
         self._bus = bus
         self._mark_provenance = mark_provenance
@@ -141,6 +143,10 @@ class BusEffectExecutor:
         self._direct_reaction_sender = direct_reaction_sender
         self._participation_pre_dispatch = participation_pre_dispatch
         self._reservation_pre_dispatch = reservation_pre_dispatch
+        # The owner's global pause is checked for every effect origin - participation,
+        # legacy, service and delete/external handlers alike - immediately before the
+        # transport call, so no producer can route around it.
+        self._pause_pre_dispatch = pause_pre_dispatch
         self._confirm = confirm
         self._delete_handler = delete_handler
         self._external_handler = external_handler
@@ -159,6 +165,12 @@ class BusEffectExecutor:
     ) -> None:
         """Install the synchronous participation check immediately before transport."""
         self._participation_pre_dispatch = checker
+
+    def set_pause_pre_dispatch(
+        self, checker: Callable[[EffectEnvelope], tuple[bool, str]] | None
+    ) -> None:
+        """Install the owner global-pause check that runs for every effect origin."""
+        self._pause_pre_dispatch = checker
 
     async def _deliver(self, message: OutboundMessage) -> "TransportReceipt | None":
         """Hand one message to the transport; return the provider receipt if it reported one.
@@ -349,6 +361,11 @@ class BusEffectExecutor:
         )
 
     def _check_participation_pre_dispatch(self, envelope: EffectEnvelope) -> None:
+        pause = self._pause_pre_dispatch
+        if pause is not None:
+            allowed, reason = pause(envelope)
+            if not allowed:
+                raise ParticipationPreDispatchDenied(str(reason))
         if self._reservation_pre_dispatch is not None:
             allowed, reason = self._reservation_pre_dispatch(envelope)
             if not allowed:
@@ -706,14 +723,28 @@ class ServiceEffectProducer:
 
 def managed_outbound_guard(
     router: "IntentEffectRouter",
+    acknowledgements: "OwnerControlAcknowledgements | None" = None,
 ) -> Callable[[OutboundMessage], tuple[bool, str]]:
     """Refuse legacy outbound for managed chats unless it carries effect provenance.
 
     This is the runtime half of "one producer per chat and turn": a producer that was not
-    migrated cannot silently keep sending for an activated chat.
+    migrated cannot silently keep sending for an activated chat. An authenticated
+    owner-control acknowledgement is neither a model turn nor an unproven legacy
+    producer: it keeps its single-use token until the transport claims it, so the bus
+    lets it through without inventing effect provenance.
     """
 
     def _guard(message: OutboundMessage) -> tuple[bool, str]:
+        if (
+            acknowledgements is not None
+            and acknowledgements.matches_metadata(
+                message.metadata,
+                channel=message.channel,
+                chat_id=message.chat_id,
+                content=str(message.content or ""),
+            )
+        ):
+            return True, "owner_control_ack"
         if not router.manages(message.channel, message.chat_id):
             return True, "unmanaged"
         metadata = dict(message.metadata or {})

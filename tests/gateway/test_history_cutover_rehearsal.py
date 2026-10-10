@@ -261,7 +261,7 @@ def test_cli_operator_contract_real_sequence(tmp_path,monkeypatch,capsys,file_in
     record_file.write_text(dumps(value))
     receipts = Path(value['receipts'])
     receipts.mkdir()
-    (receipts/'functional-smoke.owner_ack.json').write_text(dumps(dict(action='functional-smoke',record_digest=value['digest'],owner_ack=True,proof={})))
+    (receipts/'functional-smoke.owner_ack.json').write_text(dumps(dict(action='functional-smoke',record_digest=value['digest'],owner_ack=True,proof=dict(inbound_message_id_hash='a'*64,outbound_receipt_hash='b'*64,observed_ms=1))))
     monkeypatch.setattr(sys,'argv',['cutover','cutover','--record',str(record_file),'--home',str(home),'--controls','rehearsal','--apply'])
     if file_invocation:
         import os
@@ -359,8 +359,13 @@ from tests.gateway.test_history_cutover import record
 from scripts import history_cutover as m, history_cutover_probes as probes
 from yeoman_gateway.history.convert import bridge_refs
 from scripts.history_cutover_inputs import build_cutover_record
+from yeoman_gateway.knowledge._store import KnowledgeStore
 root = Path(sys.argv[1])
 path, home, old = record(root)
+# This CLI witness uses the real authenticated writer-off baseline.
+(home/'knowledge.db').unlink()
+KnowledgeStore(home/'knowledge.db').close()
+next(item for item in old['inventory']['members'] if item['path']=='knowledge.db')['kind'] = 'sqlite'
 inventory = json.loads((Path.cwd()/'scripts/history_cutover_inventory.example.json').read_text())
 inventory.update(home=str(home),output=old['output'],receipts=old['receipts'],python=sys.executable,rehearsal_root=str(root))
 inventory['inventory'].update(old['inventory'],bridge_package_dir=old['bridge_package_dir'])
@@ -374,7 +379,7 @@ path.write_text(json.dumps(value))
 value.update(approved=True,approval='synthetic-immediate-owner')
 value['digest'] = m.record_digest(value)
 path.write_text(json.dumps(value))
-m._sequence = lambda _: ['acquire','stop-overseer-clean','start-timers']
+m._sequence = lambda _: ['verify-quiescent','acquire','stop-overseer-clean','start-timers']
 probes.build_probes = lambda **_: {}
 bridge_refs.node_batch_decoder = lambda _: lambda rows: {}
 def refuse(argv, **kwargs):
@@ -384,6 +389,8 @@ sys.argv = ['cutover','cutover','--record',str(path),'--home',str(home),'--contr
 assert m.main() == 0
 receipt = json.loads((Path(value['receipts'])/'cutover.json').read_text())
 assert receipt['ok'] and receipt['phases'][-1]['action'] == 'start-timers'
+assert receipt['phases'][0]['receipt']['writers_absent']
+assert receipt['phases'][1]['frozen_baseline_digest']
 """
     result = subprocess.run([sys.executable,'-c',code,str(tmp_path)],capture_output=True,text=True,timeout=180)
     assert result.returncode == 0, result.stdout + result.stderr

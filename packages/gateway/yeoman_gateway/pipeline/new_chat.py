@@ -8,6 +8,7 @@ from datetime import UTC, datetime
 from pathlib import Path
 from typing import TYPE_CHECKING
 
+from loguru import logger
 from yeoman_shared.utils.helpers import get_operational_store_path
 
 from yeoman_gateway.core.intents import SendOutboundIntent
@@ -100,16 +101,26 @@ if TYPE_CHECKING:
 
 
 class NewChatNotifyMiddleware:
-    """Send owner notification when yeoman joins a new WhatsApp chat."""
+    """Send owner notification when yeoman joins a new WhatsApp chat.
+
+    ``global_pause`` is the owner's live global response fence. While it is active this
+    middleware is a no-op *before* it touches any state: no in-memory ``_notified``
+    entry, no ``seen_chats`` write and no notification intent. The chat therefore stays
+    unseen and is announced exactly once by the next unpaused invocation. The probe is
+    read at call time, so a pause applied after the policy decision still fences it and
+    a caller without a policy decision is covered too.
+    """
 
     def __init__(
         self,
         *,
         owner_alert_resolver: Callable[[str], list[str]] | None = None,
         history_config: HistoryConfig | None = None,
+        global_pause: Callable[[str, str], str | None] | None = None,
     ) -> None:
         self._history_config = history_config
         self._owner_resolver = owner_alert_resolver
+        self._global_pause = global_pause
         self._notified: set[str] = set()
 
     async def __call__(self, ctx: PipelineContext, next: NextFn) -> None:
@@ -117,8 +128,29 @@ class NewChatNotifyMiddleware:
             self._maybe_notify(ctx)
         await next(ctx)
 
+    def _paused(self, channel: str, chat_id: str) -> str | None:
+        probe = self._global_pause
+        if probe is None:
+            return None
+        try:
+            return probe(channel, chat_id)
+        except Exception as exc:  # noqa: BLE001 - unreadable fence state must not notify
+            logger.warning(
+                "global pause probe failed; deferring new-chat notification chat={} error_type={}",
+                chat_id,
+                type(exc).__name__,
+            )
+            return "pause_state_unreadable"
+
     def _maybe_notify(self, ctx: PipelineContext) -> None:
         event = ctx.event
+        reason = self._paused(event.channel, event.chat_id)
+        if reason is not None:
+            ctx.metric(
+                "new_chat_notification_deferred",
+                labels=(("channel", event.channel), ("reason", reason)),
+            )
+            return
         owners = self._owner_resolver(event.channel) if self._owner_resolver else []
         if not owners:
             return

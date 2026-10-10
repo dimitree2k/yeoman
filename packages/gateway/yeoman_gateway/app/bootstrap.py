@@ -27,6 +27,7 @@ from yeoman_gateway.agent.tools.file_access import build_file_access_resolver
 from yeoman_gateway.bus.events import InboundMessage, OutboundMessage, ReactionMessage
 from yeoman_gateway.bus.queue import MessageBus
 from yeoman_gateway.channels.manager import ChannelManager
+from yeoman_gateway.core.control_ack import OwnerControlAcknowledgements
 from yeoman_gateway.core.intents import (
     OrchestratorIntent,
     PersistSessionIntent,
@@ -213,6 +214,7 @@ class OrchestratorService:
         memory: MemoryService,
         effect_router: "IntentEffectRouter | None" = None,
         processing_store: object | None = None,
+        control_acknowledgements: "OwnerControlAcknowledgements | None" = None,
         release_participation_chat: Callable[[str, str], None] | None = None,
         max_concurrent_messages: int = 4,
         history_projector: Any = None,
@@ -231,6 +233,7 @@ class OrchestratorService:
         self._memory = memory
         self._effect_router = effect_router
         self._processing_store = processing_store
+        self._control_acknowledgements = control_acknowledgements
         self._release_participation_chat = release_participation_chat
         self._running = False
         # Review F03: ingest must not wait for a running generation. Generations stay
@@ -327,6 +330,23 @@ class OrchestratorService:
     def stop(self) -> None:
         self._running = False
 
+    def _is_control_ack(self, intent: SendOutboundIntent) -> bool:
+        """Deliver an authenticated owner-control acknowledgement outside the effect path.
+
+        The acknowledgement is not a model turn, so it is not converted into a planned
+        participation effect (which the response fence would refuse and which would drop
+        the token that proves it). It keeps its single-use token and goes to the bus;
+        the transport claims the token while the fence is up.
+        """
+        acks = self._control_acknowledgements
+        event = intent.event
+        return acks is not None and acks.matches_metadata(
+            event.metadata,
+            channel=event.channel,
+            chat_id=event.chat_id,
+            content=str(event.content or ""),
+        )
+
     async def _dispatch_intents(
         self, intents: list[OrchestratorIntent], *, principal: str = ""
     ) -> None:
@@ -347,6 +367,18 @@ class OrchestratorService:
                 case SetTypingIntent():
                     await self._typing_adapter(intent.channel, intent.chat_id, intent.enabled)
                 case SendOutboundIntent():
+                    if self._is_control_ack(intent):
+                        await self._bus.publish_outbound(
+                            OutboundMessage(
+                                channel=intent.event.channel,
+                                chat_id=intent.event.chat_id,
+                                content=intent.event.content,
+                                reply_to=intent.event.reply_to,
+                                media=list(intent.event.media),
+                                metadata=dict(intent.event.metadata or {}),
+                            )
+                        )
+                        continue
                     if self._effect_router is not None:
                         try:
                             if await self._effect_router.submit_outbound(
@@ -2406,6 +2438,28 @@ def _stored_reader_identity(
     return by_principal, membership
 
 
+def _global_pause_reason(policy_adapter: object, channel: str, chat_id: str) -> str | None:
+    """The owner's global response fence reason from the existing pause read API.
+
+    Fail-closed: when the pause state cannot be read, the caller must treat the
+    transport as fenced rather than deliver into an unproven window.
+    """
+    probe = getattr(policy_adapter, "participation_pause_reason", None)
+    if probe is None:
+        return None
+    try:
+        reason = probe(channel, chat_id)
+    except Exception as exc:  # noqa: BLE001 - unreadable fence state must not send
+        logger.error(
+            "global pause probe failed channel={} chat={} error_type={}",
+            channel,
+            chat_id,
+            type(exc).__name__,
+        )
+        return "pause_state_unreadable"
+    return reason if reason == "paused_global" else None
+
+
 def build_effect_router(
     config: "Config",
     policy_adapter: "EnginePolicyAdapter | None",
@@ -2713,6 +2767,18 @@ def build_effect_router(
         participation_authorizer=participation_checker,
         participation_request_builder=_participation_request,
     )
+    def _global_pause_pre_dispatch(envelope: object) -> tuple[bool, str]:
+        """The owner's global pause, checked for every effect origin before dispatch."""
+        target = getattr(envelope, "target", None)
+        reason = _global_pause_reason(
+            policy_adapter,
+            str(getattr(target, "channel", "") or ""),
+            str(getattr(target, "chat_id", "") or ""),
+        )
+        if reason is None:
+            return True, "unpaused"
+        return False, reason
+
     executor = BusEffectExecutor(
         history_mentions_selected=config.history.live_projection_enabled and (config.history.readers.whatsapp or config.history.readers.tools),
         bus=bus,
@@ -2721,6 +2787,7 @@ def build_effect_router(
         security_block_message=config.security.block_user_message,
         participation_pre_dispatch=_participation_pre_dispatch,
         reservation_pre_dispatch=_reservation_pre_dispatch,
+        pause_pre_dispatch=_global_pause_pre_dispatch,
     )
     gateway = EffectGateway(
         store,
@@ -3014,6 +3081,21 @@ def build_gateway_runtime(
     )
     if activation_tracker is not None:
         activation_tracker.refresh_activation_sync()
+
+    # One registry per process: the admin middleware registers the acknowledgement of an
+    # applied owner control and every transport claims the same single-use token, so the
+    # owner can still see "/stop all" applied while the response fence is up.
+    control_acknowledgements = OwnerControlAcknowledgements()
+
+    def _is_globally_paused(channel: str, chat_id: str = "") -> str | None:
+        """The owner's global response fence reason, or ``None``.
+
+        Reuses the existing participation-pause read API and keeps only its global
+        member: chat-scoped pauses are an admission concern and are deliberately not
+        promoted into a transport fence here.
+        """
+        return _global_pause_reason(policy_adapter, channel, chat_id)
+
     from yeoman_gateway.processing.quota import CapabilityQuotaGovernance
 
     quota_governance = CapabilityQuotaGovernance(
@@ -3105,7 +3187,11 @@ def build_gateway_runtime(
     if effect_router is not None:
         from yeoman_gateway.processing.dispatch import managed_outbound_guard
 
-        bus.set_managed_outbound_guard(managed_outbound_guard(effect_router))
+        bus.set_managed_outbound_guard(
+            managed_outbound_guard(
+                effect_router, acknowledgements=control_acknowledgements
+            )
+        )
 
     # The reaction vocabulary is an owner decision, so the effective list is named once at
     # startup: an emoji missing from it is silently unsendable, and that must be visible.
@@ -3279,6 +3365,11 @@ def build_gateway_runtime(
         # Approved effects go straight to the channel transport, so a successful send is
         # a real receipt instead of a queue guess (spec R07).
         effect_router.set_direct_transport(channels.send_now, channels.send_reaction_now)
+
+    # The owner's global pause is authoritative at the transport boundary itself, so the
+    # queued dispatcher and the direct effect transport cannot diverge.
+    channels.set_global_pause_probe(_is_globally_paused)
+    channels.set_control_acknowledgements(control_acknowledgements)
 
     # Wire recording indicator: responder switches presence to mic icon during TTS
     async def _recording_notifier(channel: str, chat_id: str) -> None:
@@ -3471,6 +3562,8 @@ def build_gateway_runtime(
         security_classifier=security_classifier,
         security_block_message=config.security.block_user_message,
         policy_admin_handler=admin_command_handler,
+        global_pause_probe=_is_globally_paused,
+        control_acknowledgements=control_acknowledgements,
         model_router=model_router,
         tts=tts,
         whatsapp_tts_outgoing_dir=config.channels.whatsapp.media.outgoing_path,
@@ -3575,6 +3668,14 @@ def build_gateway_runtime(
         if proposal.get("notified_at"):
             return
         channel = str(approval_channel or "telegram").strip() or "telegram"
+        if _is_globally_paused(channel) is not None:
+            # The owner fenced responses: defer the announcement without marking the
+            # proposal notified, so the next unpaused invocation announces it once.
+            logger.info(
+                "persona evolution review notification deferred (global pause active) proposal={}",
+                proposal.get("proposal_id"),
+            )
+            return
         raw_targets = policy_adapter.owner_recipients(channel)
         if not raw_targets:
             logger.warning(
@@ -3628,7 +3729,9 @@ def build_gateway_runtime(
     async def _notify_pending_persona_evolution_reviews() -> None:
         ledger = PersonaEvolutionLedger(persona_evolution_state_db_path)
         try:
-            proposals = ledger.pending_proposals()
+            proposals = ledger.pending_review_notifications(
+                global_pause_active=lambda: _is_globally_paused("telegram") is not None
+            )
         finally:
             ledger.close()
         for proposal in proposals:
@@ -3976,6 +4079,7 @@ def build_gateway_runtime(
         memory=memory_service,
         effect_router=effect_router,
         processing_store=processing_store,
+        control_acknowledgements=control_acknowledgements,
         release_participation_chat=_release_participation_chat,
         history_projector=history_projector,
         history_selected=config.history.live_projection_enabled and (

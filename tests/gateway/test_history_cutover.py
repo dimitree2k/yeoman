@@ -17,6 +17,25 @@ from tests.gateway.convhist.consumer_fixtures import (  # noqa: F401
     statement_case,
 )
 
+PAUSE_MEMBER = {'path': 'data/ops/response-pauses.json', 'kind': 'file', 'restore': True}
+PAUSE_CANONICAL = '{"version": 1, "global_until_ms": -1, "chat_until_ms": {}}'
+
+
+def pause_member():
+    return dict(PAUSE_MEMBER)
+
+
+def authenticate_pause(value):
+    """Durable acquisition receipt a real attempt writes for the owner-stop pause."""
+    pause = Path(value['inventory']['pause_path'])
+    digest = __import__('hashlib').sha256(pause.read_bytes()).hexdigest()
+    root = Path(value['receipts'])
+    root.mkdir(parents=True, exist_ok=True)
+    (root/'cutover-01.json').write_text(json.dumps(dict(
+        action='acquire', record_digest=value['digest'],
+        pause_baseline=dict(path=str(pause), sha256=digest, global_until_ms=-1, chat_keys=[]))))
+    return digest
+
 
 def procedure():
     spec = importlib.util.spec_from_file_location('cutover_operator', Path(__file__).parents[2] / 'scripts/history_cutover.py')
@@ -38,6 +57,10 @@ def record(tmp_path):
     (tmp_path / 'installed-text').write_text('prior owner text')
     items = [{'path': name, 'kind': 'file', 'restore': name not in ('outbox', 'disposition')}
              for name in ('knowledge.db', 'cron.json', 'outbox', 'disposition')]
+    # The canonical owner-stop record is part of the restored whole set.
+    (home/'data/ops').mkdir(parents=True, exist_ok=True)
+    (home/'data/ops/response-pauses.json').write_text(PAUSE_CANONICAL)
+    items.append(pause_member())
     items += [{'path': name, 'kind': 'tree', 'restore': False} for name in ('raw', 'spool')]
     items.append(dict(path='external/installed-text', source=str(tmp_path/'installed-text'), kind='file', restore=True))
     package = tmp_path/'bridge-package'
@@ -48,14 +71,14 @@ def record(tmp_path):
     value = dict(rehearsal_root=str(tmp_path), bridge_package_dir=str(package), version=1, mode='rehearsal', approved=True, approval='synthetic-owner-gate', home=str(home),
                  candidate='synthetic-candidate', prior='synthetic-prior', inventory=dict(
                      bridge_package_dir=str(package), members=items, raw_path='raw', bridge=dict(mode='stopped'),
-                     gateway_jobs=0, expected_gateway_jobs=0, units=[dict(name=f'yeoman-{name}.service',restart='always',executable=f'/synthetic/{name}') for name in ('overseer','gateway','bridge','a2a')], timers=['watch'],
+                     gateway_jobs=0, expected_gateway_jobs=0, units=[dict(name=f'yeoman-{name}.service',restart='always',executable=f'/synthetic/{name}') for name in ('overseer','gateway','bridge','a2a')], timers=['watch.timer'], timer_services={'watch.timer':['watch.service']},
                      host_crontab=dict(window_safe=True,timezone='UTC',window_start_ms=1791532800000,window_end_ms=1791534600000,danger_minutes=[240])), output=str(tmp_path / 'acquisition'),
                  receipts=str(tmp_path / 'receipts'), commands={})
     texts = tmp_path/'texts.json'
     texts.write_text('{"actions":[]}')
     (home/'config.json').write_text('{}')
     example = json.loads((Path(__file__).parents[2]/'scripts/history_cutover_inventory.example.json').read_text())
-    value['inventory'].update(config_path=str(home/'config.json'),pause_path=str(home/'pauses.json'),
+    value['inventory'].update(config_path=str(home/'config.json'),pause_path=str(home/'data/ops/response-pauses.json'),
         knowledge_db=str(home/'knowledge.db'),processing_db=str(home/'processing.db'),
         frozen_files=[],frozen_watermarks={},prepared_text_manifest=str(texts),
         prepared_text_manifest_sha256=__import__('hashlib').sha256(texts.read_bytes()).hexdigest(),original_home=str(home),
@@ -64,7 +87,8 @@ def record(tmp_path):
         forward_start_evidence_member='inputs/forward.json',source_dir=str(tmp_path/'source'),
         prior_source_dir=str(tmp_path/'prior-source'),tool_python=__import__('sys').executable,
         yeoman=str(tmp_path/'yeoman'),prior_yeoman=str(tmp_path/'prior-yeoman'),
-        pinned_files={},prior_pinned_files={},gateway_socket=str(home/'run/gateway.sock'))
+        pinned_files={},prior_pinned_files={},gateway_socket=str(home/'run/gateway.sock'),
+        systemd_runtime_dir=str(tmp_path/'systemd/user'),owner_uid=__import__('os').getuid())
     value['digest'] = procedure().record_digest(value)
     path = tmp_path / 'record.json'
     path.write_text(json.dumps(value))
@@ -76,15 +100,25 @@ class Controls:
     def __init__(self, module, *, fail=None, lag=False):
         self.module, self.fail, self.lag = module, fail, lag
         self.calls = []
+    def _pause_digest(self, payload):
+        pause = payload.get('record', {}).get('inventory', {}).get('pause_path')
+        path = Path(pause) if pause else None
+        if path is not None and path.is_file():
+            return __import__('hashlib').sha256(path.read_bytes()).hexdigest()
+        return 'a' * 64
+
     def __call__(self, action, payload):
         self.calls.append(action)
         if action == self.fail:
             raise RuntimeError('synthetic failure')
+        digest = self._pause_digest(payload)
         result = dict(ok=True, complete=True, fenced=True, suppressed=True, clean=True,
-                      alert_fired=False, generation=1, reopened=True, raw_deferred=0,
+                      alert_fired=False, prior_ready=True, generation=1, reopened=True, raw_deferred=0,
                       bridge_pending=int(self.lag), bridge_inflight=0, capture_ready=True,
                       all_committed=not self.lag, current_denials=True, delta_applied=True,
-                      no_duplicate_effects=True, unknown_effects_held=True, imports_verified=True, writers_absent=True, bridge_stopped=True, prior_pauses_preserved=True, sources=payload.get('sources', []))
+                      no_duplicate_effects=True, unknown_effects_held=True, imports_verified=True, writers_absent=True, bridge_stopped=True, prior_pauses_preserved=True,
+                      pause_baseline_sha256=digest, prior_pauses_sha256=digest, strictly_inactive=True,
+                      alert_state='inactive', sources=payload.get('sources', []))
         if action.startswith('smoke-reader-'):
             result.update(adapter=True, lease_closed=True, unselected_refused=True,
                           config_digest=self.module.record_digest(payload['selection']),
@@ -512,7 +546,7 @@ async def test_whole_restore_does_not_revive_purged_knowledge_source(statement_c
     path, home, value = record(tmp_path/'cutover')
     value['rehearsal_root'] = str(tmp_path)
     value['inventory']['members'] = [dict(path='knowledge.db',source=str(knowledge_path),kind='sqlite',restore=True),
-        dict(path='raw',source=str(c.raw),kind='tree',restore=False,role='raw')]
+        dict(path='raw',source=str(c.raw),kind='tree',restore=False,role='raw'), pause_member()]
     value['digest'] = m.record_digest(value)
     path.write_text(json.dumps(value))
     await c.projector.stop()
@@ -563,7 +597,7 @@ def test_snapshot_restores_preexisting_fk_violations_unchanged(tmp_path):
     m = procedure()
     path, home, value = record(tmp_path)
     original = orphan_database(home)
-    value['inventory']['members'] = [dict(path='orphan.db',kind='sqlite',restore=True)]
+    value['inventory']['members'] = [dict(path='orphan.db',kind='sqlite',restore=True), pause_member()]
     receipt = m.acquire_cutover_snapshot(home=home,output=Path(value['output']),inventory=value['inventory'])
     assert receipt['members'][0]['integrity'] == 'ok'
     assert receipt['members'][0]['fk_violations'] == 1
@@ -573,6 +607,7 @@ def test_snapshot_restores_preexisting_fk_violations_unchanged(tmp_path):
     preserved = (Path(value['output'])/'orphan.db').read_bytes()
     with sqlite3.connect(original) as db:
         db.execute('INSERT INTO memory2_nodes VALUES (99)')
+    authenticate_pause(value)
     assert m._restore_files(value,home)['complete']
     assert original.read_bytes() == preserved
     with sqlite3.connect(original) as db:
@@ -588,7 +623,7 @@ def test_snapshot_refuses_changed_fk_multiset(tmp_path,monkeypatch,operation,cha
     m = procedure()
     path, home, value = record(tmp_path)
     original = orphan_database(home)
-    value['inventory']['members'] = [dict(path='orphan.db',kind='sqlite',restore=True)]
+    value['inventory']['members'] = [dict(path='orphan.db',kind='sqlite',restore=True), pause_member()]
     def corrupt(db):
         if change=='gain':
             db.execute('INSERT INTO memory2_embeddings VALUES (2, 98)')
@@ -616,6 +651,7 @@ def test_snapshot_refuses_changed_fk_multiset(tmp_path,monkeypatch,operation,cha
                 corrupt(db)
             return digest
         monkeypatch.setattr(m,'_static_copy',changed_copy)
+        authenticate_pause(value)
         with pytest.raises(ValueError,match='snapshot_fk_drift'):
             m._restore_files(value,home)
         assert original.read_bytes() == prior

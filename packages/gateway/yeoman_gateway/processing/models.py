@@ -81,6 +81,14 @@ class ParticipationPreDispatchDenied(ProcessingError):  # noqa: N818 - contract 
     """A participation effect was denied immediately before transport dispatch."""
 
 
+class GlobalPauseRefused(ProcessingError):  # noqa: N818 - contract name is fixed
+    """The owner's global response pause refused a transport call before dispatch.
+
+    Raised by the transport boundary itself, so an effect refused while the owner's
+    fence was up is recorded as not executed and can never claim ``sent``.
+    """
+
+
 class JournalConflictError(ProcessingError, ValueError):
     """Same provider identity (or event id) with a different payload."""
 

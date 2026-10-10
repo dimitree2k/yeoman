@@ -49,6 +49,7 @@ if TYPE_CHECKING:
     from yeoman_gateway.consciousness.approval import SpeakupApprovalStore
     from yeoman_gateway.consciousness.log import SpeakupLog
     from yeoman_gateway.consciousness.tools import ConsciousnessTools
+    from yeoman_gateway.core.control_ack import OwnerControlAcknowledgements
     from yeoman_gateway.cron.workflow_state import PendingApproval, WorkflowState
     from yeoman_gateway.knowledge._contacts.service import ContactsService
     from yeoman_gateway.knowledge.models import TrustedIdentityObservation, TrustedReadContext
@@ -56,6 +57,25 @@ if TYPE_CHECKING:
     from yeoman_gateway.media.tts import TTSSynthesizer
     from yeoman_gateway.security.classifier import InputClassifier
     from yeoman_gateway.session.manager import SessionManager
+
+
+def _global_pause_from_policy(policy: object) -> "Callable[[str, str], str | None] | None":
+    """Derive the owner global-pause probe from the mandatory policy port.
+
+    The first-contact notifier is constructed here, so the fence cannot depend on a
+    call site remembering to pass it: any composition whose policy port exposes the
+    existing pause read API is fenced by default. Only the global member is promoted;
+    chat-scoped pauses stay an admission concern.
+    """
+    probe = getattr(policy, "participation_pause_reason", None)
+    if not callable(probe):
+        return None
+
+    def _probe(channel: str, chat_id: str) -> str | None:
+        reason = probe(channel, chat_id)
+        return reason if reason == "paused_global" else None
+
+    return _probe
 
 
 class Orchestrator:
@@ -109,7 +129,11 @@ class Orchestrator:
         forward_target_resolver: ForwardTargetResolver | None = None,
         forward_source_lookup: ForwardSourceLookup | None = None,
         short_reply_reactor: object | None = None,
+        global_pause_probe: "Callable[[str, str], str | None] | None" = None,
+        control_acknowledgements: "OwnerControlAcknowledgements | None" = None,
     ) -> None:
+        if global_pause_probe is None:
+            global_pause_probe = _global_pause_from_policy(policy)
         layers: list[Middleware] = [
             NormalizationMiddleware(),
             DeduplicationMiddleware(ttl_seconds=dedupe_ttl_seconds),
@@ -137,7 +161,10 @@ class Orchestrator:
                 reply_context_line_max_chars=reply_context_line_max_chars,
                 ambient_window_limit=ambient_window_limit,
             ),
-            AdminCommandMiddleware(handler=policy_admin_handler),
+            AdminCommandMiddleware(
+                handler=policy_admin_handler,
+                acknowledgements=control_acknowledgements,
+            ),
             PolicyMiddleware(policy=policy),
             ForwardCommandMiddleware(
                 target_resolver=forward_target_resolver,
@@ -178,7 +205,11 @@ class Orchestrator:
         layers.extend([
             IdeaCaptureMiddleware(security=security),
             AccessControlMiddleware(security=security),
-            NewChatNotifyMiddleware(owner_alert_resolver=owner_alert_resolver, history_config=history_secondary_config),
+            NewChatNotifyMiddleware(
+                owner_alert_resolver=owner_alert_resolver,
+                history_config=history_secondary_config,
+                global_pause=global_pause_probe,
+            ),
             NoReplyFilterMiddleware(security=security),
             InputSecurityMiddleware(security=security, classifier=security_classifier, block_message=security_block_message),
             ResponderMiddleware(

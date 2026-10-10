@@ -34,11 +34,13 @@ from yeoman_shared.raw_archive.records import (
 )
 
 try:
+    from scripts.history_cutover import _attempt_pause_digests
     from scripts.history_maintenance_guard import preflight_isolated_paths
 except ModuleNotFoundError:
+    from history_cutover import _attempt_pause_digests
     from history_maintenance_guard import preflight_isolated_paths
 
-SHOW = '--property=ActiveState,Result,UnitFileState,Restart,ActiveEnterTimestampMonotonic,InactiveEnterTimestampMonotonic,ExecMainStartTimestampMonotonic,ExecMainExitTimestampMonotonic'
+SHOW = '--property=ActiveState,Result,UnitFileState,Restart,ActiveEnterTimestampMonotonic,InactiveEnterTimestampMonotonic,ExecMainStartTimestampMonotonic,ExecMainExitTimestampMonotonic,LoadState,NeedDaemonReload,DropInPaths'
 SERVICE_ACTIONS = {
     'stop-overseer-clean', 'stop-timers-and-manual-routes', 'stop-gateway', 'stop-bridge',
     'suppress-restarts', 'verify-restart-suppression', 'verify-deploy-suppression',
@@ -50,6 +52,15 @@ READER_FAMILIES = ('knowledge', 'whatsapp', 'responder', 'tools', 'participation
 SELECT_ACTIONS = {f'select-{f}' for f in READER_FAMILIES}
 ACK_ACTIONS = {'functional-smoke'}
 COMMAND_ACTIONS = {'import-preview', 'import', 'owner-preview', 'owner-append'}
+
+
+def _pause_facts(path: Any, *, expectation: str = 'any') -> dict:
+    """The procedure's authenticated pause reader, imported without a cycle."""
+    try:
+        from scripts.history_cutover import pause_facts
+    except ModuleNotFoundError:
+        from history_cutover import pause_facts
+    return pause_facts(Path(path), expectation=expectation)
 
 
 def _raw_writer(raw: Any) -> dict:
@@ -71,27 +82,47 @@ def _subprocess(argv: list[str]) -> subprocess.CompletedProcess:
     return subprocess.run(argv, capture_output=True, text=True, check=False)
 
 
-def gateway_socket_client(request: dict, *, socket_path: Path | None = None) -> dict:
+def gateway_socket_client(request: dict, *, socket_path: Path | None = None, timeout_seconds: float = 360) -> dict:
     from yeoman_shared.config.loader import load_config
+    deadline=time.monotonic()+timeout_seconds
+    def remaining():
+        left=deadline-time.monotonic()
+        if left<=0:
+            raise TimeoutError('gateway_readiness_deadline')
+        return left
     with socket.socket(socket.AF_UNIX, socket.SOCK_STREAM) as stream:
-        stream.settimeout(360)
+        stream.settimeout(remaining())
         stream.connect(str(socket_path or Path(load_config().ipc.gateway_socket_path).expanduser()))
+        stream.settimeout(remaining())
         stream.sendall(json.dumps(request).encode() + b'\n')
-        with stream.makefile('rb') as reader:
-            line = reader.readline(1024 * 1024 + 1)
-        if not line.endswith(b'\n') or len(line) > 1024 * 1024:
+        data=bytearray()
+        while b'\n' not in data and len(data)<=1024*1024:
+            stream.settimeout(remaining())
+            chunk=stream.recv(min(65536,1024*1024+1-len(data)))
+            remaining()
+            if not chunk:
+                raise ValueError('invalid_ipc_response')
+            data.extend(chunk)
+        line=bytes(data).split(b'\n',1)[0]
+        if b'\n' not in data or len(line)>1024*1024:
             raise ValueError('invalid_ipc_response')
         return json.loads(line)
 
 
-def _bridge_probe(*, config_path: Path | None = None) -> dict:
+def _bridge_probe(*, config_path: Path | None = None, timeout_seconds: float = 30) -> dict:
     from yeoman_gateway.channels.whatsapp_runtime import WhatsAppRuntimeManager
     from yeoman_shared.config.loader import load_config
     config = load_config(config_path=config_path)
     # The existing probe generates a token if absent. Refuse that config mutation.
     if not config.channels.whatsapp.bridge_token:
         raise ValueError('bridge_token_required')
-    return asyncio.run(WhatsAppRuntimeManager(config=config)._health_check_async(30))
+    async def bounded_probe():
+        return await asyncio.wait_for(WhatsAppRuntimeManager(config=config)._health_check_async(timeout_seconds),timeout=timeout_seconds)
+    try:
+        return asyncio.run(bounded_probe())
+    except RuntimeError as exc:
+        code='readiness_protocol_mismatch' if str(exc).startswith('Bridge protocol mismatch:') else 'invalid_readiness_evidence'
+        raise ValueError(code) from None
 
 
 def _protocol_version():
@@ -132,6 +163,8 @@ def _read_db(path: Path):
     _path(str(path))
     for suffix in ('-wal', '-shm'):
         _path(str(path) + suffix)
+    if not path.is_file():
+        raise FileNotFoundError(path)
     return sqlite3.connect(path.as_uri() + '?mode=ro', uri=True)
 
 
@@ -216,13 +249,45 @@ def _restore_health(payload: dict, inventory: Mapping, raw: dict, bridge: dict) 
     return proof
 
 
-def _ack(action: str, payload: dict) -> dict:
+def _ack(action: str, payload: dict, *, wait: bool = False, clock=time) -> dict:
+    try:
+        from scripts.history_cutover import validate_ack_timeout
+    except ModuleNotFoundError:
+        from history_cutover import validate_ack_timeout
+    timeout = validate_ack_timeout(payload['record'])
     root = _path(payload['record']['receipts'])
     path = _path(str(root / f'{action}.owner_ack.json'))
-    proof = json.loads(path.read_bytes())
-    if proof.get('record_digest') != payload['record']['digest'] or proof.get('action') != action or proof.get('owner_ack') is not True:
+    deadline = clock.monotonic() + timeout
+    while True:
+        try:
+            proof = json.loads(_path(str(path)).read_bytes())
+            break
+        except FileNotFoundError:
+            if not wait:
+                raise
+            remaining = deadline - clock.monotonic()
+            if remaining <= 0:
+                raise ValueError('owner_ack_timeout') from None
+            clock.sleep(min(1, remaining))
+        except (ValueError, UnicodeError):
+            raise ValueError('invalid_owner_ack') from None
+    if (not isinstance(proof, dict) or set(proof) != {'action', 'record_digest', 'owner_ack', 'proof'}
+            or proof.get('record_digest') != payload['record']['digest'] or proof.get('action') != action
+            or proof.get('owner_ack') is not True):
         raise ValueError('owner_ack_required')
-    return dict(ok=True, owner_ack=str(path), **proof.get('proof', {}))
+    evidence = proof['proof']
+    if (not isinstance(evidence, dict)
+            or set(evidence) != {'inbound_message_id_hash', 'outbound_receipt_hash', 'observed_ms'}
+            or any(not isinstance(evidence[k], str) or not re.fullmatch(r'[a-f0-9]{64}', evidence[k])
+                   for k in ('inbound_message_id_hash', 'outbound_receipt_hash'))
+            or type(evidence['observed_ms']) is not int or evidence['observed_ms'] <= 0):
+        raise ValueError('invalid_owner_ack')
+    if wait:
+        releases = [p for p in payload.get('receipts', []) if p.get('action') == 'release-fence' and p.get('receipt', {}).get('ok') is True]
+        if (len(releases) != 1 or type(releases[0].get('ended_ns')) is not int
+                or not releases[0]['ended_ns'] // 1_000_000 <= evidence['observed_ms'] <= int(clock.time() * 1000)):
+            raise ValueError('stale_owner_ack')
+    return dict(ok=True, owner_ack=str(path), **evidence)
 
 
 def _effects(payload: dict, inventory: Mapping) -> dict:
@@ -345,6 +410,85 @@ def _import_proof(payload: dict, report: dict) -> dict:
         complete = checked == observed and report.get('status') == 'complete'
     return dict(observed or {}, ok=complete, complete=complete)
 
+def _procedure_digest(value):
+    try:
+        from scripts.history_cutover import record_digest
+    except ModuleNotFoundError:
+        from history_cutover import record_digest
+    return record_digest(value)
+
+
+def _baseline_inputs(payload):
+    record=payload['record']
+    manifest=json.loads(_path(record['output']).joinpath('manifest.json').read_bytes())
+    quiescent=[p for p in payload['receipts'] if p.get('action')=='verify-quiescent']
+    if (manifest.get('digest') != _procedure_digest(manifest)
+            or manifest.get('inventory_digest') != _procedure_digest(record['inventory'])
+            or manifest.get('home') != record['home'] or not manifest.get('ok')
+            or len(quiescent)!=1 or quiescent[0].get('record_digest') != record['digest']
+            or any(quiescent[0].get('receipt',{}).get(k) is not True for k in ('ok','writers_absent','bridge_stopped'))):
+        raise ValueError('quiescent_baseline_required')
+    receipt_root=_path(record['receipts'])
+    if not any(json.loads(_path(str(p)).read_bytes())==quiescent[0] for p in receipt_root.glob('cutover-[0-9][0-9].json')):
+        raise ValueError('quiescent_baseline_required')
+    return manifest,quiescent[0]
+
+
+def _frozen_state(record):
+    from yeoman_gateway.knowledge._history_upgrade import FROZEN_IDENTITY_TABLES, _digest
+    inv=record['inventory']
+    knowledge=_path(inv['knowledge_db'])
+    with closing(_read_db(knowledge)) as db:
+        identity=_digest(db,FROZEN_IDENTITY_TABLES)
+    # SQLite physical bytes and its WAL/SHM include permitted statement/job growth.
+    excluded={str(knowledge)+suffix for suffix in ('','-wal','-shm')}
+    watermarks={str(_path(p)):_hash(_path(p)) for p in inv['frozen_files'] if p not in excluded}
+    return dict(watermarks=watermarks,identity_digest=identity)
+
+
+def _capture_frozen_baseline(payload):
+    manifest,quiescent=_baseline_inputs(payload)
+    if payload.get('acquisition') != manifest:
+        raise ValueError('quiescent_baseline_required')
+    from yeoman_gateway.knowledge._history_upgrade import FROZEN_IDENTITY_TABLES, _digest
+    record=payload['record']
+    knowledge=_path(record['inventory']['knowledge_db'])
+    snapshots=[m for m in manifest['members'] if (Path(m['source']) if m.get('source') else Path(manifest['home'])/m['path'])==knowledge and m['exists']]
+    if len(snapshots)!=1:
+        raise ValueError('knowledge_baseline_not_acquired')
+    snapshot=_path(str(Path(record['output'])/snapshots[0]['path']))
+    if _hash(snapshot)!=snapshots[0]['sha256']:
+        raise ValueError('quiescent_baseline_required')
+    state=_frozen_state(record)
+    with closing(_read_db(snapshot)) as db:
+        if _digest(db,FROZEN_IDENTITY_TABLES)!=state['identity_digest']:
+            raise ValueError('frozen_identity_changed')
+    baseline=dict(record_digest=payload['record']['digest'],acquisition_digest=manifest['digest'],
+                  quiescent_digest=_procedure_digest(quiescent),**state)
+    baseline['digest']=_procedure_digest(baseline)
+    _write(_path(payload['record']['receipts'])/'frozen-baseline.json',json.dumps(baseline,sort_keys=True).encode(),exclusive=True)
+    return dict(ok=True,baseline_digest=baseline['digest'])
+
+
+def _verify_frozen_baseline(payload):
+    manifest,quiescent=_baseline_inputs(payload)
+    baseline=json.loads((_path(payload['record']['receipts'])/'frozen-baseline.json').read_bytes())
+    if (baseline.get('digest')!=_procedure_digest(baseline) or baseline.get('record_digest')!=payload['record']['digest']
+            or baseline.get('acquisition_digest')!=manifest['digest'] or baseline.get('quiescent_digest')!=_procedure_digest(quiescent)):
+        raise ValueError('frozen_baseline_pin_mismatch')
+    acquired=[p for p in payload['receipts'] if p.get('action')=='acquire']
+    if len(acquired)!=1 or acquired[0].get('record_digest')!=payload['record']['digest'] or acquired[0].get('frozen_baseline_digest')!=baseline['digest'] or acquired[0].get('receipt')!=manifest:
+        raise ValueError('frozen_baseline_pin_mismatch')
+    if not any(json.loads(_path(str(p)).read_bytes())==acquired[0] for p in _path(payload['record']['receipts']).glob('cutover-[0-9][0-9].json')):
+        raise ValueError('frozen_baseline_pin_mismatch')
+    current=_frozen_state(payload['record'])
+    if current['watermarks']!=baseline['watermarks']:
+        raise ValueError('frozen_watermark_changed')
+    if current['identity_digest']!=baseline['identity_digest']:
+        raise ValueError('frozen_identity_changed')
+    return dict(ok=True,baseline_digest=baseline['digest'])
+
+
 def live_host_controls(*, inventory: Mapping[str, Any],
                        runner: Callable[[list[str]], subprocess.CompletedProcess] = _subprocess,
                        ipc: Callable[[dict], dict] = gateway_socket_client,
@@ -359,20 +503,31 @@ def live_host_controls(*, inventory: Mapping[str, Any],
     gateway = inventory.get('gateway_unit', 'yeoman-gateway.service')
     bridge = inventory.get('bridge_unit', 'yeoman-bridge.service')
     overseer = 'yeoman-overseer.service'
-    routes = [*inventory.get('timers', []), *inventory.get('manual_routes', []), *[u['name'] for u in units if u.get('role') == 'a2a' or u['name'] == 'yeoman-a2a.service']]
-    all_units = list(dict.fromkeys([*names, *routes]))
+    timers = list(inventory.get('timers', []))
+    associations = inventory.get('timer_services') or {}
+    # A stopped timer does not stop the oneshot it already activated, so the associated
+    # services are first-class members of the fence: guarded, stopped and observed.
+    associated = [service for timer in timers for service in associations.get(timer, [])]
+    if timers and any(not associations.get(timer) for timer in timers):
+        raise ValueError('timer_service_association_required')
+    routes = [*timers, *inventory.get('manual_routes', []), *[u['name'] for u in units if u.get('role') == 'a2a' or u['name'] == 'yeoman-a2a.service']]
+    all_units = list(dict.fromkeys([*names, *routes, *associated]))
     if any(not re.fullmatch(r'[A-Za-z0-9_.@-]+\.(service|timer)', u) for u in [*all_units, gateway, bridge, overseer]):
         raise ValueError('invalid_unit_name')
+    if any(not re.fullmatch(r'[A-Za-z0-9_.@-]+\.service', u) for u in associated):
+        raise ValueError('invalid_unit_name')
     pause_before: bytes | None = None
+    readiness_deadline: float | None = None
 
     def run(argv, payload, *, source_dir=None):
         if runner is _subprocess:
-            source = source_dir or inventory['source_dir']
+            source = source_dir or inventory['prior_source_dir' if payload.get('operation') == 'restore' else 'source_dir']
             env = dict(os.environ, YEOMAN_HOME=payload['home'], YEOMAN_SOURCE_DIR=source)
             env.pop('PYTHONPATH', None)
             if argv[:3] == [payload['record'].get('python'), '-m', 'yeoman_gateway']:
                 env['PYTHONPATH'] = ':'.join(str(Path(source) / 'packages' / p) for p in ('gateway', 'shared', 'overseer'))
-            return subprocess.run(argv, cwd=source, env=env, capture_output=True, text=True, check=False)
+            kwargs = dict(timeout=max(0.001,readiness_deadline-clock.monotonic())) if readiness_deadline is not None else {}
+            return subprocess.run(argv, cwd=source, env=env, capture_output=True, text=True, check=False, **kwargs)
         return runner(argv)
 
     def show(unit, payload):
@@ -392,46 +547,206 @@ def live_host_controls(*, inventory: Mapping[str, Any],
     def stopped(selected, payload):
         return all(show(u, payload)['ActiveState'] == 'inactive' for u in selected)
 
+    def guard_paths(payload):
+        root = _path(inventory['systemd_runtime_dir'])
+        digest = payload['record']['digest']
+        if not re.fullmatch('[0-9a-f]{64}', digest):
+            raise ValueError('invalid_guard_digest')
+        marker = _path(str(root / f'.yeoman-cutover-{digest}.hold'))
+        guards = {u: _path(str(root / (u + '.d') / f'zz-yeoman-cutover-{digest}.conf')) for u in all_units}
+        content = f'[Unit]\nConditionPathExists=!{marker}\n'.encode()
+        return marker, guards, content
+
+    def install_guards(payload):
+        marker, guards, content = guard_paths(payload)
+        receipt = _path(payload['record']['receipts']) / 'restart-guards.json'
+        owned = dict(record_digest=payload['record']['digest'], marker=str(marker),
+                     marker_sha256=hashlib.sha256((payload['record']['digest']+'\n').encode()).hexdigest(),
+                     guards={u: str(p) for u,p in guards.items()}, guard_sha256=hashlib.sha256(content).hexdigest())
+        if receipt.exists():
+            if json.loads(receipt.read_bytes()) != owned or (marker.exists() and _hash(marker) != owned['marker_sha256']):
+                raise ValueError('guard_drift')
+            if any(p.exists() and p.read_bytes() != content for p in guards.values()):
+                raise ValueError('guard_drift')
+            if not stopped(all_units, payload):
+                raise ValueError('guard_writer_active')
+        else:
+            if marker.exists() or any(p.exists() for p in guards.values()):
+                raise ValueError('guard_path_exists')
+            _write(receipt, json.dumps(owned,sort_keys=True).encode(),exclusive=True)
+            _write(marker, (payload['record']['digest']+'\n').encode(), exclusive=True)
+        if not marker.exists():
+            _write(marker,(payload['record']['digest']+'\n').encode(),exclusive=True)
+        for path in guards.values():
+            if not path.exists():
+                _write(path, content, exclusive=True)
+        if run(['systemctl','--user','daemon-reload'],payload).returncode:
+            raise ValueError('guard_reload_failed')
+
+    def guard_loaded(unit, payload, state):
+        marker, guards, content = guard_paths(payload)
+        path = guards[unit]
+        if (not marker.exists() or marker.read_bytes() != (payload['record']['digest']+'\n').encode()
+                or not path.exists() or path.read_bytes() != content):
+            raise ValueError('guard_drift')
+        if (state.get('LoadState') != 'loaded' or state.get('NeedDaemonReload') != 'no'
+                or str(path) not in state.get('DropInPaths','').split()):
+            return False
+        escaped = ''.join(c if c.isascii() and c.isalnum() else f'_{ord(c):02x}' for c in unit)
+        response = run(['busctl','--user','--json=short','get-property','org.freedesktop.systemd1',
+                        '/org/freedesktop/systemd1/unit/'+escaped,'org.freedesktop.systemd1.Unit','Conditions'],payload)
+        if response.returncode:
+            raise ValueError('guard_condition_unobservable')
+        value = json.loads(response.stdout)
+        return value.get('type') == 'a(sbbsi)' and any(
+            isinstance(c,list) and len(c)==5 and c[:4] == ['ConditionPathExists',False,True,str(marker)]
+            for c in value.get('data',[]))
+
     def suppression(payload):
         before = {u: show(u, payload) for u in all_units}
-        # Inventory drift cannot leave an unmasked Restart=always writer.
-        matches = all((s['Restart'] == 'always') == (u in restart) for u, s in before.items() if u in names)
+        matches = all((s['Restart'] == 'always') == (u in restart) for u,s in before.items() if u in names)
+        loaded = all(guard_loaded(u,payload,s) and s['ActiveState']=='inactive' for u,s in before.items())
         clock.sleep(30)
-        after = {u: show(u, payload) for u in all_units}
-        return matches and all(before[u]['UnitFileState'] == after[u]['UnitFileState'] == 'masked-runtime' and before[u]['ActiveState'] == after[u]['ActiveState'] == 'inactive' for u in restart) and all(s['ActiveState'] == 'inactive' for s in after.values())
+        after = {u: show(u,payload) for u in all_units}
+        return matches and loaded and all(guard_loaded(u,payload,s) and s['ActiveState']=='inactive' for u,s in after.items())
+
+    def release_guard(unit,payload):
+        marker, guards, content = guard_paths(payload)
+        receipt = _path(payload['record']['receipts'])/'restart-guards.json'
+        expected=dict(record_digest=payload['record']['digest'],marker=str(marker),
+            marker_sha256=hashlib.sha256((payload['record']['digest']+'\n').encode()).hexdigest(),
+            guards={u:str(p) for u,p in guards.items()},guard_sha256=hashlib.sha256(content).hexdigest())
+        if not receipt.exists() or json.loads(receipt.read_bytes()) != expected:
+            raise ValueError('guard_ownership_unproven')
+        if not guard_loaded(unit,payload,show(unit,payload)):
+            raise ValueError('guard_loaded_unproven')
+        guards[unit].unlink()
+        if run(['systemctl','--user','daemon-reload'],payload).returncode:
+            raise ValueError('guard_reload_failed')
+        state=show(unit,payload)
+        if state.get('NeedDaemonReload')!='no' or str(guards[unit]) in state.get('DropInPaths','').split():
+            raise ValueError('guard_release_unproven')
+        if not any(p.exists() for p in guards.values()):
+            marker.unlink()
 
     def quiescent(payload):
         absent = stopped(all_units, payload)
+        owner_uid = inventory.get('owner_uid', os.getuid())
+        if type(owner_uid) is not int or owner_uid != os.getuid():
+            raise ValueError('writer_owner_uid_mismatch')
         configured = {Path(u['executable']) for u in units}
         if any(not p.is_absolute() for p in configured):
             raise ValueError('absolute_writer_executables_required')
         executables = configured | {p.resolve() for p in configured}
         for entry in proc_root.iterdir():
-            if entry.name.isdecimal():
+            if not entry.name.isdecimal():
+                continue
+            try:
+                if entry.stat().st_uid != owner_uid:
+                    continue
                 try:
                     executable = (entry / 'exe').resolve(strict=True)
-                    arguments = (entry / 'cmdline').read_bytes().split(b'\0')
-                except FileNotFoundError:
-                    continue  # Process exited between observations.
-                if executable in executables or any(os.fsencode(p) in arguments for p in executables):
-                    absent = False
+                except PermissionError:
+                    executable = None
+                try:
+                    raw = (entry / 'cmdline').read_bytes()
+                except PermissionError as exc:
+                    raise ValueError('writer_cmdline_unobservable') from exc
+                if executable is None and (not raw or not raw.endswith(b'\0')):
+                    raise ValueError('writer_cmdline_unobservable')
+                arguments = raw.split(b'\0')
+            except FileNotFoundError:
+                continue
+            if executable in executables or any(os.fsencode(p) in arguments for p in executables):
+                absent = False
         return dict(writers_absent=absent, bridge_stopped=stopped([bridge], payload))
 
     def probe_bridge():
-        return (_bridge_probe(config_path=_path(inventory['config_path']))
+        bound=min(30,max(0.001,readiness_deadline-clock.monotonic())) if readiness_deadline is not None else 30
+        return (_bridge_probe(config_path=_path(inventory['config_path']),timeout_seconds=bound)
                 if bridge_probe is _bridge_probe else bridge_probe())
+
+    def validate_bridge(health):
+        try:
+            if (not isinstance(health,dict) or type(health['protocolVersion']) is not int
+                    or type(health['whatsapp']['connected']) is not bool
+                    or type(health['persistenceFailure']) is not bool
+                    or any(type(health[a][b]) is not int or health[a][b]<0 for a,b in [('outbox','pending'),('queue','inflight')])):
+                raise ValueError('invalid_readiness_evidence')
+            if health['protocolVersion'] != _protocol_version():
+                raise ValueError('readiness_protocol_mismatch')
+            if health['persistenceFailure']:
+                raise ValueError('readiness_persistence_failure')
+        except (KeyError,TypeError) as exc:
+            raise ValueError('invalid_readiness_evidence') from exc
+        return health
+
+    def wait_ready(sample,payload):
+        nonlocal readiness_deadline
+        try:
+            from scripts.history_cutover import validate_readiness_timeout
+        except ModuleNotFoundError:
+            from history_cutover import validate_readiness_timeout
+        readiness_deadline=clock.monotonic()+validate_readiness_timeout(payload['record'])
+        try:
+            while True:
+                try:
+                    result=sample(payload)
+                    if result['ok'] and clock.monotonic()<=readiness_deadline:
+                        return result
+                except (FileNotFoundError,ConnectionRefusedError,TimeoutError,subprocess.TimeoutExpired):
+                    pass
+                remaining=readiness_deadline-clock.monotonic()
+                if remaining<=0:
+                    raise ValueError('readiness_timeout')
+                clock.sleep(min(30,remaining))
+        finally:
+            readiness_deadline=None
+
+    def raw_observed(payload):
+        response=run([payload['record']['python'],'-m','yeoman_gateway','raw','status','--json'],payload)
+        if response.returncode:
+            raise ValueError('raw_status_observation_failed')
+        raw=json.loads(response.stdout)
+        writer=_raw_writer(raw)
+        if writer['state']!='ok' or writer['last_error']:
+            raise ValueError('readiness_persistence_failure')
+        return raw
+
+    def health_sample(payload):
+        health=validate_bridge(probe_bridge())
+        raw=raw_observed(payload)
+        writer=_raw_writer(raw)
+        if payload.get('operation')=='restore':
+            result=_restore_health(payload,inventory,raw,health)
+            if not result['prior_ready']:
+                raise ValueError('prior_readiness_mismatch')
+            return result
+        return dict(ok=health['whatsapp']['connected'] and writer['spooled']==writer['pending_in_memory']==health['outbox']['pending']==health['queue']['inflight']==0,
+                    connected=health['whatsapp']['connected'],protocol=health['protocolVersion'],
+                    bridge_pending=health['outbox']['pending'],bridge_inflight=health['queue']['inflight'],writer_ok=True)
 
     def tails(payload):
         if payload.get('operation') == 'restore':
-            raw = json.loads(run([payload['record']['python'], '-m', 'yeoman_gateway', 'raw', 'status', '--json'], payload).stdout)
-            return _restore_health(payload, inventory, raw, probe_bridge())
+            raw = raw_observed(payload)
+            result=_restore_health(payload, inventory, raw, validate_bridge(probe_bridge()))
+            if not result['prior_ready']:
+                raise ValueError('prior_readiness_mismatch')
+            return result
         request = {'cmd': 'history_control', 'args': {'operation': 'status'}}
-        health = (gateway_socket_client(request, socket_path=_path(inventory['gateway_socket']))
+        health = (gateway_socket_client(request, socket_path=_path(inventory['gateway_socket']),timeout_seconds=max(0.001,readiness_deadline-clock.monotonic()))
                   if ipc is gateway_socket_client else ipc(request))
         # The response is health-only; persisted vector and a reopened lease supply the rest.
-        raw = json.loads(run([payload['record']['python'], '-m', 'yeoman_gateway', 'raw', 'status', '--json'], payload).stdout)
-        bridge_health = probe_bridge()
+        raw = raw_observed(payload)
+        bridge_health = validate_bridge(probe_bridge())
         writer = _raw_writer(raw)
+        if writer['state']!='ok' or writer['last_error']:
+            raise ValueError('readiness_persistence_failure')
+        if not isinstance(health,dict) or health.get('status')!='ok' or not isinstance(health.get('health'),dict):
+            raise ValueError('invalid_readiness_evidence')
+        h=health['health']
+        if h.get('status') not in ('ready','starting','rebuilding','backlog') or any(type(h.get(k)) is not int or h[k]<0 for k in ('generation','lag_lines','lag_bytes')):
+            raise ValueError('invalid_readiness_evidence')
         proof = _boundary(payload)
         proof.update(raw_deferred=writer['spooled'] + writer['pending_in_memory'], bridge_pending=bridge_health['outbox']['pending'], bridge_inflight=bridge_health['queue']['inflight'], capture_ready=_capture_ready(payload))
         h = health.get('health', {})
@@ -457,16 +772,28 @@ def live_host_controls(*, inventory: Mapping[str, Any],
             fired = fired or stamp > since
             for key in ('ExecMainStartTimestampMonotonic', 'ExecMainExitTimestampMonotonic'):
                 fired |= int(alert[key]) >= since and int(alert[key]) > int(alert_before[key])
+            # An activating/deactivating alert oneshot is not quiescent; only the exact
+            # inactive state is observed, and its disposition is recorded.
+            alert_state = str(alert['ActiveState'])
             clean = state['ActiveState'] == 'inactive' and state['Result'] == 'success'
-            result = dict(ok=clean and not fired, clean=clean, alert_fired=fired)
+            quiet = alert_state == 'inactive'
+            result = dict(ok=clean and quiet and not fired, clean=clean, alert_fired=fired,
+                          alert_state=alert_state, alert_quiet=quiet,
+                          alert_result=str(alert.get('Result', '')),
+                          overseer_state=str(state['ActiveState']))
         elif action in ('stop-timers-and-manual-routes', 'stop-gateway', 'stop-bridge'):
-            selected = routes if action == 'stop-timers-and-manual-routes' else [gateway if action == 'stop-gateway' else bridge]
+            if action == 'stop-timers-and-manual-routes':
+                selected = list(dict.fromkeys([*routes, *associated]))
+            else:
+                selected = [gateway if action == 'stop-gateway' else bridge]
             for u in selected:
                 run(['systemctl', '--user', 'stop', u], payload)
-            result = dict(ok=stopped(selected, payload), units=selected)
+            # Strictly inactive: activating/deactivating oneshots are not quiescent.
+            inactive = stopped(selected, payload)
+            result = dict(ok=inactive, units=selected, strictly_inactive=inactive,
+                          timer_services=sorted(set(associated)))
         elif action == 'suppress-restarts':
-            for u in restart:
-                run(['systemctl', '--user', 'mask', '--runtime', u], payload)
+            install_guards(payload)
             suppressed = suppression(payload)
             result = dict(ok=suppressed, suppressed=suppressed)
         elif action in ('verify-restart-suppression', 'verify-deploy-suppression', 'verify-no-writer-after-deploy'):
@@ -480,25 +807,57 @@ def live_host_controls(*, inventory: Mapping[str, Any],
             result['ok'] = result['writers_absent'] and result['bridge_stopped']
         elif action == 'fence-effects':
             pause_before = pause_bytes()
+            # Authenticate the pre-stop baseline: the owner's persistent, indefinite
+            # global pause with an empty unrelated-chat baseline. Missing or drifted
+            # state refuses before any writer is touched.
+            baseline = _pause_facts(inventory['pause_path'], expectation='fenced')
+            if baseline['sha256'] != hashlib.sha256(pause_before).hexdigest():
+                raise ValueError('pause_baseline_drift')
             for phase in ('stop-overseer-clean', 'stop-timers-and-manual-routes', 'stop-gateway', 'stop-bridge'):
                 if not execute(phase, payload)['ok']:
                     raise ValueError('stop_fence_unproven')
+            if (_path(payload['record']['receipts'])/'restart-guards.json').exists():
+                install_guards(payload)
+                if not suppression(payload):
+                    raise ValueError('stop_fence_unproven')
             fenced = stopped(all_units, payload)
             preserved = pause_bytes() == pause_before
-            result = dict(ok=fenced and preserved, fenced=fenced, prior_pauses_preserved=preserved, fence='verified-inactive', units=all_units)
+            result = dict(ok=fenced and preserved, fenced=fenced, prior_pauses_preserved=preserved,
+                          fence='verified-inactive', units=all_units,
+                          pause_baseline_sha256=baseline['sha256'],
+                          pause_global_until_ms=baseline['global_until_ms'],
+                          pause_chat_keys=baseline['chat_keys'],
+                          alert_state=show('yeoman-overseer-alert.service', payload)['ActiveState'])
         elif action == 'release-fence':
-            preserved = pause_before is not None and pause_bytes() == pause_before
+            if payload.get('operation') == 'restore':
+                # A restore puts the authenticated owner-stop record back, so the release
+                # permission names that restored state, not the pre-restore bytes.
+                facts = _pause_facts(inventory['pause_path'], expectation='fenced')
+                authenticated = _attempt_pause_digests(payload['record'])
+                preserved = facts['sha256'] in authenticated
+                name = facts['sha256']
+            else:
+                preserved = pause_before is not None and pause_bytes() == pause_before
+                name = hashlib.sha256(pause_before or b'').hexdigest() if pause_before is not None else ''
+                if pause_before is None:
+                    raise ValueError('release_without_fence')
             active = all(show(u, payload)['ActiveState'] == 'active' for u in (bridge, gateway))
-            result = dict(ok=preserved and active, prior_pauses_preserved=preserved)
+            result = dict(ok=preserved and active, prior_pauses_preserved=preserved,
+                          prior_pauses_sha256=name)
         elif action.startswith('start-') or action == 'resume-vetted-manual-routes':
-            starts = {'start-bridge': [bridge], 'start-gateway': [gateway], 'start-overseer': [overseer], 'start-timers': inventory.get('timers', []), 'resume-vetted-manual-routes': [u for u in routes if u not in inventory.get('timers', [])]}
+            starts = {'start-bridge': [bridge], 'start-gateway': [gateway], 'start-overseer': [overseer], 'start-timers': timers, 'resume-vetted-manual-routes': [u for u in routes if u not in timers]}
             if action not in starts:
                 raise ValueError('unknown_host_action')
             selected = starts[action]
+            # Releasing a timer's guard without releasing its associated oneshot would
+            # leave that service permanently suppressed.
+            released = [*selected, *[s for u in selected for s in associations.get(u, [])]]
+            for u in released:
+                release_guard(u, payload)
             for u in selected:
-                run(['systemctl', '--user', 'unmask', '--runtime', u], payload)
                 run(['systemctl', '--user', 'start', u], payload)
-            result = dict(ok=all(show(u, payload)['ActiveState'] == 'active' for u in selected), units=selected)
+            result = dict(ok=all(show(u, payload)['ActiveState'] == 'active' for u in selected),
+                          units=selected, released=released)
         elif action == 'deploy':
             if not suppression(payload):
                 raise ValueError('deploy_suppression_unproven')
@@ -507,22 +866,15 @@ def live_host_controls(*, inventory: Mapping[str, Any],
             result = dict(proof, deployed=deployed.returncode == 0)
             result['ok'] &= result['deployed']
         elif action in ('drain-durable-tails', 'all-committed-barrier'):
-            result = tails(payload)
+            result = wait_ready(tails,payload)
         elif action == 'health':
-            from yeoman_shared.whatsapp_protocol import PROTOCOL_VERSION
-            health = probe_bridge()
-            raw = json.loads(run([payload['record']['python'], '-m', 'yeoman_gateway', 'raw', 'status', '--json'], payload).stdout)
-            writer = _raw_writer(raw)
-            ready = health['whatsapp']['connected'] is True and health['protocolVersion'] == PROTOCOL_VERSION and writer['state'] == 'ok'
-            result = dict(ok=ready, connected=health['whatsapp']['connected'], protocol=health['protocolVersion'], bridge_pending=health['outbox']['pending'], bridge_inflight=health['queue']['inflight'], writer_ok=writer['state'] == 'ok')
-            if payload.get('operation') == 'restore':
-                result = _restore_health(payload, inventory, raw, health)
+            result = wait_ready(health_sample,payload)
         elif action == 'verify-effect-deduplication':
             result = _effects(payload, inventory)
+        elif action == 'capture-frozen-baseline':
+            result = _capture_frozen_baseline(payload)
         elif action == 'frozen-watermarks':
-            watermarks = {str(_path(p)): _hash(_path(p)) for p in inventory['frozen_files']}
-            expected = inventory['frozen_watermarks']
-            result = dict(ok=watermarks == expected, watermarks=watermarks)
+            result = _verify_frozen_baseline(payload)
         elif action == 'configure-retirement' or action in SELECT_ACTIONS:
             result = _configure(payload, inventory)
         elif action == 'apply-prepared-texts':
@@ -531,12 +883,19 @@ def live_host_controls(*, inventory: Mapping[str, Any],
             code = "import json,yeoman_gateway,yeoman_shared,yeoman_overseer;print(json.dumps([m.__file__ for m in (yeoman_gateway,yeoman_shared,yeoman_overseer)]))"
             response = run([inventory['tool_python'], '-c', code], payload)
             paths = json.loads(response.stdout)
-            verified = len(paths) == 3 and all(_path(inventory['source_dir']) in _path(p).parents for p in paths)
+            root = inventory['prior_source_dir' if payload.get('operation') == 'restore' else 'source_dir']
+            verified = len(paths) == 3 and all(_path(root) in _path(p).parents for p in paths)
             result = dict(ok=verified, imports_verified=verified, origins=paths)
         elif action == 'validate-capture-handover':
-            response = run([payload['record']['python'], '-m', 'yeoman_gateway', 'raw', 'check-capture'], payload)
-            ready = _capture_ready(payload)
-            result = dict(ok=response.returncode == 0 and ready, capture_ready=ready, capture_check_sha256=hashlib.sha256(response.stdout.encode()).hexdigest())
+            def capture_sample(p):
+                response=run([p['record']['python'],'-m','yeoman_gateway','raw','check-capture'],p)
+                if response.returncode:
+                    raise ValueError('raw_capture_failed')
+                ready=_capture_ready(p)
+                return dict(ok=ready,capture_ready=ready,capture_check_sha256=hashlib.sha256(response.stdout.encode()).hexdigest())
+            result=wait_ready(capture_sample,payload)
+            return dict(result,mode='live')
+
         elif action == 'preflight':
             pinned = inventory['pinned_files']
             verified = bool(pinned) and all(_hash(_path(p)) == digest for p, digest in pinned.items())
@@ -558,7 +917,7 @@ def live_host_controls(*, inventory: Mapping[str, Any],
         elif action == 'prepare-input-bundle':
             result = _prepare_inputs(payload, inventory)
         elif action in ACK_ACTIONS:
-            result = _ack(action, payload)
+            result = _ack(action, payload, wait=True, clock=clock)
         elif action in ('capture-suppression-delta', 'reapply-suppression-delta', 'verify-current-denials'):
             result = _suppression_delta(action, payload, inventory)
         elif action == 'restore-software-install-config-units':
@@ -690,16 +1049,25 @@ def rehearsal_host_controls(*, copy_home: Path, inventory: Mapping[str, Any], re
             if path.resolve() != root and root not in path.resolve().parents:
                 raise ValueError('rehearsal_layout_outside_root')
         if action in SERVICE_ACTIONS:
-            units = inventory.get('timers', []) if action == 'start-timers' else [u['name'] for u in inventory.get('units', [])]
+            timers = list(inventory.get('timers', []))
+            associations = inventory.get('timer_services') or {}
+            associated = [service for timer in timers for service in associations.get(timer, [])]
+            units = timers if action == 'start-timers' else [u['name'] for u in inventory.get('units', [])]
             result = dict(ok=True, simulated=True, units=units)
             if action == 'stop-overseer-clean':
-                result.update(clean=True, alert_fired=False)
+                result.update(clean=True, alert_fired=False, alert_state='inactive', alert_quiet=True)
+            if action == 'stop-timers-and-manual-routes':
+                result.update(strictly_inactive=True, timer_services=sorted(set(associated)))
             if action in ('suppress-restarts', 'verify-restart-suppression', 'verify-deploy-suppression', 'verify-no-writer-after-deploy'):
                 result['suppressed'] = True
             if action in ('verify-quiescent', 'verify-no-writer-after-deploy'):
                 result.update(writers_absent=True, bridge_stopped=True)
             if action in ('fence-effects', 'release-fence'):
-                result.update(fenced=True, prior_pauses_preserved=True)
+                # Rehearsal authenticates the same pause member from the isolated copy.
+                facts = _pause_facts(inventory['pause_path'])
+                result.update(fenced=True, prior_pauses_preserved=True,
+                              pause_baseline_sha256=facts['sha256'],
+                              prior_pauses_sha256=facts['sha256'])
         elif action in ('all-committed-barrier', 'drain-durable-tails', 'health'):
             # Rehearsal status snapshots must be acquired members, never host queries.
             status_paths = [_path(str(copy_home / inventory[k])) for k in ('raw_status_path', 'bridge_status_path')]
@@ -724,12 +1092,10 @@ def rehearsal_host_controls(*, copy_home: Path, inventory: Mapping[str, Any], re
             result = dict(ok=_capture_ready(payload), capture_ready=_capture_ready(payload))
         elif action in ('preflight', 'verify-import-origins', 'restore-software-install-config-units'):
             result = dict(ok=True, simulated=True, imports_verified=True)
+        elif action == 'capture-frozen-baseline':
+            result = _capture_frozen_baseline(payload)
         elif action == 'frozen-watermarks':
-            paths = [_path(p) for p in inventory['frozen_files']]
-            if any(copy_home not in p.parents for p in paths):
-                raise ValueError('rehearsal_input_outside_copy')
-            watermarks = {str(p): _hash(p) for p in paths}
-            result = dict(ok=watermarks == inventory['frozen_watermarks'], watermarks=watermarks)
+            result = _verify_frozen_baseline(payload)
         elif action in ('import', 'import-preview'):
             layout = payload['record']['layout']
             manifest = json.loads(_path(layout['conversion_manifest']).read_bytes())

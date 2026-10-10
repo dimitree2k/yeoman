@@ -55,6 +55,11 @@
     "timers": [
       "synthetic-watch.timer"
     ],
+    "timer_services": {
+      "synthetic-watch.timer": [
+        "synthetic-watch.service"
+      ]
+    },
     "manual_routes": [],
     "host_crontab": {
       "timezone": "UTC",

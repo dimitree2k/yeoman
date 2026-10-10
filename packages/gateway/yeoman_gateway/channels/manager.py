@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import asyncio
+from collections.abc import Callable, Mapping
 from typing import TYPE_CHECKING, Any
 
 from loguru import logger
@@ -11,6 +12,8 @@ from yeoman_shared.config.schema import Config
 from yeoman_gateway.bus.events import OutboundMessage, ReactionMessage
 from yeoman_gateway.bus.queue import MessageBus
 from yeoman_gateway.channels.base import BaseChannel
+from yeoman_gateway.core.control_ack import CONTROL_ACK_KEY, OwnerControlAcknowledgements
+from yeoman_gateway.observability import private_log_identifier, safe_log_token
 from yeoman_gateway.providers.openai_compatible import resolve_openai_compatible_credentials
 
 if TYPE_CHECKING:
@@ -48,6 +51,11 @@ class ChannelManager:
     - Route outbound messages
     """
 
+    # Class-level defaults so a partially constructed manager (tests, tooling) cannot
+    # raise in the dispatcher loop; the composed gateway installs both explicitly.
+    _global_pause_probe: Callable[[str, str], str | None] | None = None
+    _control_acks: OwnerControlAcknowledgements | None = None
+
     def __init__(
         self,
         config: Config,
@@ -78,8 +86,79 @@ class ChannelManager:
         self.channels: dict[str, BaseChannel] = {}
         self._dispatch_task: asyncio.Task | None = None
         self._reaction_dispatch_task: asyncio.Task | None = None
+        # The owner's global response pause is authoritative at the transport itself.
+        # Every send, reaction and presence call in this class passes the same check, so
+        # direct effect transports and the queued dispatchers cannot diverge.
+        self._global_pause_probe = None
+        self._control_acks = None
 
         self._init_channels()
+
+    def set_global_pause_probe(
+        self, probe: Callable[[str, str], str | None] | None
+    ) -> None:
+        """Install the owner global-pause probe (``(channel, chat_id) -> reason|None``)."""
+        self._global_pause_probe = probe
+
+    def set_control_acknowledgements(
+        self, acknowledgements: OwnerControlAcknowledgements | None
+    ) -> None:
+        """Install the registry that authenticates owner-control acknowledgements."""
+        self._control_acks = acknowledgements
+
+    def _pause_denial(
+        self,
+        channel: str,
+        chat_id: str,
+        *,
+        content: str = "",
+        metadata: Mapping[str, Any] | None = None,
+    ) -> str | None:
+        """The reason to refuse this transport call, or ``None`` to allow it.
+
+        The check runs immediately before the channel method and is fail-closed: an
+        unreadable pause state refuses. Only an authenticated, single-use owner-control
+        acknowledgement may pass a global pause - and claiming it consumes the token.
+        """
+        probe = self._global_pause_probe
+        if probe is None:
+            return None
+        try:
+            reason = probe(channel, chat_id)
+        except Exception as exc:  # noqa: BLE001 - unreadable fence state must not send
+            logger.error(
+                "global pause probe failed channel={} chat={} error_type={}",
+                channel,
+                chat_id,
+                type(exc).__name__,
+            )
+            return "pause_state_unreadable"
+        if not reason:
+            return None
+        acks = self._control_acks
+        if acks is not None and isinstance(metadata, Mapping) and acks.claim(
+            metadata.get(CONTROL_ACK_KEY),
+            channel=channel,
+            chat_id=chat_id,
+            content=str(content),
+        ):
+            return None
+        return str(reason)
+
+    @staticmethod
+    def _refusal(reason: str) -> Exception:
+        from yeoman_gateway.processing.models import GlobalPauseRefused
+
+        return GlobalPauseRefused(f"owner global response pause active ({reason})")
+
+    def _denied(self, kind: str, channel: str, chat_id: str, reason: str) -> None:
+        logger.warning(
+            "refusing {} during owner global pause channel={} chat={} reason={}",
+            kind,
+            safe_log_token(channel, max_length=40),
+            private_log_identifier(chat_id),
+            reason,
+        )
 
     def _init_channels(self) -> None:
         """Initialize channels based on config."""
@@ -228,6 +307,15 @@ class ChannelManager:
 
                 channel = self.channels.get(msg.channel)
                 if channel:
+                    denied = self._pause_denial(
+                        msg.channel,
+                        msg.chat_id,
+                        content=str(msg.content or ""),
+                        metadata=msg.metadata,
+                    )
+                    if denied is not None:
+                        self._denied("queued outbound", msg.channel, msg.chat_id, denied)
+                        continue
                     try:
                         logger.debug(
                             "Outbound dispatch start channel={} chat={} reply_to={} media_count={} content_len={}",
@@ -263,6 +351,12 @@ class ChannelManager:
 
                 channel = self.channels.get(msg.channel)
                 if channel:
+                    denied = self._pause_denial(
+                        msg.channel, msg.chat_id, metadata=msg.metadata
+                    )
+                    if denied is not None:
+                        self._denied("queued reaction", msg.channel, msg.chat_id, denied)
+                        continue
                     try:
                         logger.debug(
                             "Reaction dispatch channel={} chat={} message_id={} emoji={}",
@@ -298,6 +392,11 @@ class ChannelManager:
         if not callable(method):
             return
 
+        denied = self._pause_denial(channel_name, chat_id)
+        if denied is not None:
+            self._denied("typing indicator", channel_name, chat_id, denied)
+            return
+
         try:
             await method(chat_id)
         except Exception as e:
@@ -316,6 +415,10 @@ class ChannelManager:
             return
         method = getattr(channel, "start_recording", None)
         if not callable(method):
+            return
+        denied = self._pause_denial(channel_name, chat_id)
+        if denied is not None:
+            self._denied("recording indicator", channel_name, chat_id, denied)
             return
         try:
             await method(chat_id)
@@ -338,6 +441,15 @@ class ChannelManager:
         channel = self.channels.get(message.channel)
         if channel is None:
             raise RuntimeError(f"channel not available: {message.channel}")
+        denied = self._pause_denial(
+            message.channel,
+            message.chat_id,
+            content=str(message.content or ""),
+            metadata=message.metadata,
+        )
+        if denied is not None:
+            self._denied("direct send", message.channel, message.chat_id, denied)
+            raise self._refusal(denied)
         return await channel.send(message)
 
     async def send_reaction_now(self, message: ReactionMessage) -> dict[str, Any] | None:
@@ -348,6 +460,12 @@ class ChannelManager:
         sender = getattr(channel, "send_reaction", None)
         if sender is None:
             raise RuntimeError(f"channel does not support reactions: {message.channel}")
+        denied = self._pause_denial(
+            message.channel, message.chat_id, metadata=message.metadata
+        )
+        if denied is not None:
+            self._denied("direct reaction", message.channel, message.chat_id, denied)
+            raise self._refusal(denied)
         return await sender(message)
 
     async def lookup_message(
