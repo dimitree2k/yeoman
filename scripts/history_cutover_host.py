@@ -15,7 +15,7 @@ import socket
 import sqlite3
 import subprocess
 import time
-from collections.abc import Callable, Mapping
+from collections.abc import Callable, Iterable, Mapping
 from contextlib import closing
 from dataclasses import asdict
 from pathlib import Path
@@ -503,6 +503,15 @@ def _carries_content(record: Mapping[str, Any]) -> bool:
     return False
 
 
+def _absent_census(rows: Iterable[tuple[str, str]]) -> dict[str, dict[str, int]]:
+    """Per-destination, per-kind counts for one class of absent rows."""
+    census: dict[str, dict[str, int]] = {}
+    for source, kind in rows:
+        census.setdefault(source, {})
+        census[source][kind] = census[source].get(kind, 0) + 1
+    return census
+
+
 def _skip_deadline(record: Mapping[str, Any], clock) -> float | None:
     """The existing readiness timeout bounds this read-only pass as well."""
     try:
@@ -539,11 +548,20 @@ def _import_skip(action: str, payload: Mapping[str, Any], *, clock=time) -> dict
     """Read-only proof that the protected import has nothing left to write.
 
     Preconditions: every ``backfill/`` destination a package names is already the
-    byte-exact post-image a complete import receipt recorded for that path, and no staged
-    row absent from its destination would lose message content. One pass each over the
-    package, the receipt journal and the archive tree; nothing is written and no symlink
-    is traversed. Any doubt leaves ``provable`` false, and the caller then runs the CLI
-    exactly as before.
+    byte-exact post-image a complete import receipt recorded for that path, and every
+    absent content-bearing row sits in a destination whose bytes still are that recorded
+    post-image. A destination a complete import already wrote completely is the store the
+    plan has reached: the rows still absent from it are the delta a later attempt is
+    expected to manifest separately, and their underlying messages are captured natively
+    in Layer 1, so they are censused as an accepted gap instead of refusing the skip
+    (``accepted_absent_content_rows``, and ``accepted_absent_identity_missing`` for the
+    subset Layer 1 does not hold). An absent content-bearing row outside that boundary --
+    a destination no complete receipt covers, or one whose bytes no longer match its
+    recorded post-image -- still refuses with ``absent_content_identity_missing``: there
+    the row would be the first thing written and its loss is unproven. One pass each over
+    the package, the receipt journal and the archive tree; nothing is written and no
+    symlink is traversed. Any doubt leaves ``provable`` false, and the caller then runs the
+    CLI exactly as before.
     """
     record = payload.get('record')
     layout = record.get('layout') if isinstance(record, Mapping) else None
@@ -599,7 +617,8 @@ def _import_skip(action: str, payload: Mapping[str, Any], *, clock=time) -> dict
     verified: list[str] = []
     unverified: list[str] = []
     absent_by_source: dict[str, dict[str, int]] = {}
-    content_identities: list[set[str]] = []
+    accepted_rows: list[tuple[str, str, set[str]]] = []
+    uncovered_rows: list[tuple[str, str, set[str]]] = []
     rows = suppressed = absent = absent_reference = 0
     for relative in sorted(blobs):
         if clock.monotonic() > deadline:
@@ -651,10 +670,16 @@ def _import_skip(action: str, payload: Mapping[str, Any], *, clock=time) -> dict
             absent_by_source[relative][kind] = absent_by_source[relative].get(kind, 0) + 1
             if staged_record and _carries_content(staged_record):
                 try:
-                    content_identities.append(record_identities(staged_record))
+                    row_identities = record_identities(staged_record)
                 except (TypeError, ValueError):
-                    # An unreadable identity can never be proven present, so it refuses.
-                    content_identities.append(set())
+                    # An unreadable identity can never be proven present, so a row in a
+                    # destination no complete receipt covers refuses.
+                    row_identities = set()
+                # A destination covered by a complete, byte-exact receipt has already taken
+                # everything the plan could write; anything still absent from it is the delta
+                # a later attempt manifests separately, so it is censused, never fatal.
+                (accepted_rows if pinned else uncovered_rows).append(
+                    (relative, kind, row_identities))
             else:
                 absent_reference += 1
         files[relative] = dict(base_bytes=len(current), base_sha256=hashlib.sha256(current).hexdigest(),
@@ -679,17 +704,30 @@ def _import_skip(action: str, payload: Mapping[str, Any], *, clock=time) -> dict
                 identities |= record_identities(row)
     except (OSError, ValueError, TypeError, KeyError):
         return dict(provable=False, reason='archive_unproven', inputs=inputs)
-    found = sum(1 for ids in content_identities if ids & identities)
+    accepted_missing = [row for row in accepted_rows if not row[2] & identities]
+    uncovered_missing = [row for row in uncovered_rows if not row[2] & identities]
+    content_rows = [*accepted_rows, *uncovered_rows]
+    found = sum(1 for _, _, ids in content_rows if ids & identities)
     evidence = dict(destinations_verified=len(verified), destinations_checked=len(blobs),
                     destinations_unverified=sorted(unverified),
                     rows_total=rows, rows_suppressed=suppressed,
-                    absent_rows=absent, absent_content_rows=len(content_identities),
+                    absent_rows=absent, absent_content_rows=len(content_rows),
                     absent_reference_rows=absent_reference,
                     absent_content_identities_found=found,
+                    accepted_absent_content_rows=len(accepted_rows),
+                    accepted_absent_identity_missing=len(accepted_missing),
+                    accepted_absent_by_source=_absent_census(
+                        (source, kind) for source, kind, _ in accepted_rows),
+                    accepted_absent_identity_missing_by_source=_absent_census(
+                        (source, kind) for source, kind, _ in accepted_missing),
+                    uncovered_absent_content_rows=len(uncovered_rows),
+                    uncovered_absent_identity_missing=len(uncovered_missing),
+                    uncovered_absent_identity_missing_by_source=_absent_census(
+                        (source, kind) for source, kind, _ in uncovered_missing),
                     absent_by_source=absent_by_source,
                     layer1_files=scanned, layer1_identities=len(identities),
                     covering_receipts=sorted(covering_receipts), inputs=inputs)
-    if found != len(content_identities):
+    if uncovered_missing:
         return dict(provable=False, reason='absent_content_identity_missing',
                     inputs=inputs, evidence=evidence)
     plan = dict(version=1, package_digest=manifest['package_digest'],

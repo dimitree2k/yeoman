@@ -1370,24 +1370,37 @@ def write_package(root, files):
     return root
 
 
-def imported_package(tmp_path, grown=(), *, identities=('m1', 'm2')):
+def imported_package(tmp_path, grown=(), *, grown_derived=(), identities=('m1', 'm2'), also=(),
+                     first_derived=True):
     """A synthetic archive one completed import already wrote, plus a grown package.
 
-    The grown package repeats both destinations byte for byte and appends *grown*.
+    The grown package repeats every destination byte for byte, appends *grown* to the
+    backfill file and *grown_derived* to the derived file. *also* names further
+    ``(relative, first_rows, later_rows)`` destinations the first import also wrote
+    completely and the grown package extends. ``first_derived=False`` leaves the derived
+    file to a package no receipt covers.
     """
     from yeoman_gateway.history.convert.run import prepare_import_manifest
     from yeoman_shared.raw_archive import records
     raw = tmp_path / 'data/raw'
-    first = write_package(tmp_path / 'first', {
+    first_files = {
         'backfill/alpha.jsonl': [skip_backfill('a', 'm1'), skip_backfill('b', 'm2')],
         'derived/media-descriptions.jsonl': [skip_derived('one', 'm1', 'one'), skip_derived('two', 'm2', 'two')],
-    })
+    }
+    later_files = {
+        'backfill/alpha.jsonl': [skip_backfill('a', 'm1'), skip_backfill('b', 'm2'), *grown],
+        'derived/media-descriptions.jsonl': [skip_derived('one', 'm1', 'one'), skip_derived('two', 'm2', 'two'),
+                                             *grown_derived],
+    }
+    for relative, first_rows, later_rows in also:
+        first_files[relative] = list(first_rows)
+        later_files[relative] = [*first_rows, *later_rows]
+    if not first_derived:
+        first_files.pop('derived/media-descriptions.jsonl')
+    first = write_package(tmp_path / 'first', first_files)
     manifest = prepare_import_manifest(first)
     assert records.import_backfill(raw, first, manifest)['status'] == 'complete'
-    staged = write_package(tmp_path / 'second', {
-        'backfill/alpha.jsonl': [skip_backfill('a', 'm1'), skip_backfill('b', 'm2'), *grown],
-        'derived/media-descriptions.jsonl': [skip_derived('one', 'm1', 'one'), skip_derived('two', 'm2', 'two')],
-    })
+    staged = write_package(tmp_path / 'second', later_files)
     fresh = prepare_import_manifest(staged)
     path = tmp_path / 'conversion.json'
     path.write_text(json.dumps(fresh))
@@ -1436,8 +1449,22 @@ def skip_tree(root):
     return {str(path.relative_to(root)): path.read_bytes() for path in root.rglob('*') if path.is_file()}
 
 
+def skip_proof(tmp_path, raw, staged, manifest_path, *, action='import', operation='cutover'):
+    """The read-only proof itself, so a refusal's census stays inspectable."""
+    module = host_module()
+    record = dict(python=sys.executable, receipts=str(tmp_path / 'receipts'), digest='a' * 64,
+                  layout=dict(raw=str(raw), staged=str(staged), conversion_manifest=str(manifest_path)))
+    payload = dict(home=str(tmp_path), record=record, receipts=[], operation=operation,
+                   argv=procedure().command_for(action, record))
+    return module._import_skip(action, payload, clock=Clock())
+
+
 def test_import_skip_verifies_complete_receipts_and_leaves_the_archive_untouched(tmp_path):
-    """Witness 1 (and the content rule): an absent body already present in Layer 1."""
+    """Witness 1 (and the content rule): an absent body already present in Layer 1.
+
+    Also accepted-gap witness 6: the success path runs no CLI child, records the accepted
+    census, and leaves the archive tree byte-identical.
+    """
     raw, staged, manifest, first_digest = imported_package(
         tmp_path, grown=[skip_backfill('c', 'm5')], identities=('m1', 'm2', 'm5'))
     before = skip_tree(raw)
@@ -1452,6 +1479,11 @@ def test_import_skip_verifies_complete_receipts_and_leaves_the_archive_untouched
     assert (result['rows_total'], result['rows_suppressed']) == (5, 4)
     assert (result['absent_rows'], result['absent_content_rows'], result['absent_reference_rows']) == (1, 1, 0)
     assert result['absent_content_identities_found'] == 1
+    assert result['accepted_absent_content_rows'] == 1
+    assert result['accepted_absent_identity_missing'] == 0
+    assert result['accepted_absent_identity_missing_by_source'] == {}
+    assert result['uncovered_absent_content_rows'] == 0
+    assert result['uncovered_absent_identity_missing'] == 0
     assert result['absent_by_source'] == {'backfill/alpha.jsonl': {'message': 1}}
     assert result['covering_receipts'] == [first_digest]
     assert (result['layer1_files'], result['layer1_identities']) == (3, 6)
@@ -1477,15 +1509,157 @@ def test_import_skip_records_reference_only_absent_rows_by_kind(tmp_path):
     assert result['absent_content_identities_found'] == 0
 
 
-def test_absent_content_row_without_a_layer1_identity_runs_the_cli(tmp_path):
-    """Witness 2: absent body whose identity Layer 1 never received is never skipped."""
-    raw, staged, manifest, _ = imported_package(tmp_path, grown=[skip_backfill('lost', 'm9')])
+def test_absent_content_rows_in_a_covered_destination_are_an_accepted_gap(tmp_path):
+    """Accepted-gap witness 1: absent message and edit rows in a destination a complete
+    receipt already wrote no longer refuse; the census names them as the accepted gap."""
+    grown_edit = skip_backfill('lost-edit', 'm8', kind='edit', store='journal')
+    raw, staged, manifest, _ = imported_package(
+        tmp_path, grown=[skip_backfill('lost-msg', 'm9')],
+        also=[('backfill/journal.jsonl',
+               [skip_backfill('kept-edit', 'm1', kind='edit', store='journal')], [grown_edit])])
+    proof = skip_proof(tmp_path, raw, staged, manifest)
+    assert proof['provable'] is True and proof['reason'] == 'already-imported'
+    evidence = proof['evidence']
+    assert (evidence['destinations_checked'], evidence['destinations_verified']) == (3, 3)
+    assert evidence['destinations_unverified'] == []
+    assert (evidence['absent_rows'], evidence['absent_content_rows']) == (2, 2)
+    assert evidence['absent_content_identities_found'] == 0
+    assert evidence['accepted_absent_content_rows'] == 2
+    assert evidence['accepted_absent_identity_missing'] == 2
+    assert evidence['accepted_absent_by_source'] == {'backfill/alpha.jsonl': {'message': 1},
+                                                     'backfill/journal.jsonl': {'edit': 1}}
+    assert evidence['accepted_absent_identity_missing_by_source'] == {
+        'backfill/alpha.jsonl': {'message': 1}, 'backfill/journal.jsonl': {'edit': 1}}
+    assert evidence['uncovered_absent_content_rows'] == 0
+    assert evidence['uncovered_absent_identity_missing'] == 0
+    assert evidence['absent_by_source'] == {'backfill/alpha.jsonl': {'message': 1},
+                                            'backfill/journal.jsonl': {'edit': 1}}
     before = skip_tree(raw)
+    control, payload, calls = skip_control(tmp_path, raw, staged, manifest)
+    result = control('import', payload)
+    assert calls == []                                     # no CLI child, no write
+    assert result['skipped'] == 'already-imported' and result['wrote'] is False
+    assert result['ok'] is True and result['complete'] is True
+    assert result['accepted_absent_identity_missing'] == 2
+    assert skip_tree(raw) == before                        # the archive tree is unchanged
+
+
+def test_absent_content_row_in_an_uncovered_destination_runs_the_cli(tmp_path):
+    """Accepted-gap witness 2 (guard): the same row in a destination no complete receipt
+    covers still refuses -- that store was never imported."""
+    raw, staged, manifest, _ = imported_package(
+        tmp_path, grown_derived=[skip_derived('new', 'm9', 'new text')],
+        identities=('m1', 'm2'), first_derived=False)
+    proof = skip_proof(tmp_path, raw, staged, manifest)
+    assert proof['provable'] is False and proof['reason'] == 'absent_content_identity_missing'
+    evidence = proof['evidence']
+    assert evidence['destinations_unverified'] == ['derived/media-descriptions.jsonl']
+    assert evidence['accepted_absent_content_rows'] == 0
+    assert evidence['accepted_absent_identity_missing'] == 0
+    assert evidence['absent_content_rows'] == 3
+    assert evidence['absent_content_identities_found'] == 2      # 'one' and 'two' are in Layer 1
+    assert evidence['uncovered_absent_content_rows'] == 3
+    assert evidence['uncovered_absent_identity_missing'] == 1
+    assert evidence['uncovered_absent_identity_missing_by_source'] == {
+        'derived/media-descriptions.jsonl': {'media_description': 1}}
+    control, payload, calls = skip_control(tmp_path, raw, staged, manifest)
+    result = control('import', payload)
+    assert calls == [payload['argv']]
+    assert 'skipped' not in result
+    assert result['skip_check']['reason'] == 'absent_content_identity_missing'
+    assert (raw / 'derived/media-descriptions.jsonl').read_bytes() == \
+        (staged / 'derived/media-descriptions.jsonl').read_bytes()
+
+
+def test_changed_derived_destination_bytes_run_the_cli(tmp_path):
+    """Accepted-gap witness 3 (guard): coverage without a byte-exact post-image is not
+    coverage, so the absent row refuses again."""
+    raw, staged, manifest, _ = imported_package(tmp_path, grown_derived=[skip_derived('three', 'm9', 'three')])
+    destination = raw / 'derived/media-descriptions.jsonl'
+    destination.write_bytes(destination.read_bytes() + b'{"foreign":true}\n')
+    proof = skip_proof(tmp_path, raw, staged, manifest)
+    assert proof['provable'] is False and proof['reason'] == 'absent_content_identity_missing'
+    assert proof['evidence']['destinations_unverified'] == ['derived/media-descriptions.jsonl']
+    assert proof['evidence']['accepted_absent_content_rows'] == 0
+    assert proof['evidence']['uncovered_absent_identity_missing_by_source'] == {
+        'derived/media-descriptions.jsonl': {'media_description': 1}}
+    control, payload, calls = skip_control(tmp_path, raw, staged, manifest)
+    result = control('import', payload)
+    assert calls == [payload['argv']] and 'skipped' not in result
+    assert result['skip_check']['reason'] == 'absent_content_identity_missing'
+
+
+def test_no_receipt_at_all_runs_the_cli_and_still_writes(tmp_path):
+    """Accepted-gap witness 4: a store no receipt at all covers refuses, and the CLI
+    still performs the import it was going to perform."""
+    from yeoman_gateway.history.convert.run import prepare_import_manifest
+    raw = tmp_path / 'data/raw'
+    month = raw / 'whatsapp/2026-01.jsonl'
+    month.parent.mkdir(parents=True)
+    month.write_text(json.dumps({'channel': 'whatsapp', 'kind': 'message', 'native_id': 'w-m1',
+                                 'native': {'payload': {'messageId': 'm1'}}, 'received_ms': 100}) + '\n')
+    backfill = write_package(tmp_path / 'first-import', {'backfill/alpha.jsonl': [skip_backfill('g', 'm1')]})
+    manifest = tmp_path / 'backfill.json'
+    manifest.write_text(json.dumps(prepare_import_manifest(backfill)))
+    proof = skip_proof(tmp_path, raw, backfill, manifest)
+    assert proof['provable'] is False and proof['reason'] == 'destination_not_covered'
+    control, payload, calls = skip_control(tmp_path, raw, backfill, manifest)
+    result = control('import', payload)
+    assert calls == [payload['argv']] and 'skipped' not in result
+    assert result['skip_check']['reason'] == 'destination_not_covered'
+    assert (raw / 'backfill/alpha.jsonl').read_bytes() == (backfill / 'backfill/alpha.jsonl').read_bytes()
+    derived = write_package(tmp_path / 'derived-import',
+                            {'derived/media-descriptions.jsonl': [skip_derived('x', 'm9', 'x')]})
+    manifest = tmp_path / 'derived.json'
+    manifest.write_text(json.dumps(prepare_import_manifest(derived)))
+    proof = skip_proof(tmp_path, raw, derived, manifest)
+    assert proof['provable'] is False and proof['reason'] == 'absent_content_identity_missing'
+    assert proof['evidence']['destinations_unverified'] == ['derived/media-descriptions.jsonl']
+    assert proof['evidence']['accepted_absent_content_rows'] == 0
+    assert proof['evidence']['uncovered_absent_identity_missing_by_source'] == {
+        'derived/media-descriptions.jsonl': {'media_description': 1}}
+
+
+def test_absent_derived_content_rows_stay_skipped_and_censused(tmp_path):
+    """Accepted-gap witness 5: a derived artifact whose identity Layer 1 holds is still
+    skipped and censused, now with an explicit zero for the accepted loss."""
+    raw, staged, manifest, _ = imported_package(
+        tmp_path, grown_derived=[skip_derived('three', 'm3', 'three')], identities=('m1', 'm2', 'm3'))
+    before = skip_tree(raw)
+    proof = skip_proof(tmp_path, raw, staged, manifest)
+    assert proof['provable'] is True and proof['reason'] == 'already-imported'
+    evidence = proof['evidence']
+    assert (evidence['absent_content_rows'], evidence['absent_content_identities_found']) == (1, 1)
+    assert evidence['accepted_absent_content_rows'] == 1
+    assert evidence['accepted_absent_identity_missing'] == 0
+    assert evidence['accepted_absent_by_source'] == {'derived/media-descriptions.jsonl': {'media_description': 1}}
+    assert evidence['accepted_absent_identity_missing_by_source'] == {}
+    control, payload, calls = skip_control(tmp_path, raw, staged, manifest)
+    assert control('import', payload)['skipped'] == 'already-imported'
+    assert calls == [] and skip_tree(raw) == before
+
+
+def test_mixed_covered_and_uncovered_destinations_refuse_naming_the_uncovered_one(tmp_path):
+    """Accepted-gap witness 7: accepted rows in a covered destination cannot excuse a
+    content row in a destination no receipt covers."""
+    raw, staged, manifest, _ = imported_package(
+        tmp_path, grown=[skip_backfill('lost', 'm9')],
+        grown_derived=[skip_derived('gap', 'm9', 'gap text')], first_derived=False)
+    proof = skip_proof(tmp_path, raw, staged, manifest)
+    assert proof['provable'] is False and proof['reason'] == 'absent_content_identity_missing'
+    evidence = proof['evidence']
+    assert evidence['destinations_unverified'] == ['derived/media-descriptions.jsonl']
+    assert evidence['accepted_absent_content_rows'] == 1
+    assert evidence['accepted_absent_by_source'] == {'backfill/alpha.jsonl': {'message': 1}}
+    assert evidence['accepted_absent_identity_missing'] == 1
+    assert evidence['uncovered_absent_content_rows'] == 3
+    assert evidence['uncovered_absent_identity_missing'] == 1
+    assert evidence['uncovered_absent_identity_missing_by_source'] == {
+        'derived/media-descriptions.jsonl': {'media_description': 1}}
     control, payload, calls = skip_control(tmp_path, raw, staged, manifest)
     with pytest.raises(ValueError, match='command_failed_exit_2'):
         control('import', payload)
     assert calls == [payload['argv']]
-    assert skip_tree(raw) == before                        # the real refusal wrote nothing
 
 
 def test_changed_destination_bytes_run_the_cli(tmp_path):
@@ -1596,4 +1770,6 @@ def test_skipped_import_phase_stays_distinguishable_in_the_journal(tmp_path):
     assert journal['phases'][0]['action'] == 'import'
     assert receipt['skipped'] == 'already-imported' and receipt['wrote'] is False
     assert receipt['wrote'] is False and receipt['rows_suppressed'] == 4
+    assert receipt['accepted_absent_content_rows'] == 1
+    assert receipt['accepted_absent_identity_missing'] == 0
     assert receipt['absent_by_source'] == {'backfill/alpha.jsonl': {'message': 1}}
