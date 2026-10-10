@@ -231,16 +231,21 @@ def _boundary(payload: dict) -> dict:
 
 
 def _capture_ready(payload: dict) -> bool:
-    with closing(_read_db(_path(payload['record']['layout']['knowledge_live']))) as db:
-        version = db.execute("SELECT value FROM knowledge_meta WHERE key='schema_version'").fetchone()[0]
-        row = db.execute("SELECT value_json FROM knowledge_history_capture_state WHERE key='handover'").fetchone()
-        if version != '3' or row is None:
-            return False
-        handover = json.loads(row[0])
-        proof = _boundary(payload)
-        actual = {s['relative_path']: s for s in proof['sources']}
-        covered = all((o := actual.get(s['relative_path'])) is not None and o['end_offset'] >= s['end_offset'] and o['line_number'] >= s['line_number'] and (o['end_offset'] != s['end_offset'] or o['prefix_sha256'] == s['prefix_sha256']) for s in handover.get('sources', []))
-        return handover.get('version') == 1 and type(handover.get('generation')) is int and 0 < handover['generation'] <= proof['generation'] and covered
+    try:
+        with closing(_read_db(_path(payload['record']['layout']['knowledge_live']))) as db:
+            version = db.execute("SELECT value FROM knowledge_meta WHERE key='schema_version'").fetchone()[0]
+            row = db.execute("SELECT value_json FROM knowledge_history_capture_state WHERE key='handover'").fetchone()
+            if version != '3' or row is None:
+                return False
+            handover = json.loads(row[0])
+            proof = _boundary(payload)
+            actual = {s['relative_path']: s for s in proof['sources']}
+            covered = all((o := actual.get(s['relative_path'])) is not None and o['end_offset'] >= s['end_offset'] and o['line_number'] >= s['line_number'] and (o['end_offset'] != s['end_offset'] or o['prefix_sha256'] == s['prefix_sha256']) for s in handover.get('sources', []))
+            return handover.get('version') == 1 and type(handover.get('generation')) is int and 0 < handover['generation'] <= proof['generation'] and covered
+    except (OSError, sqlite3.DatabaseError):
+        # Not observable yet: the file is absent or the v3 capture tables a starting
+        # gateway publishes later. The polling caller retries until its bounded deadline.
+        return False
 
 
 def _knowledge_state(path: Path) -> tuple[str | None, bool]:
@@ -777,16 +782,22 @@ def live_host_controls(*, inventory: Mapping[str, Any],
         except ModuleNotFoundError:
             from history_cutover import validate_readiness_timeout
         readiness_deadline=clock.monotonic()+validate_readiness_timeout(payload['record'])
+        transient=None
         try:
             while True:
                 try:
                     result=sample(payload)
                     if result['ok'] and clock.monotonic()<=readiness_deadline:
                         return result
-                except (FileNotFoundError,ConnectionRefusedError,TimeoutError,subprocess.TimeoutExpired):
-                    pass
+                # A probe that runs before the socket accepts connections raises the whole
+                # OSError family, including the plain, errno-less aggregate asyncio raises
+                # when every address family is refused; all of them mean "not ready yet".
+                except (OSError,TimeoutError,subprocess.TimeoutExpired) as exc:
+                    transient=exc
                 remaining=readiness_deadline-clock.monotonic()
                 if remaining<=0:
+                    if transient is not None:
+                        raise ValueError('readiness_timeout') from transient
                     raise ValueError('readiness_timeout')
                 clock.sleep(min(30,remaining))
         finally:

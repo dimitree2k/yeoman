@@ -1200,3 +1200,118 @@ def test_guard_ownership_requires_the_declared_owner_uid(tmp_path):
         assert not module._owned_guard(dropin, kind='dropin', digest=digest, root=runtime, owner_uid=owner_uid)
     marker.write_text('edited\n')
     assert not module._owned_guard(marker, kind='marker', digest=digest, root=runtime, **owned)
+
+
+def bridge_health():
+    from yeoman_shared.whatsapp_protocol import PROTOCOL_VERSION
+    return dict(whatsapp=dict(connected=True), protocolVersion=PROTOCOL_VERSION,
+                persistenceFailure=False, outbox=dict(pending=0), queue=dict(inflight=0))
+
+
+def raw_status_runner():
+    """A runner that answers the raw-status child and delegates everything else."""
+    base = Runner()
+    def run(argv):
+        if argv[1:] == ['-m', 'yeoman_gateway', 'raw', 'status', '--json']:
+            return CompletedProcess(argv, 0, json.dumps(raw_status()), '')
+        return Runner.__call__(base, argv)
+    return run
+
+
+def aggregated_refusal():
+    """The plain, errno-less OSError asyncio raises when every address family is refused."""
+    error = OSError("Multiple exceptions: [Errno 111] Connect call failed ('::1', 3001, 0, 0), "
+                    "[Errno 111] Connect call failed ('127.0.0.1', 3001)")
+    assert type(error) is OSError and error.errno is None, 'the live refusal is a plain OSError'
+    return error
+
+
+def test_health_polls_through_an_aggregated_connection_refusal(tmp_path):
+    module = host_module()
+    attempts = []
+    def probe():
+        attempts.append(len(attempts) + 1)
+        if len(attempts) == 1:
+            raise aggregated_refusal()
+        return bridge_health()
+    control = module.live_host_controls(inventory=inventory(), runner=raw_status_runner(),
+                                        clock=Clock(), bridge_probe=probe)
+    p = payload(tmp_path)
+    p['record']['python'] = sys.executable
+    result = control('health', p)
+    assert result['ok'], result
+    assert attempts == [1, 2]
+
+
+def test_readiness_refuses_with_the_bounded_timeout_when_the_probe_never_answers(tmp_path):
+    module = host_module()
+    attempts = []
+    def probe():
+        attempts.append(1)
+        raise aggregated_refusal()
+    clock = Clock()
+    control = module.live_host_controls(inventory=inventory(), runner=raw_status_runner(),
+                                        clock=clock, bridge_probe=probe)
+    p = payload(tmp_path)
+    p['record'].update(python=sys.executable, readiness_timeout_seconds=60)
+    with pytest.raises(ValueError) as failure:
+        control('health', p)
+    assert str(failure.value) == 'readiness_timeout'
+    assert isinstance(failure.value.__cause__, OSError)
+    assert len(attempts) > 1 and clock.now >= 160
+
+
+@pytest.mark.parametrize('raised', [ValueError('readiness_protocol_mismatch'), KeyError('synthetic')])
+def test_readiness_never_swallows_an_unrelated_error(tmp_path, raised):
+    module = host_module()
+    attempts = []
+    def probe():
+        attempts.append(1)
+        raise raised
+    clock = Clock()
+    control = module.live_host_controls(inventory=inventory(), runner=Runner(),
+                                        clock=clock, bridge_probe=probe)
+    with pytest.raises(type(raised)) as failure:
+        control('health', payload(tmp_path))
+    assert str(failure.value) == str(raised)
+    assert attempts == [1] and clock.now == 100.0
+
+
+def capture_payload(tmp_path, *, timeout=60):
+    import sqlite3
+
+    knowledge = tmp_path/'knowledge.db'
+    with sqlite3.connect(knowledge) as db:
+        db.executescript("CREATE TABLE knowledge_meta(key TEXT,value TEXT); "
+                         "INSERT INTO knowledge_meta VALUES ('schema_version','2');")
+    return dict(home=str(tmp_path), receipts=[], record=dict(
+        python=sys.executable, readiness_timeout_seconds=timeout,
+        layout=dict(knowledge_live=str(knowledge), history=str(tmp_path/'history.db'), raw=str(tmp_path/'raw'))))
+
+
+def test_capture_handover_polls_while_the_store_is_not_observable(tmp_path):
+    module = host_module()
+    p = capture_payload(tmp_path)
+    runner = Runner()
+    def run(argv):
+        if argv[1:4] == ['-m', 'yeoman_gateway', 'raw']:
+            return CompletedProcess(argv, 0, 'status=ok', '')
+        return Runner.__call__(runner, argv)
+    control = module.live_host_controls(inventory=inventory(), runner=run, clock=Clock())
+    with pytest.raises(ValueError, match='readiness_timeout'):
+        control('validate-capture-handover', p)
+
+
+def test_capture_readiness_is_false_while_unobservable_and_true_once_ready(tmp_path, monkeypatch):
+    import sqlite3
+
+    module = host_module()
+    p = capture_payload(tmp_path)
+    assert module._capture_ready(p) is False
+    monkeypatch.setattr(module, '_boundary', lambda payload: dict(generation=2, sources=[]))
+    with sqlite3.connect(tmp_path/'knowledge.db') as db:
+        db.execute("UPDATE knowledge_meta SET value='3' WHERE key='schema_version'")
+        db.execute('CREATE TABLE knowledge_history_capture_state(key TEXT,value_json TEXT,version INTEGER)')
+        db.execute("INSERT INTO knowledge_history_capture_state VALUES ('handover',?,1)",
+                   (json.dumps(dict(version=1, generation=1, sources=[])),))
+    assert module._capture_ready(p) is True
