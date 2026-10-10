@@ -597,6 +597,19 @@ def test_rehearsal_record_refuses_runtime_acquisition_output(tmp_path):
     assert c.calls == []
 
 
+def test_prepare_input_bundle_refuses_runtime_preparation_home(tmp_path):
+    """The staged preparation home is an output and must stay outside the runtime home."""
+    import os
+    m = host_module()
+    home = Path(os.environ['YEOMAN_HOME']) / 'data' / 'preparation'
+    payload_ = payload(tmp_path / 'copy')
+    payload_['record'].update(output=str(tmp_path / 'snapshot'),
+                              layout=dict(preparation_home=str(home)))
+    with pytest.raises(ValueError, match='runtime paths are refused'):
+        m._prepare_inputs(payload_, {})
+    assert not home.exists()
+
+
 def test_rehearsal_text_symlink_refused_before_read(tmp_path):
     import hashlib
     home = tmp_path/'copy'

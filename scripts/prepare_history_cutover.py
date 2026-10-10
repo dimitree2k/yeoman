@@ -1,6 +1,10 @@
 #!/usr/bin/env python3
 """Isolated preparation only. The coordinator supplies cutover-inputs.json in snapshot-home.
 
+Read-only inputs (history_db, knowledge_source, policy_snapshot) may be the live
+stores, so they are shape-checked but not required to leave the runtime home; every
+output and target must still be isolated from it.
+
 Version-1 input: legacy_rows, preserved_rows (see _history_cutover), capture_rows
 (preserved order/completion proofs), conversion_digest, snapshot_digest. No real
 inputs/defaults are embedded here. Output is a private refs-only manifest and v3
@@ -40,6 +44,10 @@ from yeoman_shared.raw_archive.records import enumerate_committed
 
 _ARGUMENTS = ("snapshot_home", "history_db", "knowledge_source", "knowledge_target",
               "policy_snapshot", "output_root")
+# Read-only inputs may be the live store itself (the live cutover reads the live
+# schema-4 history DB); every output and target must stay outside the runtime home.
+_INPUT_ARGUMENTS = ("history_db", "knowledge_source", "policy_snapshot")
+_OUTPUT_ARGUMENTS = ("snapshot_home", "knowledge_target", "output_root")
 _COUNTS = ("total", "mapped", "missing", "ambiguous", "changed", "purged_revoked",
            "other_channel", "legacy_node", "no_legacy_row_pending", "candidate_copies", "statements", "jobs", "withheld_statements",
            "affected_jobs", "duplicate_observations", "duplicate_mapped_sources", "historical_backfill_aliases", "unmapped_terminal_job_refs",
@@ -55,19 +63,30 @@ def _affected_counts(rows, statements, jobs, aliases):
             and channels[r['event_id'],r['revision']]=='whatsapp' for r in json.loads(job['sources_json'])) for job in jobs))
 
 
-def _guard(paths: list[Path]) -> None:
+def _unsymlinked_absolute(paths: list[Path]) -> None:
     if any(not p.is_absolute() for p in paths):
         raise ValueError("unsafe_paths")
-    # The shared resolver guard calls ensure_dir; refuse bad paths before that I/O.
-    homes = (Path("/home/dm/.yeoman"), Path.home() / ".yeoman",
-             Path(os.environ.get("YEOMAN_HOME", Path.home() / ".yeoman")))
-    protected = homes
     for path in paths:
         for candidate in (path, *(Path(str(path) + s) for s in ("-wal", "-shm", ".lock"))):
             if any(p.is_symlink() for p in (candidate, *candidate.parents)):
                 raise ValueError("unsafe_paths")
+
+
+def _guard_inputs(paths: list[Path]) -> None:
+    """Read-only inputs keep the path-shape rules; the live store is a valid input."""
+    _unsymlinked_absolute(paths)
+
+
+def _guard_outputs(paths: list[Path]) -> None:
+    """Outputs and targets keep the strict isolation guarantee."""
+    _unsymlinked_absolute(paths)
+    # The shared resolver guard calls ensure_dir; refuse bad paths before that I/O.
+    homes = (Path("/home/dm/.yeoman"), Path.home() / ".yeoman",
+             Path(os.environ.get("YEOMAN_HOME", Path.home() / ".yeoman")))
+    for path in paths:
+        for candidate in (path, *(Path(str(path) + s) for s in ("-wal", "-shm", ".lock"))):
             resolved = candidate.resolve()
-            if any(resolved == root.resolve() or root.resolve() in resolved.parents for root in protected):
+            if any(resolved == root.resolve() or root.resolve() in resolved.parents for root in homes):
                 raise ValueError("unsafe_paths")
 
 
@@ -80,15 +99,17 @@ def _private_json(path: Path, value: Any) -> None:
 
 
 def prepare(args: argparse.Namespace) -> dict[str, Any]:
-    paths = [getattr(args, name) for name in _ARGUMENTS]
+    inputs = [getattr(args, name) for name in _INPUT_ARGUMENTS]
+    outputs = [getattr(args, name) for name in _OUTPUT_ARGUMENTS]
     bundle_path = args.snapshot_home / "cutover-inputs.json"
     raw = args.snapshot_home / "raw"
     manifest_path = args.output_root / "legacy-alias-manifest.json"
-    _guard([*paths, bundle_path, raw, manifest_path])
+    _guard_inputs(inputs)
+    _guard_outputs([*outputs, bundle_path, raw, manifest_path])
     # Metadata scan rejects symlink descendants before the first content read.
     for root, dirs, files in os.walk(raw, followlinks=False):
-        _guard([Path(root) / name for name in (*dirs, *files)])
-    require_isolated_paths(*paths, bundle_path, raw, manifest_path)
+        _guard_outputs([Path(root) / name for name in (*dirs, *files)])
+    require_isolated_paths(*outputs, bundle_path, raw, manifest_path)
     if (args.knowledge_target == args.knowledge_source or args.output_root.exists()
             or args.knowledge_target.exists()):
         raise ValueError("occupied_output")
@@ -221,7 +242,8 @@ def main(argv: list[str] | None = None) -> int:
         return 1
     try:
         try:
-            _guard([getattr(args, name) for name in _ARGUMENTS])
+            _guard_outputs([getattr(args, name) for name in _OUTPUT_ARGUMENTS])
+            _guard_inputs([getattr(args, name) for name in _INPUT_ARGUMENTS])
         except ValueError:
             print(json.dumps({"ok": False, "error": "unsafe_paths"}, sort_keys=True))
             return 1

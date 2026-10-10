@@ -3,6 +3,9 @@
 import copy
 import importlib.util
 import json
+import os
+import sqlite3
+from contextlib import closing
 from dataclasses import asdict, replace
 from pathlib import Path
 
@@ -200,8 +203,8 @@ def test_operator_refuses_paths_before_access(tmp_path, monkeypatch, capsys):
     assert json.loads(capsys.readouterr().out)["error"] == "unsafe_paths"
 
 
-@pytest.mark.parametrize("duplicate",[False,True])
-def test_operator_prepares_private_manifest_and_handover(tmp_path, capsys,duplicate):
+def _operator_case(tmp_path, *, duplicate=False, history_root=None):
+    """Minimal isolated preparation fixture; history_root stages the live-shaped DB."""
     from yeoman_gateway.history.attestations import make
     from yeoman_gateway.history.project import project
     from yeoman_gateway.knowledge._store import KnowledgeStore
@@ -251,10 +254,25 @@ def test_operator_prepares_private_manifest_and_handover(tmp_path, capsys,duplic
     output = tmp_path / "output"
     policy = tmp_path / "policy-copy.json"
     policy.write_text(json.dumps({"defaults": {"whoCanTalk": {"mode": "everyone"}}}))
+    if history_root is not None:
+        # The live cutover reads the live database in place; only its location differs here.
+        history_root.mkdir(mode=0o700, parents=True, exist_ok=True)
+        staged = history_root / "history.db"
+        with closing(sqlite3.connect(db)) as origin, closing(sqlite3.connect(staged)) as live:
+            origin.backup(live)
+        db = staged
     values = (home, db, source, target, policy, output)
     argv = [item for name, path in zip(module._ARGUMENTS, values, strict=True)
             for item in ("--" + name.replace("_", "-"), str(path))]
-    assert module.main(argv) == 0
+    return {"module": module, "argv": argv, "home": home, "db": db, "source": source,
+            "target": target, "output": output, "policy": policy, "mid": mid}
+
+
+@pytest.mark.parametrize("duplicate",[False,True])
+def test_operator_prepares_private_manifest_and_handover(tmp_path, capsys,duplicate):
+    case = _operator_case(tmp_path, duplicate=duplicate)
+    module, output, mid = case["module"], case["output"], case["mid"]
+    assert module.main(case["argv"]) == 0
     summary = json.loads(capsys.readouterr().out)
     assert summary["ok"] and summary["handover"] and summary["total"] == 0
     assert summary["duplicate_observations"]==int(duplicate)
@@ -273,6 +291,74 @@ def test_operator_prepares_private_manifest_and_handover(tmp_path, capsys,duplic
     assert manifest_path.stat().st_mode & 0o777 == 0o600
     assert output.stat().st_mode & 0o777 == 0o700
     assert "Synthetic original" not in manifest_path.read_text()
+
+
+def _runtime_home() -> Path:
+    """The session runtime home conftest pins; live-shaped without touching the real one."""
+    return Path(os.environ["YEOMAN_HOME"])
+
+
+def test_live_history_db_inside_runtime_home_is_accepted(tmp_path, capsys):
+    """A live cutover reads the live schema-4 DB in place; only outputs stay isolated."""
+    history_root = _runtime_home() / "data" / "history"
+    case = _operator_case(tmp_path, history_root=history_root)
+    assert case["db"] == history_root / "history.db"
+    assert case["module"].main(case["argv"]) == 0
+    summary = json.loads(capsys.readouterr().out)
+    assert summary["ok"] is True and summary["handover"] is True
+    assert (case["output"] / "legacy-alias-manifest.json").is_file()
+
+
+def test_read_only_inputs_and_outputs_are_guarded_by_role():
+    module = script()
+    home = _runtime_home() / "data"
+    # Read-only inputs keep the shape rules but may live under the runtime home.
+    module._guard_inputs([home / "history" / "history.db", home / "policy-copy.json",
+                          home / "knowledge-source.db"])
+    with pytest.raises(ValueError, match="unsafe_paths"):
+        module._guard_inputs([Path("relative.db")])
+    # Every output and target keeps the full isolation guarantee.
+    for name in ("snapshot", "knowledge-target.db", "alias-output"):
+        with pytest.raises(ValueError, match="unsafe_paths"):
+            module._guard_outputs([home / name])
+
+
+@pytest.mark.parametrize("name", ["snapshot_home", "knowledge_target", "output_root"])
+def test_runtime_home_output_is_refused_before_access(tmp_path, monkeypatch, capsys, name):
+    module = script()
+    values = {"snapshot_home": tmp_path / "snap", "history_db": tmp_path / "history.db",
+              "knowledge_source": tmp_path / "source.db", "knowledge_target": tmp_path / "target.db",
+              "policy_snapshot": tmp_path / "policy.json", "output_root": tmp_path / "out"}
+    values[name] = _runtime_home() / "data" / name
+    argv = [item for key in module._ARGUMENTS
+            for item in ("--" + key.replace("_", "-"), str(values[key]))]
+    monkeypatch.setattr(Path, "read_bytes", lambda _: pytest.fail("read before refusal"))
+    monkeypatch.setattr(Path, "mkdir", lambda *a, **kw: pytest.fail("mkdir before refusal"))
+    assert module.main(argv) == 1
+    assert json.loads(capsys.readouterr().out) == {"ok": False, "error": "unsafe_paths"}
+
+
+@pytest.mark.parametrize("shape", ["parent", "wal"])
+def test_symlinked_history_input_is_refused(tmp_path, monkeypatch, capsys, shape):
+    module = script()
+    history = tmp_path / "history"
+    history.mkdir()
+    history_db = history / "history.db"
+    history_db.write_bytes(b"synthetic")
+    if shape == "parent":
+        link = tmp_path / "link"
+        link.symlink_to(history, target_is_directory=True)
+        history_db = link / "history.db"
+    else:
+        (history / "history.db-wal").symlink_to(tmp_path / "elsewhere")
+    values = {"snapshot_home": tmp_path / "snap", "history_db": history_db,
+              "knowledge_source": tmp_path / "source.db", "knowledge_target": tmp_path / "target.db",
+              "policy_snapshot": tmp_path / "policy.json", "output_root": tmp_path / "out"}
+    argv = [item for key in module._ARGUMENTS
+            for item in ("--" + key.replace("_", "-"), str(values[key]))]
+    monkeypatch.setattr(Path, "read_bytes", lambda _: pytest.fail("read before refusal"))
+    assert module.main(argv) == 1
+    assert json.loads(capsys.readouterr().out) == {"ok": False, "error": "unsafe_paths"}
 
 
 def test_current_progress_cursor_alone_does_not_prove_historical_exclusion(capture_case):

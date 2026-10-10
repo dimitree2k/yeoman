@@ -2,7 +2,9 @@
 """Synthetic whole-set cutover witnesses; host controls are never installed."""
 import importlib.util
 import json
+import os
 import sqlite3
+from contextlib import closing
 from pathlib import Path
 
 import pytest
@@ -171,6 +173,39 @@ def test_cutover_reader_order_and_all_committed_release(tmp_path):
         result = m.run_cutover(record=path, home=home, apply=True)
     assert result['ok'] and not result['fenced']
     assert c.calls.index('all-committed-barrier') < c.calls.index('release-fence') < c.calls.index('start-overseer') < c.calls.index('start-timers')
+
+
+def _v3_knowledge(path):
+    """Minimal schema-3 stand-in: publish-v3 verifies two rows, then copies the bytes."""
+    with closing(sqlite3.connect(path)) as db:
+        db.execute("CREATE TABLE knowledge_meta (key TEXT PRIMARY KEY, value TEXT NOT NULL)")
+        db.execute("CREATE TABLE knowledge_history_capture_state (key TEXT PRIMARY KEY,"
+                   " value_json TEXT NOT NULL, version INTEGER NOT NULL)")
+        db.execute("INSERT INTO knowledge_meta VALUES ('schema_version','3')")
+        db.execute("INSERT INTO knowledge_history_capture_state VALUES ('handover',?,1)",
+                   (json.dumps({'version': 1}),))
+        db.commit()
+    return path
+
+
+def test_publish_v3_writes_live_knowledge_and_refuses_symlinks(tmp_path):
+    """Publication targets the configured live location; path shape rules still hold."""
+    m = procedure()
+    source = _v3_knowledge(tmp_path / 'v3.db')
+    live_home = Path(os.environ['YEOMAN_HOME']) / 'data' / 'knowledge'
+    live_home.mkdir(parents=True, exist_ok=True)
+    live = live_home / 'knowledge.db'
+    layout = {'knowledge_target': str(source), 'knowledge_live': str(live)}
+    controls = m.preparation_controls(host=lambda action, payload: pytest.fail('host called'))
+    result = controls('publish-v3', {'record': {'output': str(tmp_path / 'snapshot'), 'layout': layout}})
+    assert result['ok'] and result['complete'] and result['handover']
+    assert live.read_bytes() == source.read_bytes()
+    assert result['sha256'] == __import__('hashlib').sha256(source.read_bytes()).hexdigest()
+    link = tmp_path / 'linked-live.db'
+    link.symlink_to(tmp_path / 'elsewhere.db')
+    layout['knowledge_live'] = str(link)
+    with pytest.raises(ValueError, match='symlink_refused'):
+        controls('publish-v3', {'record': {'output': str(tmp_path / 'snapshot'), 'layout': layout}})
 
 
 def test_cutover_whole_set_restore_preserves_layer1_and_revocations(tmp_path):
