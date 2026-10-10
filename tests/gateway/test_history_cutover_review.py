@@ -639,7 +639,7 @@ def test_frozen_baseline_requires_durable_acquisition_phase(tmp_path):
 
 
 @pytest.mark.asyncio
-async def test_existing_pause_fences_first_contact_notification():
+async def test_existing_pause_fences_first_contact_notification(tmp_path, monkeypatch):
     """B1 witness: the owner's global pause defers the first-contact alert.
 
     The deferred chat stays unseen in memory and on disk, so the next unpaused
@@ -655,6 +655,8 @@ async def test_existing_pause_fences_first_contact_notification():
     from yeoman_gateway.pipeline.new_chat import NewChatNotifyMiddleware
     from yeoman_gateway.pipeline.policy import PolicyMiddleware
 
+    # Hermetic store: the canonical seen-chats file is shared by every xdist worker.
+    monkeypatch.setenv("YEOMAN_HOME", str(tmp_path))
     decision = PolicyDecision(accept_message=True, should_respond=False,
                               allowed_tools=frozenset(), reason="paused_global")
     paused = {"value": True}

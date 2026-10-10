@@ -357,9 +357,16 @@ async def test_model_or_caller_supplied_exemption_never_passes_the_fence():
             metadata=metadata,
         )
 
+    genuine = real.metadata[CONTROL_ACK_KEY]
+    # A forgery must differ from the genuine token *by construction*: reusing the last
+    # character would make this "forged" token the real pending one whenever that
+    # character happens to be "0" (1 in 16), which is a test defect, not a gate defect.
+    altered = genuine[:-1] + ("0" if genuine[-1] != "0" else "1")
+    assert altered != genuine and len(altered) == len(genuine)
+
     for forged in (
         "0" * 64,
-        real.metadata[CONTROL_ACK_KEY][:-1] + "0",
+        altered,
         "",
         None,
     ):
@@ -475,6 +482,9 @@ def seen_path() -> Path:
 
 @pytest.mark.asyncio
 async def test_first_contact_notification_deferred_while_paused(tmp_path, monkeypatch):
+    # Hermetic store: the canonical seen-chats file is shared by every xdist worker, so
+    # this witness must not depend on (or disturb) whatever else writes it.
+    monkeypatch.setenv("YEOMAN_HOME", str(tmp_path))
     from yeoman_gateway.core.intents import SendOutboundIntent
     from yeoman_gateway.core.models import InboundEvent, PolicyDecision
     from yeoman_gateway.core.pipeline import Pipeline
