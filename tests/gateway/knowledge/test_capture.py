@@ -137,12 +137,16 @@ def test_revoked_source_cannot_be_captured(knowledge_harness):
     h = knowledge_harness
     tom = h.person("Tom")
     source = h.source(tom)
-    h.authority.revoke_source(source)  # noqa: SLF001 - trusted adapter state
+    h.history_sources.mark_source_revoked(source)
     with pytest.raises(KnowledgeError) as excinfo:
         h.service.capture(
             h.candidate("Alex reist.", source), context=h.capture_context(source)
         )
-    assert excinfo.value.code == "source_revoked"
+    assert excinfo.value.code == "denied_unknown_basis"
+    assert h.snapshot_counts()["knowledge_statements"] == 0
+    result = h.recall_text("Alex reist.", h.read_context(tom))
+    assert result.statement_ids == ()
+    assert result.text == ""
 
 
 def test_caller_supplied_audience_is_not_part_of_the_contract():
@@ -232,7 +236,7 @@ def test_ambiguous_name_stays_unresolved_instead_of_picking_a_person(knowledge_h
     )
     sid = result.statement_ids[0]
     assert {link.role for link in h.links(sid)} == {"speaker"}
-    assert h.snapshot_counts()["contacts"] == 3
+    assert len(h.queries._rows("SELECT contact_id FROM contacts")) == 3
 
 
 def test_capture_result_reports_rejected_entries(knowledge_harness):

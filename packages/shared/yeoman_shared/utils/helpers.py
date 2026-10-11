@@ -72,13 +72,6 @@ def get_run_path() -> Path:
     return ensure_dir(get_data_path() / "run")
 
 
-def get_session_state_path() -> Path:
-    """Return the frozen legacy session-state path without creating it."""
-    yeoman_home = os.environ.get("YEOMAN_HOME", "").strip()
-    root = Path(yeoman_home) if yeoman_home else Path.home() / ".yeoman"
-    return root / "data" / "memory" / "session-state"
-
-
 def get_operational_store_path(
     name: str, *, data_dir: Path | None = None, create: bool = True
 ) -> Path:
@@ -129,12 +122,11 @@ def get_workspace_path(workspace: str | None = None) -> Path:
 
 
 def get_sessions_path(*, create: bool = True) -> Path:
-    """Get the session history directory (~/.yeoman/data/inbound)."""
-    if create:
-        return ensure_dir(get_operational_data_path() / "inbound")
+    """Get the non-WhatsApp operational session directory."""
     yeoman_home = os.environ.get("YEOMAN_HOME", "").strip()
     root = Path(yeoman_home) if yeoman_home else Path.home() / ".yeoman"
-    return root / "data" / "inbound"
+    path = root / "data" / "ops" / "telegram-sessions"
+    return ensure_dir(path) if create else path
 
 
 def get_memory_path(workspace: Path | None = None) -> Path:

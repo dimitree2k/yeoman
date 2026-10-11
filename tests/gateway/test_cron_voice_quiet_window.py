@@ -9,11 +9,12 @@ import pytest
 from yeoman_gateway.cron.service import CronJobDeferredError, CronService
 from yeoman_gateway.cron.types import CronPayload, CronSchedule
 from yeoman_gateway.cron.voice import evaluate_voice_quiet_gate
-from yeoman_gateway.storage.inbound_archive import InboundArchive
+
+from tests.gateway.synthetic_reply_archive import SyntheticReplyArchive
 
 
-def _archive(tmp_path: Path) -> InboundArchive:
-    return InboundArchive(tmp_path / "reply_context.db")
+def _archive(tmp_path: Path) -> SyntheticReplyArchive:
+    return SyntheticReplyArchive(tmp_path / "reply_context.db")
 
 
 def _voice_payload(**overrides: object) -> CronPayload:

@@ -2,8 +2,8 @@
 
 The test drives the actual :class:`Orchestrator` pipeline with an injected fake provider
 and a recording transport, over a temporary knowledge database.  Identity and ACL are
-*not* mocked: they come from the knowledge facade, a fake-but-explicit policy authority
-and a chat registry whose membership is the only membership in play.
+*not* mocked: they come from the knowledge facade and a fake-but-explicit policy
+authority whose synthetic membership is the only membership in play.
 
 A successful spy send proves local routing only - no WhatsApp connection is involved.
 """
@@ -17,19 +17,14 @@ from typing import Any
 import pytest
 from yeoman_gateway.core.models import InboundEvent, PolicyDecision
 from yeoman_gateway.core.orchestrator import Orchestrator
-from yeoman_gateway.knowledge.api import open_knowledge_store
-from yeoman_gateway.knowledge.authority import EvidenceAudience, FakeSourceAuthority
+from yeoman_gateway.knowledge.api import KnowledgeService
 from yeoman_gateway.knowledge.models import (
-    Identifier,
     PersonLinkCandidate,
     SourceRef,
     StatementCandidate,
-    TrustedCaptureContext,
-    TrustedIdentityObservation,
     TrustedReadContext,
 )
 from yeoman_gateway.providers.base import LLMProvider, LLMResponse
-from yeoman_gateway.storage.chat_registry import ChatRegistry
 
 CHAT = "120363000000000001@g.us"
 DM = "4910000000002@s.whatsapp.net"
@@ -126,42 +121,20 @@ class EndToEnd:
     def __init__(self, tmp_path: Path) -> None:
         self.tmp_path = tmp_path
         self.policy = _Policy()
-        self.authority = FakeSourceAuthority()
-        self.knowledge = open_knowledge_store(
-            tmp_path / "knowledge.db",
-            workspace_id="e2e",
-            source_authority=self.authority,
-            policy_authority=self.policy,
-        )
+        from tests.gateway.knowledge.conftest import KnowledgeHarness
+
+        self.history = KnowledgeHarness(tmp_path / "history")
+        self.knowledge: KnowledgeService = self.history.service
         self.provider = SpyProvider()
         self.transport = TransportSpy()
-        self.registry = ChatRegistry(db_path=tmp_path / "chat_registry.db")
         self.people: dict[str, str] = {}
-        self._observations = 0
-        self._sources = 0
 
     # ── setup helpers ────────────────────────────────────────────────────────
 
     def person(self, principal: str, name: str, *, preferred: str | None = None) -> str:
-        self._observations += 1
-        number = principal.split(":", 1)[1]
-        observation = TrustedIdentityObservation(
-            identifiers=(
-                Identifier("whatsapp", "phone_jid", f"{number}@s.whatsapp.net"),
-            ),
-            evidence_ref=f"obs-{self._observations}",
-            observed_name=name,
-            observed_at_ms=1_700_000_000_000,
-        )
-        self.authority.issue_observation(observation)
-        resolved = self.knowledge.resolve_person(observation)
-        assert resolved.person_id, resolved.reason
-        self.people[principal] = resolved.person_id
-        if preferred:
-            self.knowledge.set_preferred_name(
-                resolved.person_id, preferred, context=self.admin_context()
-            )
-        return resolved.person_id
+        person_id = self.history.person_for(principal, preferred or name)
+        self.people[principal] = person_id
+        return person_id
 
     def admin_context(self):
         from yeoman_gateway.knowledge.models import TrustedAdminContext
@@ -181,32 +154,22 @@ class EndToEnd:
         audience: set[str] | None = None,
         author_only: bool = False,
     ) -> SourceRef:
-        self._sources += 1
-        source = SourceRef(
-            event_id=f"evt-{self._sources}",
-            revision=1,
-            channel="whatsapp",
-            chat_id=chat,
-            author_principal=author,
-            occurred_at_ms=1_700_000_000_000,
+        person_id = self.people.get(author)
+        if person_id is None:
+            person_id = self.person(author, author)
+        return self.history.source(
+            person_id, chat=chat, audience=audience or {author},
+            author_only=author_only, when_ms=1_700_000_000_000,
         )
-        if author_only:
-            self.authority.issue_source(source, EvidenceAudience.author_only())
-        else:
-            self.authority.issue_source(
-                source, EvidenceAudience.known(audience or {author})
-            )
-        return source
 
     def register_chat(self, *, chat_id: str, members: set[str]) -> None:
-        self.registry.register_chat(
-            channel="whatsapp",
-            chat_id=chat_id,
-            chat_type="group" if chat_id.endswith("@g.us") else "direct",
-            readable_name="synthetic",
-            metadata={"participants": [{"id": member} for member in sorted(members)]},
-        )
         self.policy.set_members("whatsapp", chat_id, members, revision=f"rev-{len(members)}")
+        context = TrustedReadContext(
+            principal_id=OWNER, channel="whatsapp", chat_id=chat_id,
+            recipient_principals=frozenset(members), membership_revision=f"rev-{len(members)}",
+            policy_revision=self.history.policy.revision, purpose="reply", now_ms=self.history.clock.now_ms(),
+        )
+        self.history.policy.set_members(context, members, revision=f"rev-{len(members)}")
 
     def capture(
         self,
@@ -227,14 +190,7 @@ class EndToEnd:
             extractor_version="e2e-extractor",
             confidence=0.5,
         )
-        context = TrustedCaptureContext(
-            request_id=f"cap-{source.event_id}",
-            policy_revision=self.policy.revision,
-            capture_basis="user_message",
-            authorized_sources=(source,),
-            actor_principal=source.author_principal,
-            authorized=True,
-        )
+        context = self.history.capture_context(source)
         result = self.knowledge.capture(candidate, context=context)
         assert result.statement_ids, result.rejected
         return result.statement_ids[0]
@@ -242,7 +198,7 @@ class EndToEnd:
     def read_context(
         self, reader: str, *, chat: str = CHAT, recipients: set[str], purpose: str = "reply"
     ) -> TrustedReadContext:
-        return TrustedReadContext(
+        context = TrustedReadContext(
             principal_id=reader,
             channel="whatsapp",
             chat_id=chat,
@@ -254,6 +210,8 @@ class EndToEnd:
             is_direct=not chat.endswith("@g.us"),
             owner=reader in self.policy.owners,
         )
+        self.history.policy.set_members(context, recipients, revision=context.membership_revision or "")
+        return context
 
     def identity_revision(self) -> int:
         return self.knowledge.stats(context=self.admin_context()).identity_revision
@@ -265,7 +223,6 @@ class EndToEnd:
             policy=_AllowAll(),
             responder=responder,
             reply_archive=None,
-            contacts=None,
             knowledge=self.knowledge,
             reply_context_window_limit=6,
             reply_context_line_max_chars=500,
@@ -273,8 +230,7 @@ class EndToEnd:
         )
 
     def close(self) -> None:
-        self.knowledge.close()
-        self.registry.close()
+        self.history.close()
 
 
 class _AllowAll:
@@ -354,6 +310,10 @@ async def test_shared_claim_is_retrievable_and_private_claim_is_not(e2e):
 @pytest.mark.asyncio
 async def test_middleware_chain_runs_with_knowledge_context(e2e):
     """The real middleware chain accepts the event and the responder sees it."""
+    from yeoman_gateway.history.context import _HISTORY, history_knowledge_scope, history_turn
+
+    from tests.gateway.history_turn_fixtures import Projector
+
     responder = _Responder(e2e.provider, e2e.knowledge)
     orchestrator = e2e.orchestrator(responder)
     event = InboundEvent(
@@ -364,7 +324,16 @@ async def test_middleware_chain_runs_with_knowledge_context(e2e):
         content="hallo",
         raw_metadata={"sender_name": "Alex push"},
     )
-    intents = await orchestrator.handle(event)
+    projector = Projector()
+    e2e.history._history_db.backup(projector.db)
+    history_token = _HISTORY.set(None)
+    try:
+        async with history_turn(projector) as snapshot:
+            with history_knowledge_scope(snapshot, e2e.knowledge):
+                intents = await orchestrator.handle(event)
+    finally:
+        _HISTORY.reset(history_token)
+        projector.close()
     assert responder.seen, "the responder was never reached"
     assert e2e.provider.model_calls == 1
     for intent in intents:
@@ -408,14 +377,7 @@ async def test_revoked_source_cannot_reach_the_provider(e2e):
     prepared = e2e.knowledge.recall(RecallQuery(person_ids=(alex,)), context=context)
     assert prepared.statement_ids
 
-    capture_context = TrustedCaptureContext(
-        request_id="revoke-1",
-        policy_revision=e2e.policy.revision,
-        capture_basis="user_message",
-        authorized_sources=(source,),
-        actor_principal=TOM,
-        authorized=True,
-    )
+    capture_context = e2e.history.capture_context(source)
     e2e.knowledge.invalidate_source(source, context=capture_context)
     checked = e2e.knowledge.revalidate(prepared, context=context)
     assert checked.statement_ids == ()
@@ -424,34 +386,6 @@ async def test_revoked_source_cannot_reach_the_provider(e2e):
 
 
 @pytest.mark.asyncio
-async def test_merge_and_undo_keep_the_statement_visible_for_both_ids(e2e):
-    alex, maria = e2e.people[ALEX], e2e.people[MARIA]
-    source = e2e.source(TOM, audience={TOM, ALEX, MARIA})
-    statement_id = e2e.capture(
-        "Alex und Maria reisen.",
-        source,
-        people=((alex, "subject"), (maria, "participant")),
-    )
-    from yeoman_gateway.knowledge.models import RecallQuery
-
-    context = e2e.read_context(TOM, recipients={TOM, ALEX, MARIA})
-    receipt = e2e.knowledge.merge_people(
-        alex, maria, expected_revision=e2e.identity_revision(), context=e2e.admin_context()
-    )
-    assert e2e.knowledge.recall(RecallQuery(person_ids=(alex,)), context=context).statement_ids == (
-        statement_id,
-    )
-    assert e2e.knowledge.recall(RecallQuery(person_ids=(maria,)), context=context).statement_ids == (
-        statement_id,
-    )
-    e2e.knowledge.undo_merge(
-        receipt.operation_id, expected_revision=receipt.identity_revision, context=e2e.admin_context()
-    )
-    assert e2e.knowledge.recall(RecallQuery(person_ids=(maria,)), context=context).statement_ids == (
-        statement_id,
-    )
-
-
 @pytest.mark.asyncio
 async def test_group_member_without_audience_gets_nothing(e2e):
     """The reader may be an owner; a verified non-audience member still blocks output."""
@@ -472,7 +406,7 @@ async def test_deleted_statement_leaves_no_trace_for_the_provider(e2e):
     source = e2e.source(TOM, audience={TOM, ALEX})
     statement_id = e2e.capture("erasable-e2e-7788", source, people=((alex, "subject"),))
     e2e.knowledge.erase_statement(
-        statement_id, expected_source=source, context=e2e.admin_context()
+        statement_id, expected_source=source, context=e2e.history.admin_context()
     )
     from yeoman_gateway.knowledge.models import RecallQuery
 
@@ -481,7 +415,7 @@ async def test_deleted_statement_leaves_no_trace_for_the_provider(e2e):
     assert result.statement_ids == ()
     assert not e2e.provider.saw("erasable-e2e-7788")
     # The tombstone is still inspectable for an administrator.
-    summary = e2e.knowledge.inspect_statement(statement_id, context=e2e.admin_context())
+    summary = e2e.knowledge.inspect_statement(statement_id, context=e2e.history.admin_context())
     assert summary.status == "revoked"
     assert summary.content is None or summary.content == ""
 
@@ -732,9 +666,9 @@ def test_profile_marks_two_values_of_one_group_as_a_conflict(knowledge_harness):
 def test_profile_reports_the_person_and_its_addresses(knowledge_harness):
     h = knowledge_harness
     person = h.observe("whatsapp", "phone_jid", "49181111111@s.whatsapp.net", name="Synthetic P.")
-    h.service.set_preferred_name(person.person_id, "Synthetic Confirmed", context=h.admin_context())
     profile = h.service.person_profile(person.person_id, context=h.read_context(person.person_id))
-    assert profile.display_name == "Synthetic Confirmed"
+    assert profile.display_name == "Synthetic P."
+    assert any(endpoint.value == "49181111111@s.whatsapp.net" for endpoint in profile.endpoints)
     assert profile.identity_revision == h.identity_revision()
     assert profile.acl_epoch == h.acl_epoch()
     assert profile.reason == "ok"

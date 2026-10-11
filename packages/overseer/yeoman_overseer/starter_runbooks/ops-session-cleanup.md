@@ -15,10 +15,8 @@ safety:
 # Session Cleanup
 
 ## Context
-The former workspace/memory/session-state/ location is absent and is not to be
-recreated. Existing files in data/memory/session-state/ are owner-frozen legacy
-copies. Do not write, move, or delete them; deletion requires a later owner
-decision.
+Some frozen legacy runtime files remain under owner control. Do not write, move,
+or delete them; deletion requires a later owner decision.
 
 ## Actions
 No cleanup is authorized. This runbook stays disabled until an owner decides

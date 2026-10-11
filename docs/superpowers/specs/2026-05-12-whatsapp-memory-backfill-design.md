@@ -1,8 +1,14 @@
 # WhatsApp Memory Backfill - Design
 
+Historical document (G6, 2026-10-11): the standalone WhatsApp history stores, legacy history tools and cutover scripts referenced here have been retired. Current runtime reads use canonical History and Knowledge schema 3; old store examples describe the previous implementation.
+
+
 Status: Draft for review
 Date: 2026-05-12
 Owner: Tim
+
+Historical note: the `summarize_history` reader referenced below was retired in
+G6; this draft is not an instruction to restore that tool.
 
 ## 1. Purpose
 

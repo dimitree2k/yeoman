@@ -13,11 +13,9 @@ import sqlite3
 from pathlib import Path
 
 import pytest
-import typer
 from legacy_fixtures import legacy_snapshot_factory, v1_knowledge_store_factory
 from typer.testing import CliRunner
 from yeoman_gateway.cli.knowledge_commands import knowledge_app
-from yeoman_gateway.knowledge.models import TrustedAdminContext
 from yeoman_gateway.knowledge._migration import (
     MigrationSourceError,
     _open_source,
@@ -446,39 +444,6 @@ def test_verify_detects_a_changed_target(tmp_path: Path):
     assert verification.verdict == "failed"
     assert verification.counts_match is False
     assert ("knowledge_statement_principals", 5, 0) in verification.mismatches
-
-
-def test_upgraded_target_opens_as_a_normal_v2_store(tmp_path: Path):
-    """The published target is a real knowledge store, not a migration-only artefact."""
-    from yeoman_gateway.knowledge.api import open_knowledge_store
-    from yeoman_gateway.knowledge.authority import FakePolicyAuthority, FakeSourceAuthority
-
-    fixture = v1_knowledge_store_factory(tmp_path / "v1.db")
-    journal = processing_snapshot(tmp_path / "processing.db")
-    target, manifest = _upgrade_paths(tmp_path)
-    upgrade_v1(source=fixture.path, processing=journal, target=target, manifest=manifest)
-
-    service = open_knowledge_store(
-        target,
-        workspace_id="ws",
-        source_authority=FakeSourceAuthority(),
-        policy_authority=FakePolicyAuthority(
-            admins={"whatsapp:4910000000101"}, capture_actors={"whatsapp:4910000000101"}
-        ),
-    )
-    try:
-        admin = TrustedAdminContext(
-            actor_principal="whatsapp:4910000000101",
-            policy_revision=service.policy_revision,
-            authorization_ref="admin-ref-1",
-            owner=True,
-        )
-        stats = service.stats(context=admin)
-        assert stats.schema_version == 2
-        assert stats.people_count == 3
-        assert stats.statement_count == 5
-    finally:
-        service.close()
 
 
 def test_cli_upgrade_v1_and_verify_v1(tmp_path: Path):

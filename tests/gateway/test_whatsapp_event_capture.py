@@ -8,6 +8,7 @@ import time
 from pathlib import Path
 
 import pytest
+from history_turn_fixtures import Projector
 from yeoman_gateway.bus.events import ReactionMessage
 from yeoman_gateway.bus.queue import MessageBus
 from yeoman_gateway.channels.whatsapp import WhatsAppChannel
@@ -45,6 +46,7 @@ def _frame(
 
 def _channel(store: ProcessingStore) -> WhatsAppChannel:
     channel = WhatsAppChannel(WhatsAppConfig(), MessageBus())
+    channel._history_projector = Projector()
     channel.set_processing_signals(SignalJournalSink(store, clock=lambda: NOW))
     return channel
 
@@ -71,8 +73,6 @@ def test_message_is_committed_before_ack_archive_or_routing(tmp_path: Path) -> N
         return {"acknowledged": True}
 
     channel._send_command = ack  # type: ignore[method-assign]
-    channel._archive_inbound_event = lambda event: order.append("archive")  # type: ignore[method-assign]
-
     async def publish(event):
         order.append("route")
 
@@ -95,7 +95,7 @@ def test_message_is_committed_before_ack_archive_or_routing(tmp_path: Path) -> N
     )
     _drain_inbound(channel)
 
-    assert order == ["ack", "archive", "route"]
+    assert order == ["ack", "route"]
     assert store.count_events() == 1
     store.close()
 
@@ -349,7 +349,6 @@ def test_replay_with_a_shifted_source_timestamp_is_idempotent(tmp_path: Path) ->
         return {}
 
     channel._send_command = ack  # type: ignore[method-assign]
-    channel._archive_inbound_event = lambda event: downstream.append("archive")  # type: ignore[method-assign]
     channel._publish_event = lambda event: downstream.append("route")  # type: ignore[method-assign]
     store.append_event = fail_append  # type: ignore[method-assign]
 
@@ -383,7 +382,6 @@ def test_ack_failure_keeps_canonical_row_but_invokes_no_downstream(tmp_path: Pat
         raise RuntimeError("ack failed")
 
     channel._send_command = fail_ack  # type: ignore[method-assign]
-    channel._archive_inbound_event = lambda event: downstream.append("archive")  # type: ignore[method-assign]
     channel._publish_event = lambda event: downstream.append("route")  # type: ignore[method-assign]
 
     asyncio.run(

@@ -1,5 +1,8 @@
 # Memory Recall Safety Roadmap - Design
 
+Historical document (G6, 2026-10-11): the standalone WhatsApp history stores, legacy history tools and cutover scripts referenced here have been retired. Current runtime reads use canonical History and Knowledge schema 3; old store examples describe the previous implementation.
+
+
 Status: Proposed implementation sequence
 Date: 2026-06-04
 Owner: Tim

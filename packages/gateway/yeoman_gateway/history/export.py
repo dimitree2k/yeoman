@@ -107,17 +107,13 @@ async def read_history_export(projector: HistoryProjector, *, context: TrustedRe
                                      after_ms=after_ms, limit=limit, aggregate=aggregate)
 
 
-def secondary_archive(legacy: Any, config: Any) -> Any:
-    if config.live_projection_enabled and config.readers.secondary:
-        from yeoman_gateway.adapters.reply_archive_history import HistoryReplyArchiveAdapter
-        snapshot = current_history_snapshot()
-        if snapshot is None:
-            raise HistoryPaused('secondary_history_scope_required')
-        history_effect_metadata()
-        return HistoryReplyArchiveAdapter(HistoryQueries(snapshot))
-    if getattr(config, 'legacy_writers_disabled', False):
-        raise HistoryPaused('secondary_reader_unselected')
-    return legacy
+def secondary_archive() -> Any:
+    from yeoman_gateway.adapters.reply_archive_history import HistoryReplyArchiveAdapter
+    snapshot = current_history_snapshot()
+    if snapshot is None:
+        raise HistoryPaused('secondary_history_scope_required')
+    history_effect_metadata()
+    return HistoryReplyArchiveAdapter(HistoryQueries(snapshot))
 
 
 def require_isolated_paths(*paths: Path) -> None:
@@ -160,13 +156,6 @@ def secondary_consumer(function: Any) -> Any:
         channel = kwargs.get('channel') or (getattr(args[0], 'channel', None) if args else None)
         if channel is not None and channel != 'whatsapp':
             return await function(self, *args, **kwargs)
-        config = getattr(self, 'config', getattr(self, '_config', None))
-        history = getattr(config, 'history', None)
-        selected = history is not None and history.live_projection_enabled and history.readers.secondary
-        if not selected:
-            if history is not None and history.legacy_writers_disabled:
-                raise HistoryPaused('secondary_reader_unselected')
-            return await function(self, *args, **kwargs)
         projector = getattr(self, '_history_projector', None)
         if projector is None:
             raise HistoryPaused('secondary_history_projector_required')
@@ -178,16 +167,13 @@ def secondary_consumer(function: Any) -> Any:
 
 class SecondaryArchive:
     """Resolve an adapter on each call, retaining neither a connection nor rows."""
-    def __init__(self, legacy: Any, config: Any):
-        self.legacy, self.config = legacy, config
-
     def __getattr__(self, name: str) -> Any:
         def read(*args: Any, **kwargs: Any) -> Any:
             channel = args[0] if args else kwargs.get('channel')
             if channel != 'whatsapp':
-                return getattr(self.legacy, name)(*args, **kwargs)
-            adapter = secondary_archive(self.legacy, self.config)
-            method = adapter.row if name == 'lookup_message' and adapter is not self.legacy else getattr(adapter, name)
+                return [] if name.startswith(('search_', 'list_')) else None
+            adapter = secondary_archive()
+            method = adapter.row if name == 'lookup_message' else getattr(adapter, name)
             return method(*args, **kwargs)
         return read
 

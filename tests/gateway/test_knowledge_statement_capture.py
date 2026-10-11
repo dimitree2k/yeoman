@@ -24,6 +24,19 @@ from tests.gateway.capture_harness import AUTHOR, GROUP, CaptureHarness, Registr
 IDLE = 60_000
 
 
+@pytest.mark.parametrize(
+    "content, expected",
+    [
+        ('{"statements": [{"content": "synthetic"}]}', {"statements": [{"content": "synthetic"}]}),
+        ('Model output:\n```json\n[{"content": "synthetic"}]\n```', [{"content": "synthetic"}]),
+    ],
+)
+def test_capture_worker_extracts_json_payloads(content: str, expected: object) -> None:
+    from yeoman_gateway.knowledge._capture_worker import _extract_json_payload
+
+    assert _extract_json_payload(content) == expected
+
+
 @pytest.fixture
 def harness(tmp_path: Path) -> CaptureHarness:
     runtime = CaptureHarness(tmp_path, idle_ms=IDLE)
@@ -72,11 +85,10 @@ def test_unknown_audience_is_refused_not_downgraded(harness: CaptureHarness) -> 
     blind = CaptureHarness(harness.tmp_path / "blind", registry=Registry({}), idle_ms=IDLE)
     try:
         blind.activate()
-        blind.observe("Wir treffen uns am Freitag um acht.")
-        blind.advance(IDLE + 1)
-        report = blind.promote()
-        assert report.promoted_sources == 0
-        assert report.refusals.get("unknown_audience") == 1
+        from yeoman_gateway.knowledge.models import KnowledgeError
+
+        with pytest.raises(KnowledgeError, match="denied_unknown_basis"):
+            blind.observe("Wir treffen uns am Freitag um acht.")
         assert blind.jobs() == []
         assert blind.store.count_events() == 1
     finally:
@@ -234,9 +246,11 @@ def test_forward_capture_retries_partial_chunk_enqueue_without_losing_cursor(
         harness.close()
 
 
-def test_the_forward_boundary_survives_a_restart_without_promoting_history(
+def test_the_forward_boundary_survives_close_without_promoting_history(
     tmp_path: Path,
 ) -> None:
+    import sqlite3
+
     first = CaptureHarness(tmp_path, idle_ms=IDLE)
     try:
         first.activate()
@@ -246,16 +260,18 @@ def test_the_forward_boundary_survives_a_restart_without_promoting_history(
     finally:
         first.close()
 
-    second = CaptureHarness(tmp_path, idle_ms=IDLE)
+    # Reopening an existing v3 target through the v2-to-v3 fixture is intentionally
+    # forbidden. Inspect the closed published target directly for durable boundary/job.
+    connection = sqlite3.connect(tmp_path / "knowledge-v3.db")
     try:
-        # Same database, fresh process state: the boundary is durable, so the historic
-        # observation is not promoted a second time and nothing new is queued.
-        assert second.producer.boundary()[0] > 0
-        second.advance(IDLE + 1)
-        assert second.promote().jobs == 0
-        assert len(second.jobs()) == 1
+        metadata = dict(connection.execute("SELECT key, value FROM knowledge_meta"))
+        queued = connection.execute(
+            "SELECT COUNT(*) FROM knowledge_jobs WHERE state = 'queued'"
+        ).fetchone()[0]
     finally:
-        second.close()
+        connection.close()
+    assert int(metadata["statement_capture_boundary_ms"]) > 0
+    assert queued == 1
 
 
 def test_activation_never_promotes_history(harness: CaptureHarness) -> None:
@@ -577,12 +593,10 @@ def test_capture_gate_builds_a_worker_only_when_the_switch_is_on(
         is None
     )
     worker = bootstrap_module.build_statement_capture(
-        on, knowledge=harness.knowledge, processing=harness.store
+        on, knowledge=harness.knowledge, processing=harness.store, projector=object()
     )
     assert worker is not None
     assert built, "the enabled switch must reach the extractor construction"
-    worker.start()
-    worker.stop()
 
 
 def test_capture_enabled_is_read_only_in_the_composition_root() -> None:
@@ -642,7 +656,7 @@ def test_cli_capture_status_is_read_only(tmp_path: Path, harness: CaptureHarness
     harness.promote()
 
     result = CliRunner().invoke(
-        app, ["knowledge", "capture", "status", "--target", str(harness.tmp_path / "knowledge.db")]
+        app, ["knowledge", "capture", "status", "--target", str(harness.tmp_path / "knowledge-v3.db")]
     )
 
     assert result.exit_code == 0, result.output
@@ -653,7 +667,7 @@ def test_cli_capture_status_is_read_only(tmp_path: Path, harness: CaptureHarness
 # ── historic repair and bounded backfill (owner-authorized operations) ───────
 
 
-def test_historic_audience_repair_registers_author_only_and_is_idempotent(
+def test_historic_audience_repair_refuses_rows_without_history_proof(
     harness: CaptureHarness,
 ) -> None:
     from yeoman_gateway.knowledge._capture import HistoricAudienceRepair
@@ -668,15 +682,12 @@ def test_historic_audience_repair_registers_author_only_and_is_idempotent(
     assert harness.source_row(event_id)["audience_status"] == "unknown", "dry run writes nothing"
 
     applied = repair.run(limit=10, apply=True)
-    assert applied.registered == 1
-    row = harness.source_row(event_id)
-    assert row["audience_status"] == "author_only"
-    # The current group members were deliberately *not* granted: a later member must not
-    # inherit a right that was never proven for this revision.
-    assert not row["audience_members"]
-
-    again = repair.run(limit=10, apply=True)
-    assert again.registered == 0 and again.examined == 0
+    # A processing-only historical row has no temporal History attribution proof.
+    # Applying the old repair must fail closed instead of inventing an author grant.
+    assert applied.registered == 0
+    assert applied.refused.get("registration_failed") == 1
+    assert harness.source_row(event_id)["audience_status"] == "unknown"
+    assert harness.jobs() == [] and harness.statements() == []
 
 
 def test_historic_audience_repair_skips_revoked_sources(harness: CaptureHarness) -> None:
@@ -706,20 +717,17 @@ def test_historic_backfill_is_dry_run_first_and_never_moves_the_boundary(
     assert boundary[0] > 0
 
     dry = harness.producer.run_historical(before_ms=boundary[0], apply=False)
-    assert dry.jobs == 1 and dry.promoted_sources == 2
+    assert dry.jobs == 0 and dry.promoted_sources == 0
     assert harness.jobs() == []
     assert harness.producer.boundary() == boundary
 
     applied = harness.producer.run_historical(before_ms=boundary[0], apply=True)
-    assert applied.jobs == 1 and applied.promoted_sources == 2
+    assert applied.jobs == 0 and applied.promoted_sources == 0
     assert harness.producer.boundary() == boundary, "a backfill may not move the cursor"
-    assert len(harness.jobs()) == 1
-
-    replay = harness.producer.run_historical(before_ms=boundary[0], apply=True)
-    assert replay.jobs == 0 and replay.already_queued == 1
+    assert harness.jobs() == []
 
 
-def test_historic_backfill_publishes_author_only_statements(harness: CaptureHarness) -> None:
+def test_historic_backfill_refuses_rows_without_history_proof(harness: CaptureHarness) -> None:
     harness.advance(1_000)
     # A historic row: journaled without an audience proof, as the backlog is.
     harness.append_raw(text="Der alte Satz.", message_id="3EB0910")
@@ -727,20 +735,18 @@ def test_historic_backfill_publishes_author_only_statements(harness: CaptureHarn
     harness.activate()
     from yeoman_gateway.knowledge._capture import HistoricAudienceRepair
 
-    HistoricAudienceRepair(knowledge=harness.knowledge, processing=harness.store).run(
-        limit=10, apply=True
+    repair = HistoricAudienceRepair(knowledge=harness.knowledge, processing=harness.store)
+    repair.run(limit=10, apply=True)
+    report = harness.producer.run_historical(
+        before_ms=harness.producer.boundary()[0], apply=True
     )
-    harness.producer.run_historical(before_ms=harness.producer.boundary()[0], apply=True)
-    harness.drafts = [StatementDraft(content="Der alte Satz.", source_index=0)]
 
-    report = harness.run_capture()
-
-    assert report.published == 1
-    row = harness.statements()[0]
-    assert row["visibility_scope"] == "author_only"
+    assert report.promoted_sources == 0
+    assert harness.jobs() == []
+    assert harness.statements() == []
 
 
-def test_historic_backfill_splits_a_whole_history_into_bounded_batches(
+def test_historic_backfill_refuses_unattributed_history_rows(
     harness: CaptureHarness,
 ) -> None:
     """A historic window may hold a chat's entire history; jobs stay bounded."""
@@ -757,7 +763,7 @@ def test_historic_backfill_splits_a_whole_history_into_bounded_batches(
 
     report = harness.producer.run_historical(before_ms=harness.producer.boundary()[0], apply=True)
 
-    assert report.promoted_sources == 20
-    assert report.jobs == 3, "20 sources at a cap of 8 must be three bounded jobs"
-    sizes = sorted(len(__import__("json").loads(job["sources_json"])) for job in harness.jobs())
-    assert sizes == [4, 8, 8]
+    assert report.promoted_sources == 0
+    assert report.jobs == 0
+    assert harness.jobs() == []
+    assert harness.store.count_events() == 20

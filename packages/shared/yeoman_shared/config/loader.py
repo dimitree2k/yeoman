@@ -11,7 +11,7 @@ from yeoman_shared.config.defaults import apply_missing_defaults
 from yeoman_shared.config.schema import Config
 from yeoman_shared.utils.backups import backup_file
 
-CONFIG_VERSION = 2
+CONFIG_VERSION = 3
 
 
 def get_config_path() -> Path:
@@ -263,6 +263,8 @@ def _migrate_config_with_change(data: dict[str, Any]) -> tuple[dict[str, Any], b
                 memory_cfg[key] = memory2_cfg[key]
         snake.pop("memory2", None)
 
+    # History is always live; old rollout selectors have no effect.
+    snake.pop("history", None)
     apply_missing_defaults(snake)
     snake["config_version"] = CONFIG_VERSION
 

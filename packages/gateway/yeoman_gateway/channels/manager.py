@@ -24,7 +24,6 @@ if TYPE_CHECKING:
     from yeoman_gateway.media.storage import MediaStorage
     from yeoman_gateway.providers.factory import ProviderFactory
     from yeoman_gateway.session.manager import SessionManager
-    from yeoman_gateway.storage.inbound_archive import InboundArchive
 
 
 def build_raw_archive(config: Config) -> RawArchive | None:
@@ -61,7 +60,6 @@ class ChannelManager:
         config: Config,
         bus: MessageBus,
         session_manager: "SessionManager | None" = None,
-        inbound_archive: "InboundArchive | None" = None,
         model_router: "ModelRouter | None" = None,
         media_storage: "MediaStorage | None" = None,
         provider_factory: "ProviderFactory | None" = None,
@@ -74,7 +72,6 @@ class ChannelManager:
         self.config = config
         self.bus = bus
         self.session_manager = session_manager
-        self.inbound_archive = inbound_archive
         self.model_router = model_router
         self.media_storage = media_storage
         self.provider_factory = provider_factory
@@ -189,7 +186,6 @@ class ChannelManager:
                 self.channels["whatsapp"] = WhatsAppChannel(
                     self.config.channels.whatsapp,
                     self.bus,
-                    inbound_archive=self.inbound_archive,
                     model_router=self.model_router,
                     media_storage=self.media_storage,
                     provider_factory=self.provider_factory,
@@ -198,7 +194,6 @@ class ChannelManager:
                     openai_api_key=openai_compat.api_key if openai_compat else None,
                     openai_api_base=openai_compat.api_base if openai_compat else None,
                     openai_extra_headers=openai_compat.extra_headers if openai_compat else None,
-                    legacy_history_disabled=self.config.history.legacy_writers_disabled,
                 )
                 self.channels["whatsapp"].set_raw_archive(self.raw_archive)
                 if self.processing_gate is not None:

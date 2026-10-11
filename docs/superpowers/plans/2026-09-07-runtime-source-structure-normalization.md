@@ -1,5 +1,8 @@
 # Yeoman Runtime and Source Structure Normalization Implementation Plan
 
+Historical document (G6, 2026-10-11): the standalone WhatsApp history stores, legacy history tools and cutover scripts referenced here have been retired. Current runtime reads use canonical History and Knowledge schema 3; old store examples describe the previous implementation.
+
+
 > **For agentic workers:** REQUIRED SUB-SKILL: Use `superpowers:subagent-driven-development` (recommended) or `superpowers:executing-plans` to implement this plan task-by-task. Steps use checkbox (`- [ ]`) syntax for tracking.
 
 **Goal:** Die Struktur von `/home/dm/.yeoman` (private Runtime) und `/home/dm/Documents/yeoman` (änderbarer Source) so vereinheitlichen, dass jeder persistente Zustand genau einen Besitzer und einen nachvollziehbaren Ablageort hat. Veraltete Dokumentation, doppelte Datenpfade und unnötige Caches sollen kontrolliert entfernt werden, ohne den laufenden WhatsApp-Betrieb oder relevante Arbeit aus `c/turn-engine-v2` zu verlieren.

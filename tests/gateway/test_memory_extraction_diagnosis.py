@@ -6,6 +6,7 @@ import json
 from collections.abc import Mapping
 from types import SimpleNamespace
 
+import pytest
 from yeoman_gateway.knowledge._capture import ObservedEvent
 from yeoman_gateway.knowledge._capture_worker import StatementDraft, StatementExtractor
 from yeoman_shared.config.schema import Config
@@ -104,13 +105,14 @@ def diagnose_draft(row: Mapping[str, object], draft: StatementDraft) -> tuple[st
 def test_capture_harness_still_refuses_unknown_audience(tmp_path) -> None:
     harness = CaptureHarness(tmp_path, registry=Registry({}))
     try:
+        from yeoman_gateway.knowledge.models import KnowledgeError
+
         harness.activate()
-        harness.observe("Synthetic tuning source.")
-        harness.advance(60_001)
+        with pytest.raises(KnowledgeError, match="denied_unknown_basis"):
+            harness.observe("Synthetic tuning source.")
 
-        report = harness.build_worker().run_due(now_ms=harness.now)
-
-        assert report.refusals.get("unknown_audience") == 1
+        assert harness.store.count_events() == 1
+        assert harness.jobs() == []
         assert harness.statements() == []
     finally:
         harness.close()

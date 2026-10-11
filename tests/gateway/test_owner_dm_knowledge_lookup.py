@@ -22,6 +22,11 @@ def responder(monkeypatch):
     responder._history_selected = True
     queries = SimpleNamespace(
         owner_member_chat_ids=Mock(return_value=("stocks@g.us",)),
+        members=Mock(side_effect=lambda *, chat_id, at_ms: SimpleNamespace(
+            status="known" if chat_id == "stocks@g.us" and at_ms is not None else "unknown",
+            members=frozenset({"whatsapp:10001"}) if chat_id == "stocks@g.us" else frozenset(),
+            snapshot_id="synthetic-membership",
+        )),
         is_owner_direct_chat=Mock(side_effect=lambda principal, chat, at_ms, **kwargs:
                                   kwargs.get("is_owner") and (principal, chat) in OWNER_ENDPOINTS),
         resolve_people_in_text=Mock(side_effect=lambda text, **kwargs: (("Alex", "alex-person"),) if "Alex" in text else ()),

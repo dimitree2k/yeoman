@@ -69,10 +69,21 @@ def _observed(
 
 
 def _material_provider(archive, log):
-    """Compose pure archive ACL lookup with the durable ledger sequence."""
+    """Compose exact synthetic History rows with the durable ledger sequence."""
+    from datetime import UTC, datetime
 
     def provide(channel: str, chat_id: str, source_ids: tuple[str, ...] | None):
-        resolved = archive.resolve_source_ids(channel, chat_id, source_ids)
+        if source_ids is None:
+            rows = archive.lookup_messages_in_range(
+                channel, chat_id, datetime.fromtimestamp(0, UTC),
+                datetime.fromtimestamp(4_000_000_000, UTC), limit=300,
+            )
+            resolved = tuple(str(row.get("message_id") or "") for row in rows if row.get("message_id"))
+        else:
+            resolved = tuple(
+                source for source in dict.fromkeys(source_ids)
+                if archive.lookup_message(channel, chat_id, source) is not None
+            )
         if resolved:
             log.ensure_source_revisions_sync(
                 channel=channel, chat_id=chat_id, source_ids=resolved
@@ -94,64 +105,43 @@ def _synthetic_material_provider(
 def test_archive_material_resolution_is_pure_and_ledger_owns_revision(
     tmp_path: Path,
 ) -> None:
+    import asyncio
+
+    from history_turn_fixtures import Projector
     from yeoman_gateway.consciousness.log import SpeakupLog
-    from yeoman_gateway.storage.inbound_archive import InboundArchive
+    from yeoman_gateway.history.context import history_turn
+    from yeoman_gateway.history.export import SecondaryArchive
 
-    archive = InboundArchive(tmp_path / "inbound.db", retention_days=None)
-    for index, message_id in enumerate(("m1", "m2"), start=1):
-        archive.record_inbound(
-            channel="whatsapp",
-            chat_id=CHAT,
-            message_id=message_id,
-            participant=f"person{index}@s.whatsapp.net",
-            sender_id=f"person{index}",
-            text=message_id,
-            timestamp=index,
-        )
-
-    assert archive.resolve_source_ids(
-        "whatsapp", CHAT, ("m2", "missing", "observed:whatsapp:" + CHAT, "m1")
-    ) == ("m1", "m2")
-    assert not archive._conn.execute(  # noqa: SLF001 - schema guard for the source owner
-        "SELECT 1 FROM sqlite_master WHERE type = 'table' AND name = 'participation_material_state'"
-    ).fetchone()
-
+    projector = Projector()
+    projector.add("m1", chat=CHAT, text="m1")
+    projector.add("m2", chat=CHAT, text="m2")
     log = SpeakupLog(tmp_path / "speakups.db")
-    provider = _material_provider(archive, log)
-    material, revision = provider(
-        "whatsapp", CHAT, ("m2", "missing", "observed:whatsapp:" + CHAT, "m1")
-    )
-    assert material == ("m1", "m2")
-    assert revision == 2
-    assert log.highest_considered_revision_sync(channel="whatsapp", chat_id=CHAT) == 0
-    log.mark_material_considered_sync(
-        channel="whatsapp", chat_id=CHAT, observed_revision=revision
-    )
-    # The same source sequence remains the same after a later source appears.
-    archive.record_inbound(
-        channel="whatsapp",
-        chat_id=CHAT,
-        message_id="m3",
-        participant="person3@s.whatsapp.net",
-        sender_id="person3",
-        text="m3",
-        timestamp=3,
-    )
-    again, again_revision = provider("whatsapp", CHAT, ("m1",))
-    assert again == ()
-    assert again_revision == revision
-    new_material, new_revision = provider("whatsapp", CHAT, None)
-    assert new_material == ("m3",)
-    assert new_revision == 3
-    # Lookup alone does not advance the considered watermark, so an unaccepted
-    # repeat still returns the same source. The runtime marks it after queue accept.
-    assert provider("whatsapp", CHAT, None) == (("m3",), new_revision)
-    log.mark_material_considered_sync(
-        channel="whatsapp", chat_id=CHAT, observed_revision=new_revision
-    )
-    assert provider("whatsapp", CHAT, None) == ((), new_revision)
-    log.close()
-    archive.close()
+    provider = _material_provider(SecondaryArchive(), log)
+
+    async def exercise() -> None:
+        async with history_turn(projector):
+            material, revision = provider("whatsapp", CHAT, ("m2", "missing", "m1"))
+            assert material == ("m1", "m2")
+            assert revision == 2
+            assert log.highest_considered_revision_sync(channel="whatsapp", chat_id=CHAT) == 0
+            log.mark_material_considered_sync(channel="whatsapp", chat_id=CHAT, observed_revision=revision)
+        projector.add("m3", chat=CHAT, text="m3")
+        async with history_turn(projector):
+            again, again_revision = provider("whatsapp", CHAT, ("m1",))
+            assert again == ()
+            assert again_revision == revision
+            new_material, new_revision = provider("whatsapp", CHAT, None)
+            assert new_material == ("m3",)
+            assert new_revision == 3
+            assert provider("whatsapp", CHAT, None) == (("m3",), new_revision)
+            log.mark_material_considered_sync(channel="whatsapp", chat_id=CHAT, observed_revision=new_revision)
+            assert provider("whatsapp", CHAT, None) == ((), new_revision)
+
+    try:
+        asyncio.run(exercise())
+    finally:
+        projector.close()
+        log.close()
 
 
 def test_explicit_material_is_new_only_with_root_authorized_source_set(tmp_path: Path) -> None:
@@ -181,62 +171,51 @@ def test_explicit_material_is_new_only_with_root_authorized_source_set(tmp_path:
 def test_first_enable_baselines_archive_history_but_restart_keeps_unconsidered_sources(
     tmp_path: Path,
 ) -> None:
-    """Only a truly uninitialized ledger chat may adopt retained history as baseline."""
+    """Only an uninitialized ledger chat may baseline retained History rows."""
+    import asyncio
+    from datetime import UTC, datetime
+
+    from history_turn_fixtures import Projector
     from yeoman_gateway.consciousness.log import SpeakupLog
-    from yeoman_gateway.storage.inbound_archive import InboundArchive
+    from yeoman_gateway.history.context import history_turn
+    from yeoman_gateway.history.export import SecondaryArchive
 
-    archive = InboundArchive(tmp_path / "inbound.db", retention_days=None)
-    archive.record_inbound(
-        channel="whatsapp",
-        chat_id=CHAT,
-        message_id="historic",
-        participant="person@s.whatsapp.net",
-        sender_id="person",
-        text="historic",
-        timestamp=1,
-    )
+    projector = Projector()
+    projector.add("historic", chat=CHAT, text="historic")
+    archive = SecondaryArchive()
     log = SpeakupLog(tmp_path / "speakups.db")
-    historic = archive.resolve_source_ids("whatsapp", CHAT, None)
-    assert log.initialize_material_baseline_sync(
-        channel="whatsapp", chat_id=CHAT, source_ids=historic
-    ) == 1
-    assert log.material_for_opportunity("whatsapp", CHAT, None) == ((), 1)
-    assert log.material_for_opportunity(
-        "whatsapp", CHAT, None, lane="shadow"
-    ) == ((), 1)
 
-    archive.record_inbound(
-        channel="whatsapp",
-        chat_id=CHAT,
-        message_id="new",
-        participant="person@s.whatsapp.net",
-        sender_id="person",
-        text="new",
-        timestamp=2,
-    )
-    new_ids = archive.resolve_source_ids("whatsapp", CHAT, None)
-    log.ensure_source_revisions_sync(
-        channel="whatsapp", chat_id=CHAT, source_ids=new_ids
-    )
-    assert log.material_for_opportunity("whatsapp", CHAT, None) == (("new",), 2)
+    async def exercise() -> None:
+        async with history_turn(projector):
+            historic = tuple(row["message_id"] for row in archive.lookup_messages_in_range(
+                "whatsapp", CHAT, datetime.fromtimestamp(0, UTC),
+                datetime.fromtimestamp(4_000_000_000, UTC), limit=300
+            ))
+            assert log.initialize_material_baseline_sync(
+                channel="whatsapp", chat_id=CHAT, source_ids=tuple(historic)
+            ) == 2
+            assert log.material_for_opportunity("whatsapp", CHAT, None) == ((), 1)
+            assert log.material_for_opportunity("whatsapp", CHAT, None, lane="shadow") == ((), 1)
+            assert "historic" in historic
+        projector.add("new", chat=CHAT, text="new")
+        async with history_turn(projector):
+            log.ensure_source_revisions_sync(
+                channel="whatsapp", chat_id=CHAT, source_ids=("new",)
+            )
+            assert log.material_for_opportunity("whatsapp", CHAT, None) == (("new",), 2)
+            pending_chat = "pending@g.us"
+            log.ensure_source_revisions_sync(channel="whatsapp", chat_id=pending_chat, source_ids=("pending",))
+            assert log.initialize_material_baseline_sync(
+                channel="whatsapp", chat_id=pending_chat, source_ids=("pending",)
+            ) == 0
+            log.ensure_source_revisions_sync(channel="whatsapp", chat_id=pending_chat, source_ids=("after-restart",))
+            assert log.material_for_opportunity("whatsapp", pending_chat, None) == (("pending", "after-restart"), 2)
 
-    pending_chat = "pending@g.us"
-    log.ensure_source_revisions_sync(
-        channel="whatsapp", chat_id=pending_chat, source_ids=("pending",)
-    )
-    # A restart/second baseline attempt cannot hide a registered but unconsidered id.
-    assert log.initialize_material_baseline_sync(
-        channel="whatsapp", chat_id=pending_chat, source_ids=("pending",)
-    ) == 0
-    log.ensure_source_revisions_sync(
-        channel="whatsapp", chat_id=pending_chat, source_ids=("after-restart",)
-    )
-    assert log.material_for_opportunity("whatsapp", pending_chat, None) == (
-        ("pending", "after-restart"),
-        2,
-    )
-    log.close()
-    archive.close()
+    try:
+        asyncio.run(exercise())
+    finally:
+        projector.close()
+        log.close()
 
 
 def test_ledger_migrates_legacy_claims_and_dispositions_without_reallocating_on_restart(
@@ -316,53 +295,19 @@ def test_ledger_migrates_legacy_claims_and_dispositions_without_reallocating_on_
     reopened.close()
 
 
-def test_archive_retention_does_not_renumber_ledger_source_revisions(tmp_path: Path) -> None:
-    """Purging retained rows cannot move the durable source sequence backwards."""
+def test_removed_history_source_does_not_renumber_ledger_source_revisions(tmp_path: Path) -> None:
+    """A source disappearing from current History cannot move the ledger sequence back."""
     from yeoman_gateway.consciousness.log import SpeakupLog
-    from yeoman_gateway.storage.inbound_archive import InboundArchive
 
-    archive = InboundArchive(tmp_path / "inbound.db", retention_days=1)
-    archive.record_inbound(
-        channel="whatsapp",
-        chat_id=CHAT,
-        message_id="old",
-        participant="person@s.whatsapp.net",
-        sender_id="person",
-        text="old",
-        timestamp=1,
-    )
     log = SpeakupLog(tmp_path / "speakups.db")
-    log.ensure_source_revisions_sync(
-        channel="whatsapp", chat_id=CHAT, source_ids=("old",)
-    )
-    log.mark_material_considered_sync(
-        channel="whatsapp", chat_id=CHAT, observed_revision=1
-    )
-    with archive._lock:  # noqa: SLF001 - deterministic synthetic retention setup
-        archive._conn.execute(  # noqa: SLF001
-            "UPDATE inbound_messages SET created_at = ? WHERE message_id = ?",
-            ("2000-01-01T00:00:00+00:00", "old"),
-        )
-        archive._conn.commit()  # noqa: SLF001
-    assert archive.purge_older_than(1) == 1
-
-    archive.record_inbound(
-        channel="whatsapp",
-        chat_id=CHAT,
-        message_id="new",
-        participant="person@s.whatsapp.net",
-        sender_id="person",
-        text="new",
-        timestamp=2,
-    )
-    resolved = archive.resolve_source_ids("whatsapp", CHAT, None)
-    assert resolved == ("new",)
+    log.ensure_source_revisions_sync(channel="whatsapp", chat_id=CHAT, source_ids=("old",))
+    log.mark_material_considered_sync(channel="whatsapp", chat_id=CHAT, observed_revision=1)
+    assert log.material_for_opportunity("whatsapp", CHAT, ()) == ((), 1)
     assert log.ensure_source_revisions_sync(
-        channel="whatsapp", chat_id=CHAT, source_ids=resolved
+        channel="whatsapp", chat_id=CHAT, source_ids=("new",)
     ) == (("new", 2),)
-    assert log.material_for_opportunity("whatsapp", CHAT, None) == (("new",), 2)
+    assert log.material_for_opportunity("whatsapp", CHAT, ("new",)) == (("new",), 2)
     log.close()
-    archive.close()
 
 
 def test_ingress_uses_batch_material_provider_without_consuming_duplicate_revision(
@@ -370,9 +315,10 @@ def test_ingress_uses_batch_material_provider_without_consuming_duplicate_revisi
 ) -> None:
     from yeoman_gateway.consciousness.log import SpeakupLog
     from yeoman_gateway.consciousness.participation_runtime import ParticipationIngress
-    from yeoman_gateway.storage.inbound_archive import InboundArchive
 
-    archive = InboundArchive(tmp_path / "inbound.db", retention_days=None)
+    from tests.gateway.synthetic_reply_archive import SyntheticReplyArchive
+
+    archive = SyntheticReplyArchive(tmp_path / "inbound.db", retention_days=None)
     for index, message_id in enumerate(("m1", "m2"), start=1):
         archive.record_inbound(
             channel="whatsapp",
@@ -547,9 +493,10 @@ async def test_duplicate_batch_material_reaches_one_real_runtime_evaluation(
         ParticipationIngress,
         ParticipationRuntime,
     )
-    from yeoman_gateway.storage.inbound_archive import InboundArchive
 
-    archive = InboundArchive(tmp_path / "inbound.db", retention_days=None)
+    from tests.gateway.synthetic_reply_archive import SyntheticReplyArchive
+
+    archive = SyntheticReplyArchive(tmp_path / "inbound.db", retention_days=None)
     for index, message_id in enumerate(("m1", "m2"), start=1):
         archive.record_inbound(
             channel="whatsapp",
@@ -661,12 +608,16 @@ async def test_event_dispatch_is_not_blocked_by_an_observer_producer(tmp_path: P
         )
         producer_done.set()
 
+    from history_turn_fixtures import Projector
+
+    projector = Projector()
     burst = BurstObserver(
         config=_config(),
         state_path=tmp_path / "burst.json",
         on_burst=offer,
         is_eligible=_eligible,
     )
+    burst._history_projector = projector
     bus = MessageBus()
     bus.subscribe_event("InboundObservedEvent", burst.handle)
     second_seen = asyncio.Event()
@@ -692,6 +643,7 @@ async def test_event_dispatch_is_not_blocked_by_an_observer_producer(tmp_path: P
         with pytest.raises(asyncio.CancelledError):
             await dispatcher
         await scheduler.stop()
+        projector.close()
         log.close()
     assert handler_calls
 
@@ -721,6 +673,9 @@ async def test_burst_and_lull_callbacks_return_without_model_work(tmp_path: Path
     runtime = ParticipationRuntime(
         scheduler=scheduler, source_owner=owner, activation_epoch=1, is_enabled=lambda c, i: True
     )
+    from history_turn_fixtures import Projector
+
+    projector = Projector()
     burst = BurstObserver(
         config=_config(),
         state_path=tmp_path / "burst.json",
@@ -733,6 +688,7 @@ async def test_burst_and_lull_callbacks_return_without_model_work(tmp_path: Path
         ),
         is_eligible=_eligible,
     )
+    burst._history_projector = projector
     # A lull is a genuinely later revision with its own retained source, so it is a
     # new opportunity rather than a replay of the burst material.
     lull = LullObserver(
@@ -748,6 +704,7 @@ async def test_burst_and_lull_callbacks_return_without_model_work(tmp_path: Path
         is_eligible=_eligible,
         clock=lambda: _LULL_NOW,
     )
+    lull._history_projector = projector
     try:
         # Two messages reach the burst threshold and fire without awaiting the handler.
         await asyncio.wait_for(burst.handle(_observed(100.0, message_id="b1")), timeout=1)
@@ -779,6 +736,7 @@ async def test_burst_and_lull_callbacks_return_without_model_work(tmp_path: Path
     finally:
         release.set()
         await scheduler.stop()
+        projector.close()
         log.close()
 
 

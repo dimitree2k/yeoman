@@ -8,6 +8,7 @@ import re
 from pathlib import Path
 
 import pytest
+from history_turn_fixtures import Projector
 from yeoman_gateway.bus.queue import MessageBus
 from yeoman_gateway.channels.whatsapp import WhatsAppChannel
 from yeoman_gateway.processing.signals import (
@@ -30,6 +31,7 @@ T0 = 1_700_000_000_000
 
 def _channel(store: ProcessingStore) -> WhatsAppChannel:
     channel = WhatsAppChannel(WhatsAppConfig(), MessageBus())
+    channel._history_projector = Projector()
     channel.set_processing_signals(SignalJournalSink(store, clock=lambda: T0))
     return channel
 
@@ -350,8 +352,8 @@ def _event_ids(store: ProcessingStore) -> list[str]:
         con.close()
 
 
-def test_a_message_frame_is_captured_before_the_legacy_path(tmp_path: Path) -> None:
-    """Canonical capture precedes the existing message projection."""
+def test_a_message_frame_is_captured_before_routing(tmp_path: Path) -> None:
+    """Canonical capture precedes the live routing projection."""
     store = ProcessingStore(tmp_path / "p.db")
     channel = _channel(store)
     published: list[str] = []
@@ -487,23 +489,8 @@ def test_the_inbound_metadata_carries_the_identity_inputs(tmp_path: Path) -> Non
 
 
 def test_opaque_encrypted_edit_is_canonical_but_never_projected_as_a_message() -> None:
-    class Memory:
-        indexed: list[object] = []
-
-        def index_canonical_event(self, event: object, **kwargs: object) -> None:
-            self.indexed.append(event)
-
-    class Sources:
-        registered: list[str] = []
-
-        def __call__(self, event_id: str) -> bool:
-            self.registered.append(event_id)
-            return True
-
     store = ProcessingStore(":memory:")
-    memory = Memory()
-    sources = Sources()
-    sink = SignalJournalSink(store, clock=lambda: T0, memory=memory, sources=sources)
+    sink = SignalJournalSink(store, clock=lambda: T0)
     payload = {
         "chatJid": CHAT,
         "messageId": "edit-envelope-1",
@@ -539,9 +526,6 @@ def test_opaque_encrypted_edit_is_canonical_but_never_projected_as_a_message() -
     assert event.payload["target_message_id"] == "target-1"
     assert event.payload["encrypted_edit"]["encPayload"] == "AQID"
     assert event.payload["sender_name"] == "Synthetic sender"
-    assert memory.indexed == []
-    assert sources.registered == []
-
     channel = WhatsAppChannel(WhatsAppConfig(), MessageBus())
     channel._parse_inbound_event = lambda _: pytest.fail("opaque edit reached normal parsing")  # type: ignore[method-assign]
     asyncio.run(channel._project_bridge_event(type("Work", (), {"kind": "message", "payload": payload})()))
@@ -549,25 +533,8 @@ def test_opaque_encrypted_edit_is_canonical_but_never_projected_as_a_message() -
 
 
 def test_partial_encrypted_edit_fields_are_canonical_but_not_projected() -> None:
-    class Memory:
-        def __init__(self) -> None:
-            self.indexed: list[object] = []
-
-        def index_canonical_event(self, event: object, **kwargs: object) -> None:
-            self.indexed.append(event)
-
-    class Sources:
-        def __init__(self) -> None:
-            self.registered: list[str] = []
-
-        def __call__(self, event_id: str) -> bool:
-            self.registered.append(event_id)
-            return True
-
     store = ProcessingStore(":memory:")
-    memory = Memory()
-    sources = Sources()
-    sink = SignalJournalSink(store, clock=lambda: T0, memory=memory, sources=sources)
+    sink = SignalJournalSink(store, clock=lambda: T0)
     id_only = {
         "chatJid": CHAT,
         "messageId": "edit-envelope-id-only",
@@ -621,9 +588,6 @@ def test_partial_encrypted_edit_fields_are_canonical_but_not_projected() -> None
     assert second_edit["encPayload"] == "%%%malformed-but-bounded"
     assert "encIv" not in second_edit
     assert "fromMe" not in second_edit["targetMessageKey"]
-    assert memory.indexed == []
-    assert sources.registered == []
-
     channel = WhatsAppChannel(WhatsAppConfig(), MessageBus())
     projected: list[dict[str, str]] = []
     channel._parse_inbound_event = lambda payload: payload  # type: ignore[method-assign]
@@ -656,8 +620,6 @@ def test_partial_encrypted_edit_fields_are_canonical_but_not_projected() -> None
     assert projected == [ordinary]
     ordinary_event = store.get_event("ordinary-after-opaque")
     assert ordinary_event is not None
-    assert len(memory.indexed) == 1
-    assert sources.registered == ["ordinary-after-opaque"]
     store.close()
 
 

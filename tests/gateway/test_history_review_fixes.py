@@ -28,7 +28,7 @@ async def test_selected_contacts_resolve_terminal_string_once():
     event = InboundEvent(channel='whatsapp', chat_id='a@g.us', sender_id='491000000001@s.whatsapp.net', content='synthetic', timestamp=datetime.fromtimestamp(1700000000, UTC))
     try:
         async with history_turn(p):
-            await Pipeline([ContactsMiddleware(history_selected=True), downstream]).run(event)
+            await Pipeline([ContactsMiddleware(), downstream]).run(event)
         downstream.assert_awaited_once()
         assert downstream.call_args.args[0].event.raw_metadata['contact_id'] == 'person'
     finally:
@@ -51,7 +51,6 @@ async def test_spawned_send_reacquires_after_parent_closed(paused):
     p.db.commit()
     channel = WhatsAppChannel(WhatsAppConfig(bridge_token='synthetic-token'), MessageBus())
     channel._history_projector = p
-    channel._history_mentions_selected = True
     channel._connected = True
     channel._stop_typing = AsyncMock()
     channel._raw_archive_outbound = AsyncMock()
@@ -110,8 +109,6 @@ async def test_observer_scopes_only_eligible_inbound(tmp_path, kind, case):
     from yeoman_shared.config.schema import Config
 
     config = Config()
-    config.history.live_projection_enabled = True
-    config.history.readers.secondary = True
     config.consciousness.enabled = case != 'disabled'
     config.consciousness.burst_enabled = True
     config.consciousness.lull_enabled = True
@@ -134,28 +131,3 @@ async def test_observer_scopes_only_eligible_inbound(tmp_path, kind, case):
         p.close()
 
 
-@pytest.mark.parametrize('kind', ['burst', 'lull'])
-async def test_dormant_observer_keeps_eligibility_order(tmp_path, kind):
-    from yeoman_gateway.bus.events import InboundObservedEvent
-    from yeoman_gateway.consciousness.burst import BurstObserver
-    from yeoman_gateway.consciousness.lull import LullObserver
-    from yeoman_shared.config.schema import Config
-
-    config = Config()
-    config.consciousness.enabled = True
-    config.consciousness.burst_enabled = True
-    config.consciousness.lull_enabled = True
-    calls = []
-    def eligible(channel, chat_id):
-        calls.append('eligible')
-        return False
-    cls = BurstObserver if kind == 'burst' else LullObserver
-    observer = cls(config=config, state_path=tmp_path / f'{kind}.json', is_eligible=eligible,
-                   **{f'on_{kind}': AsyncMock()})
-    def direct(event):
-        assert current_history_snapshot() is None
-        calls.append('direct')
-        return False
-    observer._is_direct_bot_interaction = direct
-    await observer.handle(InboundObservedEvent(channel='whatsapp', chat_id='a@g.us', sender_id='synthetic', content='synthetic', timestamp=1700000000))
-    assert calls == (['direct', 'eligible'] if kind == 'burst' else ['direct'])

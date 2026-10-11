@@ -27,6 +27,7 @@ from datetime import UTC, datetime
 from typing import Any
 
 from yeoman_gateway.history.live import HistoryPaused
+from yeoman_gateway.knowledge.models import TrustedReadContext
 from yeoman_gateway.policy.engine import ParticipationSnapshot
 from yeoman_gateway.processing.participation import (
     ParticipationDecisionError,
@@ -124,8 +125,7 @@ class ParticipationContextBuilder:
         knowledge_context_supplier: Callable[[ParticipationOpportunity, Mapping[str, Any]], Any]
         | None = None,
     ) -> None:
-        self._legacy_archive = archive
-        self._history_selected = False
+        self._archive = _ParticipationArchive(archive)
         # Kept on the constructor for old object construction; decision inputs are the
         # sole source of trusted policy values during ``build``.
         self._policy = policy
@@ -135,20 +135,6 @@ class ParticipationContextBuilder:
         self._source_authorizer = source_authorizer
         self._knowledge_selector = knowledge_selector
         self._knowledge_context_supplier = knowledge_context_supplier
-
-    @property
-    def _archive(self):
-        if self._history_selected:
-            from yeoman_gateway.adapters.reply_archive_history import HistoryReplyArchiveAdapter
-            from yeoman_gateway.history.context import current_history_snapshot
-            from yeoman_gateway.history.queries import HistoryQueries
-            snapshot = current_history_snapshot()
-            if snapshot is None:
-                raise HistoryPaused('history_scope_required')
-            adapter = HistoryReplyArchiveAdapter(HistoryQueries(snapshot))
-            # Participation consumes row dictionaries, not the reply port's model.
-            return _ParticipationArchive(adapter)
-        return self._legacy_archive
 
     async def build(
         self,
@@ -265,7 +251,7 @@ class ParticipationContextBuilder:
                 if not anchor.get("provider_message_id"):
                     continue
                 current = dict(anchor)
-                if self._history_selected and opportunity.channel == 'whatsapp':
+                if opportunity.channel == 'whatsapp':
                     row = self._archive.lookup_message(opportunity.channel, opportunity.chat_id,
                         str(anchor['provider_message_id']))
                     if row is None:
@@ -537,8 +523,10 @@ def _knowledge_readers(trusted: object) -> ParticipationKnowledgeReaders | None:
     """Accept the verified reader bundle, and a bare single reader pair for tests."""
     if isinstance(trusted, ParticipationKnowledgeReaders):
         return trusted
-    if isinstance(trusted, tuple) and len(trusted) == 2:
-        return readers_from_single(trusted[0], trusted[1])
+    if isinstance(trusted, TrustedReadContext):
+        return readers_from_single(trusted)
+    if isinstance(trusted, tuple) and len(trusted) == 1:
+        return readers_from_single(trusted[0])
     return None
 
 
@@ -628,7 +616,7 @@ def _row_timestamp_ms(row: Mapping[str, Any]) -> int | None:
     value = row.get("timestamp")
     if isinstance(value, (int, float)) and not isinstance(value, bool):
         number = float(value)
-        # InboundArchive stores Unix seconds; test doubles often use milliseconds.
+        # Source timestamps may be Unix seconds or milliseconds.
         return int(number * 1000 if abs(number) < 100_000_000_000 else number)
     created_at = str(row.get("created_at") or "").strip()
     if not created_at:

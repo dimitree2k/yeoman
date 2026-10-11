@@ -38,8 +38,9 @@ from yeoman_gateway.processing.participation_runtime import (
     ParticipationRuntime as DecisionRuntime,
 )
 from yeoman_gateway.processing.store import ProcessingStore
-from yeoman_gateway.storage.inbound_archive import InboundArchive
 from yeoman_shared.config.schema import ProcessingConfig
+
+from tests.gateway.synthetic_reply_archive import SyntheticReplyArchive
 
 CHANNEL = "whatsapp"
 CHAT = "pilot@g.us"
@@ -152,7 +153,11 @@ def _pilot_runtime(tmp_path: Path, *, decision: dict[str, object], shadow: bool)
     engine = PolicyEngine(policy, workspace=tmp_path)
     log = SpeakupLog(tmp_path / "speakups.db")
     store = ProcessingStore(tmp_path / "processing.db")
-    archive = InboundArchive(tmp_path / "inbound.db")
+    archive = SyntheticReplyArchive(tmp_path / "inbound.db")
+    from history_turn_fixtures import Projector
+
+    projector = Projector()
+    projector.add("m1", chat=CHAT, text="Wer steht heute im Tor?")
     archive.record_inbound(
         channel=CHANNEL,
         chat_id=CHAT,
@@ -249,6 +254,7 @@ def _pilot_runtime(tmp_path: Path, *, decision: dict[str, object], shadow: bool)
         reactor=reactor,
         clock_ms=lambda: NOW_MS,
     )
+    decision_runtime._history_projector = projector
     scheduler = OpportunityScheduler(
         handle=decision_runtime.evaluate_participation,
         max_concurrent_decisions=1,
@@ -292,6 +298,7 @@ def _pilot_runtime(tmp_path: Path, *, decision: dict[str, object], shadow: bool)
         "scheduler": scheduler,
         "ingress": ingress,
         "decision_runtime": decision_runtime,
+        "projector": projector,
         "submission": submission,
         "reactor": reactor,
     }
@@ -337,6 +344,7 @@ async def test_shadow_pilot_admits_and_decides_without_any_effect(tmp_path: Path
             await asyncio.sleep(0.02)
     finally:
         await rt["scheduler"].stop()
+        rt["projector"].close()
 
     # The judge ran, and the decision was recorded as a shadow decision.
     assert rt["client"].calls == 1
@@ -381,6 +389,7 @@ async def test_live_pilot_path_produces_one_comment_and_one_reservation(tmp_path
             await asyncio.sleep(0.02)
     finally:
         await rt["scheduler"].stop()
+        rt["projector"].close()
 
     assert rt["client"].calls == 1
     assert rt["submission"].drafts == 1
@@ -415,6 +424,7 @@ async def test_silence_pilot_records_silence_and_spends_nothing(tmp_path: Path) 
             await asyncio.sleep(0.02)
     finally:
         await rt["scheduler"].stop()
+        rt["projector"].close()
     assert rt["client"].calls == 1
     disposition = await rt["log"].disposition_by_chat(CHANNEL, CHAT)
     assert disposition is not None and disposition["disposition"] == "decided_silence"
@@ -618,4 +628,6 @@ async def test_continuation_candidate_may_use_reserved_slots_end_to_end(
         channel=CHANNEL, chat_id=CHAT, since_ms=NOW_MS - 3_600_000
     )
     assert any(int(a["continuation_candidate"]) == 1 for a in attempts)
+    await rt["scheduler"].stop()
+    rt["projector"].close()
     log.close()

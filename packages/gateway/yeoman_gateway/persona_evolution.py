@@ -11,17 +11,13 @@ from collections.abc import Callable
 from dataclasses import dataclass, field
 from datetime import UTC, datetime, timedelta
 from pathlib import Path
-from typing import TYPE_CHECKING, Any
+from typing import Any
 
 from yeoman_shared.utils.helpers import ensure_dir, safe_filename
 
 from yeoman_gateway.consciousness.log import SpeakupLog
-
-if TYPE_CHECKING:  # the persona path consumes the facade's ranking results, not its store
-    from yeoman_gateway.knowledge._memory.service import MemoryService
 from yeoman_gateway.policy.persona import resolve_persona_path
 from yeoman_gateway.policy.schema import PolicyConfig
-from yeoman_gateway.storage.inbound_archive import InboundArchive
 
 PERSONA_EVOLUTION_PROPOSAL_TTL_SECONDS = 24 * 60 * 60
 PERSONA_EVOLUTION_ALLOWED_SECTIONS = {
@@ -75,7 +71,6 @@ class PersonaChatRef:
 @dataclass(frozen=True, slots=True)
 class ChatEvolutionEvidence:
     chat: PersonaChatRef
-    learned_taste: list[str] = field(default_factory=list)
     recent_preferences: list[str] = field(default_factory=list)
     speakup_outcomes: dict[str, int] = field(default_factory=dict)
     speakups: list[dict[str, Any]] = field(default_factory=list)
@@ -918,15 +913,12 @@ async def collect_persona_evolution_evidence(
     policy: PolicyConfig,
     workspace: Path,
     persona_file: str,
-    memory: "MemoryService",
     speakup_log: SpeakupLog,
-    inbound_archive: InboundArchive,
     window_days: int = 14,
     per_chat_limit: int = 20,
     since: datetime | None = None,
     now: datetime | None = None,
     history_projector: object | None = None,
-    history_config: object | None = None,
     knowledge: object | None = None,
 ) -> PersonaEvolutionEvidence:
     from yeoman_gateway.history.context import (
@@ -935,18 +927,15 @@ async def collect_persona_evolution_evidence(
         history_turn,
     )
     from yeoman_gateway.history.live import HistoryPaused
-    selected = history_config is not None and history_config.live_projection_enabled and history_config.readers.secondary
-    if selected and current_history_snapshot() is None:
+    if current_history_snapshot() is None:
         if history_projector is None:
-            raise HistoryPaused('secondary_history_projector_required')
+            raise HistoryPaused('history_projector_required')
         arguments = dict(locals())
-        for key in ('current_history_snapshot', 'history_turn', 'history_knowledge_scope', 'HistoryPaused', 'selected'):
+        for key in ('current_history_snapshot', 'history_turn', 'history_knowledge_scope', 'HistoryPaused'):
             arguments.pop(key, None)
         async with history_turn(history_projector) as snapshot:
             with history_knowledge_scope(snapshot, knowledge):
                 return await collect_persona_evolution_evidence(**arguments)
-    if history_config is not None and history_config.legacy_writers_disabled and not selected:
-        raise HistoryPaused('secondary_reader_unselected')
     collected_at = now or datetime.now(UTC)
     if collected_at.tzinfo is None:
         collected_at = collected_at.replace(tzinfo=UTC)
@@ -962,30 +951,18 @@ async def collect_persona_evolution_evidence(
         effective_since = since if since.tzinfo else since.replace(tzinfo=UTC)
         effective_since = effective_since.astimezone(UTC)
 
-    if selected:
-        from yeoman_gateway.history.export import secondary_archive
-        inbound_archive = secondary_archive(inbound_archive, history_config)
+    from yeoman_gateway.history.export import secondary_archive
+    inbound_archive = secondary_archive()
     chats: list[ChatEvolutionEvidence] = []
     for chat in chats_for_persona(policy, persona_file):
-        taste_hits = memory.learned_chat_taste(
-            channel=chat.channel,
-            chat_id=chat.chat_id,
-            limit=per_chat_limit,
-        )
-        if selected and chat.channel == 'whatsapp':
+        preference_texts: list[str] = []
+        if chat.channel == 'whatsapp':
             from yeoman_gateway.knowledge.models import RecallQuery
             if knowledge is None:
                 raise HistoryPaused('secondary_knowledge_required')
             context = knowledge.owner_read_context(channel=chat.channel, chat_id=chat.chat_id)
             preferences = knowledge.recall(RecallQuery(limit=min(50, per_chat_limit)), context=context)
             preference_texts = list(preferences.entry_texts)
-        else:
-            preference_hits = memory.recent_chat_preferences(
-                channel=chat.channel,
-                chat_id=chat.chat_id,
-                limit=per_chat_limit,
-            )
-            preference_texts = [hit.entry.content for hit in preference_hits]
         speakups = await speakup_log.history(
             chat.channel,
             chat.chat_id,
@@ -1006,7 +983,6 @@ async def collect_persona_evolution_evidence(
         chats.append(
             ChatEvolutionEvidence(
                 chat=chat,
-                learned_taste=[hit.entry.content for hit in taste_hits],
                 recent_preferences=preference_texts,
                 speakup_outcomes=outcome_counts,
                 speakups=[_safe_speakup(row) for row in speakups],
@@ -1104,7 +1080,6 @@ def _active_evidence_chats(evidence: PersonaEvolutionEvidence) -> list[ChatEvolu
         for chat in evidence.chats
         if chat.recent_message_count > 0
         or bool(chat.speakup_outcomes)
-        or bool(chat.learned_taste)
         or bool(chat.recent_preferences)
     ]
 
@@ -1226,7 +1201,7 @@ def _redundancy_tokens(text: str) -> set[str]:
 def _unique_taste_patterns(chat_evidence: ChatEvolutionEvidence) -> list[str]:
     unique: list[str] = []
     seen: set[str] = set()
-    for raw in [*chat_evidence.learned_taste, *chat_evidence.recent_preferences]:
+    for raw in chat_evidence.recent_preferences:
         pattern = _clean_taste_pattern(raw)
         key = re.sub(r"\s+", " ", pattern).strip().casefold()
         if not key or key in seen:
@@ -1284,9 +1259,7 @@ async def run_persona_evolution_cron(
     policy: PolicyConfig,
     workspace: Path,
     persona_file: str,
-    memory: "MemoryService",
     speakup_log: SpeakupLog,
-    inbound_archive: InboundArchive,
     window_days: int = 1,
     limit: int = 20,
     output_path: Path | None = None,
@@ -1298,7 +1271,6 @@ async def run_persona_evolution_cron(
     proposal_mode: str = "preview",
     now: datetime | None = None,
     history_projector: object | None = None,
-    history_config: object | None = None,
     knowledge: object | None = None,
 ) -> str:
     """Run typed persona-evolution cron and write an owner-reviewable proposal."""
@@ -1308,18 +1280,15 @@ async def run_persona_evolution_cron(
         history_turn,
     )
     from yeoman_gateway.history.live import HistoryPaused
-    selected = history_config is not None and history_config.live_projection_enabled and history_config.readers.secondary
-    if selected and current_history_snapshot() is None:
+    if current_history_snapshot() is None:
         if history_projector is None:
-            raise HistoryPaused('secondary_history_projector_required')
+            raise HistoryPaused('history_projector_required')
         arguments = dict(locals())
-        for key in ('current_history_snapshot', 'history_turn', 'history_knowledge_scope', 'HistoryPaused', 'selected'):
+        for key in ('current_history_snapshot', 'history_turn', 'history_knowledge_scope', 'HistoryPaused'):
             arguments.pop(key, None)
         async with history_turn(history_projector) as snapshot:
             with history_knowledge_scope(snapshot, knowledge):
                 return await run_persona_evolution_cron(**arguments)
-    if history_config is not None and history_config.legacy_writers_disabled and not selected:
-        raise HistoryPaused('secondary_reader_unselected')
     collected_at = now or datetime.now(UTC)
     if collected_at.tzinfo is None:
         collected_at = collected_at.replace(tzinfo=UTC)
@@ -1353,14 +1322,11 @@ async def run_persona_evolution_cron(
 
         evidence = await collect_persona_evolution_evidence(
             history_projector=history_projector,
-            history_config=history_config,
             knowledge=knowledge,
             policy=policy,
             workspace=workspace,
             persona_file=persona_file,
-            memory=memory,
             speakup_log=speakup_log,
-            inbound_archive=inbound_archive,
             window_days=window_days,
             per_chat_limit=limit,
             since=since,
@@ -1558,7 +1524,6 @@ def persona_evolution_signal_score(evidence: PersonaEvolutionEvidence) -> float:
     score = 0.0
     for chat_evidence in evidence.chats:
         score += chat_evidence.recent_message_count * 0.25
-        score += len(chat_evidence.learned_taste) * 3.0
         score += len(chat_evidence.recent_preferences) * 2.0
         for outcome, count in chat_evidence.speakup_outcomes.items():
             weight = 2.0 if str(outcome) in {"replied", "approved", "denied"} else 1.0
@@ -1570,7 +1535,6 @@ async def build_persona_evolution_status(
     *,
     policy: PolicyConfig,
     workspace: Path,
-    memory: "MemoryService",
     speakup_log: SpeakupLog,
     state_db_path: Path,
     persona_file: str,
@@ -1608,12 +1572,10 @@ async def build_persona_evolution_status(
     }
     if channel and chat_id:
         summary = await speakup_log.learning_summary(channel=channel, chat_id=chat_id)
-        taste = memory.learned_chat_taste(channel=channel, chat_id=chat_id, limit=1)
         status["chat"] = {
             **summary,
             "channel": channel,
             "chat_id": chat_id,
-            "last_learned_taste": taste[0].entry.content if taste else None,
         }
     return status
 

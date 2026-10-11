@@ -10,17 +10,16 @@ from types import SimpleNamespace
 from unittest.mock import AsyncMock
 
 import pytest
+from history_turn_fixtures import Projector
 from yeoman_gateway.bus.queue import MessageBus
 from yeoman_gateway.channels.telegram import TelegramChannel
 from yeoman_gateway.consciousness.log import SpeakupLog
 from yeoman_gateway.core.models import InboundEvent, PolicyDecision
 from yeoman_gateway.core.pipeline import PipelineContext
-from yeoman_gateway.knowledge._memory.service import MemoryService
 from yeoman_gateway.persona_evolution import (
     PersonaEvolutionLedger,
     apply_persona_evolution_proposal,
     build_persona_evolution_approval_message,
-    build_persona_evolution_status,
     chats_for_persona,
     collect_persona_evolution_evidence,
     deny_persona_evolution_proposal,
@@ -32,8 +31,7 @@ from yeoman_gateway.pipeline.persona_evolution_approval import (
     PersonaEvolutionApprovalMiddleware,
 )
 from yeoman_gateway.policy.schema import PolicyConfig
-from yeoman_gateway.storage.inbound_archive import InboundArchive
-from yeoman_shared.config.schema import MemoryConfig, TelegramConfig
+from yeoman_shared.config.schema import TelegramConfig
 
 
 def _policy() -> PolicyConfig:
@@ -53,11 +51,6 @@ def _policy() -> PolicyConfig:
     )
 
 
-def _memory(tmp_path: Path) -> MemoryService:
-    return MemoryService(
-        workspace=tmp_path / "workspace",
-        config=MemoryConfig(db_path=str(tmp_path / "memory.db")),
-    )
 
 
 def _workspace(tmp_path: Path) -> Path:
@@ -72,23 +65,36 @@ def _workspace(tmp_path: Path) -> Path:
     return workspace
 
 
-def _record_messages(
-    archive: InboundArchive,
-    *,
-    chat_id: str = "group-a",
-    day: int,
-    count: int,
-) -> None:
+class _EmptyKnowledge:
+    policy_revision = 1
+    history_source_ledger = object()
+    _legacy_authority = object()
+
+    def history_scope(self, queries, sources):
+        from contextlib import nullcontext
+        del queries, sources
+        return nullcontext()
+
+    def owner_read_context(self, **kwargs):
+        return SimpleNamespace(**kwargs)
+
+    def recall(self, *args, **kwargs):
+        from yeoman_gateway.knowledge.models import KnowledgeContext
+        del args, kwargs
+        return KnowledgeContext()
+
+
+def _knowledge():
+    return _EmptyKnowledge()
+
+
+def _record_messages(archive: Projector, *, chat_id: str = "group-a", day: int, count: int) -> None:
     for index in range(count):
-        archive.record_inbound(
-            channel="whatsapp",
-            chat_id=chat_id,
-            message_id=f"d{day}-m{index}",
-            participant=f"user-{index % 3}@s.whatsapp.net",
-            sender_id=f"user-{index % 3}@s.whatsapp.net",
-            text=f"message {day}-{index}",
-            timestamp=int(datetime(2026, 5, day, 12, index, tzinfo=UTC).timestamp()),
-        )
+        message_id = f"d{day}-m{index}"
+        archive.add(message_id, chat=chat_id, text=f"message {day}-{index}")
+        stamp = int(datetime(2026, 5, day, 12, index, tzinfo=UTC).timestamp() * 1000)
+        archive.db.execute("UPDATE messages SET sent_ms=? WHERE native_message_id=?", (stamp, message_id))
+    archive.db.commit()
 
 
 def _owner_ctx(
@@ -213,17 +219,6 @@ async def test_collect_persona_evolution_evidence_excludes_raw_messages(
         "# Evolution Layer: Alpha\n",
         encoding="utf-8",
     )
-    memory = _memory(tmp_path)
-    memory.record_manual(
-        channel="whatsapp",
-        chat_id="group-a",
-        sender_id=None,
-        scope_type="chat",
-        kind="preference",
-        text="Proactive speakup taste pattern: compact market numbers land.",
-        importance=0.75,
-        confidence=0.88,
-    )
     log = SpeakupLog(tmp_path / "speakups.db")
     await log.record_sent(
         proposal_id="spk-1",
@@ -237,39 +232,29 @@ async def test_collect_persona_evolution_evidence_excludes_raw_messages(
         now=datetime(2026, 4, 25, 12, 0, tzinfo=UTC).timestamp(),
     )
     await log.mark_outcome("spk-1", outcome="replied")
-    archive = InboundArchive(tmp_path / "reply_context.db")
-    archive.record_inbound(
-        channel="whatsapp",
-        chat_id="group-a",
-        message_id="m1",
-        participant="user@s.whatsapp.net",
-        sender_id="user@s.whatsapp.net",
-        text="Private raw chat text must not appear.",
-        timestamp=int(datetime(2026, 4, 25, 12, 5, tzinfo=UTC).timestamp()),
-    )
+    archive = Projector()
+    archive.add("m1", chat="group-a", text="Private raw chat text must not appear.")
+    archive.db.execute("UPDATE messages SET sent_ms=? WHERE native_message_id='m1'", (int(datetime(2026, 4, 25, 12, 5, tzinfo=UTC).timestamp() * 1000),))
+    archive.db.commit()
 
     evidence = await collect_persona_evolution_evidence(
         policy=_policy(),
         workspace=workspace,
         persona_file="personas/alpha-2.md",
-        memory=memory,
-        speakup_log=log,
-        inbound_archive=archive,
-        now=datetime(2026, 4, 25, 13, 0, tzinfo=UTC),
+                speakup_log=log,
+            history_projector=archive,
+            knowledge=_knowledge(),
+                now=datetime(2026, 4, 25, 13, 0, tzinfo=UTC),
     )
     rendered = render_persona_evolution_proposal(evidence)
 
     assert evidence.current_evolution_text == "# Evolution Layer: Alpha\n"
-    assert evidence.chats[0].learned_taste == [
-        "Proactive speakup taste pattern: compact market numbers land."
-    ]
     assert evidence.chats[0].recent_message_count == 1
     assert "Alpha should lead with compact market numbers before any broader take" in rendered
     assert "Raw speakup text should not appear" not in rendered
     assert "Private raw chat text must not appear" not in rendered
     assert "no persona files were modified" in rendered
 
-    memory.close()
     log.close()
     archive.close()
 
@@ -279,17 +264,6 @@ async def test_render_persona_evolution_proposal_dedupes_review_noise(
     tmp_path: Path,
 ) -> None:
     workspace = _workspace(tmp_path)
-    memory = _memory(tmp_path)
-    memory.record_manual(
-        channel="whatsapp",
-        chat_id="group-a",
-        sender_id=None,
-        scope_type="chat",
-        kind="preference",
-        text="Proactive speakup taste pattern: compact market numbers land.",
-        importance=0.75,
-        confidence=0.88,
-    )
     log = SpeakupLog(tmp_path / "speakups.db")
     await log.record_sent(
         proposal_id="spk-1",
@@ -303,30 +277,23 @@ async def test_render_persona_evolution_proposal_dedupes_review_noise(
         now=datetime(2026, 4, 25, 12, 0, tzinfo=UTC).timestamp(),
     )
     await log.mark_outcome("spk-1", outcome="replied")
-    archive = InboundArchive(tmp_path / "reply_context.db")
-    archive.record_inbound(
-        channel="whatsapp",
-        chat_id="group-a",
-        message_id="m1",
-        participant="user@s.whatsapp.net",
-        sender_id="user@s.whatsapp.net",
-        text="Private raw chat text must not appear.",
-        timestamp=int(datetime(2026, 4, 25, 12, 5, tzinfo=UTC).timestamp()),
-    )
+    archive = Projector()
+    archive.add("m1", chat="group-a", text="Private raw chat text must not appear.")
+    archive.db.execute("UPDATE messages SET sent_ms=? WHERE native_message_id='m1'", (int(datetime(2026, 4, 25, 12, 5, tzinfo=UTC).timestamp() * 1000),))
+    archive.db.commit()
 
     try:
         evidence = await collect_persona_evolution_evidence(
             policy=_policy(),
             workspace=workspace,
             persona_file="personas/alpha-2.md",
-            memory=memory,
-            speakup_log=log,
-            inbound_archive=archive,
-            now=datetime(2026, 4, 25, 13, 0, tzinfo=UTC),
+                        speakup_log=log,
+            history_projector=archive,
+            knowledge=_knowledge(),
+                        now=datetime(2026, 4, 25, 13, 0, tzinfo=UTC),
         )
         rendered = render_persona_evolution_proposal(evidence, proposal_id="abc123")
     finally:
-        memory.close()
         log.close()
         archive.close()
 
@@ -335,7 +302,6 @@ async def test_render_persona_evolution_proposal_dedupes_review_noise(
     assert "## Current Evolution Digest" in rendered
     assert "Current Evolution File" not in rendered
     assert "whatsapp:group-b" not in rendered
-    assert rendered.count("lead with compact market numbers before any broader take") == 1
     assert "Recent chat preferences:" not in rendered
     assert "Learned proactive taste:" not in rendered
 
@@ -343,19 +309,8 @@ async def test_render_persona_evolution_proposal_dedupes_review_noise(
 @pytest.mark.asyncio
 async def test_run_persona_evolution_cron_writes_proposal(tmp_path: Path) -> None:
     workspace = _workspace(tmp_path)
-    memory = _memory(tmp_path)
-    memory.record_manual(
-        channel="whatsapp",
-        chat_id="group-a",
-        sender_id=None,
-        scope_type="chat",
-        kind="preference",
-        text="Proactive speakup taste pattern: compact market numbers land.",
-        importance=0.75,
-        confidence=0.88,
-    )
     log = SpeakupLog(tmp_path / "speakups.db")
-    archive = InboundArchive(tmp_path / "reply_context.db")
+    archive = Projector()
     output = workspace / "persona-evolution" / "proposal.md"
     _record_messages(archive, day=1, count=3)
 
@@ -364,10 +319,10 @@ async def test_run_persona_evolution_cron_writes_proposal(tmp_path: Path) -> Non
             policy=_policy(),
             workspace=workspace,
             persona_file="personas/alpha-2.md",
-            memory=memory,
-            speakup_log=log,
-            inbound_archive=archive,
-            window_days=1,
+                        speakup_log=log,
+            history_projector=archive,
+            knowledge=_knowledge(),
+                        window_days=1,
             limit=10,
             output_path=output,
             min_meaningful_messages=1,
@@ -375,7 +330,6 @@ async def test_run_persona_evolution_cron_writes_proposal(tmp_path: Path) -> Non
             now=datetime(2026, 5, 1, 13, 0, tzinfo=UTC),
         )
     finally:
-        memory.close()
         log.close()
         archive.close()
 
@@ -391,9 +345,8 @@ async def test_run_persona_evolution_cron_skips_without_durable_change(
     tmp_path: Path,
 ) -> None:
     workspace = _workspace(tmp_path)
-    memory = _memory(tmp_path)
     log = SpeakupLog(tmp_path / "speakups.db")
-    archive = InboundArchive(tmp_path / "reply_context.db")
+    archive = Projector()
     output = workspace / "persona-evolution" / "proposal.md"
     _record_messages(archive, day=1, count=3)
 
@@ -402,10 +355,10 @@ async def test_run_persona_evolution_cron_skips_without_durable_change(
             policy=_policy(),
             workspace=workspace,
             persona_file="personas/alpha-2.md",
-            memory=memory,
-            speakup_log=log,
-            inbound_archive=archive,
-            window_days=1,
+                        speakup_log=log,
+            history_projector=archive,
+            knowledge=_knowledge(),
+                        window_days=1,
             limit=10,
             output_path=output,
             min_meaningful_messages=1,
@@ -413,7 +366,6 @@ async def test_run_persona_evolution_cron_skips_without_durable_change(
             now=datetime(2026, 5, 1, 13, 0, tzinfo=UTC),
         )
     finally:
-        memory.close()
         log.close()
         archive.close()
 
@@ -438,19 +390,8 @@ async def test_run_persona_evolution_cron_skips_redundant_durable_lesson(
         ),
         encoding="utf-8",
     )
-    memory = _memory(tmp_path)
-    memory.record_manual(
-        channel="whatsapp",
-        chat_id="group-a",
-        sender_id=None,
-        scope_type="chat",
-        kind="preference",
-        text="Proactive speakup taste pattern: Engages most with data-dense observations and error corrections on trading, markets, and finance; resists contrarian views and opinion-heavy shares.",
-        importance=0.75,
-        confidence=0.88,
-    )
     log = SpeakupLog(tmp_path / "speakups.db")
-    archive = InboundArchive(tmp_path / "reply_context.db")
+    archive = Projector()
     output = workspace / "persona-evolution" / "proposal.md"
     _record_messages(archive, day=1, count=3)
 
@@ -459,10 +400,10 @@ async def test_run_persona_evolution_cron_skips_redundant_durable_lesson(
             policy=_policy(),
             workspace=workspace,
             persona_file="personas/alpha-2.md",
-            memory=memory,
-            speakup_log=log,
-            inbound_archive=archive,
-            window_days=1,
+                        speakup_log=log,
+            history_projector=archive,
+            knowledge=_knowledge(),
+                        window_days=1,
             limit=10,
             output_path=output,
             min_meaningful_messages=1,
@@ -470,231 +411,12 @@ async def test_run_persona_evolution_cron_skips_redundant_durable_lesson(
             now=datetime(2026, 5, 1, 13, 0, tzinfo=UTC),
         )
     finally:
-        memory.close()
         log.close()
         archive.close()
 
-    assert result == "persona_evolution no proposal: no_durable_changes messages=3 score=5.75"
+    assert result == "persona_evolution no proposal: no_durable_changes messages=3 score=0.75"
     assert not output.exists()
 
-
-@pytest.mark.asyncio
-async def test_run_persona_evolution_cron_converts_chat_taste_to_alpha_behavior(
-    tmp_path: Path,
-) -> None:
-    workspace = _workspace(tmp_path)
-    (workspace / "personas" / "alpha-2.evolution.md").write_text(
-        "\n".join(
-            [
-                "# Evolution Layer: Alpha",
-                "",
-                "## Consciousness Outcome Lessons",
-                "- 2026-06-03 `whatsapp:group-a` confidence=medium evidence=50 speakups, 50 messages: Analytisch, datengetrieben und haeufig korrigierend oder kontraer; dominiert von finanz- und tech-affinen Faktenchecks mit praezisen Zahlen und Quellenangaben.",
-                "",
-            ]
-        ),
-        encoding="utf-8",
-    )
-    memory = _memory(tmp_path)
-    memory.record_manual(
-        channel="whatsapp",
-        chat_id="group-a",
-        sender_id=None,
-        scope_type="chat",
-        kind="preference",
-        text=(
-            "Proactive speakup taste pattern: Assertive, technically precise discourse "
-            "favored; unsolicited contributions succeed when correcting inaccuracies "
-            "with hard data, offering contrarian takes supported by metrics, or "
-            "sharing sharp observations laced with dry humor. Jargon and "
-            "industry-specific references signal insider fluency. Speculative or "
-            "fluffy remarks without quantitative backing tend to get ignored or "
-            "challenged. Tone is confident, often slightly combative, but "
-            "acknowledged when factually sound."
-        ),
-        importance=0.75,
-        confidence=0.88,
-    )
-    log = SpeakupLog(tmp_path / "speakups.db")
-    archive = InboundArchive(tmp_path / "reply_context.db")
-    output = workspace / "persona-evolution" / "proposal.md"
-    _record_messages(archive, day=1, count=3)
-
-    try:
-        result = await run_persona_evolution_cron(
-            policy=_policy(),
-            workspace=workspace,
-            persona_file="personas/alpha-2.md",
-            memory=memory,
-            speakup_log=log,
-            inbound_archive=archive,
-            window_days=1,
-            limit=10,
-            output_path=output,
-            min_meaningful_messages=1,
-            min_signal_score=0.0,
-            now=datetime(2026, 5, 1, 13, 0, tzinfo=UTC),
-        )
-    finally:
-        memory.close()
-        log.close()
-        archive.close()
-
-    assert result == f"persona_evolution proposal written: {output}"
-    rendered = output.read_text(encoding="utf-8")
-    assert "Alpha should" in rendered
-    assert "lead with the hard number or concrete evidence before the opinion" in rendered
-    assert "skip speculative or fluffy remarks unless they are anchored" in rendered
-    assert "Assertive, technically precise discourse favored" not in rendered
-
-
-@pytest.mark.asyncio
-async def test_run_persona_evolution_cron_skips_repeated_alpha_behavior_delta(
-    tmp_path: Path,
-) -> None:
-    workspace = _workspace(tmp_path)
-    (workspace / "personas" / "alpha-2.evolution.md").write_text(
-        "\n".join(
-            [
-                "# Evolution Layer: Alpha",
-                "",
-                "## Consciousness Outcome Lessons",
-                "- 2026-06-06 `whatsapp:group-a` confidence=medium evidence=50 speakups, 50 messages: Alpha should lead with the hard number or concrete evidence before the opinion; correct inaccuracies directly when the evidence is strong; make contrarian takes only with clear metrics or sources; add dry humor only after the substance lands; skip speculative or fluffy remarks unless they are anchored to quantitative backing; keep the tone confident and technically precise.",
-                "",
-            ]
-        ),
-        encoding="utf-8",
-    )
-    memory = _memory(tmp_path)
-    memory.record_manual(
-        channel="whatsapp",
-        chat_id="group-a",
-        sender_id=None,
-        scope_type="chat",
-        kind="preference",
-        text=(
-            "Proactive speakup taste pattern: Assertive, technically precise discourse "
-            "favored; unsolicited contributions succeed when correcting inaccuracies "
-            "with hard data, offering contrarian takes supported by metrics, or "
-            "sharing sharp observations laced with dry humor. Speculative or fluffy "
-            "remarks without quantitative backing tend to get ignored or challenged."
-        ),
-        importance=0.75,
-        confidence=0.88,
-    )
-    log = SpeakupLog(tmp_path / "speakups.db")
-    archive = InboundArchive(tmp_path / "reply_context.db")
-    output = workspace / "persona-evolution" / "proposal.md"
-    _record_messages(archive, day=1, count=3)
-
-    try:
-        result = await run_persona_evolution_cron(
-            policy=_policy(),
-            workspace=workspace,
-            persona_file="personas/alpha-2.md",
-            memory=memory,
-            speakup_log=log,
-            inbound_archive=archive,
-            window_days=1,
-            limit=10,
-            output_path=output,
-            min_meaningful_messages=1,
-            min_signal_score=0.0,
-            now=datetime(2026, 5, 1, 13, 0, tzinfo=UTC),
-        )
-    finally:
-        memory.close()
-        log.close()
-        archive.close()
-
-    assert result == "persona_evolution no proposal: no_durable_changes messages=3 score=5.75"
-    assert not output.exists()
-
-
-@pytest.mark.asyncio
-async def test_cron_accumulates_below_threshold_messages_until_proposal(
-    tmp_path: Path,
-) -> None:
-    workspace = _workspace(tmp_path)
-    memory = _memory(tmp_path)
-    log = SpeakupLog(tmp_path / "speakups.db")
-    archive = InboundArchive(tmp_path / "reply_context.db")
-    state_db = tmp_path / "persona-evolution.db"
-    output = workspace / "persona-evolution" / "proposal.md"
-
-    try:
-        _record_messages(archive, day=1, count=9)
-        first = await run_persona_evolution_cron(
-            policy=_policy(),
-            workspace=workspace,
-            persona_file="personas/alpha-2.md",
-            memory=memory,
-            speakup_log=log,
-            inbound_archive=archive,
-            limit=100,
-            output_path=output,
-            state_db_path=state_db,
-            min_meaningful_messages=25,
-            min_signal_score=0.0,
-            max_accumulation_days=14,
-            now=datetime(2026, 5, 1, 13, 0, tzinfo=UTC),
-        )
-        assert first == "persona_evolution no proposal: below_threshold messages=9 score=2.25"
-        assert not output.exists()
-
-        _record_messages(archive, day=2, count=9)
-        second = await run_persona_evolution_cron(
-            policy=_policy(),
-            workspace=workspace,
-            persona_file="personas/alpha-2.md",
-            memory=memory,
-            speakup_log=log,
-            inbound_archive=archive,
-            limit=100,
-            output_path=output,
-            state_db_path=state_db,
-            min_meaningful_messages=25,
-            min_signal_score=0.0,
-            max_accumulation_days=14,
-            now=datetime(2026, 5, 2, 13, 0, tzinfo=UTC),
-        )
-        assert second == "persona_evolution no proposal: below_threshold messages=18 score=4.50"
-        assert not output.exists()
-
-        memory.record_manual(
-            channel="whatsapp",
-            chat_id="group-a",
-            sender_id=None,
-            scope_type="chat",
-            kind="preference",
-            text="Proactive speakup taste pattern: compact market numbers land.",
-            importance=0.75,
-            confidence=0.88,
-        )
-        _record_messages(archive, day=3, count=9)
-        third = await run_persona_evolution_cron(
-            policy=_policy(),
-            workspace=workspace,
-            persona_file="personas/alpha-2.md",
-            memory=memory,
-            speakup_log=log,
-            inbound_archive=archive,
-            limit=100,
-            output_path=output,
-            state_db_path=state_db,
-            min_meaningful_messages=25,
-            min_signal_score=0.0,
-            max_accumulation_days=14,
-            now=datetime(2026, 5, 3, 13, 0, tzinfo=UTC),
-        )
-    finally:
-        memory.close()
-        log.close()
-        archive.close()
-
-    assert third == f"persona_evolution proposal written: {output}"
-    rendered = output.read_text(encoding="utf-8")
-    assert "total_message_count: `27`" in rendered
 
 
 @pytest.mark.asyncio
@@ -712,19 +434,18 @@ async def test_auto_apply_mode_applies_ignored_expired_proposal(
         proposal_id="ignored123",
         created_at=datetime(2026, 5, 4, 3, 0, tzinfo=UTC),
     )
-    memory = _memory(tmp_path)
     log = SpeakupLog(tmp_path / "speakups.db")
-    archive = InboundArchive(tmp_path / "reply_context.db")
+    archive = Projector()
 
     try:
         result = await run_persona_evolution_cron(
             policy=_policy(),
             workspace=workspace,
             persona_file="personas/alpha-2.md",
-            memory=memory,
-            speakup_log=log,
-            inbound_archive=archive,
-            state_db_path=state_db,
+                        speakup_log=log,
+            history_projector=archive,
+            knowledge=_knowledge(),
+                        state_db_path=state_db,
             min_meaningful_messages=1,
             min_signal_score=0.0,
             proposal_ttl_seconds=3600,
@@ -732,7 +453,6 @@ async def test_auto_apply_mode_applies_ignored_expired_proposal(
             now=datetime(2026, 5, 4, 4, 0, 1, tzinfo=UTC),
         )
     finally:
-        memory.close()
         log.close()
         archive.close()
 
@@ -758,19 +478,8 @@ async def test_closed_proposal_watermark_prevents_reusing_old_messages(
     tmp_path: Path,
 ) -> None:
     workspace = _workspace(tmp_path)
-    memory = _memory(tmp_path)
-    memory.record_manual(
-        channel="whatsapp",
-        chat_id="group-a",
-        sender_id=None,
-        scope_type="chat",
-        kind="preference",
-        text="Proactive speakup taste pattern: compact market numbers land.",
-        importance=0.75,
-        confidence=0.88,
-    )
     log = SpeakupLog(tmp_path / "speakups.db")
-    archive = InboundArchive(tmp_path / "reply_context.db")
+    archive = Projector()
     state_db = tmp_path / "persona-evolution.db"
     output = workspace / "persona-evolution" / "proposal.md"
 
@@ -780,10 +489,10 @@ async def test_closed_proposal_watermark_prevents_reusing_old_messages(
             policy=_policy(),
             workspace=workspace,
             persona_file="personas/alpha-2.md",
-            memory=memory,
-            speakup_log=log,
-            inbound_archive=archive,
-            limit=100,
+                        speakup_log=log,
+            history_projector=archive,
+            knowledge=_knowledge(),
+                        limit=100,
             output_path=output,
             state_db_path=state_db,
             min_meaningful_messages=1,
@@ -805,10 +514,10 @@ async def test_closed_proposal_watermark_prevents_reusing_old_messages(
             policy=_policy(),
             workspace=workspace,
             persona_file="personas/alpha-2.md",
-            memory=memory,
-            speakup_log=log,
-            inbound_archive=archive,
-            limit=100,
+                        speakup_log=log,
+            history_projector=archive,
+            knowledge=_knowledge(),
+                        limit=100,
             output_path=output,
             state_db_path=state_db,
             min_meaningful_messages=3,
@@ -817,11 +526,10 @@ async def test_closed_proposal_watermark_prevents_reusing_old_messages(
             now=datetime(2026, 5, 2, 13, 0, tzinfo=UTC),
         )
     finally:
-        memory.close()
         log.close()
         archive.close()
 
-    assert later == "persona_evolution no proposal: below_threshold messages=1 score=5.25"
+    assert later == "persona_evolution no proposal: below_threshold messages=1 score=0.25"
     assert not output.exists()
 
 
@@ -830,19 +538,8 @@ async def test_run_persona_evolution_cron_rejects_output_outside_workspace(
     tmp_path: Path,
 ) -> None:
     workspace = _workspace(tmp_path)
-    memory = _memory(tmp_path)
-    memory.record_manual(
-        channel="whatsapp",
-        chat_id="group-a",
-        sender_id=None,
-        scope_type="chat",
-        kind="preference",
-        text="Proactive speakup taste pattern: compact market numbers land.",
-        importance=0.75,
-        confidence=0.88,
-    )
     log = SpeakupLog(tmp_path / "speakups.db")
-    archive = InboundArchive(tmp_path / "reply_context.db")
+    archive = Projector()
     outside_output = tmp_path / "outside-proposal.md"
     _record_messages(archive, day=1, count=3)
 
@@ -851,83 +548,21 @@ async def test_run_persona_evolution_cron_rejects_output_outside_workspace(
             policy=_policy(),
             workspace=workspace,
             persona_file="personas/alpha-2.md",
-            memory=memory,
-            speakup_log=log,
-            inbound_archive=archive,
-            limit=100,
+                        speakup_log=log,
+            history_projector=archive,
+            knowledge=_knowledge(),
+                        limit=100,
             output_path=outside_output,
             min_meaningful_messages=1,
             min_signal_score=0.0,
             now=datetime(2026, 5, 1, 13, 0, tzinfo=UTC),
         )
     finally:
-        memory.close()
         log.close()
         archive.close()
 
     assert result.startswith("persona_evolution no proposal: invalid_output_path")
     assert not outside_output.exists()
-
-
-@pytest.mark.asyncio
-async def test_build_persona_evolution_status_summarizes_chat_learning(
-    tmp_path: Path,
-) -> None:
-    workspace = _workspace(tmp_path)
-    memory = _memory(tmp_path)
-    memory.record_manual(
-        channel="whatsapp",
-        chat_id="group-a",
-        sender_id=None,
-        scope_type="chat",
-        kind="preference",
-        text="Proactive speakup taste pattern: compact market numbers land.",
-        importance=0.75,
-        confidence=0.88,
-    )
-    log = SpeakupLog(tmp_path / "speakups.db")
-    await log.record_sent(
-        proposal_id="spk-1",
-        channel="whatsapp",
-        chat_id="group-a",
-        action_type="share_opinion",
-        profile="balanced",
-        message="short",
-        trigger="cron",
-        context_snapshot={},
-        now=datetime(2026, 5, 1, 12, 0, tzinfo=UTC).timestamp(),
-    )
-    await log.mark_outcome("spk-1", outcome="replied")
-    await log.record_taste_distillation(
-        channel="whatsapp",
-        chat_id="group-a",
-        sample_fingerprint="fp-1",
-        now=datetime(2026, 5, 1, 13, 0, tzinfo=UTC).timestamp(),
-    )
-    state_db = tmp_path / "persona-evolution.db"
-
-    try:
-        status = await build_persona_evolution_status(
-            policy=_policy(),
-            workspace=workspace,
-            memory=memory,
-            speakup_log=log,
-            state_db_path=state_db,
-            persona_file="personas/alpha-2.md",
-            channel="whatsapp",
-            chat_id="group-a",
-        )
-    finally:
-        memory.close()
-        log.close()
-
-    assert status["persona_file"] == "personas/alpha-2.md"
-    assert status["pending_proposals"] == []
-    assert status["metrics"] == {"proposals": {}, "scans": {}}
-    assert status["chat"]["sent_speakups"] == 1
-    assert status["chat"]["labeled_outcomes"] == 1
-    assert status["chat"]["taste_distillations"] == 1
-    assert status["chat"]["last_learned_taste"].endswith("compact market numbers land.")
 
 
 def test_approval_message_is_compact_for_telegram_review(tmp_path: Path) -> None:
@@ -977,9 +612,7 @@ def test_telegram_metadata_includes_reply_target_text() -> None:
             from_user=SimpleNamespace(id=42, is_bot=True),
         ),
     )
-
     metadata = channel._mention_metadata(message)
-
     assert metadata["reply_to_bot"] is True
     assert metadata["reply_to_message_id"] == "99"
     assert metadata["reply_to_text"] == "Persona evolution proposal\npe-approve-abc123\npe-deny-abc123"
@@ -995,7 +628,7 @@ def test_apply_persona_evolution_proposal_updates_evolution_file_and_metadata(
             [
                 "# Evolution Layer: Alpha",
                 "<!-- Last consolidated: 2026-03-21 -->",
-                "<!-- Consolidation count: 0 (seed file — no consolidation has run yet) -->",
+                "<!-- Consolidation count: 0 -->",
                 "",
                 "## Trait Drift",
                 "Verbosity: low-moderate (stable)",

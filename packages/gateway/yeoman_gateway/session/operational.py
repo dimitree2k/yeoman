@@ -2,12 +2,8 @@
 
 from __future__ import annotations
 
-import json
 import sqlite3
-from datetime import datetime
 from pathlib import Path
-
-from yeoman_shared.utils.helpers import get_operational_store_path
 
 
 class OperationalSessions:
@@ -75,45 +71,3 @@ class OperationalSessions:
     def close(self) -> None:
         self._db.close()
 
-
-def import_session_boundaries(source: Path, target: OperationalSessions) -> dict[str, int]:
-    """Import final isolated JSONL copies; validate the whole inventory before writing."""
-    source = source.resolve(strict=True)
-    runtime_data = get_operational_store_path("session_metadata", create=False).parents[1]
-    for protected in (runtime_data, Path("/home/dm/.yeoman/data")):
-        if source.is_relative_to(protected.resolve()):
-            raise ValueError("session boundary import requires an isolated snapshot")
-    paths = sorted(source.glob("*.jsonl")) if source.is_dir() else [source]
-    inventory: dict[str, int] = {}
-    routes: dict[str, tuple[str, str, str | None]] = {}
-    for path in paths:
-        if path.is_symlink():
-            raise ValueError("session snapshot must not contain symlinks")
-        rows = [json.loads(line) for line in path.read_text().splitlines() if line.strip()]
-        markers = [row for row in rows if row.get("role") == "session_boundary"]
-        if not markers:
-            continue
-        metadata = next((row.get("metadata", {}) for row in rows
-                         if row.get("_type") == "metadata"), {})
-        channel, chat_id = metadata.get("channel"), metadata.get("chat_id")
-        thread_id = metadata.get("thread_id")
-        if not channel or not chat_id:
-            channel, separator, chat_id = path.stem.partition("_")
-            # Legacy filenames lose colons; thread routes need an explicit inventory.
-            if not separator or "_thread_" in chat_id or "_" in chat_id:
-                raise ValueError("ambiguous legacy session route needs explicit metadata")
-        if not isinstance(channel, str) or not isinstance(chat_id, str):
-            raise ValueError("invalid session route")
-        moments = []
-        for row in markers:
-            moment = datetime.fromisoformat(row["timestamp"])
-            # Legacy Session used local naive datetimes; preserve that timezone meaning.
-            moments.append(int(moment.timestamp() * 1000))
-        key = f"{channel}:{chat_id}"
-        inventory[key] = max(inventory.get(key, max(moments)), max(moments))
-        routes[key] = (channel, chat_id, thread_id)
-    for key, at_ms in inventory.items():
-        channel, chat_id, thread_id = routes[key]
-        target.set_route(session_key=key, channel=channel, chat_id=chat_id, thread_id=thread_id)
-        target.set_boundary(channel=channel, chat_id=chat_id, at_ms=at_ms)
-    return inventory

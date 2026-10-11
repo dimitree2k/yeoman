@@ -62,19 +62,18 @@ class BurstObserver:
         chat_id = str(event.chat_id or "").strip()
         if not channel or not chat_id:
             return
-        history = getattr(self._config, 'history', None)
-        selected = bool(channel == 'whatsapp' and history is not None
-                        and history.live_projection_enabled and history.readers.secondary)
-        if selected and not await self._eligible(channel, chat_id):
+        if channel == "whatsapp" and not await self._eligible(channel, chat_id):
             return
-        await self._handle_activity(event, eligibility_checked=selected)
+        await self._handle_activity(event)
 
     @secondary_consumer
-    async def _handle_activity(self, event: InboundObservedEvent, *, eligibility_checked: bool) -> None:
+    async def _handle_activity(self, event: InboundObservedEvent) -> None:
         channel = str(event.channel or "").strip()
         chat_id = str(event.chat_id or "").strip()
         key = (channel, chat_id)
         event_ts = float(event.timestamp)
+        if channel != "whatsapp" and not await self._eligible(channel, chat_id):
+            return
         if self._is_direct_bot_interaction(event):
             self._windows.pop(key, None)
             self._last_direct_bot_interaction[key] = event_ts
@@ -91,8 +90,6 @@ class BurstObserver:
                 )
                 return
             self._last_direct_bot_interaction.pop(key, None)
-        if not eligibility_checked and not await self._eligible(channel, chat_id):
-            return
 
         cutoff = event_ts - window_seconds
         window = self._windows[key]

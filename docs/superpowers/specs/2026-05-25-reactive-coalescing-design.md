@@ -1,8 +1,14 @@
 # Reactive Coalescing - Design
 
+Historical document (G6, 2026-10-11): the standalone WhatsApp history stores, legacy history tools and cutover scripts referenced here have been retired. Current runtime reads use canonical History and Knowledge schema 3; old store examples describe the previous implementation.
+
+
 Status: Draft for review
 Date: 2026-05-25
 Owner: Tim
+
+Historical note: the `summarize_history` tool in the example allowlist below
+was retired in G6 and must not be copied into a live policy.
 Builds on:
 - `docs/superpowers/specs/2026-05-07-chat-situation-layer-design.md`
 - `session-context/2026-05-24-omega-runtime-followup.md`
@@ -391,7 +397,7 @@ uv run pytest tests/gateway/
     "tools": [
       "web_search",
       "web_fetch",
-      "summarize_history"
+      "history_read"
     ],
     "deny": [
       "exec",

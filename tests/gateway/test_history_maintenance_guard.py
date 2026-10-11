@@ -14,9 +14,6 @@ import pytest
 
 ROOT = Path(__file__).resolve().parents[2]
 CLI_PATHS = {
-    "backfill_memory_insights.py": ("--archive-db",),
-    "migrate_person_profile_scope.py": ("--memory-db", "--contacts-db"),
-    "backfill_contact_aliases.py": ("--archive-db", "--contacts-db"),
     "estimate_memory_rebuild.py": ("--segments", "--rates", "--output"),
 }
 PROTECTED = Path("/home/dm/.yeoman/data/ops/cron-jobs.json")
@@ -25,7 +22,7 @@ PROTECTED = Path("/home/dm/.yeoman/data/ops/cron-jobs.json")
 def _load_cli(filename: str, monkeypatch: pytest.MonkeyPatch) -> ModuleType:
     monkeypatch.syspath_prepend(str(ROOT / "scripts"))
     path = ROOT / "scripts" / filename
-    spec = importlib.util.spec_from_file_location(f"history_cutover_{path.stem}", path)
+    spec = importlib.util.spec_from_file_location(f"history_maintenance_{path.stem}", path)
     assert spec is not None and spec.loader is not None
     module = importlib.util.module_from_spec(spec)
     sys.modules[spec.name] = module
@@ -44,8 +41,6 @@ def _arguments(filename: str, root: Path) -> list[str]:
         "--output": root / "estimate.json",
     }
     args = [part for flag in CLI_PATHS[filename] for part in (flag, str(paths[flag]))]
-    if filename == "backfill_memory_insights.py":
-        args.append("--dry-run")
     return args
 
 
@@ -99,9 +94,6 @@ def _install_access_sentinels(
     if hasattr(module, "load_config"):
         monkeypatch.setattr(module, "load_config", touch("load_config"))
     monkeypatch.setattr(module, "require_isolated_paths", touch("shared require_isolated_paths"))
-    for name in ("MemoryService", "ContactsService"):
-        if hasattr(module, name):
-            monkeypatch.setattr(module, name, touch(name))
     return touched
 
 
@@ -163,18 +155,3 @@ def test_isolated_preflight_accepts_paths_and_scripts_import_as_package(
         importlib.import_module(f"scripts.{Path(filename).stem}")
 
 
-def test_memory_insights_extraction_requires_explicit_dry_run(
-    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
-) -> None:
-    module = _load_cli("backfill_memory_insights.py", monkeypatch)
-    touched = _install_access_sentinels(monkeypatch, module)
-    monkeypatch.setattr(
-        sys,
-        "argv",
-        ["backfill_memory_insights.py", "--archive-db", str(tmp_path / "archive.db")],
-    )
-
-    with pytest.raises(SystemExit):
-        module.main()
-
-    assert touched == []

@@ -14,8 +14,7 @@ def history_path_refused(db_path: Path, ctx: Any) -> bool:
     home = ctx.yeoman_home.resolve()
     if resolved.name.startswith('history.db') or (resolved.is_relative_to(home) and 'history' in resolved.relative_to(home).parts):
         return True
-    retired = getattr(ctx, 'legacy_history_disabled', False) or getattr(ctx, 'history_selected', False)
-    return retired and any(resolved.name.startswith(name) for name in (
+    return any(resolved.name.startswith(name) for name in (
         'reply_context.db', 'chat_registry.db', 'contacts.db', 'memory.db', 'knowledge.db'))
 
 

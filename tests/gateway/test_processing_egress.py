@@ -1356,7 +1356,6 @@ async def test_typing_stays_ephemeral_presence_without_an_effect(tmp_path: Path)
         orchestrator=None,  # type: ignore[arg-type]
         typing_adapter=_typing,
         telemetry=None,  # type: ignore[arg-type]
-        memory=None,  # type: ignore[arg-type]
         effect_router=router,
     )
     await service._dispatch_intents(

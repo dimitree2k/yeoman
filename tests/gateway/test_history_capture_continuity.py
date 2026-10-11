@@ -121,7 +121,7 @@ def case(tmp_path):
     legacy = RuntimeKnowledgeSources()
     def open_service():
         return open_knowledge_store(path, workspace_id="synthetic", source_authority=legacy,
-                                    policy_authority=policy, history_mode=True)
+                                    policy_authority=policy)
     knowledge = open_service()
     history = History(tmp_path / "history.db")
     yield history, knowledge, policy, open_service
@@ -494,22 +494,16 @@ async def test_unprocessed_edit_queues_current_revision_once_and_preserves_job_i
     assert all(r["outcome"] != "pending" for r in k._store.query("SELECT outcome FROM knowledge_history_capture"))
 
 
-def test_builder_selection_keeps_default_worker_and_selects_history(case, monkeypatch):
+def test_builder_always_selects_history_worker(case, monkeypatch):
     from yeoman_gateway.app.bootstrap import build_statement_capture
-    from yeoman_gateway.knowledge import _capture_worker
     from yeoman_gateway.knowledge._history_capture import HistoryCaptureWorker
     from yeoman_shared.config.loader import load_config
     h, k, _, _ = case
-    monkeypatch.setattr(_capture_worker, "StatementExtractor", lambda **kwargs: extract)
     base = {"knowledge": {"captureEnabled": True}}
     path = h.path.parent / "settings.json"
     path.write_text(json.dumps(base))
-    dormant = load_config(path)
-    legacy = build_statement_capture(dormant, knowledge=k, processing=object(), projector=h.projector)
-    assert type(legacy).__name__ == "StatementCaptureWorker"
-    path.write_text(json.dumps({**base, "history": {
-        "liveProjectionEnabled": True, "readers": {"knowledge": True}}}))
     selected = load_config(path)
+    monkeypatch.setattr("yeoman_gateway.knowledge._capture_worker.StatementExtractor", lambda **kwargs: lambda rows: [])
     assert isinstance(build_statement_capture(selected, knowledge=k, processing=None, projector=h.projector),
                       HistoryCaptureWorker)
     assert k._store.scalar("SELECT count(*) FROM knowledge_history_capture_state") == 0

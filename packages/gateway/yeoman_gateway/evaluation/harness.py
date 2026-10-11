@@ -23,7 +23,7 @@ CONTRIBUTION_TYPES: tuple[str, ...] = (
 
 
 class ScenarioArchive:
-    """InboundArchive stand-in over synthetic messages."""
+    """History row adapter over synthetic evaluation messages."""
 
     def __init__(self, scenario: Scenario) -> None:
         self._rows: list[dict[str, Any]] = [
@@ -51,7 +51,7 @@ class ScenarioArchive:
         selected = rows[-limit:] if latest else rows[:limit]
         return [dict(row) for row in selected]
 
-    def lookup_message(self, channel: str, chat_id: str, message_id: str) -> dict[str, Any] | None:
+    def row(self, channel: str, chat_id: str, message_id: str) -> dict[str, Any] | None:
         for row in self._rows:
             if (row["channel"], row["chat_id"], row["message_id"]) == (channel, chat_id, message_id):
                 return dict(row)

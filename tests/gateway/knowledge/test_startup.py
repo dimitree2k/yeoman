@@ -21,7 +21,6 @@ from yeoman_gateway.knowledge.api import (
 from yeoman_gateway.knowledge.authority import FakePolicyAuthority, FakeSourceAuthority
 from yeoman_gateway.knowledge.models import KnowledgeError, TrustedReadContext
 from yeoman_gateway.knowledge.runtime import (
-    EvidenceAudience,
     RuntimeKnowledgePolicy,
     RuntimeKnowledgeSources,
 )
@@ -36,20 +35,15 @@ def _open(path: Path, *, legacy: tuple[Path, ...] = (), workspace: Path | None =
         workspace_id=workspace_id_for(workspace or path.parent),
         source_authority=FakeSourceAuthority(),
         policy_authority=policy,
-        legacy_sources=legacy,
     )
 
 
-def test_fresh_installation_initialises_an_empty_knowledge_store(tmp_path: Path):
-    service = _open(tmp_path / "knowledge" / "knowledge.db")
-    try:
-        stats = service.stats(context=_admin(service))
-        assert stats.state == "ready"
-        assert stats.people_count == 0
-        assert stats.statement_count == 0
-        assert stats.schema_version >= 1
-    finally:
-        service.close()
+def test_published_empty_schema3_store_opens_ready(knowledge_harness):
+    stats = knowledge_harness.service.stats(context=knowledge_harness.admin_context())
+    assert stats.state == "ready"
+    assert stats.people_count == 0
+    assert stats.statement_count == 0
+    assert stats.schema_version == 3
 
 
 def _admin(service):
@@ -85,10 +79,9 @@ def test_legacy_memory_file_used_as_target_is_refused(tmp_path: Path):
     assert sources.memory.read_bytes() == before
 
 
-def test_incompatible_schema_version_is_reported_without_writes(tmp_path: Path):
-    path = tmp_path / "knowledge.db"
-    service = _open(path)
-    service.close()
+def test_incompatible_schema_version_is_reported_without_writes(knowledge_harness):
+    path = knowledge_harness.tmp_path / "knowledge-v3.db"
+    knowledge_harness.service.close()
     conn = sqlite3.connect(path)
     try:
         conn.execute("UPDATE knowledge_meta SET value = '999' WHERE key = 'schema_version'")
@@ -157,115 +150,59 @@ def test_v1_store_without_complete_marker_is_refused_without_writes(tmp_path: Pa
     assert fixture.path.read_bytes() == before
 
 
-def test_fresh_store_reports_the_v2_schema(tmp_path: Path):
-    from yeoman_gateway.knowledge._store import SCHEMA_VERSION
-
-    assert SCHEMA_VERSION == 2
-    service = _open(tmp_path / "knowledge.db")
-    try:
-        assert service.stats(context=_admin(service)).schema_version == 2
-    finally:
-        service.close()
+def test_fresh_store_reports_the_schema3_store(knowledge_harness):
+    assert knowledge_harness.service.stats(
+        context=knowledge_harness.admin_context()
+    ).schema_version == 3
 
 
-def test_knowledge_store_without_complete_marker_reports_migration_required(tmp_path: Path):
-    path = tmp_path / "knowledge.db"
-    service = _open(path)
+def test_knowledge_store_without_complete_marker_reports_migration_required(knowledge_harness):
+    path = knowledge_harness.tmp_path / "knowledge-v3.db"
+    service = knowledge_harness.service
+    service._store.set_meta("migration_complete", "0")  # noqa: SLF001 - corrupt marker fixture
     service.close()
-    conn = sqlite3.connect(path)
-    try:
-        conn.execute("UPDATE knowledge_meta SET value = '0' WHERE key = 'migration_complete'")
-        conn.commit()
-    finally:
-        conn.close()
     with pytest.raises(KnowledgeStartupError) as excinfo:
         _open(path)
     assert excinfo.value.code == "migration_required"
 
 
-def test_missing_parent_directory_is_created_for_a_fresh_store(tmp_path: Path):
-    target = tmp_path / "deep" / "nested" / "knowledge.db"
-    service = _open(target)
-    try:
-        assert target.exists()
-    finally:
-        service.close()
-
-
-def test_degraded_read_returns_neutral_result_without_personal_recall(tmp_path: Path):
+def test_degraded_read_returns_neutral_result_without_personal_recall(knowledge_harness):
     """With unknown membership the read is empty, not a fallback to legacy search."""
-    service = _open(tmp_path / "knowledge.db")
-    try:
-        context = TrustedReadContext(
-            principal_id="whatsapp:4910000000002",
-            channel="whatsapp",
-            chat_id="group-a",
-            recipient_principals=None,  # membership not proven
-            membership_revision=None,
-            policy_revision=service.policy_revision,
-            purpose="reply",
-            now_ms=1,
-        )
-        from yeoman_gateway.knowledge.models import RecallQuery
+    service = knowledge_harness.service
+    context = TrustedReadContext(
+        principal_id="whatsapp:4910000000002",
+        channel="whatsapp",
+        chat_id="group-a",
+        recipient_principals=None,
+        membership_revision=None,
+        policy_revision=service.policy_revision,
+        purpose="reply",
+        now_ms=1,
+    )
+    from yeoman_gateway.knowledge.models import RecallQuery
 
-        result = service.recall(RecallQuery(text="anything"), context=context)
-        assert result.statement_ids == ()
-        assert result.text == ""
-        assert result.reason == "membership_unknown"
-    finally:
-        service.close()
+    result = service.recall(RecallQuery(text="anything"), context=context)
+    assert result.statement_ids == ()
+    assert result.text == ""
+    assert result.reason == "membership_unknown"
 
 
-def test_failed_capture_is_not_reported_as_success(tmp_path: Path):
+def test_failed_capture_is_not_reported_as_success(knowledge_harness):
     """A storage failure surfaces as an error, never as an empty successful capture."""
-    from yeoman_gateway.knowledge.models import (
-        SourceRef,
-        StatementCandidate,
-        TrustedCaptureContext,
-    )
 
-    authority = FakeSourceAuthority()
-    policy = FakePolicyAuthority(capture_actors={"whatsapp:4910000000001"})
-    policy.issue_capture("cap-1")
-    service = open_knowledge_store(
-        tmp_path / "knowledge.db",
-        workspace_id="ws",
-        source_authority=authority,
-        policy_authority=policy,
-    )
-    try:
-        source = SourceRef(
-            event_id="evt-1",
-            revision=1,
-            channel="whatsapp",
-            chat_id="group-a",
-            author_principal="whatsapp:4910000000001",
-            occurred_at_ms=1,
-        )
-        authority.issue_source(source, EvidenceAudience.known({"whatsapp:4910000000001"}))
-        context = TrustedCaptureContext(
-            request_id="cap-1",
-            policy_revision=service.policy_revision,
-            capture_basis="user_message",
-            authorized_sources=(source,),
-            actor_principal="whatsapp:4910000000001",
-            authorized=True,
-        )
-        candidate = StatementCandidate(
-            content="Alex reist.", sources=(source,), extractor_version="v", confidence=0.5
-        )
-        service._store.fail_next_commit = True  # noqa: SLF001 - injected storage failure
-        with pytest.raises(KnowledgeError) as excinfo:
-            service.capture(candidate, context=context)
-        assert excinfo.value.code == "storage_unavailable"
-        # The failure left no partial statement behind.
-        assert service.active_statement_ids_for_source(source) == ()
-    finally:
-        service.close()
+    h = knowledge_harness
+    source = h.source(h.person("Tom"))
+    context = h.capture_context(source)
+    candidate = h.candidate("Alex reist.", source)
+    h.service._store.fail_next_commit = True  # noqa: SLF001 - injected storage failure
+    with pytest.raises(KnowledgeError) as excinfo:
+        h.service.capture(candidate, context=context)
+    assert excinfo.value.code == "storage_unavailable"
+    assert h.service.active_statement_ids_for_source(source) == ()
 
 
-def test_close_drains_and_leaves_no_writer(tmp_path: Path):
-    service = _open(tmp_path / "knowledge.db")
+def test_close_drains_and_leaves_no_writer(knowledge_harness):
+    service = knowledge_harness.service
     service.close()
     service.close()  # idempotent
     with pytest.raises(KnowledgeError) as excinfo:
@@ -274,19 +211,9 @@ def test_close_drains_and_leaves_no_writer(tmp_path: Path):
     assert excinfo.value.code == "storage_unavailable"
 
 
-def test_runtime_policy_reads_membership_from_the_chat_registry(tmp_path: Path):
-    """The runtime adapter is the only bridge to the registry; unknown means unknown."""
-    from yeoman_gateway.storage.chat_registry import ChatRegistry
-
-    registry = ChatRegistry(db_path=tmp_path / "registry.db")
-    registry.register_chat(
-        channel="whatsapp",
-        chat_id="group-a",
-        chat_type="group",
-        readable_name="synthetic",
-        metadata={"participants": [{"id": "whatsapp:4910000000002"}]},
-    )
-    policy = RuntimeKnowledgePolicy(engine=None, chat_registry=registry)
+def test_runtime_policy_without_history_fails_closed():
+    """Membership remains unknown when no active History scope provides it."""
+    policy = RuntimeKnowledgePolicy(engine=None, chat_registry=None)
     context = TrustedReadContext(
         principal_id="whatsapp:4910000000002",
         channel="whatsapp",
@@ -297,9 +224,7 @@ def test_runtime_policy_reads_membership_from_the_chat_registry(tmp_path: Path):
         purpose="reply",
         now_ms=1,
     )
-    membership = policy.membership(context)
-    assert membership is not None
-    assert membership.members == frozenset({"whatsapp:4910000000002"})
+    assert policy.membership(context) is None
 
     unknown = TrustedReadContext(
         principal_id="whatsapp:4910000000002",
@@ -312,7 +237,6 @@ def test_runtime_policy_reads_membership_from_the_chat_registry(tmp_path: Path):
         now_ms=1,
     )
     assert policy.membership(unknown) is None
-    registry.close()
 
 
 def test_runtime_source_adapter_refuses_unregistered_evidence():

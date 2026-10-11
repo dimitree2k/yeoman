@@ -10,6 +10,7 @@ from pathlib import Path
 
 import pytest
 import yeoman_gateway.channels.whatsapp as whatsapp_module
+from history_turn_fixtures import Projector
 from yeoman_gateway.bus.queue import MessageBus
 from yeoman_gateway.channels.whatsapp import InboundEvent, WhatsAppChannel
 from yeoman_gateway.media.asr import ASRResult
@@ -51,6 +52,7 @@ def _setup(tmp_path: Path) -> tuple[WhatsAppChannel, RawArchive, ProcessingStore
     store = ProcessingStore(tmp_path / "processing.db")
     media = MediaStorage(incoming_dir=tmp_path / "incoming", outgoing_dir=tmp_path / "outgoing")
     channel = WhatsAppChannel(WhatsAppConfig(), MessageBus(), media_storage=media)
+    channel._history_projector = Projector()
     channel.set_processing_signals(SignalJournalSink(store, clock=lambda: NOW))
     archive = RawArchive(
         tmp_path / "raw",
@@ -64,8 +66,6 @@ def _setup(tmp_path: Path) -> tuple[WhatsAppChannel, RawArchive, ProcessingStore
         return {"acknowledged": True}
 
     channel._send_command = ack  # type: ignore[method-assign]
-    channel._archive_inbound_event = lambda event: None  # type: ignore[method-assign]
-
     async def publish(event):
         return None
 

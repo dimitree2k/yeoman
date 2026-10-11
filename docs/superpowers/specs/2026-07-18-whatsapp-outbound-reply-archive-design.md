@@ -1,5 +1,12 @@
 # WhatsApp Outbound Reply Archive Design
 
+Historical document (G6, 2026-10-11): the standalone WhatsApp history stores, legacy history tools and cutover scripts referenced here have been retired. Current runtime reads use canonical History and Knowledge schema 3; old store examples describe the previous implementation.
+
+
+Historical note: `summarize_history` was retired in G6. The archive remains for
+reply routing; this design's references to that reader describe its former
+inbound-only behavior.
+
 ## Goal
 
 Make delayed WhatsApp replies to Yeoman messages resolve to the correct quoted

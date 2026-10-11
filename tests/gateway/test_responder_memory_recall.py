@@ -7,38 +7,65 @@ import pytest
 from yeoman_gateway.adapters.responder_llm import LLMResponder
 from yeoman_gateway.bus.queue import MessageBus
 from yeoman_gateway.core.models import InboundEvent, PolicyDecision
-from yeoman_gateway.knowledge._memory.service import MemoryService
-from yeoman_gateway.knowledge._memory.session_state import resolve_session_state_dir
 from yeoman_gateway.providers.base import LLMProvider, LLMResponse
-from yeoman_shared.config.schema import Config
-from yeoman_shared.telemetry import InMemoryTelemetry
 
 
-class CaptureMemoryProvider(LLMProvider):
-    def __init__(self, wal_file: Path) -> None:
-        super().__init__()
-        self.wal_file = wal_file
-        self.messages_seen: list[list[dict[str, Any]]] = []
-        self.pre_write_seen = False
 
-    async def chat(
-        self,
-        messages: list[dict[str, Any]],
-        tools: list[dict[str, Any]] | None = None,
-        model: str | None = None,
-        max_tokens: int = 4096,
-        temperature: float = 0.7,
-        reasoning: dict[str, Any] | None = None,
-    ) -> LLMResponse:
-        del tools, model, max_tokens, temperature, reasoning
-        self.messages_seen.append(messages)
-        if self.wal_file.exists() and " PRE" in self.wal_file.read_text(encoding="utf-8"):
-            self.pre_write_seen = True
-        return LLMResponse(content="ok")
+@pytest.fixture(autouse=True)
+def _history_scope_for_whatsapp_responder(monkeypatch: pytest.MonkeyPatch, tmp_path: Path):
+    """Give responder unit tests a real, isolated SQLite History snapshot per turn."""
+    import sqlite3
+    from types import SimpleNamespace
 
-    def get_default_model(self) -> str:
-        return "dummy/model"
+    from yeoman_gateway.history.context import history_knowledge_scope, history_turn
+    from yeoman_gateway.history.reader import HistorySnapshot
+    from yeoman_gateway.history.schema import create as create_history
 
+    history_path = tmp_path / "synthetic-history.db"
+    with sqlite3.connect(history_path) as connection:
+        create_history(connection)
+
+    async def read_turn():
+        connection = sqlite3.connect(f"file:{history_path}?mode=ro", uri=True)
+        return HistorySnapshot(1, (), connection)
+
+    projector = SimpleNamespace(
+        read_turn=read_turn,
+        health=lambda: {"status": "ready", "generation": 1},
+    )
+    original_init = LLMResponder.__init__
+    original_generate = LLMResponder.generate_reply
+
+    def init_with_history(self, *args, **kwargs):
+        original_init(self, *args, **kwargs)
+        self._history_projector = projector
+        self._history_knowledge = None
+
+    async def generate_in_history(self, event, decision, *args, **kwargs):
+        if getattr(event, "channel", "") != "whatsapp":
+            return await original_generate(self, event, decision, *args, **kwargs)
+        timestamp = getattr(event, "timestamp", None)
+        occurred_ms = int(timestamp.timestamp() * 1000) if timestamp is not None else 0
+        event_id = str(getattr(event, "message_id", "") or f"unit-{occurred_ms}")
+        with sqlite3.connect(history_path) as connection:
+            connection.execute(
+                "INSERT OR REPLACE INTO messages (message_id,channel,chat_id,native_message_id,"
+                "sender_contact_id,sender_identifier,sender_basis,direction,sent_ms,"
+                "time_certainty,text,provenance,source_refs) "
+                "VALUES (?, 'whatsapp', ?, ?, NULL, ?, 'unknown', 'in', ?, 'unknown', ?, 'native', '[]')",
+                (
+                    f"unit:{event_id}", str(getattr(event, "chat_id", "")), event_id,
+                    str(getattr(event, "sender_id", "")), occurred_ms,
+                    str(getattr(event, "content", "") or ""),
+                ),
+            )
+        async with history_turn(projector) as snapshot:
+            with history_knowledge_scope(snapshot, self._history_knowledge):
+                kwargs.setdefault("history_snapshot", snapshot)
+                return await original_generate(self, event, decision, *args, **kwargs)
+
+    monkeypatch.setattr(LLMResponder, "__init__", init_with_history)
+    monkeypatch.setattr(LLMResponder, "generate_reply", generate_in_history)
 
 class CountProvider(LLMProvider):
     def __init__(self) -> None:
@@ -87,106 +114,10 @@ class TalkativeLlmProvider(LLMProvider):
         return "dummy/model"
 
 
-class SequenceProvider(LLMProvider):
-    def __init__(self, responses: list[str]) -> None:
-        super().__init__()
-        self.responses = responses
-        self.calls = 0
-
-    async def chat(
-        self,
-        messages: list[dict[str, Any]],
-        tools: list[dict[str, Any]] | None = None,
-        model: str | None = None,
-        max_tokens: int = 4096,
-        temperature: float = 0.7,
-        reasoning: dict[str, Any] | None = None,
-    ) -> LLMResponse:
-        del messages, tools, model, max_tokens, temperature, reasoning
-        response = self.responses[min(self.calls, len(self.responses) - 1)]
-        self.calls += 1
-        return LLMResponse(content=response)
-
-    def get_default_model(self) -> str:
-        return "dummy/model"
 
 
-@pytest.mark.asyncio
-async def test_responder_injects_retrieved_memory_without_writing_session_state(tmp_path: Path) -> None:
-    workspace = tmp_path / "ws"
-    workspace.mkdir()
-
-    cfg = Config()
-    cfg.memory.db_path = str(tmp_path / "longterm.db")
-    memory_service = MemoryService(workspace=workspace, config=cfg.memory)
-
-    # Seed one manual memory entry.
-    memory_service.record_manual(
-        channel="cli",
-        chat_id="direct",
-        sender_id="direct",
-        scope_type="user",
-        kind="preference",
-        text="I prefer concise responses",
-        importance=0.9,
-    )
-
-    wal_file = resolve_session_state_dir(workspace, cfg.memory.wal.state_dir) / "cli_test.md"
-    provider = CaptureMemoryProvider(wal_file=wal_file)
-    telemetry = InMemoryTelemetry()
-    responder = LLMResponder(
-        bus=MessageBus(),
-        provider=provider,
-        workspace=workspace,
-        memory_service=memory_service,
-        telemetry=telemetry,
-    )
-
-    out = await responder.process_direct(
-        "Please keep concise responses.",
-        session_key="cli:test",
-        channel="cli",
-        chat_id="direct",
-    )
-
-    await responder.aclose()
-    memory_service.close()
-
-    assert out == "ok"
-    assert provider.pre_write_seen is False
-
-    sent = provider.messages_seen[-1]
-    memory_system_msgs = [
-        msg["content"]
-        for msg in sent
-        if msg.get("role") == "system"
-        and isinstance(msg.get("content"), str)
-        and "[Retrieved Memory]" in msg["content"]
-    ]
-    assert memory_system_msgs
-
-    assert not wal_file.exists()
-    assert not wal_file.parent.exists()
-    assert telemetry.get_counter("memory_recall_hit") == 1
-    assert telemetry.get_counter("memory_prompt_chars") > 0
-    assert telemetry.get_counter("memory_capture_dropped_low_conf") >= 1
 
 
-def test_remaining_copies_reports_frozen_session_state_files(tmp_path: Path) -> None:
-    workspace = tmp_path / "ws"
-    state_dir = workspace / "data/memory/session-state"
-    state_dir.mkdir(parents=True)
-    cfg = Config()
-    cfg.memory.db_path = str(tmp_path / "longterm.db")
-    cfg.memory.wal.state_dir = str(state_dir)
-    memory_service = MemoryService(workspace=workspace, config=cfg.memory)
-
-    try:
-        assert "session_state_markdown" not in memory_service.remaining_copies()
-        (state_dir / "frozen.md").write_text("legacy copy", encoding="utf-8")
-        assert "session_state_markdown" in memory_service.remaining_copies()
-    finally:
-        memory_service.close()
 
 
 @pytest.mark.asyncio

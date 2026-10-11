@@ -43,19 +43,17 @@ def current_history_scope(store: KnowledgeStore | None = None) -> HistoryKnowled
 
 class ScopedKnowledgeAdapter:
     """Stable engine references dispatch through the current task/thread scope."""
-    def __init__(self, store: KnowledgeStore, legacy: Any, kind: str, *, selected: bool):
-        self.store, self.legacy, self.kind, self.selected = store, legacy, kind, selected
+    def __init__(self, store: KnowledgeStore, kind: str):
+        self.store, self.kind = store, kind
 
     def __getattr__(self, name: str) -> Any:
         scope = current_history_scope(self.store)
         if scope is not None:
             adapter = scope.identity if self.kind == 'identity' else scope.sources
             return getattr(adapter, name)
-        if self.selected:
-            if self.kind == 'identity' and name in IdentityEngine.__dict__ and name not in HistoryIdentityEngine.__dict__ and name not in HistoryIdentityEngine._inherited_reads:
-                raise KnowledgeError('history_identity_read_only', 'use the local owner-attestation CLI')
-            raise HistoryPaused('knowledge_history_scope_required')
-        return getattr(self.legacy, name)
+        if self.kind == 'identity' and name in IdentityEngine.__dict__ and name not in HistoryIdentityEngine.__dict__ and name not in HistoryIdentityEngine._inherited_reads:
+            raise KnowledgeError('history_identity_read_only', 'use the local owner-attestation CLI')
+        raise HistoryPaused('knowledge_history_scope_required')
 
 
 class HistoryIdentityEngine(IdentityEngine):

@@ -7,11 +7,20 @@ duplicates business logic and never reaches into the store to make a test pass.
 
 from __future__ import annotations
 
+import json
+import sqlite3
+import uuid
 from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any, Iterator
 
 import pytest
+from yeoman_gateway.history.queries import HistoryQueries
+from yeoman_gateway.history.reader import HistorySnapshot
+from yeoman_gateway.history.schema import create as create_history_schema
+from yeoman_gateway.knowledge._history_sources import HistoryKnowledgeSources
+from yeoman_gateway.knowledge._history_upgrade import upgrade_history_knowledge
+from yeoman_gateway.knowledge._store import KnowledgeStore
 from yeoman_gateway.knowledge.api import KnowledgeService, open_knowledge_store
 from yeoman_gateway.knowledge.authority import (
     EvidenceAudience,
@@ -31,7 +40,6 @@ from yeoman_gateway.knowledge.models import (
     StatementSummary,
     TrustedAdminContext,
     TrustedCaptureContext,
-    TrustedIdentityObservation,
     TrustedReadContext,
 )
 
@@ -61,30 +69,68 @@ class ProviderSpy:
         self.seen.clear()
 
 
+class _SyntheticHistoryQueries(HistoryQueries):
+    """History projection with fixture-supplied, synthetic source audiences."""
+
+    def __init__(self, snapshot: HistorySnapshot, audiences: dict[str, EvidenceAudience]):
+        super().__init__(snapshot)
+        self._fixture_audiences = audiences
+
+    def audience(self, message_id: str) -> EvidenceAudience:
+        provided = self._fixture_audiences.get(message_id)
+        return provided if provided is not None else super().audience(message_id)
+
+
 class KnowledgeHarness:
     """A fully synthetic knowledge runtime bound to a temporary database."""
 
     def __init__(self, tmp_path: Path) -> None:
         self.tmp_path = tmp_path
+        self.tmp_path.mkdir(parents=True, exist_ok=True)
         self.clock = FakeClock()
         self.authority = FakeSourceAuthority()
         self.policy = FakePolicyAuthority(admins={OWNER}, capture_actors={OWNER})
+        v2_path = tmp_path / "knowledge-v2.db"
+        legacy = KnowledgeStore(v2_path)
+        legacy.set_meta("migration_complete", "1")
+        legacy.close()
+        knowledge_path = tmp_path / "knowledge-v3.db"
+        upgrade_history_knowledge(source=v2_path, target=knowledge_path)
         self.service: KnowledgeService = open_knowledge_store(
-            tmp_path / "knowledge.db",
+            knowledge_path,
             workspace_id=WORKSPACE_ID,
             source_authority=self.authority,
             policy_authority=self.policy,
             clock=self.clock,
         )
+        self._history_db = sqlite3.connect(":memory:")
+        create_history_schema(self._history_db)
+        self._snapshot = HistorySnapshot(1, (), self._history_db)
+        from yeoman_gateway.history.context import _HISTORY
+
+        self._history_token = _HISTORY.set(self._snapshot)
+        self._audiences: dict[str, EvidenceAudience] = {}
+        self.queries = _SyntheticHistoryQueries(self._snapshot, self._audiences)
+        self.history_sources = HistoryKnowledgeSources(
+            self.queries, {}, self.service.history_source_ledger, self.authority
+        )
+        self._scope = self.service.history_scope(self.queries, self.history_sources)
+        self._scope.__enter__()
         self.provider_spy = ProviderSpy()
         self._observation_counter = 0
         self._source_counter = 0
         self._people: dict[str, str] = {}
         self._principals: dict[str, str] = {}
+        self._identifier_people: dict[tuple[str, str, str], str] = {}
 
     # ── lifecycle ────────────────────────────────────────────────────────────
 
     def close(self) -> None:
+        self._scope.__exit__(None, None, None)
+        from yeoman_gateway.history.context import _HISTORY
+
+        _HISTORY.reset(self._history_token)
+        self._snapshot.close()
         self.service.close()
 
     # ── people ───────────────────────────────────────────────────────────────
@@ -101,32 +147,46 @@ class KnowledgeHarness:
         context: TrustedReadContext | None = None,
     ) -> PersonResolution:
         """Issue a verified observation and resolve it through the public API."""
-        self._observation_counter += 1
         identifiers = (Identifier(channel=channel, kind=kind, value=value), *extra)
-        account_namespace = None
-        if (
-            mapping
-            and len(identifiers) == 2
-            and all(item.channel == "whatsapp" for item in identifiers)
-            and {item.kind for item in identifiers} == {"phone_jid", "lid"}
-            and len({item.namespace for item in identifiers}) == 1
-        ):
-            account_namespace = identifiers[0].namespace
-        observation = TrustedIdentityObservation(
-            identifiers=identifiers,
-            evidence_ref=f"obs-{self._observation_counter}",
-            observed_name=name,
-            observed_at_ms=self.clock.now_ms(),
-            mapping_verified=mapping,
-            account_namespace=account_namespace or "",
+        supported = [
+            item for item in identifiers
+            if item.channel == "whatsapp" and item.kind in {"phone_jid", "lid"}
+        ]
+        prior = next((self._identifier_people.get((item.channel, item.kind, item.value))
+                      for item in supported
+                      if self._identifier_people.get((item.channel, item.kind, item.value))), None)
+        if prior is not None:
+            row = self.queries.contact(prior)
+            return PersonResolution("resolved", prior, row["display_name"] if row else name, 0, "history_identifier")
+        self._observation_counter += 1
+        person_id = str(uuid.uuid5(uuid.NAMESPACE_URL, f"{WORKSPACE_ID}:person:{self._observation_counter}"))
+        display_name = name or next((item.value for item in supported), person_id)
+        self._history_db.execute(
+            "INSERT INTO contacts(contact_id,kind,role,display_name,status,merged_into,source_refs) "
+            "VALUES (?,'person',NULL,?,'confirmed',NULL,'[]')",
+            (person_id, display_name),
         )
-        self.authority.issue_observation(observation)
-        resolved = self.service.resolve_person(observation, context=context)
-        if resolved.person_id and resolved.person_id not in self._principals:
-            self._principals[resolved.person_id] = self._principal_for_identifiers(
-                identifiers, resolved.person_id
+        for item in supported:
+            kind = "pn_jid" if item.kind == "phone_jid" else "lid"
+            mapping_proven = kind == "pn_jid" or mapping
+            self._history_db.execute(
+                "INSERT INTO identifier_history(contact_id,channel,kind,value,strength,evidence,first_seen_ms,last_seen_ms,ended_ms,valid_from_ms,valid_until_ms,source_refs) "
+                "VALUES (?,'whatsapp',?,?,?,'observed',?,?,NULL,0,NULL,'[]')",
+                (person_id, kind, item.value, "strong" if mapping_proven else "weak",
+                 self.clock.now_ms(), self.clock.now_ms()),
             )
-        return resolved
+            self._identifier_people[(item.channel, item.kind, item.value)] = person_id
+        self._history_db.commit()
+        if supported:
+            principal = self._principal_for_identifiers(tuple(supported), person_id)
+            self._principals[person_id] = principal
+            status = "resolved"
+            reason = "history_identifier"
+        else:
+            status = "unresolved"
+            reason = "no_history_identifier"
+            person_id = None
+        return PersonResolution(status, person_id, display_name if person_id else None, 0, reason)
 
     @staticmethod
     def _principal_for_identifiers(
@@ -202,24 +262,28 @@ class KnowledgeHarness:
         self._source_counter += 1
         principal = self.principal_for(author_person)
         members = set(audience) if audience is not None else {principal}
-        source = SourceRef(
-            event_id=f"event-{self._source_counter}",
-            revision=int(revision),
-            channel=channel,
-            chat_id=chat,
-            author_principal=principal,
-            occurred_at_ms=int(when_ms if when_ms is not None else self.clock.now_ms()),
-        )
-        if unknown_audience:
-            self.authority.issue_source(source, EvidenceAudience.unknown())
-        elif author_only:
-            self.authority.issue_source(source, EvidenceAudience.author_only())
-        else:
+        event_id = f"event-{self._source_counter}"
+        occurred_ms = int(when_ms if when_ms is not None else self.clock.now_ms())
+        source = SourceRef(event_id, int(revision), channel, chat, principal, occurred_ms)
+        if channel != "whatsapp" or unknown_audience:
             self.authority.issue_source(
-                source,
-                EvidenceAudience.known(members, snapshot_id=f"snap-{source.event_id}"),
+                source, EvidenceAudience.unknown() if unknown_audience else EvidenceAudience.known(members)
             )
-        return source
+            return source
+        person_id = author_person
+        phone = principal.split(":", 1)[-1]
+        identifier = f"{phone}@s.whatsapp.net"
+        self._history_db.execute(
+            "INSERT INTO messages(message_id,channel,chat_id,native_message_id,sender_contact_id,sender_identifier,sender_basis,direction,sent_ms,time_certainty,text,media_json,reply_to_native_id,mentions_json,provenance,source_refs) "
+            "VALUES (?,'whatsapp',?,?,?,?,'native_identifier','in',?,'native','Synthetic source',NULL,NULL,NULL,'native','[]')",
+            (event_id, chat, event_id, person_id, identifier, occurred_ms),
+        )
+        self._audiences[event_id] = (
+            EvidenceAudience.author_only(snapshot_id=f"snap-{event_id}")
+            if author_only else EvidenceAudience.known(members, snapshot_id=f"snap-{event_id}")
+        )
+        self._history_db.commit()
+        return self.history_sources.issue(event_id)
 
     def capture_context(self, *sources: SourceRef, basis: str = "user_message") -> TrustedCaptureContext:
         request_id = f"cap-{'/'.join(item.event_id for item in sources) or 'empty'}"
@@ -428,7 +492,6 @@ class KnowledgeHarness:
     def security_fingerprint(self) -> str:
         """Content fingerprint of every authorization-bearing row in the store."""
         import hashlib
-        import json
 
         payload: dict[str, list[list[object]]] = {}
         for table in (

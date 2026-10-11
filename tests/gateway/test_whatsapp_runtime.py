@@ -217,20 +217,12 @@ def test_gateway_cleanup_closes_processing_when_retention_stop_fails(monkeypatch
         def close(self):
             closed.append("processing")
 
-    class Closing:
-        def close(self):
-            closed.append("close")
-
     runtime = GatewayRuntime(
         orchestrator=FailingOrchestrator(),
         channels=Channels(),
         cron=Lifecycle(),
         heartbeat=Lifecycle(),
-        inbound_archive=Closing(),
         responder=AsyncNoop(),
-        memory=Closing(),
-        contacts=Closing(),
-        chat_registry=Closing(),
         processing=Processing(),
         retention=FailingRetention(),
     )

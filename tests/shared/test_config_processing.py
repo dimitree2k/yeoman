@@ -17,13 +17,12 @@ def test_processing_is_disabled_by_default() -> None:
 
 
 def test_operational_store_paths_and_frozen_session_state_lookup(tmp_path, monkeypatch):
-    from yeoman_shared.utils.helpers import get_operational_store_path, get_session_state_path
+    from yeoman_shared.utils.helpers import get_operational_store_path
 
     monkeypatch.setenv("YEOMAN_HOME", str(tmp_path))
     assert get_operational_store_path("processing") == tmp_path / "data/ops/processing.db"
     assert get_operational_store_path("speakups") == tmp_path / "data/ops/speakups.db"
     assert get_operational_store_path("document_cache") == tmp_path / "data/ops/document-cache.db"
-    assert get_session_state_path() == tmp_path / "data/memory/session-state"
     assert not (tmp_path / "data/memory/session-state").exists()
 
 

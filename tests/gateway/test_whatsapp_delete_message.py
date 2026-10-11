@@ -4,6 +4,7 @@ import asyncio
 import json
 
 import pytest
+from history_turn_fixtures import Projector
 from loguru import logger
 from yeoman_gateway.bus.events import OutboundMessage
 from yeoman_gateway.channels.whatsapp import WhatsAppChannel
@@ -31,6 +32,7 @@ async def test_whatsapp_channel_routes_delete_without_sending_text() -> None:
 
     channel = object.__new__(WhatsAppChannel)
     channel._connected = True
+    channel._history_projector = Projector()
     channel._stop_typing = stop_typing
     channel._send_command_with_retry = send_command
 
@@ -55,6 +57,7 @@ async def test_whatsapp_channel_routes_delete_without_sending_text() -> None:
 async def test_whatsapp_channel_rejects_malformed_delete_request() -> None:
     channel = object.__new__(WhatsAppChannel)
     channel._connected = True
+    channel._history_projector = Projector()
 
     async def stop_typing(chat_id: str) -> None:
         del chat_id

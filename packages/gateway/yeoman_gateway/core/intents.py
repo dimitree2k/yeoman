@@ -36,32 +36,6 @@ class PersistSessionIntent:
 
 
 @dataclass(frozen=True, slots=True, kw_only=True)
-class QueueMemoryNotesCaptureIntent:
-    """Queue one inbound event for background memory-notes capture."""
-
-    channel: str
-    chat_id: str
-    sender_id: str
-    message_id: str | None
-    content: str
-    is_group: bool
-    mode: Literal["adaptive", "heuristic", "hybrid"]
-    batch_interval_seconds: int
-    batch_max_messages: int
-
-
-@dataclass(frozen=True, slots=True, kw_only=True)
-class RecordManualMemoryIntent:
-    """Persist one explicit memory capture entry immediately."""
-
-    channel: str
-    chat_id: str
-    sender_id: str | None
-    content: str
-    entry_kind: Literal["idea", "backlog"]
-
-
-@dataclass(frozen=True, slots=True, kw_only=True)
 class RecordMetricIntent:
     """Emit one structured counter metric."""
 
@@ -91,8 +65,6 @@ type OrchestratorIntent = (
     | SendOutboundIntent
     | SendReactionIntent
     | PersistSessionIntent
-    | QueueMemoryNotesCaptureIntent
-    | RecordManualMemoryIntent
     | RecordMetricIntent
 )
 type IntentKind = Literal[
@@ -100,7 +72,5 @@ type IntentKind = Literal[
     "send_outbound",
     "send_reaction",
     "persist_session",
-    "queue_memory_notes_capture",
-    "record_manual_memory",
     "record_metric",
 ]

@@ -12,10 +12,21 @@ from yeoman_gateway.bus.queue import MessageBus
 from yeoman_gateway.consciousness.log import SpeakupLog
 from yeoman_gateway.consciousness.lull import LullObserver
 from yeoman_gateway.consciousness.tools import ConsciousnessTools
+from yeoman_gateway.history.export import SecondaryArchive
 from yeoman_gateway.policy.engine import PolicyEngine
 from yeoman_gateway.policy.schema import PolicyConfig
-from yeoman_gateway.storage.inbound_archive import InboundArchive
 from yeoman_shared.config.schema import Config, ConsciousnessConfig
+
+from tests.gateway.history_turn_fixtures import Projector
+
+
+@pytest.fixture
+def history_projector():
+    projector = Projector()
+    try:
+        yield projector
+    finally:
+        projector.close()
 
 
 def _config(**overrides: object) -> Config:
@@ -97,7 +108,7 @@ def _event(
 
 @pytest.mark.asyncio
 async def test_lull_observer_fires_after_silence_following_recent_activity(
-    tmp_path: Path,
+    tmp_path: Path, history_projector: Projector,
 ) -> None:
     calls: list[tuple[str, str]] = []
     base = datetime(2026, 4, 26, 12, 0, tzinfo=UTC)
@@ -110,6 +121,7 @@ async def test_lull_observer_fires_after_silence_following_recent_activity(
         is_eligible=lambda channel, chat_id: True,
         clock=lambda: now_holder["value"],
     )
+    observer._history_projector = history_projector
 
     for index in range(4):
         await observer.handle(_event(at=base + timedelta(minutes=index)))
@@ -124,7 +136,7 @@ async def test_lull_observer_fires_after_silence_following_recent_activity(
 
 
 @pytest.mark.asyncio
-async def test_lull_observer_clears_activity_after_callback(tmp_path: Path) -> None:
+async def test_lull_observer_clears_activity_after_callback(tmp_path: Path, history_projector: Projector) -> None:
     calls: list[tuple[str, str]] = []
     base = datetime(2026, 4, 26, 12, 0, tzinfo=UTC)
     now_holder = {"value": base.timestamp()}
@@ -137,6 +149,7 @@ async def test_lull_observer_clears_activity_after_callback(tmp_path: Path) -> N
         is_eligible=lambda channel, chat_id: True,
         clock=lambda: now_holder["value"],
     )
+    observer._history_projector = history_projector
 
     for index in range(4):
         await observer.handle(_event(at=base + timedelta(minutes=index)))
@@ -150,7 +163,7 @@ async def test_lull_observer_clears_activity_after_callback(tmp_path: Path) -> N
 
 
 @pytest.mark.asyncio
-async def test_lull_observer_skips_when_too_few_recent_activity(tmp_path: Path) -> None:
+async def test_lull_observer_skips_when_too_few_recent_activity(tmp_path: Path, history_projector: Projector) -> None:
     calls: list[tuple[str, str]] = []
     base = datetime(2026, 4, 26, 12, 0, tzinfo=UTC)
     now_holder = {"value": base.timestamp()}
@@ -162,6 +175,7 @@ async def test_lull_observer_skips_when_too_few_recent_activity(tmp_path: Path) 
         is_eligible=lambda channel, chat_id: True,
         clock=lambda: now_holder["value"],
     )
+    observer._history_projector = history_projector
 
     for index in range(3):
         await observer.handle(_event(at=base + timedelta(minutes=index)))
@@ -172,7 +186,7 @@ async def test_lull_observer_skips_when_too_few_recent_activity(tmp_path: Path) 
 
 
 @pytest.mark.asyncio
-async def test_lull_observer_skips_direct_bot_interaction(tmp_path: Path) -> None:
+async def test_lull_observer_skips_direct_bot_interaction(tmp_path: Path, history_projector: Projector) -> None:
     calls: list[tuple[str, str]] = []
     base = datetime(2026, 4, 26, 12, 0, tzinfo=UTC)
     now_holder = {"value": base.timestamp()}
@@ -184,6 +198,7 @@ async def test_lull_observer_skips_direct_bot_interaction(tmp_path: Path) -> Non
         is_eligible=lambda channel, chat_id: True,
         clock=lambda: now_holder["value"],
     )
+    observer._history_projector = history_projector
 
     await observer.handle(_event(at=base, mentioned_bot=True))
     await observer.handle(_event(at=base + timedelta(minutes=1), reply_to_bot=True))
@@ -195,7 +210,7 @@ async def test_lull_observer_skips_direct_bot_interaction(tmp_path: Path) -> Non
 
 
 @pytest.mark.asyncio
-async def test_lull_observer_skips_plain_name_interaction(tmp_path: Path) -> None:
+async def test_lull_observer_skips_plain_name_interaction(tmp_path: Path, history_projector: Projector) -> None:
     calls: list[tuple[str, str]] = []
     base = datetime(2026, 4, 26, 12, 0, tzinfo=UTC)
     now_holder = {"value": base.timestamp()}
@@ -207,6 +222,7 @@ async def test_lull_observer_skips_plain_name_interaction(tmp_path: Path) -> Non
         is_eligible=lambda channel, chat_id: True,
         clock=lambda: now_holder["value"],
     )
+    observer._history_projector = history_projector
 
     await observer.handle(_event(at=base, content="Arvid kannst du Nokia checken"))
     for index in range(1, 4):
@@ -218,7 +234,7 @@ async def test_lull_observer_skips_plain_name_interaction(tmp_path: Path) -> Non
 
 
 @pytest.mark.asyncio
-async def test_lull_observer_respects_daily_cap(tmp_path: Path) -> None:
+async def test_lull_observer_respects_daily_cap(tmp_path: Path, history_projector: Projector) -> None:
     calls: list[tuple[str, str]] = []
     base = datetime(2026, 4, 26, 12, 0, tzinfo=UTC)
     now_holder = {"value": base.timestamp()}
@@ -230,6 +246,7 @@ async def test_lull_observer_respects_daily_cap(tmp_path: Path) -> None:
         is_eligible=lambda channel, chat_id: True,
         clock=lambda: now_holder["value"],
     )
+    observer._history_projector = history_projector
 
     for fire in range(3):
         bucket_start = base + timedelta(hours=fire)
@@ -264,7 +281,7 @@ async def test_lull_observer_disabled_when_flag_off(tmp_path: Path) -> None:
 
 
 @pytest.mark.asyncio
-async def test_lull_observer_persists_count(tmp_path: Path) -> None:
+async def test_lull_observer_persists_count(tmp_path: Path, history_projector: Projector) -> None:
     state_path = tmp_path / "lull.json"
     base = datetime(2026, 4, 26, 12, 0, tzinfo=UTC)
     now_holder = {"value": base.timestamp()}
@@ -277,6 +294,7 @@ async def test_lull_observer_persists_count(tmp_path: Path) -> None:
         is_eligible=lambda channel, chat_id: True,
         clock=lambda: now_holder["value"],
     )
+    first._history_projector = history_projector
     for index in range(3):
         await first.handle(_event(at=base + timedelta(minutes=index)))
     now_holder["value"] = (base + timedelta(minutes=20)).timestamp()
@@ -288,7 +306,9 @@ async def test_lull_observer_persists_count(tmp_path: Path) -> None:
 
 
 @pytest.mark.asyncio
-async def test_lull_rejects_reply_to_outside_activity_window(tmp_path: Path) -> None:
+async def test_lull_rejects_reply_to_outside_activity_window(
+    tmp_path: Path, history_projector: Projector
+) -> None:
     cfg = _config(lullActivityWindowMinutes=60)
     now = datetime(2026, 5, 2, 7, 30, tzinfo=UTC)
     tools = ConsciousnessTools(
@@ -296,22 +316,17 @@ async def test_lull_rejects_reply_to_outside_activity_window(tmp_path: Path) -> 
         policy_engine=PolicyEngine(_policy(), workspace=tmp_path),
         bus=MessageBus(),
         log=SpeakupLog(tmp_path / "speakups.db"),
-        inbound_archive=InboundArchive(tmp_path / "inbound.db"),
-        memory=None,
+        inbound_archive=SecondaryArchive(),
         security=_FakeSecurity(),
         approval_store=None,
         now=lambda: now,
     )
+    tools._history_projector = history_projector
     tools.begin_run(trigger="lull")
-    tools.inbound_archive.record_inbound(
-        channel="whatsapp",
-        chat_id="group@g.us",
-        message_id="yesterday-options",
-        participant="timo@s.whatsapp.net",
-        sender_id="timo@s.whatsapp.net",
+    history_projector.add(
+        "yesterday-options",
+        chat="group@g.us",
         text="31 Win Streak options trader from yesterday",
-        timestamp=int((now - timedelta(days=1)).timestamp()),
-        sender_name="Timo",
     )
 
     result = await tools.propose_speakup(

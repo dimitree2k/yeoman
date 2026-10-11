@@ -54,16 +54,13 @@ async def test_secondary_readers_use_history_and_seen_state_stays_operational(tm
     p = Projector()
     seen = tmp_path / 'seen-chats.json'
     seen.write_text('{"chats":[]}')
-    archive = Mock()
-    archive.lookup_messages_in_range.side_effect = AssertionError('legacy')
-    selected = SimpleNamespace(live_projection_enabled=True, readers=SimpleNamespace(secondary=True))
     payload = CronPayload(voice_wait_for_quiet=True)
     from yeoman_gateway.consciousness.tools import ConsciousnessTools
-    from yeoman_gateway.history.export import SecondaryArchive
     tools = object.__new__(ConsciousnessTools)
-    tools.config = SimpleNamespace(history=selected)
+    tools.config = SimpleNamespace()
     tools._history_projector, tools._history_knowledge = p, None
-    tools.inbound_archive = SecondaryArchive(archive, selected)
+    from yeoman_gateway.history.export import SecondaryArchive
+    tools.inbound_archive = SecondaryArchive()
     tools._resolve_eligible = lambda chat_id, channel=None: SimpleNamespace(channel='whatsapp', chat_id=chat_id)
     tools._now = lambda: datetime.fromtimestamp(1800000000, UTC)
     tools._chat_window_since_for_trigger = lambda **kwargs: datetime.fromtimestamp(0, UTC)
@@ -73,9 +70,9 @@ async def test_secondary_readers_use_history_and_seen_state_stays_operational(tm
                 p.add('synthetic')
                 p.generation += 1
             async with history_turn(p):
-                rows = secondary_archive(archive, selected).lookup_messages_in_range('whatsapp', 'a@g.us', datetime.fromtimestamp(0, UTC), datetime.fromtimestamp(1800000000, UTC))
+                rows = secondary_archive().lookup_messages_in_range('whatsapp', 'a@g.us', datetime.fromtimestamp(0, UTC), datetime.fromtimestamp(1800000000, UTC))
                 assert len(rows) == count
-                decision = evaluate_voice_quiet_gate(payload=payload, inbound_archive=secondary_archive(archive, selected), channel='whatsapp', chat_id='a@g.us', now=datetime.fromtimestamp(1700000010, UTC))
+                decision = evaluate_voice_quiet_gate(payload=payload, inbound_archive=secondary_archive(), channel='whatsapp', chat_id='a@g.us', now=datetime.fromtimestamp(1700000010, UTC))
                 assert decision.status == ('defer' if count else 'allowed')
             result = await tools.read_chat_window('a@g.us')
             assert len(result['messages']) == count
@@ -291,14 +288,11 @@ async def test_secondary_persona_and_policy_metadata_reopen_in_owned_scope(tmp_p
 
     from tests.gateway.convhist.test_hist_queries import event
     p = Projector()
-    config = SimpleNamespace(live_projection_enabled=True, readers=SimpleNamespace(secondary=True), legacy_writers_disabled=False)
     persona = 'personas/synthetic.md'
     (tmp_path / 'personas').mkdir()
     (tmp_path / persona).write_text('# Synthetic persona')
     policy = PolicyConfig.model_validate({'channels': {'whatsapp': {'chats': {'a@g.us': {'personaFile': persona}}}}})
-    memory = SimpleNamespace(learned_chat_taste=lambda **kwargs: [], recent_chat_preferences=Mock(side_effect=AssertionError('legacy preferences')))
     log = SimpleNamespace(history=AsyncMock(return_value=[]))
-    legacy = SimpleNamespace(lookup_messages_in_range=Mock(side_effect=AssertionError('legacy archive')))
     generations = []
     class Knowledge:
         history_source_ledger = SimpleNamespace()
@@ -313,7 +307,6 @@ async def test_secondary_persona_and_policy_metadata_reopen_in_owned_scope(tmp_p
             generations.append(current_history_snapshot().generation)
             return SimpleNamespace(entry_texts=(f'Synthetic preference {p.generation}',))
     adapter = object.__new__(EnginePolicyAdapter)
-    adapter._history_config = config
     try:
         for generation in (1, 2):
             p.generation = generation
@@ -321,15 +314,13 @@ async def test_secondary_persona_and_policy_metadata_reopen_in_owned_scope(tmp_p
             event(p.db, f's{generation}', 'group_subject', generation, {'subject': f'Synthetic group {generation}'}, chat='a@g.us')
             p.db.commit()
             evidence = await collect_persona_evolution_evidence(policy=policy, workspace=tmp_path, persona_file=persona,
-                memory=memory, speakup_log=log, inbound_archive=legacy, since=datetime.fromtimestamp(0, UTC),
-                now=datetime.fromtimestamp(1800000000, UTC), history_projector=p, history_config=config, knowledge=Knowledge())
+                speakup_log=log, since=datetime.fromtimestamp(0, UTC),
+                now=datetime.fromtimestamp(1800000000, UTC), history_projector=p, knowledge=Knowledge())
             assert evidence.chats[0].recent_message_count == generation
             assert evidence.chats[0].recent_preferences == [f'Synthetic preference {generation}']
             async with history_turn(p):
                 assert adapter._get_group_name('a@g.us') == f'Synthetic group {generation}'
         assert generations == [1, 2] and p.live_snapshot_count == 0
-        memory.recent_chat_preferences.assert_not_called()
-        legacy.lookup_messages_in_range.assert_not_called()
     finally:
         p.close()
 
@@ -412,11 +403,17 @@ def test_selected_direct_tool_context_preserves_trusted_origin(case, monkeypatch
     service, _, _, _ = case
     monkeypatch.setattr(service._policy, 'admin_actor', lambda: AUTHOR)
     responder = SimpleNamespace(tools=SimpleNamespace(get=lambda _: None), knowledge=service,
-        _history_secondary_selected=True, _history_tools_selected=False,
         _trusted_turn_binding=lambda: SimpleNamespace(turn=SimpleNamespace(principal=origin)))
     token = set_tool_context(None)
     try:
-        LLMResponder._set_tool_context(responder, channel=channel, chat_id='direct' if channel == 'cli' else 'g@g.us', session_key=session, is_owner=owner)
+        LLMResponder._set_tool_context(
+            responder,
+            channel=channel,
+            chat_id='direct' if channel == 'cli' else 'g@g.us',
+            session_key=session,
+            canonical_user_id=expected,
+            is_owner=owner,
+        )
         assert current_tool_context().canonical_user_id == expected
     finally:
         reset_tool_context(token)

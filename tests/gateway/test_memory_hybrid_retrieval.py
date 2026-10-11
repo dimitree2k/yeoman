@@ -10,19 +10,14 @@ Offline and synthetic: temporary database, recording embedder, no network.
 
 from __future__ import annotations
 
-import hashlib
+import json
+from array import array
 from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Iterator
 
 import pytest
-from yeoman_gateway.knowledge.api import KnowledgeService, open_knowledge_store
-from yeoman_gateway.knowledge.authority import (
-    EvidenceAudience,
-    FakeClock,
-    FakePolicyAuthority,
-    FakeSourceAuthority,
-)
+from yeoman_gateway.knowledge.api import KnowledgeService
 from yeoman_gateway.knowledge.models import (
     PersonLinkCandidate,
     RecallQuery,
@@ -32,7 +27,7 @@ from yeoman_gateway.knowledge.models import (
     TrustedReadContext,
 )
 
-WORKSPACE_ID = "hybrid-workspace"
+WORKSPACE_ID = "test-workspace"
 OWNER = "whatsapp:4910000000001"
 TOM = "whatsapp:4910000000002"
 ALEX = "whatsapp:4910000000003"
@@ -59,52 +54,27 @@ class HybridHarness:
     tmp_path: Path
 
     def __post_init__(self) -> None:
-        self.clock = FakeClock()
-        self.authority = FakeSourceAuthority()
-        self.policy = FakePolicyAuthority(admins={OWNER}, capture_actors={OWNER})
-        self.service: KnowledgeService = open_knowledge_store(
-            self.tmp_path / "knowledge.db",
-            workspace_id=WORKSPACE_ID,
-            source_authority=self.authority,
-            policy_authority=self.policy,
-            clock=self.clock,
-        )
+        from tests.gateway.knowledge.conftest import KnowledgeHarness
+
+        self.history = KnowledgeHarness(self.tmp_path / "history")
+        self.clock = self.history.clock
+        self.authority = self.history.authority
+        self.policy = self.history.policy
+        self.service: KnowledgeService = self.history.service
         self.embedder = SpyEmbedder()
         self._counter = 0
 
     def close(self) -> None:
-        self.service.close()
+        self.history.close()
 
     def source(self, *, author: str = TOM, audience: set[str] | None = None) -> SourceRef:
-        self._counter += 1
-        source = SourceRef(
-            event_id=f"event-{self._counter}",
-            revision=1,
-            channel="whatsapp",
-            chat_id=CHAT,
-            author_principal=author,
-            occurred_at_ms=self.clock.now_ms(),
+        return self.history.source(
+            self.person_for(author), chat=CHAT,
+            audience=set(audience) if audience is not None else {author},
         )
-        self.authority.issue_source(
-            source,
-            EvidenceAudience.known(
-                set(audience) if audience is not None else {author},
-                snapshot_id=f"snap-{source.event_id}",
-            ),
-        )
-        return source
 
     def capture_context(self, *sources: SourceRef) -> TrustedCaptureContext:
-        request_id = f"cap-{'/'.join(item.event_id for item in sources)}"
-        self.policy.issue_capture(request_id)
-        return TrustedCaptureContext(
-            request_id=request_id,
-            policy_revision=self.policy.revision,
-            capture_basis="user_message",
-            authorized_sources=tuple(sources),
-            actor_principal=OWNER,
-            authorized=True,
-        )
+        return self.history.capture_context(*sources)
 
     def capture(self, text: str, *, author: str = TOM) -> tuple[str, SourceRef]:
         source = self.source(author=author)
@@ -130,49 +100,30 @@ class HybridHarness:
 
     def person_for(self, principal: str) -> str:
         """Resolve a synthetic person through a proven observation."""
-        from yeoman_gateway.knowledge.models import Identifier, TrustedIdentityObservation
-
-        number = principal.split(":", 1)[-1]
-        observation = TrustedIdentityObservation(
-            identifiers=(
-                Identifier(channel="whatsapp", kind="phone_jid", value=f"{number}@s.whatsapp.net"),
-            ),
-            evidence_ref=f"obs-{number}",
-            observed_at_ms=self.clock.now_ms(),
-        )
-        self.authority.issue_observation(observation)
-        resolved = self.service.resolve_person(observation)
-        assert resolved.person_id, resolved.reason
-        return resolved.person_id
+        return self.history.person_for(principal, principal)
 
     def publish_vector(self, statement_id: str, *, dims: int | None = None) -> None:
-        """Publish one embedding section for a statement node, as the worker would."""
-        from yeoman_gateway.knowledge._memory.store import MemoryStore
-
-        memory = MemoryStore(owner=self.service._store)  # noqa: SLF001 - same file, one owner
+        """Seed a preserved, read-only schema-3 vector row for retrieval tests."""
         children = dims if dims is not None else self.embedder.dims
-        text = self.service._store.scalar(  # noqa: SLF001 - test fixture only
-            "SELECT content FROM memory2_nodes WHERE id = ?", (statement_id,)
-        )
-        memory.publish_embedding_section(
-            document_id=f"emb:{statement_id}:s0",
-            content_hash=hashlib.sha256(str(text).encode("utf-8")).hexdigest()[:32],
-            source_revision_hash="rev-hash-1",
-            model_id=self.embedder.model,
-            dimension=children,
-            preprocessing_version="memory-text-v1",
-            workspace_id=WORKSPACE_ID,
-            scope_key=SCOPE,
-            channel="whatsapp",
-            chat_id=CHAT,
-            source_event_id="event-1",
-            source_revision=1,
-            node_id=statement_id,
-            section_index=0,
-            section_start=0,
-            section_end=len(str(text)),
-            vector=[0.5] * children,
-            now_ms=self.clock.now_ms(),
+        store = self.service._store  # noqa: SLF001 - schema fixture only
+        store.execute("""
+            CREATE TABLE IF NOT EXISTS memory2_embedding_index (
+                document_id TEXT PRIMARY KEY, workspace_id TEXT NOT NULL,
+                status TEXT NOT NULL, dimension INTEGER NOT NULL, model_id TEXT NOT NULL,
+                preprocessing_version TEXT NOT NULL, scope_key TEXT NOT NULL,
+                vector BLOB, created_ms INTEGER NOT NULL, conversation_ids_json TEXT,
+                source_event_id TEXT, node_id TEXT NOT NULL
+            )
+        """)
+        vector = array("f", [0.5] * children).tobytes()
+        store.execute(
+            "INSERT OR REPLACE INTO memory2_embedding_index "
+            "(document_id,workspace_id,status,dimension,model_id,preprocessing_version,"
+            "scope_key,vector,created_ms,conversation_ids_json,source_event_id,node_id) "
+            "VALUES (?,?,?,?,?,?,?,?,?,?,?,?)",
+            (f"emb:{statement_id}:s0", WORKSPACE_ID, "active", children,
+             self.embedder.model, "memory-text-v1", SCOPE, vector,
+             self.clock.now_ms(), json.dumps([CHAT]), "", statement_id),
         )
 
     def read_context(self, reader: str = TOM, *, chat: str = CHAT) -> TrustedReadContext:

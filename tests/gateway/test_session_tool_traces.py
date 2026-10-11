@@ -53,7 +53,7 @@ def test_session_save_replaces_file_atomically(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     manager = SessionManager(tmp_path, sessions_dir=tmp_path / "sessions")
-    session = manager.get_or_create("whatsapp:finance@g.us")
+    session = manager.get_or_create("telegram:finance")
     session.add_message("user", "first")
     manager.save(session)
     path = manager._get_session_path(session.key)

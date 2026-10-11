@@ -65,15 +65,13 @@ def resolve_whatsapp_recipient(
     *,
     policy_adapter: Any,
     knowledge: Any = None,
-    contacts_service: Any = None,
 ) -> tuple[str | None, str | None]:
     """Resolve an exact typed alias without accepting identifiers or fuzzy matches.
 
     A peer request carries no conversation context, so a contact alias is an address
     only when it was *explicitly released* as one (spec 7.3: recognising a name is not
     permission to address somebody) in the global scope, and only when the address is an
-    active proven binding.  The legacy contacts cache answers for compositions that run
-    without knowledge; it is never consulted when knowledge is wired.
+    active proven binding in the canonical History scope.
     """
     refresh = getattr(policy_adapter, "owner_recipients", None)
     if callable(refresh):
@@ -109,22 +107,6 @@ def resolve_whatsapp_recipient(
                 getattr(exc, "code", type(exc).__name__),
             )
             contact_hits = []
-    elif contacts_service is not None:
-        # Transitional branch: a composition without knowledge has no proven bindings to
-        # answer from, so the legacy cache still names the target it always named.
-        for contact in contacts_service.store.search_by_alias(alias):
-            if not any(
-                candidate.alias == alias
-                for candidate in contacts_service.store.get_aliases(contact.id)
-            ):
-                continue
-            contact_hits.extend(
-                identifier.identifier
-                for identifier in contacts_service.store.get_identifiers(contact.id)
-                if identifier.channel == "whatsapp"
-                and not identifier.identifier.endswith("@g.us")
-            )
-
     hits = group_hits if kind == "group" else contact_hits
     other_hits = contact_hits if kind == "group" else group_hits
     unique = list(dict.fromkeys(hits))
@@ -219,7 +201,7 @@ async def process_a2a_invocation(
     arguments = dict(locals())
     arguments.pop('history_projector')
     arguments.pop('history_knowledge')
-    if history_projector is None or skill != 'whatsapp.send':
+    if skill != 'whatsapp.send':
         return await _process_a2a_invocation(**arguments)
     # Untrusted requests are refused by the existing checks before a history acquisition.
     if peer != configured_peer or not configured_peer or skill not in advertised_skills:
@@ -233,7 +215,7 @@ async def process_a2a_invocation(
     from yeoman_gateway.history.context import history_knowledge_scope, history_turn
     from yeoman_gateway.history.live import HistoryPaused
     try:
-        if history_knowledge is None:
+        if history_projector is None or history_knowledge is None:
             raise HistoryPaused('history_knowledge_required')
         async with history_turn(history_projector) as snapshot:
             with history_knowledge_scope(snapshot, history_knowledge):

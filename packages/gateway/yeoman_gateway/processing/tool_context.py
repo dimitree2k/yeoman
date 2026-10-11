@@ -59,14 +59,14 @@ def current_tool_context() -> ToolInvocationContext | None:
     return CURRENT_TOOL_CONTEXT.get()
 
 
-def tool_history_snapshot(*, selected: bool = False) -> HistorySnapshot | None:
+def tool_history_snapshot() -> HistorySnapshot | None:
     context = current_tool_context()
     if context is not None and context.channel != 'whatsapp':
         return None
     snapshot = context.history_snapshot if context is not None else None
     if snapshot is not None:
         snapshot.assert_current(snapshot.generation)
-    elif selected:
+    elif context is not None and context.channel == 'whatsapp':
         from yeoman_gateway.history.live import HistoryPaused
         raise HistoryPaused('tool_history_scope_required')
     return snapshot

@@ -153,6 +153,8 @@ class RuntimeKnowledgePolicy:
             if audience.status != 'known':
                 return None
             return PolicyMembership(audience.members, f"history:{scope.queries.snapshot.generation}:{audience.snapshot_id}")
+        if context.channel == "whatsapp":
+            return None
         if self.chat_registry is None:
             return None
         record = self.chat_registry.get_chat(context.channel, context.chat_id)

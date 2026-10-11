@@ -1,5 +1,8 @@
 # Consciousness Fresh Context Implementation Plan
 
+Historical document (G6, 2026-10-11): the standalone WhatsApp history stores, legacy history tools and cutover scripts referenced here have been retired. Current runtime reads use canonical History and Knowledge schema 3; old store examples describe the previous implementation.
+
+
 > **For agentic workers:** REQUIRED SUB-SKILL: Use superpowers:subagent-driven-development (recommended) or superpowers:executing-plans to implement this plan task-by-task. Steps use checkbox (`- [ ]`) syntax for tracking.
 
 **Goal:** Prevent proactive consciousness speakups from reacting to days-old messages during active chats, while preserving existing burst, lull, memory, archive, approval, policy, and daily-cap behavior.

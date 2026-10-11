@@ -25,7 +25,8 @@ from yeoman_gateway.processing.participation_context import (
     _knowledge_query,
 )
 from yeoman_gateway.processing.store import ProcessingStore
-from yeoman_gateway.storage.inbound_archive import InboundArchive
+
+from tests.gateway.synthetic_reply_archive import SyntheticReplyArchive
 
 CHANNEL = "whatsapp"
 CHAT = "group@g.us"
@@ -54,12 +55,12 @@ def _policy(*, participation: dict | None = None):
     )
 
 
-def _archive(tmp_path: Path) -> InboundArchive:
-    return InboundArchive(tmp_path / "inbound.db")
+def _archive(tmp_path: Path) -> SyntheticReplyArchive:
+    return SyntheticReplyArchive(tmp_path / "inbound.db")
 
 
 def _record(
-    archive: InboundArchive,
+    archive: SyntheticReplyArchive,
     *,
     message_id: str,
     text: str,
@@ -69,7 +70,7 @@ def _record(
     channel: str = CHANNEL,
     reply_to_message_id: str | None = None,
 ) -> None:
-    archive.record_inbound(
+    archive.adapter.record_inbound(
         channel=channel,
         chat_id=chat_id,
         message_id=message_id,

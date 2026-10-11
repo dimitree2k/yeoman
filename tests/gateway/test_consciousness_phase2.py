@@ -13,11 +13,22 @@ from yeoman_gateway.consciousness.log import SpeakupLog
 from yeoman_gateway.consciousness.tools import ConsciousnessTools
 from yeoman_gateway.core.models import InboundEvent, PolicyDecision
 from yeoman_gateway.core.pipeline import PipelineContext
+from yeoman_gateway.history.export import SecondaryArchive
 from yeoman_gateway.pipeline.speakup_approval import SpeakupApprovalMiddleware
 from yeoman_gateway.policy.engine import PolicyEngine
 from yeoman_gateway.policy.schema import PolicyConfig
-from yeoman_gateway.storage.inbound_archive import InboundArchive
 from yeoman_shared.config.schema import Config, ConsciousnessConfig
+
+from tests.gateway.history_turn_fixtures import Projector
+
+
+@pytest.fixture
+def history_projector():
+    projector = Projector()
+    try:
+        yield projector
+    finally:
+        projector.close()
 
 
 class _FakeSecurity:
@@ -29,12 +40,6 @@ class _FakeSecurity:
             stage="output",
             decision=SecurityDecision(action="allow", reason="ok"),
         )
-
-
-class _FakeMemory:
-    def search(self, **kwargs: object) -> list[object]:
-        del kwargs
-        return []
 
 
 def _config(**overrides: object) -> Config:
@@ -86,6 +91,7 @@ def _tools(
     opt_in_group: bool,
     preview: str | None = None,
     config: Config | None = None,
+    history_projector: Projector,
 ) -> tuple[ConsciousnessTools, SpeakupApprovalStore, SpeakupLog]:
     fixed_now = datetime(2026, 4, 25, 12, 0, tzinfo=UTC)
     approval_store = SpeakupApprovalStore(
@@ -98,12 +104,12 @@ def _tools(
         policy_engine=PolicyEngine(_policy(opt_in_group=opt_in_group, preview=preview), workspace=tmp_path),
         bus=MessageBus(),
         log=log,
-        inbound_archive=InboundArchive(tmp_path / "inbound.db"),
-        memory=_FakeMemory(),
+        inbound_archive=SecondaryArchive(),
         security=_FakeSecurity(),
         approval_store=approval_store,
         now=lambda: fixed_now,
     )
+    tools._history_projector = history_projector
     tools.begin_run(trigger="cron")
     return tools, approval_store, log
 
@@ -135,8 +141,8 @@ def _owner_ctx(
 
 
 @pytest.mark.asyncio
-async def test_group_opt_in_is_required(tmp_path: Path) -> None:
-    tools, _, _ = _tools(tmp_path, opt_in_group=False)
+async def test_group_opt_in_is_required(tmp_path: Path, history_projector: Projector) -> None:
+    tools, _, _ = _tools(tmp_path, opt_in_group=False, history_projector=history_projector)
 
     proposal = await tools.propose_speakup(
         chat_id="group@g.us",
@@ -150,8 +156,8 @@ async def test_group_opt_in_is_required(tmp_path: Path) -> None:
 
 
 @pytest.mark.asyncio
-async def test_group_preview_queues_owner_approval_instead_of_sending_directly(tmp_path: Path) -> None:
-    tools, store, _ = _tools(tmp_path, opt_in_group=True)
+async def test_group_preview_queues_owner_approval_instead_of_sending_directly(tmp_path: Path, history_projector: Projector) -> None:
+    tools, store, _ = _tools(tmp_path, opt_in_group=True, history_projector=history_projector)
     proposal = await tools.propose_speakup(
         chat_id="group@g.us",
         message="hello group",
@@ -172,9 +178,9 @@ async def test_group_preview_queues_owner_approval_instead_of_sending_directly(t
 
 
 @pytest.mark.asyncio
-async def test_service_preview_does_not_count_as_target_send(tmp_path: Path) -> None:
+async def test_service_preview_does_not_count_as_target_send(tmp_path: Path, history_projector: Projector) -> None:
     """A preview is an owner-destination effect, never a target send (spec section 9)."""
-    tools, approvals, log = _tools(tmp_path, opt_in_group=True)
+    tools, approvals, log = _tools(tmp_path, opt_in_group=True, history_projector=history_projector)
 
     class Effects:
         def __init__(self) -> None:
@@ -206,9 +212,8 @@ async def test_service_preview_does_not_count_as_target_send(tmp_path: Path) -> 
 
 
 @pytest.mark.asyncio
-async def test_chat_window_uses_most_recent_messages(tmp_path: Path) -> None:
-    tools, _, _ = _tools(tmp_path, opt_in_group=True)
-    archive = tools.inbound_archive
+async def test_chat_window_uses_most_recent_messages(tmp_path: Path, history_projector: Projector) -> None:
+    tools, _, _ = _tools(tmp_path, opt_in_group=True, history_projector=history_projector)
     base = datetime(2026, 4, 25, 12, 0, tzinfo=UTC)
     for index, (timestamp, text) in enumerate(
         [
@@ -220,15 +225,12 @@ async def test_chat_window_uses_most_recent_messages(tmp_path: Path) -> None:
             (int((base - timedelta(minutes=1)).timestamp()), "recent-3"),
         ]
     ):
-        archive.record_inbound(
-            channel="whatsapp",
-            chat_id="group@g.us",
-            message_id=f"msg-{index}",
-            participant="user@s.whatsapp.net",
-            sender_id="user@s.whatsapp.net",
-            text=text,
-            timestamp=timestamp,
+        history_projector.add(f"msg-{index}", chat="group@g.us", text=text)
+        history_projector.db.execute(
+            "UPDATE messages SET sent_ms=? WHERE message_id=?",
+            (timestamp * 1000, f"msg-{index}"),
         )
+    history_projector.db.commit()
 
     window = await tools.read_chat_window("group@g.us", n=3)
 
@@ -247,8 +249,8 @@ def test_whatsapp_owner_phone_normalizes_to_dm_jid() -> None:
 
 
 @pytest.mark.asyncio
-async def test_approve_code_sends_to_target_chat(tmp_path: Path) -> None:
-    tools, store, log = _tools(tmp_path, opt_in_group=True)
+async def test_approve_code_sends_to_target_chat(tmp_path: Path, history_projector: Projector) -> None:
+    tools, store, log = _tools(tmp_path, opt_in_group=True, history_projector=history_projector)
     proposal = await tools.propose_speakup(
         chat_id="group@g.us",
         message="hello group",
@@ -281,8 +283,8 @@ async def test_approve_code_sends_to_target_chat(tmp_path: Path) -> None:
 
 
 @pytest.mark.asyncio
-async def test_approval_after_consciousness_pause_does_not_send(tmp_path: Path) -> None:
-    tools, store, log = _tools(tmp_path, opt_in_group=True)
+async def test_approval_after_consciousness_pause_does_not_send(tmp_path: Path, history_projector: Projector) -> None:
+    tools, store, log = _tools(tmp_path, opt_in_group=True, history_projector=history_projector)
     proposal = await tools.propose_speakup(
         chat_id="group@g.us",
         message="hello group",
@@ -310,8 +312,8 @@ async def test_approval_after_consciousness_pause_does_not_send(tmp_path: Path) 
 
 
 @pytest.mark.asyncio
-async def test_valid_approval_submits_exactly_one_bound_target_effect(tmp_path: Path) -> None:
-    tools, store, log = _tools(tmp_path, opt_in_group=True)
+async def test_valid_approval_submits_exactly_one_bound_target_effect(tmp_path: Path, history_projector: Projector) -> None:
+    tools, store, log = _tools(tmp_path, opt_in_group=True, history_projector=history_projector)
 
     class Effects:
         def __init__(self) -> None:
@@ -357,9 +359,9 @@ async def test_valid_approval_submits_exactly_one_bound_target_effect(tmp_path: 
 
 @pytest.mark.asyncio
 async def test_approval_security_rejection_releases_unsubmitted_reservation(
-    tmp_path: Path,
+    tmp_path: Path, history_projector: Projector,
 ) -> None:
-    tools, store, log = _tools(tmp_path, opt_in_group=True)
+    tools, store, log = _tools(tmp_path, opt_in_group=True, history_projector=history_projector)
     proposal = await tools.propose_speakup(
         chat_id="group@g.us",
         message="blocked output",
@@ -397,8 +399,8 @@ async def test_approval_security_rejection_releases_unsubmitted_reservation(
 
 
 @pytest.mark.asyncio
-async def test_approve_code_accepts_owner_lid_chat_when_participant_matches(tmp_path: Path) -> None:
-    tools, store, log = _tools(tmp_path, opt_in_group=True)
+async def test_approve_code_accepts_owner_lid_chat_when_participant_matches(tmp_path: Path, history_projector: Projector) -> None:
+    tools, store, log = _tools(tmp_path, opt_in_group=True, history_projector=history_projector)
     proposal = await tools.propose_speakup(
         chat_id="group@g.us",
         message="hello group",
@@ -433,8 +435,8 @@ async def test_approve_code_accepts_owner_lid_chat_when_participant_matches(tmp_
 
 
 @pytest.mark.asyncio
-async def test_deny_code_prevents_send(tmp_path: Path) -> None:
-    tools, store, log = _tools(tmp_path, opt_in_group=True)
+async def test_deny_code_prevents_send(tmp_path: Path, history_projector: Projector) -> None:
+    tools, store, log = _tools(tmp_path, opt_in_group=True, history_projector=history_projector)
     proposal = await tools.propose_speakup(
         chat_id="group@g.us",
         message="hello group",
@@ -461,8 +463,8 @@ async def test_deny_code_prevents_send(tmp_path: Path) -> None:
 
 
 @pytest.mark.asyncio
-async def test_expired_approval_does_not_send_and_does_not_consume_daily_cap(tmp_path: Path) -> None:
-    tools, store, log = _tools(tmp_path, opt_in_group=True)
+async def test_expired_approval_does_not_send_and_does_not_consume_daily_cap(tmp_path: Path, history_projector: Projector) -> None:
+    tools, store, log = _tools(tmp_path, opt_in_group=True, history_projector=history_projector)
     fixed_ts = datetime(2026, 4, 25, 12, 0, tzinfo=UTC).timestamp()
     proposal_id = await log.record_proposed(
         proposal_id="expired-proposal",
@@ -510,9 +512,9 @@ async def test_expired_approval_does_not_send_and_does_not_consume_daily_cap(tmp
 
 @pytest.mark.asyncio
 async def test_stale_speakup_code_halts_after_expired_approval_was_purged(
-    tmp_path: Path,
+    tmp_path: Path, history_projector: Projector,
 ) -> None:
-    tools, store, log = _tools(tmp_path, opt_in_group=True)
+    tools, store, log = _tools(tmp_path, opt_in_group=True, history_projector=history_projector)
     fixed_ts = datetime(2026, 4, 25, 12, 0, tzinfo=UTC).timestamp()
     proposal_id = await log.record_proposed(
         proposal_id="expired-proposal",
@@ -563,18 +565,18 @@ async def test_stale_speakup_code_halts_after_expired_approval_was_purged(
 
 
 @pytest.mark.asyncio
-async def test_approve_carries_reply_to_message_id_into_outbound(tmp_path: Path) -> None:
-    tools, store, log = _tools(tmp_path, opt_in_group=True)
-    tools.inbound_archive.record_inbound(
-        channel="whatsapp",
-        chat_id="group@g.us",
-        message_id="msg-anchor",
-        participant="part-1",
-        sender_id="sender-1",
-        text="anchor in group",
-        timestamp=int(datetime(2026, 4, 25, 11, 50, tzinfo=UTC).timestamp()),
-        sender_name="Robin",
+async def test_approve_carries_reply_to_message_id_into_outbound(tmp_path: Path, history_projector: Projector) -> None:
+    tools, store, log = _tools(tmp_path, opt_in_group=True, history_projector=history_projector)
+    history_projector.add("msg-anchor", chat="group@g.us", text="anchor in group")
+    history_projector.db.execute(
+        "INSERT INTO contacts(contact_id,kind,role,display_name,status,merged_into,source_refs) "
+        "VALUES ('synthetic-robin','person',NULL,'Robin','confirmed',NULL,'[]')"
     )
+    history_projector.db.execute(
+        "UPDATE messages SET sent_ms=?,sender_contact_id='synthetic-robin' WHERE message_id='msg-anchor'",
+        (int(datetime(2026, 4, 25, 11, 50, tzinfo=UTC).timestamp()) * 1000,),
+    )
+    history_projector.db.commit()
     proposal = await tools.propose_speakup(
         chat_id="group@g.us",
         message="anchored reply",

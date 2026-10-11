@@ -54,6 +54,63 @@ from yeoman_shared.config.schema import Config, ExecIsolationConfig, ExecToolCon
 from yeoman_shared.utils.helpers import get_workspace_path
 
 
+
+@pytest.fixture(autouse=True)
+def _history_scope_for_whatsapp_responder(monkeypatch: pytest.MonkeyPatch, tmp_path: Path):
+    """Give responder unit tests a real, isolated SQLite History snapshot per turn."""
+    import sqlite3
+    from types import SimpleNamespace
+
+    from yeoman_gateway.history.context import history_knowledge_scope, history_turn
+    from yeoman_gateway.history.reader import HistorySnapshot
+    from yeoman_gateway.history.schema import create as create_history
+
+    history_path = tmp_path / "synthetic-history.db"
+    with sqlite3.connect(history_path) as connection:
+        create_history(connection)
+
+    async def read_turn():
+        connection = sqlite3.connect(f"file:{history_path}?mode=ro", uri=True)
+        return HistorySnapshot(1, (), connection)
+
+    projector = SimpleNamespace(
+        read_turn=read_turn,
+        health=lambda: {"status": "ready", "generation": 1},
+    )
+    original_init = LLMResponder.__init__
+    original_generate = LLMResponder.generate_reply
+
+    def init_with_history(self, *args, **kwargs):
+        original_init(self, *args, **kwargs)
+        self._history_projector = projector
+        self._history_knowledge = None
+
+    async def generate_in_history(self, event, decision, *args, **kwargs):
+        if getattr(event, "channel", "") != "whatsapp":
+            return await original_generate(self, event, decision, *args, **kwargs)
+        timestamp = getattr(event, "timestamp", None)
+        occurred_ms = int(timestamp.timestamp() * 1000) if timestamp is not None else 0
+        event_id = str(getattr(event, "message_id", "") or f"unit-{occurred_ms}")
+        with sqlite3.connect(history_path) as connection:
+            connection.execute(
+                "INSERT OR REPLACE INTO messages (message_id,channel,chat_id,native_message_id,"
+                "sender_contact_id,sender_identifier,sender_basis,direction,sent_ms,"
+                "time_certainty,text,provenance,source_refs) "
+                "VALUES (?, 'whatsapp', ?, ?, NULL, ?, 'unknown', 'in', ?, 'unknown', ?, 'native', '[]')",
+                (
+                    f"unit:{event_id}", str(getattr(event, "chat_id", "")), event_id,
+                    str(getattr(event, "sender_id", "")), occurred_ms,
+                    str(getattr(event, "content", "") or ""),
+                ),
+            )
+        async with history_turn(projector) as snapshot:
+            with history_knowledge_scope(snapshot, self._history_knowledge):
+                kwargs.setdefault("history_snapshot", snapshot)
+                return await original_generate(self, event, decision, *args, **kwargs)
+
+    monkeypatch.setattr(LLMResponder, "__init__", init_with_history)
+    monkeypatch.setattr(LLMResponder, "generate_reply", generate_in_history)
+
 class SampleTool(Tool):
     @property
     def name(self) -> str:
@@ -316,8 +373,9 @@ def test_exec_isolation_defaults_and_camel_case_roundtrip() -> None:
     assert iso.max_containers == 5
     assert iso.pressure_policy == "preempt_oldest_active"
     assert cfg.agents.defaults.timing_logs_enabled is False
-    assert cfg.memory.enabled is True
-    assert cfg.memory.mode == "primary"
+    # Removed legacy mode flags are ignored; Knowledge capture remains separately configured.
+    assert not hasattr(cfg.memory, "enabled")
+    assert not hasattr(cfg.memory, "mode")
     assert cfg.memory.capture.enabled is True
     assert cfg.memory.capture.mode == "hybrid"
     assert cfg.memory.recall.max_results == 8
@@ -350,12 +408,16 @@ def test_exec_isolation_defaults_and_camel_case_roundtrip() -> None:
             }
         },
     }
+    data["memory"]["enabled"] = False
+    data["memory"]["mode"] = "legacy"
     loaded = Config.model_validate(convert_keys(data))
     assert loaded.tools.exec.allow_host_execution is True
     assert loaded.tools.exec.isolation.enabled is True
     assert loaded.tools.exec.isolation.batch_session_idle_seconds == 123
     assert loaded.tools.exec.isolation.max_containers == 7
     assert loaded.agents.defaults.timing_logs_enabled is True
+    assert not hasattr(loaded.memory, "enabled")
+    assert not hasattr(loaded.memory, "mode")
     assert loaded.memory.capture.enabled is False
     assert loaded.memory.capture.min_confidence == 0.9
 
@@ -864,7 +926,8 @@ class _VoiceRegistry:
         }
 
 
-def test_non_owner_voice_guard_requires_current_chat_member_and_one_per_day(
+@pytest.mark.asyncio
+async def test_non_owner_voice_guard_requires_current_chat_member_and_one_per_day(
     tmp_path: Path,
 ) -> None:
     store = ProcessingStore(tmp_path / "processing.db")
@@ -872,9 +935,34 @@ def test_non_owner_voice_guard_requires_current_chat_member_and_one_per_day(
         bus=MessageBus(),
         provider=_CountingProvider(),
         workspace=tmp_path,
-        chat_registry=_VoiceRegistry(),  # type: ignore[arg-type]
         processing_store=store,
     )
+    import sqlite3
+    import time
+
+    from yeoman_gateway.history.context import history_turn
+
+    history_path = responder.workspace / "synthetic-history.db"
+    now_ms = time.time_ns() // 1_000_000
+    with sqlite3.connect(history_path) as connection:
+        connection.execute(
+            "INSERT INTO contacts(contact_id,kind,role,display_name,status,merged_into,source_refs) "
+            "VALUES ('voice-recipient','person',NULL,'Recipient','confirmed',NULL,'[]')"
+        )
+        connection.execute(
+            "INSERT INTO identifier_history(contact_id,channel,kind,value,strength,evidence,"
+            "first_seen_ms,last_seen_ms,valid_from_ms,source_refs) "
+            "VALUES ('voice-recipient','whatsapp','pn_jid','491234@s.whatsapp.net',"
+            "'strong','owner_attested',?,?,0,'[]')",
+            (now_ms, now_ms),
+        )
+        connection.execute(
+            "INSERT INTO message_events(event_id,kind,channel,chat_id,actor_basis,occurred_ms,"
+            "time_certainty,payload_json,provenance,source_refs) "
+            "VALUES ('voice-roster','member_snapshot','whatsapp','friends@g.us',"
+            "'owner_attested',?,'native',?,'native','[]')",
+            (now_ms - 1, json.dumps({"complete": True, "participants": [["491234@s.whatsapp.net"]]})),
+        )
     context_token = set_tool_context(
         ToolInvocationContext(
             channel="whatsapp",

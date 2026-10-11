@@ -128,7 +128,7 @@ class ThreadActorResponder:
     # -- port --------------------------------------------------------------------------
 
     async def generate_reply(self, event: Any, decision: Any) -> str | None:
-        if getattr(self._inner, '_history_selected', False) and event.channel == 'whatsapp':
+        if event.channel == 'whatsapp':
             from yeoman_gateway.history.context import history_knowledge_scope, history_turn
             async with history_turn(self._inner._history_projector) as snapshot:
                 with history_knowledge_scope(snapshot, self._inner._history_knowledge):
@@ -389,7 +389,7 @@ class ThreadActorResponder:
         chat_key = f"{channel}:{chat_id}"
         if chat_key == session_key or str(chat_id).endswith("@g.us"):
             return
-        if isinstance(sessions, SessionManager) and sessions.uses_history(channel):
+        if isinstance(sessions, SessionManager) and channel == "whatsapp":
             # The final reply supplies its snapshot later; never persist a history copy.
             if history_snapshot is None:
                 return None

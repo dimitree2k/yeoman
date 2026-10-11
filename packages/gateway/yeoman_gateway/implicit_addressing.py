@@ -606,7 +606,7 @@ def _last_session_assistant_content(
     chat_id: str,
 ) -> str | None:
     from yeoman_gateway.session.manager import SessionManager
-    if isinstance(session_manager, SessionManager) and session_manager.uses_history(channel):
+    if isinstance(session_manager, SessionManager) and channel == "whatsapp":
         from yeoman_gateway.history.context import current_history_snapshot
         snapshot = current_history_snapshot()
         if snapshot is None:
@@ -640,7 +640,7 @@ def seconds_since_last_assistant(
     if session_manager is None:
         return None
     from yeoman_gateway.session.manager import SessionManager
-    if isinstance(session_manager, SessionManager) and session_manager.uses_history(channel):
+    if isinstance(session_manager, SessionManager) and channel == "whatsapp":
         from yeoman_gateway.history.context import current_history_snapshot
         snapshot = current_history_snapshot()
         if snapshot is None:

@@ -22,38 +22,52 @@ def v2(path):
                   " VALUES ('curated-binding','whatsapp','phone_jid','whatsapp','10009@s.whatsapp.net','curated',1,'synthetic-proof',1,1,1)")
     store.execute("INSERT INTO contact_aliases(contact_id,alias,source,first_seen,last_seen,status,address_allowed,normalized_alias)"
                   " VALUES ('curated','Synthetic','owner_confirmed','date','date','confirmed',1,'synthetic')")
-    store.commit_if_idle()
-    from yeoman_gateway.knowledge.api import KnowledgeService
-    from yeoman_gateway.knowledge.authority import EvidenceAudience
-    from yeoman_gateway.knowledge.models import (
-        AttributeCandidate,
-        AttributeValue,
-        PersonLinkCandidate,
-        SourceRef,
-        StatementCandidate,
-        TrustedCaptureContext,
+    # Seed a preserved v2 snapshot directly.  This fixture exercises the offline
+    # converter and must not depend on retired runtime writer APIs.
+    for index, content in enumerate(('Curated synthetic source', 'Curated synthetic correction'), start=1):
+        sid = f'curated-statement-{index}'
+        store.execute(
+            "INSERT INTO memory2_nodes(id,workspace_id,scope_type,scope_key,sector,kind,content,content_norm,content_hash,salience,confidence,source,meta_json,created_at,updated_at) "
+            "VALUES (?, 'synthetic','chat','curated@g.us','knowledge','statement',?,?,?,1,1,'curated','{}','date','date')",
+            (sid, content, content.casefold(), f'hash-{index}'),
+        )
+        store.execute(
+            "INSERT INTO knowledge_statements(statement_id,workspace_id,scope_key,author_principal,status,visibility_scope,group_rule,source_chat_id,source_channel,valid_from_ms,extractor_version,content_hash,dedupe_key,created_ms,updated_ms) "
+            "VALUES (?, 'synthetic','curated@g.us','whatsapp:10009','confirmed','author_only','author_only','curated@g.us','whatsapp',100,'fixture','hash-'||?,'dedupe-'||?,100,100)",
+            (sid, str(index), str(index)),
+        )
+        store.execute(
+            "INSERT INTO knowledge_statement_sources(statement_id,event_id,revision,channel,chat_id,author_principal,occurred_at_ms,status) "
+            "VALUES (?,'curated-source',4,'whatsapp','curated@g.us','whatsapp:10009',100,'active')",
+            (sid,),
+        )
+        store.execute(
+            "INSERT INTO knowledge_statement_people(statement_id,person_id,role,evidence_source_id,evidence_revision,attribution) "
+            "VALUES (?,'curated','subject','curated-source',4,'confirmed')", (sid,)
+        )
+        if index == 1:
+            store.execute(
+                "INSERT INTO knowledge_person_attributes(statement_id,person_id,attribute_key,value_json,value_key,created_ms,updated_ms) "
+                "VALUES (?,'curated','description','\"Synthetic attribute\"','synthetic',100,100)", (sid,)
+            )
+        store.execute(
+            "INSERT INTO knowledge_statement_audit(statement_id,operation,actor_principal,evidence_ref,reason,created_ms) "
+            "VALUES (?,'curated','whatsapp:10009','synthetic-proof','fixture',100)", (sid,)
+        )
+    store.execute(
+        "INSERT INTO knowledge_jobs(job_id,workspace_id,scope_key,kind,sources_json,extractor_version,state,due_ms,created_ms,updated_ms) "
+        "VALUES ('curated-job','synthetic','curated@g.us','capture','[{\"event_id\":\"curated-source\",\"revision\":4}]','fixture','queued',100,100,100)"
     )
-    authority = RuntimeKnowledgeSources()
-    source = SourceRef('curated-source', 4, 'whatsapp', 'curated@g.us', 'whatsapp:10009', 100)
-    authority.register_source(source, EvidenceAudience.author_only())
-    service = KnowledgeService(store=store, workspace_id='synthetic', source_authority=authority,
-                               policy_authority=RuntimeKnowledgePolicy(engine=None))
-    context = TrustedCaptureContext('synthetic', 1, 'native', (source,))
-    result = service.capture(StatementCandidate('Curated synthetic source', (source,), people=(
-        PersonLinkCandidate('curated', 'subject', source, 'confirmed'),), attributes=(
-        AttributeCandidate('curated', 'description', AttributeValue('Synthetic attribute')),)), context=context)
-    service.correct_statement(result.statement_ids[0], StatementCandidate('Curated synthetic correction', (source,)),
-                              expected_source=source, context=context)
-    service.enqueue_capture((source,), context=context)
     # A persisted suppression/curation control remains opaque to the copy tool.
     store.set_meta('curated_suppression', 'synthetic-withheld-ref')
-    service.close()
+    store.commit_if_idle()
+    store.close()
     return path
 
 
-def open_service(path, *, history_mode=False):
+def open_service(path):
     return open_knowledge_store(path, workspace_id="synthetic", source_authority=RuntimeKnowledgeSources(),
-                                policy_authority=RuntimeKnowledgePolicy(engine=None), history_mode=history_mode)
+                                policy_authority=RuntimeKnowledgePolicy(engine=None))
 
 
 def test_history_knowledge_upgrade_preserves_curated_rows_and_frozen_identity(tmp_path):
@@ -83,7 +97,7 @@ def test_history_knowledge_upgrade_preserves_curated_rows_and_frozen_identity(tm
         assert {row[0] for row in db.execute("SELECT name FROM sqlite_master WHERE name LIKE 'knowledge_history_%' AND type='table'")} == {
             'knowledge_history_source_aliases', 'knowledge_history_sources',
             'knowledge_history_capture', 'knowledge_history_capture_state'}
-    service = open_service(target, history_mode=True)
+    service = open_service(target)
     service.close()
 
 
@@ -97,14 +111,10 @@ def test_upgrade_refuses_existing_target_and_normal_start_does_not_migrate(tmp_p
         upgrade_history_knowledge(source=source, target=target)
     assert {p.name: p.read_bytes() for p in tmp_path.iterdir()} == before
     with pytest.raises(KnowledgeStartupError):
-        open_service(source, history_mode=True)
+        open_service(source)
     assert {p.name: p.read_bytes() for p in tmp_path.iterdir()} == before
-    service = open_service(source)
-    assert service._store.schema_version == 2
-    assert not any(name.startswith('knowledge_history_') for name in service._store.table_names())
-    service.close()
     with pytest.raises(KnowledgeStartupError):
-        open_service(tmp_path / 'fresh-v3.db', history_mode=True)
+        open_service(tmp_path / 'fresh-v3.db')
     assert not (tmp_path / 'fresh-v3.db').exists()
 
 

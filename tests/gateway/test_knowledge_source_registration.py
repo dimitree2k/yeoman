@@ -49,8 +49,17 @@ class _Runtime:
         self.policy = RuntimeKnowledgePolicy(
             engine=None, chat_registry=self.registry, policy_revision=1
         )
+        from yeoman_gateway.knowledge._history_upgrade import upgrade_history_knowledge
+        from yeoman_gateway.knowledge._store import KnowledgeStore
+
+        source_path = tmp_path / "knowledge-v2.db"
+        legacy_store = KnowledgeStore(source_path)
+        legacy_store.set_meta("migration_complete", "1")
+        legacy_store.close()
+        knowledge_path = tmp_path / "knowledge-v3.db"
+        upgrade_history_knowledge(source=source_path, target=knowledge_path)
         self.knowledge = open_knowledge_store(
-            tmp_path / "knowledge.db",
+            knowledge_path,
             workspace_id=workspace_id_for(tmp_path),
             source_authority=self.sources,
             policy_authority=self.policy,

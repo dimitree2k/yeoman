@@ -11,6 +11,17 @@ from yeoman_gateway.bus.events import InboundObservedEvent
 from yeoman_gateway.consciousness.burst import BurstObserver
 from yeoman_shared.config.schema import Config, ConsciousnessConfig
 
+from tests.gateway.history_turn_fixtures import Projector
+
+
+@pytest.fixture
+def history_projector():
+    projector = Projector()
+    try:
+        yield projector
+    finally:
+        projector.close()
+
 
 def _config(**overrides: object) -> Config:
     payload = {
@@ -51,7 +62,7 @@ def _event(
 
 
 @pytest.mark.asyncio
-async def test_burst_observer_fires_only_after_threshold_inside_window(tmp_path: Path) -> None:
+async def test_burst_observer_fires_only_after_threshold_inside_window(tmp_path: Path, history_projector: Projector) -> None:
     calls: list[tuple[str, str]] = []
     observer = BurstObserver(
         config=_config(),
@@ -59,6 +70,7 @@ async def test_burst_observer_fires_only_after_threshold_inside_window(tmp_path:
         on_burst=lambda channel, chat_id: calls.append((channel, chat_id)),
         is_eligible=lambda channel, chat_id: True,
     )
+    observer._history_projector = history_projector
     base = datetime(2026, 4, 26, 12, 0, tzinfo=UTC)
 
     await observer.handle(_event(at=base))
@@ -70,7 +82,7 @@ async def test_burst_observer_fires_only_after_threshold_inside_window(tmp_path:
 
 
 @pytest.mark.asyncio
-async def test_burst_observer_clears_window_after_fire(tmp_path: Path) -> None:
+async def test_burst_observer_clears_window_after_fire(tmp_path: Path, history_projector: Projector) -> None:
     calls: list[tuple[str, str]] = []
     observer = BurstObserver(
         config=_config(defaultDailyCap=3),
@@ -78,6 +90,7 @@ async def test_burst_observer_clears_window_after_fire(tmp_path: Path) -> None:
         on_burst=lambda channel, chat_id: calls.append((channel, chat_id)),
         is_eligible=lambda channel, chat_id: True,
     )
+    observer._history_projector = history_projector
     base = datetime(2026, 4, 26, 12, 0, tzinfo=UTC)
 
     for index in range(4):
@@ -104,7 +117,7 @@ async def test_burst_observer_is_disabled_by_default(tmp_path: Path) -> None:
 
 
 @pytest.mark.asyncio
-async def test_burst_observer_ignores_direct_bot_interaction_messages(tmp_path: Path) -> None:
+async def test_burst_observer_ignores_direct_bot_interaction_messages(tmp_path: Path, history_projector: Projector) -> None:
     calls: list[tuple[str, str]] = []
     observer = BurstObserver(
         config=_config(),
@@ -112,6 +125,7 @@ async def test_burst_observer_ignores_direct_bot_interaction_messages(tmp_path: 
         on_burst=lambda channel, chat_id: calls.append((channel, chat_id)),
         is_eligible=lambda channel, chat_id: True,
     )
+    observer._history_projector = history_projector
     base = datetime(2026, 4, 26, 12, 0, tzinfo=UTC)
 
     await observer.handle(_event(at=base, mentioned_bot=True))
@@ -125,7 +139,7 @@ async def test_burst_observer_ignores_direct_bot_interaction_messages(tmp_path: 
 
 @pytest.mark.asyncio
 async def test_burst_observer_suppresses_window_after_direct_bot_interaction(
-    tmp_path: Path,
+    tmp_path: Path, history_projector: Projector,
 ) -> None:
     calls: list[tuple[str, str]] = []
     observer = BurstObserver(
@@ -134,6 +148,7 @@ async def test_burst_observer_suppresses_window_after_direct_bot_interaction(
         on_burst=lambda channel, chat_id: calls.append((channel, chat_id)),
         is_eligible=lambda channel, chat_id: True,
     )
+    observer._history_projector = history_projector
     base = datetime(2026, 4, 26, 12, 0, tzinfo=UTC)
 
     await observer.handle(_event(at=base, mentioned_bot=True))
@@ -145,7 +160,7 @@ async def test_burst_observer_suppresses_window_after_direct_bot_interaction(
 
 @pytest.mark.asyncio
 async def test_burst_observer_suppresses_plain_name_interaction_window(
-    tmp_path: Path,
+    tmp_path: Path, history_projector: Projector,
 ) -> None:
     calls: list[tuple[str, str]] = []
     observer = BurstObserver(
@@ -154,6 +169,7 @@ async def test_burst_observer_suppresses_plain_name_interaction_window(
         on_burst=lambda channel, chat_id: calls.append((channel, chat_id)),
         is_eligible=lambda channel, chat_id: True,
     )
+    observer._history_projector = history_projector
     base = datetime(2026, 4, 26, 12, 0, tzinfo=UTC)
 
     await observer.handle(_event(at=base, content="Arvid kannst du Nokia checken"))
@@ -165,7 +181,7 @@ async def test_burst_observer_suppresses_plain_name_interaction_window(
 
 @pytest.mark.asyncio
 async def test_burst_observer_suppresses_recent_assistant_followup_window(
-    tmp_path: Path,
+    tmp_path: Path, history_projector: Projector,
 ) -> None:
     calls: list[tuple[str, str]] = []
     base = datetime(2026, 4, 26, 12, 0, tzinfo=UTC)
@@ -193,6 +209,7 @@ async def test_burst_observer_suppresses_recent_assistant_followup_window(
         is_eligible=lambda channel, chat_id: True,
         session_manager=_Sessions(),
     )
+    observer._history_projector = history_projector
 
     await observer.handle(_event(at=base, content="was meinst du bei Intel"))
     for index in range(1, 4):
@@ -202,7 +219,7 @@ async def test_burst_observer_suppresses_recent_assistant_followup_window(
 
 
 @pytest.mark.asyncio
-async def test_burst_debounce_state_survives_restart(tmp_path: Path) -> None:
+async def test_burst_debounce_state_survives_restart(tmp_path: Path, history_projector: Projector) -> None:
     calls: list[tuple[str, str]] = []
     state_path = tmp_path / "burst.json"
     base = datetime(2026, 4, 26, 12, 0, tzinfo=UTC)
@@ -212,6 +229,7 @@ async def test_burst_debounce_state_survives_restart(tmp_path: Path) -> None:
         on_burst=lambda channel, chat_id: calls.append((channel, chat_id)),
         is_eligible=lambda channel, chat_id: True,
     )
+    first._history_projector = history_projector
     for index in range(3):
         await first.handle(_event(at=base + timedelta(minutes=index)))
 
@@ -221,6 +239,7 @@ async def test_burst_debounce_state_survives_restart(tmp_path: Path) -> None:
         on_burst=lambda channel, chat_id: calls.append((channel, chat_id)),
         is_eligible=lambda channel, chat_id: True,
     )
+    restarted._history_projector = history_projector
     for index in range(3):
         await restarted.handle(_event(at=base + timedelta(minutes=20 + index)))
 
@@ -228,7 +247,7 @@ async def test_burst_debounce_state_survives_restart(tmp_path: Path) -> None:
 
 
 @pytest.mark.asyncio
-async def test_burst_state_is_not_saved_when_callback_fails(tmp_path: Path) -> None:
+async def test_burst_state_is_not_saved_when_callback_fails(tmp_path: Path, history_projector: Projector) -> None:
     state_path = tmp_path / "burst.json"
     base = datetime(2026, 4, 26, 12, 0, tzinfo=UTC)
 
@@ -242,6 +261,7 @@ async def test_burst_state_is_not_saved_when_callback_fails(tmp_path: Path) -> N
         on_burst=failing_burst,
         is_eligible=lambda channel, chat_id: True,
     )
+    first._history_projector = history_projector
 
     with pytest.raises(RuntimeError, match="planner failed"):
         for index in range(3):
@@ -256,6 +276,7 @@ async def test_burst_state_is_not_saved_when_callback_fails(tmp_path: Path) -> N
         on_burst=lambda channel, chat_id: calls.append((channel, chat_id)),
         is_eligible=lambda channel, chat_id: True,
     )
+    restarted._history_projector = history_projector
     for index in range(3):
         await restarted.handle(_event(at=base + timedelta(minutes=20 + index)))
 
@@ -263,7 +284,7 @@ async def test_burst_state_is_not_saved_when_callback_fails(tmp_path: Path) -> N
 
 
 @pytest.mark.asyncio
-async def test_burst_observer_respects_configurable_daily_cap(tmp_path: Path) -> None:
+async def test_burst_observer_respects_configurable_daily_cap(tmp_path: Path, history_projector: Projector) -> None:
     calls: list[tuple[str, str]] = []
     cfg = _config(defaultDailyCap=3)
     state_path = tmp_path / "burst.json"
@@ -275,6 +296,7 @@ async def test_burst_observer_respects_configurable_daily_cap(tmp_path: Path) ->
         on_burst=lambda channel, chat_id: calls.append((channel, chat_id)),
         is_eligible=lambda channel, chat_id: True,
     )
+    observer._history_projector = history_projector
 
     for fire in range(4):
         offset = fire * 30
@@ -290,7 +312,7 @@ async def test_burst_observer_respects_configurable_daily_cap(tmp_path: Path) ->
 
 
 @pytest.mark.asyncio
-async def test_burst_observer_migrates_legacy_state_format(tmp_path: Path) -> None:
+async def test_burst_observer_migrates_legacy_state_format(tmp_path: Path, history_projector: Projector) -> None:
     calls: list[tuple[str, str]] = []
     state_path = tmp_path / "burst.json"
     state_path.write_text(
@@ -305,6 +327,7 @@ async def test_burst_observer_migrates_legacy_state_format(tmp_path: Path) -> No
         on_burst=lambda channel, chat_id: calls.append((channel, chat_id)),
         is_eligible=lambda channel, chat_id: True,
     )
+    observer._history_projector = history_projector
 
     for index in range(3):
         await observer.handle(_event(at=base + timedelta(minutes=index)))

@@ -8,40 +8,11 @@ partial row behind, and that the public facade does not hand out a second writer
 from __future__ import annotations
 
 import sqlite3
-import threading
 
 import pytest
-from yeoman_gateway.knowledge.authority import FakePolicyAuthority, FakeSourceAuthority
 from yeoman_gateway.knowledge.models import (
-    Identifier,
     KnowledgeError,
-    TrustedAdminContext,
-    TrustedIdentityObservation,
 )
-
-
-def test_identity_and_alias_write_roll_back_together(knowledge_harness):
-    h = knowledge_harness
-    person = h.person("Tom")
-    before = h.snapshot_counts()
-    before_revision = h.identity_revision()
-    h.fail_next_commit()
-    with pytest.raises(KnowledgeError) as excinfo:
-        with h.service._store.transaction():  # noqa: SLF001 - fault injection harness
-            h.service._store.execute(  # noqa: SLF001
-                "UPDATE contacts SET display_name = ? WHERE id = ?", ("Rollback", person)
-            )
-            h.service._store.execute(  # noqa: SLF001
-                "INSERT INTO contact_aliases (contact_id, alias, source, first_seen, last_seen)"
-                " VALUES (?, ?, 'observed', 'now', 'now')",
-                (person, "Rollback"),
-            )
-            h.service._store.set_meta("identity_revision", "9999")  # noqa: SLF001
-    assert excinfo.value.code == "storage_unavailable"
-    assert h.snapshot_counts() == before
-    assert h.service.display_name(person) == "Tom"
-    assert "Rollback" not in h.service.alias_names(person)
-    assert h.identity_revision() == before_revision
 
 
 def test_nested_operation_joins_the_outer_transaction(knowledge_harness):
@@ -49,14 +20,13 @@ def test_nested_operation_joins_the_outer_transaction(knowledge_harness):
     import sqlite3
 
     h = knowledge_harness
-    person = h.person("Tom")
     db = h.service.db_path
 
     def outside_preferred_name() -> str | None:
         conn = sqlite3.connect(f"file:{db}?mode=ro", uri=True)
         try:
             row = conn.execute(
-                "SELECT preferred_name FROM contacts WHERE id = ?", (person,)
+                "SELECT value FROM knowledge_meta WHERE key = 'transaction_probe'"
             ).fetchone()
             return None if row is None else row[0]
         finally:
@@ -65,70 +35,20 @@ def test_nested_operation_joins_the_outer_transaction(knowledge_harness):
     assert outside_preferred_name() is None
     with h.service._store.transaction():  # noqa: SLF001
         h.service._store.execute(  # noqa: SLF001
-            "UPDATE contacts SET display_name = 'inner' WHERE id = ?", (person,)
+            "INSERT OR REPLACE INTO knowledge_meta(key, value) VALUES ('transaction_probe', 'inner')"
         )
         with h.service._store.transaction():  # noqa: SLF001
             h.service._store.execute(  # noqa: SLF001
-                "UPDATE contacts SET preferred_name = 'inner-too' WHERE id = ?", (person,)
+                "INSERT OR REPLACE INTO knowledge_meta(key, value) VALUES ('transaction_probe', 'inner-too')"
             )
         # Still inside the outer transaction: another connection must not see it.
         assert outside_preferred_name() is None
     assert outside_preferred_name() == "inner-too"
-    assert h.service.display_name(person) == "inner-too"
+    assert h.service._store.get_meta("transaction_probe") == "inner-too"  # noqa: SLF001
 
 
-def test_identifier_racing_creates_at_most_one_person(knowledge_harness):
-    h = knowledge_harness
-    value = "49188888888@s.whatsapp.net"
-    results: list[str | None] = []
-    errors: list[BaseException] = []
-
-    def worker() -> None:
-        try:
-            resolved = h.observe("whatsapp", "phone_jid", value)
-            results.append(resolved.person_id)
-        except BaseException as exc:  # pragma: no cover - reported below
-            errors.append(exc)
-
-    threads = [threading.Thread(target=worker) for _ in range(4)]
-    for thread in threads:
-        thread.start()
-    for thread in threads:
-        thread.join()
-    assert not errors, errors
-    assert len(set(results)) == 1
-    assert results[0] is not None
-    assert h.snapshot_counts()["contacts"] == 1
-    assert h.snapshot_counts()["contact_identifiers"] == 1
 
 
-def test_second_service_instance_on_one_file_sees_the_same_identity(tmp_path):
-    """Two processes may read one file; there is exactly one logical writer path."""
-    from yeoman_gateway.knowledge.api import open_knowledge_store
-
-    db = tmp_path / "shared.db"
-    authority = FakeSourceAuthority()
-    policy = FakePolicyAuthority(admins={"owner:p"}, capture_actors={"owner:p"})
-    first = open_knowledge_store(
-        db, workspace_id="ws", source_authority=authority, policy_authority=policy
-    )
-    second = open_knowledge_store(
-        db, workspace_id="ws", source_authority=authority, policy_authority=policy
-    )
-    try:
-        observation = TrustedIdentityObservation(
-            identifiers=(Identifier("whatsapp", "phone_jid", "49177777777@s.whatsapp.net"),),
-            evidence_ref="obs-x",
-        )
-        authority.issue_observation(observation)
-        created = first.resolve_person(observation)
-        assert created.person_id
-        again = second.resolve_person(observation)
-        assert again.person_id == created.person_id
-        assert again.reason == "existing_binding"
-    finally:
-        first.close()
-        second.close()
 
 
 def test_close_is_idempotent_and_stops_writes(knowledge_harness):
@@ -141,18 +61,6 @@ def test_close_is_idempotent_and_stops_writes(knowledge_harness):
     assert excinfo.value.code == "storage_unavailable"
 
 
-def test_admin_context_requires_owner_authority(knowledge_harness):
-    h = knowledge_harness
-    person = h.person("Tom")
-    context = TrustedAdminContext(
-        actor_principal="whatsapp:4910000000001",
-        policy_revision=1,
-        authorization_ref="ref",
-        owner=False,
-    )
-    with pytest.raises(KnowledgeError) as excinfo:
-        h.service.set_preferred_name(person, "Dimi", context=context)
-    assert excinfo.value.code == "unauthorized"
 
 
 def test_public_boundary_exposes_no_store_handle():
@@ -196,101 +104,8 @@ def _insert_binding(
     )
 
 
-def test_ended_binding_history_coexists_while_only_one_active_binding_is_allowed(
-    knowledge_harness,
-):
-    """The partial unique index is the point of the temporal binding table.
-
-    Number re-assignment must be representable: an ended row and a new active row for the
-    same fully typed identifier coexist, but two *active* rows never do.
-    """
-    h = knowledge_harness
-    first = h.person("Tom")
-    second = h.person("Alex")
-    value = "49170000001@s.whatsapp.net"
-    with h.service._store.transaction():  # noqa: SLF001 - schema contract under test
-        _insert_binding(
-            h.service._store,  # noqa: SLF001
-            binding_id="bind-old",
-            person_id=first,
-            value=value,
-            status="ended",
-            valid_until_ms=500,
-        )
-        _insert_binding(
-            h.service._store,  # noqa: SLF001
-            binding_id="bind-new",
-            person_id=second,
-            value=value,
-            status="active",
-            valid_from_ms=500,
-        )
-    rows = h.service._store.query(  # noqa: SLF001
-        "SELECT binding_id, status FROM knowledge_identifier_bindings WHERE value = ?"
-        " ORDER BY binding_id",
-        (value,),
-    )
-    assert [(str(row["binding_id"]), str(row["status"])) for row in rows] == [
-        ("bind-new", "active"),
-        ("bind-old", "ended"),
-    ]
-
-    with pytest.raises(sqlite3.IntegrityError):
-        with h.service._store.transaction():  # noqa: SLF001
-            _insert_binding(
-                h.service._store,  # noqa: SLF001
-                binding_id="bind-second-active",
-                person_id=first,
-                value=value,
-                status="active",
-                valid_from_ms=900,
-            )
-    # The refused insert left nothing behind.
-    assert h.service._store.scalar(  # noqa: SLF001
-        "SELECT COUNT(*) FROM knowledge_identifier_bindings WHERE binding_id = ?",
-        ("bind-second-active",),
-    ) == 0
 
 
-def test_a_withheld_binding_is_never_the_active_one(knowledge_harness):
-    """A withheld candidate may keep its row, but it must not block or resolve a person."""
-    h = knowledge_harness
-    person = h.person("Tom")
-    value = "49170000002@s.whatsapp.net"
-    with h.service._store.transaction():  # noqa: SLF001
-        _insert_binding(
-            h.service._store,  # noqa: SLF001
-            binding_id="bind-withheld",
-            person_id=person,
-            value=value,
-            status="withheld",
-        )
-    assert (
-        h.service._store.scalar(  # noqa: SLF001
-            "SELECT COUNT(*) FROM knowledge_identifier_bindings"
-            " WHERE value = ? AND status = 'active'",
-            (value,),
-        )
-        == 0
-    )
-    # A new proven observation may still claim the identifier as the active binding.
-    with h.service._store.transaction():  # noqa: SLF001
-        _insert_binding(
-            h.service._store,  # noqa: SLF001
-            binding_id="bind-active",
-            person_id=person,
-            value=value,
-            status="active",
-            valid_from_ms=10,
-        )
-    assert (
-        h.service._store.scalar(  # noqa: SLF001
-            "SELECT binding_id FROM knowledge_identifier_bindings"
-            " WHERE value = ? AND status = 'active'",
-            (value,),
-        )
-        == "bind-active"
-    )
 
 
 def test_statement_person_status_rejects_unknown_values(knowledge_harness):
@@ -348,31 +163,6 @@ def test_attribute_polarity_rejects_unknown_values(knowledge_harness):
                 " attribute_key, value_json, value_key, polarity, revision, created_ms,"
                 " updated_ms) VALUES (?, ?, 'residence', '{}', 'k', 'maybe', 1, 1, 1)",
                 (statement_id, person),
-            )
-
-
-def test_alias_preference_index_blocks_two_preferred_aliases_in_one_scope(
-    knowledge_harness,
-):
-    h = knowledge_harness
-    person = h.person("Tom")
-    with h.service._store.transaction():  # noqa: SLF001
-        h.service._store.execute(  # noqa: SLF001
-            "INSERT INTO contact_aliases (contact_id, alias, source, first_seen, last_seen,"
-            " alias_kind, normalized_alias, scope_key, status, address_allowed, is_preferred,"
-            " revision) VALUES (?, 'Tommy', 'owner_confirmed', 'now', 'now', 'nickname',"
-            " 'tommy', 'global', 'confirmed', 1, 1, 1)",
-            (person,),
-        )
-    with pytest.raises(sqlite3.IntegrityError):
-        with h.service._store.transaction():  # noqa: SLF001
-            h.service._store.execute(  # noqa: SLF001
-                "INSERT INTO contact_aliases (contact_id, alias, source, first_seen,"
-                " last_seen, alias_kind, normalized_alias, scope_key, status,"
-                " address_allowed, is_preferred, revision) VALUES (?, 'Thomas',"
-                " 'owner_confirmed', 'now', 'now', 'short_name', 'thomas', 'global',"
-                " 'confirmed', 1, 1, 1)",
-                (person,),
             )
 
 

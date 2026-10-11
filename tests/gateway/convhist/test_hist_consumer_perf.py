@@ -269,7 +269,6 @@ class PerfCase(ConsumerCase):
             source_authorizer=lambda row: participant_is_allowed(engine=self.policy.engine,
                 channel=str(row.get('channel') or ''), chat_id=str(row.get('chat_id') or ''),
                 sender=str(row.get('sender_id') or row.get('participant') or '')))
-        builder._history_selected = True
         self.runners['participation'] = builder
         self.observe_acquisitions(monkeypatch)
 
@@ -360,8 +359,8 @@ class PerfCase(ConsumerCase):
         from yeoman_gateway.session.manager import SessionManager
         from yeoman_gateway.session.operational import OperationalSessions
 
-        sessions = SessionManager(self.root, sessions_dir=self.root / 'sessions', history_selected=True,
-            legacy_history_disabled=True, operational_store=OperationalSessions(self.root / 'sessions.db'))
+        sessions = SessionManager(self.root, sessions_dir=self.root / 'sessions',
+            operational_store=OperationalSessions(self.root / 'sessions.db'))
         tool = RecallConversationTool(sessions)
         class Provider(LLMProvider):
             async def chat(self, **kwargs):
@@ -373,7 +372,6 @@ class PerfCase(ConsumerCase):
             def get_default_model(self):
                 return 'synthetic/model'
         responder = LLMResponder(provider=Provider(), workspace=self.root, bus=MessageBus(), session_manager=sessions)
-        responder._history_selected = responder._history_tools_selected = True
         async def generate(ctx, next):
             answer = await responder._generate(session_key='perf', channel='whatsapp', chat_id=self.chat,
                 content=ctx.event.content, sender_id=self.sender, media=(),
@@ -381,11 +379,10 @@ class PerfCase(ConsumerCase):
             ctx.intents.append(SendOutboundIntent(event=OutboundEvent(channel='whatsapp', chat_id=self.chat, content=answer)))
             await next(ctx)
         orchestrator = object.__new__(Orchestrator)
-        orchestrator._history_reply_selected = True
-        orchestrator._pipeline = Pipeline([ContactsMiddleware(history_selected=True), ReplyContextMiddleware(history_selected=True), generate])
+        orchestrator._pipeline = Pipeline([ContactsMiddleware(), ReplyContextMiddleware(), generate])
         bus = SimpleNamespace(publish_outbound=AsyncMock(), publish_reaction=AsyncMock())
         service = OrchestratorService(bus=bus, orchestrator=orchestrator, typing_adapter=AsyncMock(),
-            telemetry=SimpleNamespace(), memory=None, history_projector=self.projector, history_selected=True, history_knowledge=self.knowledge)
+            telemetry=SimpleNamespace(), history_projector=self.projector, history_knowledge=self.knowledge)
         self.responder, self.reply_service, self.reply_bus = responder, service, bus
         self.runners['reply_tools'] = sessions, tool
 
@@ -606,7 +603,7 @@ async def prepare_case(inputs, monkeypatch, *, synthetic=False):
     elif version != '3':
         raise ValueError('verified Knowledge schema 2 or 3 required')
     knowledge = open_knowledge_store(target, workspace_id='synthetic-perf', source_authority=RuntimeKnowledgeSources(),
-        policy_authority=policy, history_mode=True)
+        policy_authority=policy)
     case = PerfCase(inputs.destination, inputs.raw, inputs.destination / 'history.db', knowledge, policy,
                     chat=chat, sender=sender, now=now)
     case.synthetic = synthetic

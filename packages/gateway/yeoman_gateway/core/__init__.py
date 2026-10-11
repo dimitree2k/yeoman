@@ -2,8 +2,6 @@
 
 from yeoman_gateway.core.intents import (
     PersistSessionIntent,
-    QueueMemoryNotesCaptureIntent,
-    RecordManualMemoryIntent,
     RecordMetricIntent,
     SendOutboundIntent,
     SendReactionIntent,
@@ -24,8 +22,6 @@ __all__ = [
     "OutboundEvent",
     "PersistSessionIntent",
     "PolicyDecision",
-    "QueueMemoryNotesCaptureIntent",
-    "RecordManualMemoryIntent",
     "RecordMetricIntent",
     "SendOutboundIntent",
     "SendReactionIntent",

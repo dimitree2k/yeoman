@@ -76,14 +76,10 @@ if TYPE_CHECKING:
     from yeoman_gateway.a2a.registry import A2AWorkerRegistry
     from yeoman_gateway.caldav.service import CalDAVService
     from yeoman_gateway.cron.service import CronService
-    from yeoman_gateway.knowledge._contacts.service import ContactsService
-    from yeoman_gateway.knowledge._memory.service import MemoryService
-    from yeoman_gateway.knowledge.models import SourceRef, TrustedReadContext
+    from yeoman_gateway.knowledge.models import TrustedReadContext
     from yeoman_gateway.media.lazy_resolver import LazyMediaResolver
     from yeoman_gateway.media.router import ModelRouter
     from yeoman_gateway.media.tts import TTSSynthesizer
-    from yeoman_gateway.storage.chat_registry import ChatRegistry
-    from yeoman_gateway.storage.inbound_archive import InboundArchive
     from yeoman_gateway.storage.private_handoff import PrivateHandoffStore
 
 
@@ -144,7 +140,6 @@ _TEXTUAL_TOOL_COERCION_SAFE_TOOLS = frozenset(
         "media_history",
         "ops",
         "recall_conversation",
-        "summarize_history",
         "web_fetch",
         "web_search",
         "youtube_transcript",
@@ -650,13 +645,10 @@ class LLMResponder(ResponderPort):
         web_config: "WebToolsConfig | None" = None,
         exec_config: "ExecToolConfig | None" = None,
         cron_service: "CronService | None" = None,
-        contacts_service: "ContactsService | None" = None,
-        chat_registry: "ChatRegistry | None" = None,
         caldav_service: "CalDAVService | None" = None,
         restrict_to_workspace: bool = False,
         session_manager: SessionManager | None = None,
         effect_router: object | None = None,
-        memory_service: "MemoryService | None" = None,
         knowledge: object | None = None,
         knowledge_sources: object | None = None,
         telemetry: TelemetryPort | None = None,
@@ -671,7 +663,6 @@ class LLMResponder(ResponderPort):
         whatsapp_tts_outgoing_dir: Path | None = None,
         whatsapp_tts_max_raw_bytes: int = 160 * 1024,
         recording_notifier: "Callable[[str, str], Awaitable[None]] | None" = None,
-        inbound_archive: "InboundArchive | None" = None,
         private_handoff_store: "PrivateHandoffStore | None" = None,
         a2a_registry: "A2AWorkerRegistry | None" = None,
         a2a_delivery: object | None = None,
@@ -692,15 +683,9 @@ class LLMResponder(ResponderPort):
         self.web_config = web_config
         self.exec_config = exec_config or ExecToolConfig()
         self.cron_service = cron_service
-        self.contacts_service = contacts_service
-        self.chat_registry = chat_registry
         self.caldav_service = caldav_service
-        self.memory = memory_service
         #: Public person-knowledge facade.  Read paths that need names, rosters or a
         #: protected recall use this instead of reaching into contacts/memory stores.
-        self._history_selected = False
-        self._history_tools_selected = False
-        self._history_secondary_selected = False
         self._history_projector: Any = None
         self._history_knowledge: Any = None
         self.knowledge = knowledge
@@ -720,7 +705,6 @@ class LLMResponder(ResponderPort):
         self._whatsapp_tts_outgoing_dir = whatsapp_tts_outgoing_dir
         self._whatsapp_tts_max_raw_bytes = max(1, int(whatsapp_tts_max_raw_bytes))
         self._recording_notifier = recording_notifier
-        self.inbound_archive = inbound_archive
         self._private_handoff_store = private_handoff_store
         self._a2a_registry = a2a_registry
         self._a2a_delivery = a2a_delivery
@@ -854,14 +838,12 @@ class LLMResponder(ResponderPort):
             cron_tool = CronTool(self.cron_service)
             self.tools.register(cron_tool)
 
-        if self.knowledge is not None or self.contacts_service is not None:
-            contacts_tool = ContactsTool(self.contacts_service, knowledge=self.knowledge)
+        if self.knowledge is not None:
+            contacts_tool = ContactsTool(knowledge=self.knowledge)
             self.tools.register(contacts_tool)
             self.tools.register(
                 ResolveContactTool(
-                    contacts=self.contacts_service,
                     knowledge=self.knowledge,
-                    chat_registry=self.chat_registry,
                 )
             )
 
@@ -869,19 +851,6 @@ class LLMResponder(ResponderPort):
         if self.caldav_service is not None:
             from yeoman_gateway.agent.tools.calendar import CalendarTool
             self.tools.register(CalendarTool(self.caldav_service))
-
-        # Summarize history — only if archive is available
-        if self.inbound_archive is not None:
-            from yeoman_gateway.agent.tools.summarize_history import SummarizeHistoryTool
-
-            self.tools.register(
-                SummarizeHistoryTool(
-                    self.inbound_archive,
-                    self.contacts_service,
-                    knowledge=self.knowledge,
-                    group_resolver=self._resolve_group_reference,
-                )
-            )
 
         if self._a2a_registry is not None:
             from yeoman_gateway.agent.tools.a2a import A2ADelegateTool
@@ -947,13 +916,6 @@ class LLMResponder(ResponderPort):
             ToolInvocationContext,
             set_tool_context,
         )
-        if getattr(self, '_history_secondary_selected', False):
-            if channel == 'system' and not canonical_user_id:
-                binding = self._trusted_turn_binding()
-                canonical_user_id = str(getattr(getattr(binding, 'turn', None), 'principal', '') or '')
-            elif channel == 'cli' and chat_id == 'direct' and (session_key.startswith('cli:') or is_owner):
-                knowledge: Any = getattr(self, 'knowledge', None)
-                canonical_user_id = knowledge._policy.admin_actor() if knowledge is not None else ''
         set_tool_context(
             ToolInvocationContext(
                 channel=channel,
@@ -963,8 +925,7 @@ class LLMResponder(ResponderPort):
                 is_owner=is_owner,
                 reply_to_message_id=reply_to_message_id,
                 request_text=request_text,
-                history_snapshot=(current_history_snapshot()
-                    if (getattr(self, '_history_tools_selected', False) and channel == 'whatsapp' or getattr(self, '_history_secondary_selected', False) and channel in {'whatsapp', 'cli', 'system'}) else None),
+                history_snapshot=current_history_snapshot() if channel == 'whatsapp' else None,
             )
         )
         message_tool = self.tools.get("message")
@@ -1013,12 +974,6 @@ class LLMResponder(ResponderPort):
         a2a_tool = self.tools.get("a2a_delegate")
         if isinstance(a2a_tool, A2ADelegateTool):
             a2a_tool.set_context(channel, chat_id, session_key=session_key)
-
-        from yeoman_gateway.agent.tools.summarize_history import SummarizeHistoryTool
-
-        summarize_tool = self.tools.get("summarize_history")
-        if isinstance(summarize_tool, SummarizeHistoryTool):
-            summarize_tool.set_context(channel, chat_id, is_owner=is_owner)
 
         from yeoman_gateway.agent.tools.recall_conversation import RecallConversationTool
 
@@ -1106,8 +1061,10 @@ class LLMResponder(ResponderPort):
 
     def _voice_send_governance_error(self, request: VoiceSendRequest) -> str | None:
         """Enforce non-owner recipient membership and the rolling daily quota."""
-        from yeoman_gateway.agent.tools.resolve_contact import chat_participant_identifiers
-        from yeoman_gateway.knowledge._memory.read_gate import registry_members
+        import time
+
+        from yeoman_gateway.history.context import current_history_snapshot
+        from yeoman_gateway.history.queries import HistoryQueries
         from yeoman_gateway.processing.dispatch import CURRENT_PRINCIPAL
         from yeoman_gateway.processing.tool_context import current_tool_context
 
@@ -1137,19 +1094,15 @@ class LLMResponder(ResponderPort):
 
         if context.channel != "whatsapp" or not context.chat_id.endswith("@g.us"):
             return refusal()
-        members = registry_members(
-            self.chat_registry,
-            channel=context.channel,
-            chat_id=context.chat_id,
+        snapshot = current_history_snapshot()
+        if snapshot is None:
+            raise HistoryPaused("history_scope_required")
+        queries = HistoryQueries(snapshot)
+        audience = queries.members(chat_id=context.chat_id, at_ms=time.time_ns() // 1_000_000)
+        recipient = queries.resolve_identifier(
+            request.chat_id, at_ms=time.time_ns() // 1_000_000, time_basis="native"
         )
-        members.update(
-            chat_participant_identifiers(
-                self.chat_registry,
-                channel=context.channel,
-                chat_id=context.chat_id,
-            )
-        )
-        if request.chat_id not in members:
+        if audience.status != "known" or recipient not in audience.members:
             return refusal()
 
         principal = CURRENT_PRINCIPAL.get().strip()
@@ -1386,16 +1339,14 @@ class LLMResponder(ResponderPort):
         if not target_names:
             return
         target_name = target_names[-1]
-        if self.knowledge is not None or self.contacts_service is not None:
+        if self.knowledge is not None:
             resolved_targets: dict[str, str] = {}
             for candidate in target_names:
                 resolution = resolve_contact_reference(
-                    contacts=self.contacts_service,
                     knowledge=self.knowledge,
                     reference=candidate,
                     channel=channel,
                     chat_id=chat_id,
-                    chat_registry=self.chat_registry,
                 )
                 if resolution is not None:
                     resolved_targets[resolution.jid] = candidate
@@ -1458,27 +1409,23 @@ class LLMResponder(ResponderPort):
         channel: str,
         chat_id: str,
     ) -> str | None:
-        if self.knowledge is None and self.contacts_service is None:
+        if self.knowledge is None:
             return None
         target_name = str(pending.get("target_name") or "").strip()
         if not target_name:
             return None
         expected = resolve_contact_reference(
-            contacts=self.contacts_service,
             knowledge=self.knowledge,
             reference=target_name,
             channel=channel,
             chat_id=chat_id,
-            chat_registry=self.chat_registry,
         )
         for mention in self._pending_delivery_mentions(content=content, metadata=metadata):
             resolution = resolve_contact_reference(
-                contacts=self.contacts_service,
                 knowledge=self.knowledge,
                 reference=mention,
                 channel=channel,
                 chat_id=chat_id,
-                chat_registry=self.chat_registry,
             )
             if resolution is None:
                 continue
@@ -1487,7 +1434,6 @@ class LLMResponder(ResponderPort):
             ):
                 return expected.jid
             if expected is None and contact_resolution_matches_reference(
-                contacts=self.contacts_service,
                 knowledge=self.knowledge,
                 reference=target_name,
                 resolution=resolution,
@@ -2468,15 +2414,14 @@ class LLMResponder(ResponderPort):
             reset_tool_context,
             set_tool_context,
         )
-        selected = getattr(self, '_history_selected', False) and kwargs['channel'] == 'whatsapp'
         snapshot = kwargs.get('history_snapshot') or current_history_snapshot()
-        if selected and snapshot is None:
+        if kwargs['channel'] == 'whatsapp' and snapshot is None:
             raise HistoryPaused('history_scope_required')
         if snapshot is not None:
             snapshot.assert_current(snapshot.generation)
-        if selected:
+        if kwargs['channel'] == 'whatsapp':
             kwargs['history_snapshot'] = snapshot
-        if not selected and not getattr(self, '_history_tools_selected', False):
+        else:
             return await self._generate_scoped(**kwargs)
         token = set_tool_context(current_tool_context())
         try:
@@ -2724,7 +2669,7 @@ class LLMResponder(ResponderPort):
         canonical_id = resolve_canonical_user_id(channel, str(sender_id or ""), metadata)
 
         binding = None
-        if self.sessions.history_selected or self.sessions.legacy_history_disabled:
+        if channel == "whatsapp":
             from yeoman_gateway.processing.dispatch import CURRENT_TURN
 
             binding = CURRENT_TURN.get(None)
@@ -2737,7 +2682,7 @@ class LLMResponder(ResponderPort):
         else:
             session = self.sessions.get_or_create(session_key)
 
-        if not canonical_id and is_owner and channel == "whatsapp" and getattr(self, "_history_selected", False):
+        if not canonical_id and is_owner and channel == "whatsapp":
             from yeoman_gateway.history.context import current_history_snapshot
             from yeoman_gateway.history.queries import HistoryQueries
 
@@ -2850,62 +2795,13 @@ class LLMResponder(ResponderPort):
                 logger.warning("lazy media retrieval failed: {}", e)
 
         retrieved_memory_text = ""
-        retrieved_hits_count = 0
-        if self.memory is not None and not (getattr(self, '_history_selected', False) and channel == 'whatsapp'):
-            try:
-                # Augment the memory query with recent ambient messages so that vague
-                # inputs like "what do you think?" can surface relevant memories.
-                memory_query = content
-                ambient_raw = metadata.get("ambient_context_window") if metadata else None
-                if isinstance(ambient_raw, list) and ambient_raw:
-                    ambient_snippet = " ".join(
-                        (line.split("] ", 1)[-1] if "] " in line else line)
-                        for line in ambient_raw[:5]
-                        if isinstance(line, str)
-                    ).strip()
-                    if ambient_snippet:
-                        memory_query = f"{ambient_snippet} {content}".strip()
-                retrieved_memory_text, retrieved_hits = self.memory.build_retrieved_context(
-                    channel=channel,
-                    chat_id=chat_id,
-                    sender_id=sender_id,
-                    query=memory_query,
-                    reply_to_text=str(metadata.get("reply_to_text") or "").strip() or None,
-                    reply_to_jid=str(metadata.get("reply_to_participant") or "").strip() or None,
-                    owner_context=is_owner,
-                )
-                retrieved_hits_count = len(retrieved_hits)
-                # Plan 05: shared facts the *reader* may see, decided in SQL before
-                # retrieval. Attached only when the shared runtime is wired (opt-in);
-                # the legacy recall path above stays untouched either way.
-                shared_text = self._shared_fact_context(
-                    query=memory_query,
-                    channel=channel,
-                    chat_id=chat_id,
-                    is_owner=is_owner,
-                )
-                if shared_text:
-                    retrieved_memory_text = f"{retrieved_memory_text}\n{shared_text}".strip()
-            except HistoryPaused:
-                raise
-            except Exception as e:
-                logger.warning("memory recall failed: {}", e)
-
-            if retrieved_hits_count > 0:
-                self._metric("memory_recall_hit")
-            else:
-                self._metric("memory_recall_miss")
-            if retrieved_memory_text:
-                self._metric("memory_prompt_chars", len(retrieved_memory_text))
-
-        if getattr(self, '_history_selected', False) and channel == 'whatsapp':
-            shared = self._shared_fact_context(query=content, channel=channel, chat_id=chat_id, is_owner=is_owner)
+        if channel == 'whatsapp':
             statements = self._knowledge_statement_context(
                 query=content, channel=channel, chat_id=chat_id,
                 principal=canonical_id, is_owner=is_owner,
                 purpose="proactive" if metadata.get("participation_draft") else "reply",
             )
-            retrieved_memory_text = '\n'.join(value for value in (shared, statements) if value)
+            retrieved_memory_text = statements
 
         talkative_reply = await self._maybe_talkative_cooldown_reply(
             session_key=session_key,
@@ -3040,58 +2936,6 @@ class LLMResponder(ResponderPort):
                 budget_result.get("reason"),
             )
 
-        if self.memory is not None:
-            try:
-                capture_result = self.memory.capture_from_turn(
-                    channel=channel,
-                    chat_id=chat_id,
-                    sender_id=sender_id,
-                    user_message=content,
-                    source_message_id=str(metadata.get("message_id") or "").strip() or None,
-                    assistant_reply=final_content,
-                )
-                logger.info(
-                    "memory capture: saved={} deduped={} dropped_low_conf={} dropped_safety={}",
-                    len(capture_result.saved),
-                    capture_result.deduped,
-                    capture_result.dropped_low_confidence,
-                    capture_result.dropped_safety,
-                )
-                if capture_result.saved:
-                    self._metric("memory_capture_saved", len(capture_result.saved))
-                if capture_result.dropped_low_confidence:
-                    self._metric(
-                        "memory_capture_dropped_low_conf",
-                        capture_result.dropped_low_confidence,
-                    )
-                if capture_result.dropped_safety:
-                    self._metric("memory_capture_dropped_safety", capture_result.dropped_safety)
-                if capture_result.deduped:
-                    self._metric("memory_capture_deduped", capture_result.deduped)
-            except HistoryPaused:
-                raise
-            except Exception as e:
-                logger.warning("memory capture failed: {}", e)
-
-            # Plan 05: announce the finished turn to the extraction queue. The queue runs
-            # on its own worker thread, so this never waits for a model call here.
-            try:
-                self._enqueue_shared_extraction(channel=channel, chat_id=chat_id)
-            except HistoryPaused:
-                raise
-            except Exception as e:
-                logger.warning("shared fact extraction enqueue failed: {}", e)
-
-            # Person knowledge: register this turn's archived revisions with the proof
-            # owner so a later capture has verifiable provenance.  Registering evidence
-            # is not a capture: no statement is published here.
-            try:
-                self._register_turn_knowledge_sources(channel=channel, chat_id=chat_id)
-            except HistoryPaused:
-                raise
-            except Exception as e:
-                logger.warning("knowledge source registration failed: {}", e)
-
         # Only add messages if they weren't already added (for new sessions)
         if not _user_message_already_added:
             session.add_message("user", content, **self._session_user_metadata(sender_id, metadata))
@@ -3111,53 +2955,11 @@ class LLMResponder(ResponderPort):
         self._current_trace = None
         return final_content
 
-    # -- shared facts (Plan 05) -------------------------------------------------
-
-    def _shared_fact_runtime(self):
-        """The opt-in shared-fact runtime, or ``None`` while it is switched off."""
-        return getattr(self, "shared_facts", None)
-
     def _trusted_turn_binding(self) -> Any:
         """The frozen turn of this generation - never ``metadata`` or model output."""
         from yeoman_gateway.processing.responder import CURRENT_TURN
 
         return CURRENT_TURN.get(None)
-
-    def _shared_fact_context(self, *, query: str, channel: str, chat_id: str, is_owner: bool) -> str:
-        runtime = self._shared_fact_runtime()
-        binding = self._trusted_turn_binding()
-        if runtime is None or binding is None or self.memory is None:
-            return ""
-        import time
-
-        from yeoman_gateway.knowledge._memory.read_gate import build_read_context
-
-        turn = getattr(binding, "turn", None)
-        principal = str(getattr(turn, "principal", "") or "")
-        if not principal:
-            return ""
-        is_direct = not str(chat_id).endswith("@g.us")
-        context = build_read_context(
-            principal_id=principal,
-            channel=channel,
-            chat_id=chat_id,
-            chat_registry=getattr(runtime, "chat_registry", None),
-            policy=getattr(runtime, "policy", None),
-            now_ms=int(time.time() * 1000),
-            epoch=self.memory.store.acl_epoch(),
-            owner=bool(is_owner),
-            is_direct=is_direct,
-            counterpart=str(chat_id) if is_direct else None,
-        )
-        if getattr(runtime.config, "require_known_membership", True) and not context.membership_known:
-            return ""
-        result = self.memory.retrieve_for_context(query=query, read_context=context)
-        if result.denied_count:
-            self._metric("memory_shared_denied", result.denied_count)
-        if not result.text:
-            return ""
-        self._metric("memory_shared_chars", len(result.text))
-        return result.text
 
     def _knowledge_read_context(
         self,
@@ -3175,7 +2977,6 @@ class LLMResponder(ResponderPort):
         """
         if self.knowledge is None or not principal:
             return None
-        from yeoman_gateway.knowledge._memory.read_gate import registry_members
         from yeoman_gateway.knowledge.models import TrustedReadContext
 
         is_direct = not str(chat_id).endswith("@g.us")
@@ -3184,16 +2985,15 @@ class LLMResponder(ResponderPort):
 
         snapshot = current_history_snapshot()
         now_ms = int(time.time() * 1000)
-        owner_direct = bool(snapshot is not None and getattr(self, "_history_selected", False)
-            and channel == "whatsapp" and is_owner
+        owner_direct = bool(snapshot is not None and channel == "whatsapp" and is_owner
             and HistoryQueries(snapshot).is_owner_direct_chat(
             principal, chat_id, now_ms, is_owner=bool(is_owner), channel=channel,
         ))
         members = None
-        if self.chat_registry is not None:
-            proven = registry_members(self.chat_registry, channel=channel, chat_id=chat_id)
-            if proven:
-                members = frozenset(str(item) for item in proven)
+        if snapshot is not None and channel == "whatsapp" and not is_direct:
+            audience = HistoryQueries(snapshot).members(chat_id=chat_id, at_ms=now_ms)
+            if audience.status == "known":
+                members = audience.members
         if members is None and is_direct:
             members = (frozenset({principal}) if owner_direct
                        else frozenset({principal, str(chat_id)}))
@@ -3311,188 +3111,6 @@ class LLMResponder(ResponderPort):
             lines.append(f"- {name}: {facts_text}" if facts_text else f"- {name}")
         return "\n".join(lines)
 
-    def _register_knowledge_sources(
-        self, *, channel: str, chat_id: str, sources: list[tuple[str, int]]
-    ) -> bool:
-        """Hand the finished turn's archived revisions to the knowledge proof owner.
-
-        The audience snapshot comes from the chat registry as it is *now*: for a direct
-        conversation the author is the only reader, for a group the proven participant
-        list.  Without a proven list nothing is registered, so a later capture fails
-        closed instead of publishing an unproven provenance.
-        """
-        register = getattr(self.knowledge, "register_turn_source", None)
-        if register is None or not sources:
-            return False
-        from yeoman_gateway.knowledge._memory.read_gate import registry_members
-
-        is_direct = not str(chat_id).endswith("@g.us")
-        members: frozenset[str] = frozenset()
-        if is_direct:
-            binding = self._trusted_turn_binding()
-            turn = getattr(binding, "turn", None) if binding is not None else None
-            principal = str(getattr(turn, "principal", "") or "")
-            if principal:
-                members = frozenset({principal})
-        elif self.chat_registry is not None:
-            proven = registry_members(self.chat_registry, channel=channel, chat_id=chat_id)
-            members = frozenset(str(item) for item in proven)
-        if not is_direct and not members:
-            # Unknown membership: register nothing rather than an audience we cannot prove.
-            return False
-        snapshot_id = f"{channel}:{chat_id}:{len(members)}"
-        registered = 0
-        for event_id, revision in sources:
-            # Real canonical provenance: the authority row that was created when the
-            # event was journaled.  Substituting wall-clock time here conflicted with the
-            # immutable source authority (JournalConflictError on occurred_at_ms) and the
-            # audience proof was silently never registered.
-            source = self._canonical_source_ref(
-                event_id=str(event_id),
-                revision=int(revision),
-                channel=str(channel),
-                chat_id=str(chat_id),
-            )
-            if source is None:
-                continue
-            if register(
-                source=source,
-                verified_members=members,
-                snapshot_id=snapshot_id,
-                author_only=is_direct,
-            ):
-                registered += 1
-        if registered:
-            self._metric("knowledge_sources_registered", registered)
-        return bool(registered)
-
-    def _canonical_source_ref(
-        self, *, event_id: str, revision: int, channel: str, chat_id: str
-    ) -> "SourceRef | None":
-        """The proven source revision of one journaled event, or ``None``.
-
-        The proof owner's own record wins: it is the revision identity the store issued
-        when the event was appended, so registering it can never contradict the row.
-        """
-        from yeoman_gateway.knowledge.models import SourceRef
-
-        sources = getattr(self.knowledge, "knowledge_sources", None)
-        issued = getattr(sources, "verify_source_ref", None)
-        if callable(issued):
-            try:
-                known = issued(str(event_id), int(revision))
-            except HistoryPaused:
-                raise
-            except Exception:  # pragma: no cover - defensive
-                known = None
-            if known is not None:
-                return known
-        runtime = self._shared_fact_runtime()
-        processing = getattr(runtime, "processing", None) if runtime is not None else None
-        get_event = getattr(processing, "get_event", None)
-        if callable(get_event):
-            try:
-                event = get_event(str(event_id))
-            except HistoryPaused:
-                raise
-            except Exception:  # pragma: no cover - defensive
-                event = None
-            if event is not None:
-                principal = str(getattr(event, "principal", "") or "")
-                occurred = int(getattr(event, "occurred_ms", 0) or 0)
-                if principal:
-                    return SourceRef(
-                        event_id=str(event_id),
-                        revision=int(getattr(event, "revision", revision) or revision),
-                        channel=str(getattr(event, "channel", "") or channel),
-                        chat_id=str(getattr(event, "chat_id", "") or chat_id),
-                        author_principal=principal,
-                        occurred_at_ms=occurred,
-                    )
-        principal = self._source_author_principal(event_id)
-        if not principal:
-            return None
-        return SourceRef(
-            event_id=str(event_id),
-            revision=int(revision),
-            channel=str(channel),
-            chat_id=str(chat_id),
-            author_principal=principal,
-            occurred_at_ms=0,
-        )
-
-    def _source_author_principal(self, event_id: str) -> str:
-        """Author principal of an archived event, read from the archive owner."""
-        archive = self.inbound_archive
-        for name in ("author_principal", "principal_for_event"):
-            method = getattr(archive, name, None)
-            if callable(method):
-                try:
-                    value = method(event_id)
-                except HistoryPaused:
-                    raise
-                except Exception:  # pragma: no cover - defensive
-                    value = None
-                if value:
-                    return str(value)
-        return ""
-
-    def _register_turn_knowledge_sources(self, *, channel: str, chat_id: str) -> int:
-        """Register the finished turn's live sources; returns how many were registered."""
-        runtime = self._shared_fact_runtime()
-        binding = self._trusted_turn_binding()
-        if runtime is None or binding is None:
-            return 0
-        turn = getattr(binding, "turn", None)
-        turn_id = str(getattr(turn, "turn_id", "") or "")
-        processing = getattr(runtime, "processing", None)
-        if not turn_id or processing is None:
-            return 0
-        refs = [
-            (source.event_id, int(source.revision_at_join))
-            for source in processing.turn_sources(turn_id)
-            if source.removed_ms is None
-        ]
-        self._register_knowledge_sources(channel=channel, chat_id=chat_id, sources=refs)
-        return len(refs)
-
-    def _enqueue_shared_extraction(self, *, channel: str, chat_id: str) -> bool:
-        """Queue extraction for the finished turn. Returns True when a job was queued."""
-        runtime = self._shared_fact_runtime()
-        if runtime is None or not getattr(runtime, "extraction_enabled", False):
-            return False
-        binding = self._trusted_turn_binding()
-        if binding is None or self.memory is None:
-            return False
-        turn = getattr(binding, "turn", None)
-        turn_id = str(getattr(turn, "turn_id", "") or "")
-        if not turn_id:
-            return False
-        processing = getattr(runtime, "processing", None)
-        if processing is None:
-            return False
-        refs = [
-            (source.event_id, int(source.revision_at_join))
-            for source in processing.turn_sources(turn_id)
-            if source.removed_ms is None
-        ]
-        if not refs:
-            return False
-        import time
-
-        from yeoman_gateway.knowledge._memory.read_gate import chat_scope_key
-
-        job_key = runtime.extraction.enqueue(
-            turn_ref=turn_id,
-            source_refs=refs,
-            now_ms=int(time.time() * 1000),
-            workspace_id=self.memory.workspace_id,
-            chat_scope_key=chat_scope_key(channel, chat_id),
-        )
-        if job_key:
-            self._metric("memory_shared_job_queued")
-        return bool(job_key)
-
     @override
     async def generate_reply(
         self,
@@ -3503,7 +3121,7 @@ class LLMResponder(ResponderPort):
         history_snapshot: HistorySnapshot | None = None,
     ) -> str | None:
         from yeoman_gateway.history.context import current_history_snapshot
-        if self._history_selected and event.channel == 'whatsapp':
+        if event.channel == 'whatsapp':
             history_snapshot = history_snapshot or current_history_snapshot()
             if history_snapshot is None:
                 raise HistoryPaused('history_scope_required')
@@ -3829,7 +3447,7 @@ class LLMResponder(ResponderPort):
             history_knowledge_scope,
             history_turn,
         )
-        if ((self._history_selected or self._history_tools_selected) and channel == 'whatsapp' or self._history_secondary_selected and channel in {'whatsapp', 'cli', 'system'}) and current_history_snapshot() is None:
+        if channel == 'whatsapp' and current_history_snapshot() is None:
             arguments = dict(locals())
             for key in ('self', 'content', 'current_history_snapshot', 'history_knowledge_scope', 'history_turn'):
                 arguments.pop(key, None)

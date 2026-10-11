@@ -40,8 +40,7 @@ def case(tmp_path):
     path = get_operational_store_path("session_metadata", data_dir=tmp_path, create=False)
     ops = OperationalSessions(path)
     sessions = SessionManager(tmp_path, sessions_dir=tmp_path / "sessions",
-                              operational_store=ops, history_selected=True,
-                              legacy_history_disabled=True)
+                              operational_store=ops)
     yield SimpleNamespace(ops=ops, sessions=sessions, snapshot=snapshot, path=path,
                           root=tmp_path)
     snapshot.close()
@@ -66,8 +65,7 @@ def test_new_boundary_survives_restart_without_conversation_text(case, monkeypat
     case.ops.close()
     case.ops = OperationalSessions(case.path)
     case.sessions = SessionManager(case.root, sessions_dir=case.root / "sessions",
-                                  operational_store=case.ops, history_selected=True,
-                                  legacy_history_disabled=True)
+                                  operational_store=case.ops)
     session = case.sessions.get_or_create("opaque:thread:key", channel="whatsapp",
                                          chat_id=ctx.chat_id, thread_id="t:1",
                                          history_snapshot=case.snapshot)
@@ -136,17 +134,6 @@ def test_new_boundary_applies_to_thread_and_implicit_followup(case):
                                     thread_id="t:1").get_history()
 
 
-def test_boundary_import_is_explicit_and_preserves_last_marker(case):
-    from yeoman_gateway.session.operational import import_session_boundaries
-
-    source = case.root / "frozen"
-    source.mkdir()
-    (source / "whatsapp_dm.jsonl").write_text(
-        json.dumps({"_type": "metadata", "metadata": {}}) + "\n" +
-        json.dumps({"role": "session_boundary", "timestamp": "2026-01-01T00:00:00+00:00"}) + "\n")
-    assert import_session_boundaries(source, case.ops) == {"whatsapp:dm": 1767225600000}
-    assert case.ops.boundary(channel="whatsapp", chat_id="dm") == 1767225600000
-    assert import_session_boundaries(source, case.ops) == {"whatsapp:dm": 1767225600000}
 
 
 def test_retired_session_routing_keeps_legacy_non_whatsapp_callers(case):
@@ -159,33 +146,8 @@ def test_retired_session_routing_keeps_legacy_non_whatsapp_callers(case):
         case.sessions.get_or_create("whatsapp:dm:synthetic:thread:1")
 
 
-def test_defaults_create_only_legacy_session_files(tmp_path):
-    sessions = SessionManager(tmp_path, sessions_dir=tmp_path / "sessions")
-    session = sessions.get_or_create("whatsapp:synthetic")
-    session.add_message("user", "default legacy text")
-    session.add_boundary()
-    session.add_message("assistant", "after boundary")
-    sessions.save(session)
-    assert sessions._load(session.key).get_history()[0]["content"] == "after boundary"
-    assert not (tmp_path / "ops").exists()
 
 
-def test_import_validation_leaves_boundaries_unchanged(case, monkeypatch):
-    from yeoman_gateway.session import operational
-
-    source = case.root / "frozen"
-    source.mkdir()
-    valid = {"role": "session_boundary", "timestamp": "2026-01-01T00:00:00+00:00"}
-    (source / "whatsapp_dm.jsonl").write_text(json.dumps(valid) + "\n")
-    (source / "whatsapp_other.jsonl").write_text('{"role":"session_boundary"}\n')
-    with pytest.raises(KeyError):
-        operational.import_session_boundaries(source, case.ops)
-    assert case.ops.boundary(channel="whatsapp", chat_id="dm") is None
-    monkeypatch.setattr(operational, "get_operational_store_path",
-                        lambda *args, **kwargs: source / "ops" / "session-metadata.db")
-    with pytest.raises(ValueError, match="isolated"):
-        operational.import_session_boundaries(source, case.ops)
-    assert case.ops.boundary(channel="whatsapp", chat_id="dm") is None
 
 
 @pytest.mark.asyncio
@@ -241,7 +203,27 @@ async def test_selected_history_excludes_current_inbound_and_has_no_duplicates(c
 def test_sessions_path_can_resolve_without_creating_directories():
     root = Path(os.environ["YEOMAN_HOME"])
     before = set(root.rglob("*"))
-    assert get_sessions_path(create=False) == root / "data" / "inbound"
+    assert get_sessions_path(create=False) == root / "data" / "ops" / "telegram-sessions"
     assert set(root.rglob("*")) == before
-    assert get_sessions_path() == root / "data" / "inbound"
-    assert (root / "data" / "inbound").is_dir()
+    assert get_sessions_path() == root / "data" / "ops" / "telegram-sessions"
+    assert (root / "data" / "ops" / "telegram-sessions").is_dir()
+
+
+def test_telegram_frozen_sessions_remain_readable_but_save_to_operational_path(tmp_path):
+    root = Path(os.environ["YEOMAN_HOME"])
+    frozen = root / "data" / "inbound"
+    frozen.mkdir(parents=True)
+    source = frozen / "telegram_42.jsonl"
+    source.write_text(json.dumps({"role": "user", "content": "preserved Telegram", "timestamp": "2026-01-01T00:00:00"}) + "\n")
+    original = source.read_bytes()
+    sessions = SessionManager(tmp_path)
+    try:
+        session = sessions.get_or_create("telegram:42")
+        assert session.messages[0]["content"] == "preserved Telegram"
+        sessions.save(session)
+        assert source.read_bytes() == original
+        assert (get_sessions_path(create=False) / source.name).exists()
+        with pytest.raises(ValueError):
+            sessions._load("whatsapp:synthetic")
+    finally:
+        sessions.operational_store.close()

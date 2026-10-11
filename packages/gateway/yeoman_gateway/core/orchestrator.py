@@ -19,7 +19,6 @@ from yeoman_gateway.core.ports import PolicyPort, ReplyArchivePort, ResponderPor
 from yeoman_gateway.pipeline.access import AccessControlMiddleware, NoReplyFilterMiddleware
 from yeoman_gateway.pipeline.admin import AdminCommandMiddleware
 from yeoman_gateway.pipeline.approval import ApprovalMiddleware
-from yeoman_gateway.pipeline.archive import ArchiveMiddleware
 from yeoman_gateway.pipeline.contacts import ContactsMiddleware
 from yeoman_gateway.pipeline.dedup import DeduplicationMiddleware
 from yeoman_gateway.pipeline.forward import (
@@ -43,15 +42,12 @@ from yeoman_gateway.pipeline.speakup_approval import SpeakupApprovalMiddleware
 if TYPE_CHECKING:
     from collections.abc import Awaitable, Callable, Sequence
 
-    from yeoman_shared.config.schema import HistoryConfig
-
     from yeoman_gateway.bus.queue import MessageBus
     from yeoman_gateway.consciousness.approval import SpeakupApprovalStore
     from yeoman_gateway.consciousness.log import SpeakupLog
     from yeoman_gateway.consciousness.tools import ConsciousnessTools
     from yeoman_gateway.core.control_ack import OwnerControlAcknowledgements
     from yeoman_gateway.cron.workflow_state import PendingApproval, WorkflowState
-    from yeoman_gateway.knowledge._contacts.service import ContactsService
     from yeoman_gateway.knowledge.models import TrustedIdentityObservation, TrustedReadContext
     from yeoman_gateway.media.router import ModelRouter
     from yeoman_gateway.media.tts import TTSSynthesizer
@@ -92,13 +88,10 @@ class Orchestrator:
         policy: PolicyPort,
         responder: ResponderPort,
         reply_archive: ReplyArchivePort | None = None,
-        contacts: "ContactsService | None" = None,
         knowledge: object | None = None,
         identity_observation_issuer: "Callable[[TrustedIdentityObservation], object] | None" = None,
         mention_context_factory: "Callable[[InboundEvent], TrustedReadContext | None] | None" = None,
         reply_context_window_limit: int,
-        history_reply_selected: bool = False,
-        history_secondary_config: HistoryConfig | None = None,
         reply_context_line_max_chars: int,
         ambient_window_limit: int = 30,
         dedupe_ttl_seconds: int = 20 * 60,
@@ -137,7 +130,6 @@ class Orchestrator:
         layers: list[Middleware] = [
             NormalizationMiddleware(),
             DeduplicationMiddleware(ttl_seconds=dedupe_ttl_seconds),
-            ArchiveMiddleware(archive=reply_archive),
         ]
         # Identity resolution goes through the public knowledge facade, never through a
         # private contacts writer.  Without knowledge the middleware is a no-op: the
@@ -146,7 +138,6 @@ class Orchestrator:
             layers.append(
                 ContactsMiddleware(
                     knowledge=knowledge,
-                    history_selected=history_reply_selected,
                     observation_issuer=identity_observation_issuer,
                     mention_context_factory=mention_context_factory,
                 )
@@ -154,8 +145,6 @@ class Orchestrator:
         layers.extend([
             ReplyContextMiddleware(
                 archive=reply_archive,
-                history_selected=history_reply_selected,
-                contacts=contacts,
                 knowledge=knowledge,
                 reply_context_window_limit=reply_context_window_limit,
                 reply_context_line_max_chars=reply_context_line_max_chars,
@@ -165,8 +154,7 @@ class Orchestrator:
                 handler=policy_admin_handler,
                 acknowledgements=control_acknowledgements,
             ),
-            PolicyMiddleware(policy=policy, legacy_history_disabled=bool(
-                history_secondary_config and history_secondary_config.legacy_writers_disabled)),
+            PolicyMiddleware(policy=policy),
             ForwardCommandMiddleware(
                 target_resolver=forward_target_resolver,
                 source_lookup=forward_source_lookup,
@@ -204,15 +192,13 @@ class Orchestrator:
         if workflow_state and approval_trigger:
             layers.append(ApprovalMiddleware(workflow_state=workflow_state, trigger_callback=approval_trigger))
         layers.extend([
-            IdeaCaptureMiddleware(security=security, legacy_history_disabled=bool(
-                history_secondary_config and history_secondary_config.legacy_writers_disabled)),
-            AccessControlMiddleware(security=security),
+            IdeaCaptureMiddleware(security=security),
+            AccessControlMiddleware(),
             NewChatNotifyMiddleware(
                 owner_alert_resolver=owner_alert_resolver,
-                history_config=history_secondary_config,
                 global_pause=global_pause_probe,
             ),
-            NoReplyFilterMiddleware(security=security),
+            NoReplyFilterMiddleware(),
             InputSecurityMiddleware(security=security, classifier=security_classifier, block_message=security_block_message),
             ResponderMiddleware(
                 responder=responder,
@@ -221,8 +207,6 @@ class Orchestrator:
                 report_lookup=report_lookup,
             ),
             OutboundMiddleware(
-                contacts=contacts,
-                history_selected=history_reply_selected,
                 knowledge=knowledge,
                 security=security,
                 security_block_message=security_block_message,
@@ -235,12 +219,11 @@ class Orchestrator:
                 allowed_reaction_emojis=allowed_reaction_emojis,
             ),
         ])
-        self._history_reply_selected = history_reply_selected
         self._pipeline = Pipeline(layers)
 
     async def handle(self, event: InboundEvent) -> list[OrchestratorIntent]:
         """Process one inbound event and return executable intents."""
-        if self._history_reply_selected and event.channel == 'whatsapp':
+        if event.channel == 'whatsapp':
             from yeoman_gateway.history.context import current_history_snapshot
             from yeoman_gateway.history.live import HistoryPaused
             if current_history_snapshot() is None:

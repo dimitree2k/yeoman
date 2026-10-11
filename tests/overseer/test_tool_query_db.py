@@ -1,12 +1,12 @@
 import sqlite3
 from pathlib import Path
-from unittest.mock import MagicMock
+from types import SimpleNamespace
 
 from yeoman_overseer.agent.tools.query_db import execute
 
 
-def _ctx():
-    return MagicMock()
+def _ctx(tmp_path: Path):
+    return SimpleNamespace(yeoman_home=tmp_path)
 
 
 def _make_db(tmp_path: Path) -> Path:
@@ -22,7 +22,7 @@ def _make_db(tmp_path: Path) -> Path:
 
 def test_select_returns_rows(tmp_path):
     db = _make_db(tmp_path)
-    result = execute({"db_path": str(db), "query": "SELECT * FROM items"}, _ctx())
+    result = execute({"db_path": str(db), "query": "SELECT * FROM items"}, _ctx(tmp_path))
     assert "alpha" in result
     assert "beta" in result
 
@@ -30,7 +30,7 @@ def test_select_returns_rows(tmp_path):
 def test_select_with_filter(tmp_path):
     db = _make_db(tmp_path)
     result = execute(
-        {"db_path": str(db), "query": "SELECT name FROM items WHERE id = 1"}, _ctx()
+        {"db_path": str(db), "query": "SELECT name FROM items WHERE id = 1"}, _ctx(tmp_path)
     )
     assert "alpha" in result
 
@@ -38,19 +38,26 @@ def test_select_with_filter(tmp_path):
 def test_write_attempt_is_rejected(tmp_path):
     db = _make_db(tmp_path)
     result = execute(
-        {"db_path": str(db), "query": "INSERT INTO items VALUES (3, 'gamma')"}, _ctx()
+        {"db_path": str(db), "query": "INSERT INTO items VALUES (3, 'gamma')"}, _ctx(tmp_path)
     )
     assert "error" in result.lower() or "readonly" in result.lower()
 
 
 def test_drop_attempt_is_rejected(tmp_path):
     db = _make_db(tmp_path)
-    result = execute({"db_path": str(db), "query": "DROP TABLE items"}, _ctx())
+    result = execute({"db_path": str(db), "query": "DROP TABLE items"}, _ctx(tmp_path))
     assert "error" in result.lower() or "readonly" in result.lower()
 
 
 def test_missing_db_returns_error(tmp_path):
     result = execute(
-        {"db_path": str(tmp_path / "nope.db"), "query": "SELECT 1"}, _ctx()
+        {"db_path": str(tmp_path / "nope.db"), "query": "SELECT 1"}, _ctx(tmp_path)
     )
     assert "error" in result.lower()
+
+
+def test_retired_stores_are_refused_without_selector_flags(tmp_path):
+    ctx = SimpleNamespace(yeoman_home=tmp_path)
+    for name in ("reply_context.db", "chat_registry.db", "contacts.db", "memory.db", "knowledge.db"):
+        result = execute({"db_path": str(tmp_path / "data" / name), "query": "SELECT 1"}, ctx)
+        assert "refused" in result.lower()

@@ -1,5 +1,8 @@
 # Overseer Phase 2: LLM Tier (Read-Only) — Implementation Plan
 
+Historical document (G6, 2026-10-11): the standalone WhatsApp history stores, legacy history tools and cutover scripts referenced here have been retired. Current runtime reads use canonical History and Knowledge schema 3; old store examples describe the previous implementation.
+
+
 > **For agentic workers:** REQUIRED SUB-SKILL: Use superpowers:subagent-driven-development (recommended) or superpowers:executing-plans to implement this plan task-by-task. Steps use checkbox (`- [ ]`) syntax for tracking.
 
 **Goal:** Add an LLM agent tier to the overseer — when a runbook sets `escalate_to_llm: true`, the trigger evaluator routes it to a new `agent/` module that can reason, query, and alert, but cannot write anything.

@@ -71,7 +71,6 @@ CUT_OVER_CONSUMERS = (
     "pipeline/reply_context.py",
     "pipeline/outbound.py",
     "adapters/responder_llm.py",
-    "agent/tools/summarize_history.py",
     "agent/tools/contacts.py",
     "agent/tools/resolve_contact.py",
     "ipc/a2a_invoke.py",
@@ -92,8 +91,6 @@ LEGACY_CACHE_REACH: dict[str, int] = {
 #: literal source fragment; the checker fails if the count of matches exceeds the
 #: documented number, so a new violation cannot hide here.
 DOCUMENTED_EXCEPTIONS: dict[str, int] = {
-    # The memory CLI keeps a fallback for a service that predates the knowledge facade.
-    "cli/memory_commands.py": 2,
 }
 
 #: The only modules allowed to touch a raw SQLite connection for runtime data.

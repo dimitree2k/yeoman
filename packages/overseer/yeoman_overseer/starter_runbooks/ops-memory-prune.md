@@ -27,5 +27,5 @@ Maintain curated Knowledge through its existing owner-authorized maintenance and
 2. Inspect current statement metadata using `yeoman memory statements list`. Use `show <statement-id> --content` only for explicit owner diagnostics.
 3. Report expired, quarantined, revoked and pending-job counts. Age or low salience alone does not authorize deleting curated statements.
 4. Apply only an already-authorized specific statement erasure through `yeoman memory statements erase <statement-id>`; otherwise report candidates for owner curation.
-5. Never call `prune_memory` on legacy history/identity stores or run direct DELETE, retention SQL, legacy backfill or re-extraction.
-6. Stop on paused/unavailable reads. Keep source revocation and statement curation separate; frozen identity/history files remain untouched.
+5. Legacy database pruning is unavailable. Do not call `prune_memory`, run direct DELETE or retention SQL, or perform legacy backfill or re-extraction.
+6. Stop on paused/unavailable reads. Keep source revocation and statement curation separate; frozen legacy files remain untouched.

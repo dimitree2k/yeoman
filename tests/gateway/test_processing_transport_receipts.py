@@ -5,6 +5,7 @@ from __future__ import annotations
 from pathlib import Path
 
 import pytest
+from history_turn_fixtures import Projector
 from yeoman_gateway.processing.effects import EffectGateway
 from yeoman_gateway.processing.models import (
     EffectEnvelope,
@@ -85,6 +86,17 @@ def _submit(gateway: EffectGateway) -> str:
     return receipt.effect_id
 
 
+async def _execute_with_history(gateway: EffectGateway):
+    from yeoman_gateway.history.context import history_turn
+
+    projector = Projector()
+    try:
+        async with history_turn(projector):
+            return await gateway.execute_ready("fx1")
+    finally:
+        projector.close()
+
+
 @pytest.mark.asyncio
 async def test_provider_message_id_is_recorded_as_a_receipt(tmp_path: Path) -> None:
     store = ProcessingStore(tmp_path / "p.db")
@@ -92,7 +104,7 @@ async def test_provider_message_id_is_recorded_as_a_receipt(tmp_path: Path) -> N
     gateway = _gateway(store, transport, _Clock())
     _submit(gateway)
 
-    result = await gateway.execute_ready("fx1")
+    result = await _execute_with_history(gateway)
 
     assert result.state == "sent"
     assert store.effect_state("fx1") == "sent"
@@ -114,7 +126,7 @@ async def test_adapter_without_a_provider_id_records_nothing(tmp_path: Path) -> 
     gateway = _gateway(store, transport, _Clock())
     _submit(gateway)
 
-    result = await gateway.execute_ready("fx1")
+    result = await _execute_with_history(gateway)
 
     assert result.state == "sent"  # local acceptance is still a success
     assert store.transport_receipts("fx1") == ()
@@ -128,9 +140,9 @@ async def test_a_second_execution_does_not_add_a_second_receipt(tmp_path: Path) 
     transport = _Transport({"provider_message_id": "3EB0ABC"})
     gateway = _gateway(store, transport, _Clock())
     _submit(gateway)
-    await gateway.execute_ready("fx1")
+    await _execute_with_history(gateway)
 
-    await gateway.execute_ready("fx1")
+    await _execute_with_history(gateway)
 
     assert len(store.transport_receipts("fx1")) == 1
     assert transport.sent == ["hi"]

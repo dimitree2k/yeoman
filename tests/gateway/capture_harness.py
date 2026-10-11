@@ -8,10 +8,16 @@ read path - so a test proves the real path rather than a re-implementation of it
 
 from __future__ import annotations
 
+import json
+import sqlite3
+import uuid
 from pathlib import Path
 from typing import Any, Sequence
 
-from yeoman_gateway.knowledge import open_knowledge_store, workspace_id_for
+from yeoman_gateway.history.queries import HistoryQueries
+from yeoman_gateway.history.reader import HistorySnapshot
+from yeoman_gateway.history.schema import create as create_history_schema
+from yeoman_gateway.knowledge import open_knowledge_store
 from yeoman_gateway.knowledge._capture import (
     ObservedSourceRegistrar,
     StatementCaptureProducer,
@@ -21,11 +27,12 @@ from yeoman_gateway.knowledge._capture_worker import (
     StatementCaptureWorker,
     StatementDraft,
 )
-from yeoman_gateway.knowledge._memory import MemoryService
+from yeoman_gateway.knowledge._history_sources import HistoryKnowledgeSources
+from yeoman_gateway.knowledge._history_upgrade import upgrade_history_knowledge
+from yeoman_gateway.knowledge._store import KnowledgeStore
 from yeoman_gateway.knowledge.runtime import RuntimeKnowledgePolicy, RuntimeKnowledgeSources
 from yeoman_gateway.processing.signals import SignalJournalSink
 from yeoman_gateway.processing.store import ProcessingStore
-from yeoman_shared.config.schema import MemoryConfig
 
 GROUP = "491786127564-1611913127@g.us"
 DIRECT = "491757070305@s.whatsapp.net"
@@ -67,28 +74,32 @@ class CaptureHarness:
         self.registry = registry if registry is not None else Registry()
         self.authority = RuntimeKnowledgeSources(processing_store=self.store)
         self.policy = RuntimeKnowledgePolicy(
-            engine=None, chat_registry=self.registry, policy_revision=1
+            engine=None, policy_revision=1
         )
+        self._history_db = sqlite3.connect(":memory:")
+        create_history_schema(self._history_db)
+        self._snapshot = HistorySnapshot(1, (), self._history_db)
+        self.queries = HistoryQueries(self._snapshot)
+        self._people: dict[str, str] = {}
+        self._history_ids: set[str] = set()
+        source_path = tmp_path / "knowledge-v2.db"
+        old = KnowledgeStore(source_path)
+        old.set_meta("migration_complete", "1")
+        old.close()
+        knowledge_path = tmp_path / "knowledge-v3.db"
+        upgrade_history_knowledge(source=source_path, target=knowledge_path)
         self.knowledge = open_knowledge_store(
-            tmp_path / "knowledge.db",
-            workspace_id=workspace_id_for(tmp_path),
+            knowledge_path,
+            workspace_id="capture-harness",
             source_authority=self.authority,
             policy_authority=self.policy,
             clock=self,
         )
-        self.memory = MemoryService(
-            workspace=tmp_path,
-            config=MemoryConfig.model_validate(
-                {
-                    "dbPath": str(tmp_path / "memory.db"),
-                    # The ordinary responder read path only injects shared facts when the
-                    # shared-fact lane is on; the statement nodes live in that lane.
-                    "shared": {"enabled": True, "extractionEnabled": False},
-                }
-            ),
-            store=self.knowledge.memory_store(),
-            owns_store=False,
+        self.history_sources = HistoryKnowledgeSources(
+            self.queries, {}, self.knowledge.history_source_ledger, self.authority
         )
+        self._scope = self.knowledge.history_scope(self.queries, self.history_sources)
+        self._scope.__enter__()
         self.registrar = ObservedSourceRegistrar(
             knowledge=self.knowledge,
             processing=self.store,
@@ -133,9 +144,10 @@ class CaptureHarness:
     def close(self) -> None:
         if self.worker is not None:
             self.worker.stop()
-        self.memory.close()
+        self._scope.__exit__(None, None, None)
         self.knowledge.close()
         self.store.close()
+        self._snapshot.close()
 
     # ── observation ──────────────────────────────────────────────────────────
 
@@ -156,7 +168,7 @@ class CaptureHarness:
         payload: dict[str, Any] = {
             "chatJid": chat_id,
             "messageId": provider_id,
-            "senderId": sender,
+            "senderId": sender if sender.startswith("whatsapp:") else f"whatsapp:{sender.split('@', 1)[0]}",
             "text": text,
             "isGroup": chat_id.endswith("@g.us"),
             "timestamp": int(occurred_ms if occurred_ms is not None else self.now),
@@ -164,6 +176,11 @@ class CaptureHarness:
         if role is not None:
             payload["role"] = role
         event_id = f"wa_{provider_id}"
+        timestamp = int(occurred_ms if occurred_ms is not None else self.now)
+        self._seed_history_message(
+            event_id=event_id, native_id=provider_id, chat_id=chat_id,
+            sender=sender, text=text, occurred_ms=timestamp,
+        )
         stored = self.sink.capture(
             "message",
             payload,
@@ -174,7 +191,58 @@ class CaptureHarness:
             strict=True,
         )
         assert stored == event_id
+        self.registrar.register(event_id)
+        source = self.history_sources.issue(event_id)
+        audience = self.queries.audience(event_id)
+        self.store.upsert_event_source_authority(
+            source=source, audience=audience, audience_snapshot_id=f"history:{event_id}",
+            policy_revision=1, now_ms=self.now,
+        )
         return str(stored)
+
+    def _seed_history_message(
+        self, *, event_id: str, native_id: str, chat_id: str, sender: str,
+        text: str, occurred_ms: int,
+    ) -> None:
+        phone = sender if "@" in sender else f"{sender}@s.whatsapp.net"
+        person = self._ensure_person(phone)
+        if chat_id.endswith("@g.us"):
+            roster_id = f"capture-roster-{self._counter}"
+            raw_members = self.registry.get_chat("whatsapp", chat_id)
+            members = (raw_members or {}).get("metadata", {}).get("participants", [])
+            participant_ids = [
+                [str(item).split("@", 1)[0] + "@s.whatsapp.net"]
+                for item in members if isinstance(item, str)
+            ]
+            for participant in participant_ids:
+                self._ensure_person(participant[0])
+            if participant_ids:
+                self._history_db.execute(
+                    "INSERT INTO message_events(event_id,kind,channel,chat_id,target_message_id,actor_basis,occurred_ms,time_certainty,payload_json,provenance,source_refs) "
+                    "VALUES (?,'member_snapshot','whatsapp',?,NULL,'unknown',?,'native',?,'native','[]')",
+                    (roster_id, chat_id, max(0, occurred_ms - 1), json.dumps({"complete": True, "participants": participant_ids})),
+                )
+        self._history_db.execute(
+            "INSERT INTO messages(message_id,channel,chat_id,native_message_id,sender_contact_id,sender_identifier,sender_basis,direction,sent_ms,time_certainty,text,media_json,reply_to_native_id,mentions_json,provenance,source_refs) "
+            "VALUES (?,'whatsapp',?,?,?,?, 'native_identifier','in',?,'native',?,NULL,NULL,NULL,'native','[]')",
+            (event_id, chat_id, native_id, person, phone, occurred_ms, text),
+        )
+        self._history_db.commit()
+
+    def _ensure_person(self, phone: str) -> str:
+        person = self._people.get(phone)
+        if person is None:
+            person = str(uuid.uuid5(uuid.NAMESPACE_URL, f"capture-harness:{phone}"))
+            self._people[phone] = person
+            self._history_db.execute(
+                "INSERT INTO contacts(contact_id,kind,role,display_name,status,merged_into,source_refs) "
+                "VALUES (?,'person',NULL,?,'confirmed',NULL,'[]')", (person, phone)
+            )
+            self._history_db.execute(
+                "INSERT INTO identifier_history(contact_id,channel,kind,value,strength,evidence,valid_from_ms,valid_until_ms,source_refs) "
+                "VALUES (?,'whatsapp','pn_jid',?,'strong','observed',0,NULL,'[]')", (person, phone)
+            )
+        return person
 
     def append_raw(
         self,
@@ -300,21 +368,8 @@ class CaptureHarness:
     def recall(
         self, query: str, *, principal: str = f"{AUTHOR}@s.whatsapp.net", chat_id: str = GROUP
     ) -> str:
-        """The ordinary responder recall: shared-fact retrieval for a verified reader."""
-        from yeoman_gateway.knowledge._memory.read_gate import build_read_context
-
-        context = build_read_context(
-            principal_id=principal,
-            channel="whatsapp",
-            chat_id=chat_id,
-            chat_registry=self.registry,
-            policy=None,
-            now_ms=self.now,
-            epoch=self.memory.store.acl_epoch(),
-            is_direct=not chat_id.endswith("@g.us"),
-            counterpart=chat_id if not chat_id.endswith("@g.us") else None,
-        )
-        result = self.memory.retrieve_for_context(query=query, read_context=context)
+        """The ordinary History-scoped Knowledge recall for a verified reader."""
+        result = self.knowledge_recall(query, principal=principal, chat_id=chat_id)
         return str(result.text or "")
 
     def knowledge_recall(
@@ -323,14 +378,13 @@ class CaptureHarness:
         """The statement layer's own gated recall, for scope and identity assertions."""
         from yeoman_gateway.knowledge.models import RecallQuery, TrustedReadContext
 
+        raw_members = (self.registry.get_chat("whatsapp", chat_id) or {}).get("metadata", {}).get("participants", [])
         members = frozenset(
-            f"{item}@s.whatsapp.net"
-            for item in (self.registry.get_chat("whatsapp", chat_id) or {})
-            .get("metadata", {})
-            .get("participants", [])
+            f"whatsapp:{str(item).split('@', 1)[0]}" for item in raw_members if isinstance(item, str)
         )
+        principal_id = principal if principal.startswith("whatsapp:") else f"whatsapp:{principal.split('@', 1)[0]}"
         context = TrustedReadContext(
-            principal_id=principal,
+            principal_id=principal_id,
             channel="whatsapp",
             chat_id=chat_id,
             recipient_principals=members,
@@ -340,4 +394,7 @@ class CaptureHarness:
             now_ms=self.now,
             is_direct=not chat_id.endswith("@g.us"),
         )
-        return self.knowledge.recall(RecallQuery(text=query, limit=10), context=context)
+        return self.knowledge.recall(
+            RecallQuery(text=query, limit=10), context=context,
+            group_wide=not chat_id.endswith("@s.whatsapp.net"),
+        )

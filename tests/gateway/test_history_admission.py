@@ -43,7 +43,6 @@ async def test_admission_and_final_reply_do_not_share_pre_enrichment_snapshot():
     p = Projector()
     channel = object.__new__(WhatsAppChannel)
     channel._history_projector = p
-    channel._history_selected = True
     channel._history_knowledge = None
     channel._is_duplicate = Mock(return_value=False)
     channel._processing_request = Mock(return_value=object())
@@ -52,7 +51,6 @@ async def test_admission_and_final_reply_do_not_share_pre_enrichment_snapshot():
         admission_ids.append(id(current_history_snapshot()))
         return SimpleNamespace(denied=True, reason='synthetic', decision=None)
     channel._processing_gate = SimpleNamespace(admit_async=admit)
-    channel._archive_inbound_event = Mock()
     event = SimpleNamespace(chat_jid='a@g.us', message_id='m')
     await channel._ingest_inbound_event(event)
     assert admission_ids and admission_ids[0] != id(None)
@@ -73,7 +71,6 @@ async def test_admission_and_final_reply_do_not_share_pre_enrichment_snapshot():
     channel._enrich_media_event = AsyncMock()
     await channel._ingest_inbound_event(event)
     channel._enrich_media_event.assert_not_called()
-    assert channel._archive_inbound_event.call_count == 2
     p.close()
 
 
@@ -94,4 +91,13 @@ def test_reply_anchor_cannot_leak_other_chat_or_deleted_payload():
     resolved, _, _ = ReplyContextMiddleware(archive=adapter)._resolve_reply_context(event)
     assert resolved.reply_to_text is None
     assert 'old quoted payload' not in str(resolved.raw_metadata)
+    from dataclasses import replace
+    cached = replace(event, raw_metadata={
+        "reply_context_source": "payload", "reply_context_window": ["stale quote"],
+        "ambient_context_window": ["private text"], "ambient_context_rows": [{"text": "private text"}],
+        "sender_name": "Synthetic",
+    })
+    unresolved, _, _ = ReplyContextMiddleware()._resolve_reply_context(cached)
+    assert unresolved.reply_to_text is None
+    assert unresolved.raw_metadata == {"sender_name": "Synthetic"}
     snapshot.close()

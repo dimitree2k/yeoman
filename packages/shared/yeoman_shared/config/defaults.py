@@ -13,7 +13,6 @@ DEFAULT_VISION_MODEL = "google/gemini-2.5-flash-lite"
 DEFAULT_ASR_MODEL = "whisper-large-v3"
 DEFAULT_TTS_MODEL = "tts-1"
 DEFAULT_PROCESSING_DB_PATH = f"data/{OPERATIONAL_STORE_PATHS['processing']}"
-DEFAULT_SESSION_STATE_DIR = "data/memory/session-state"
 
 DEFAULT_MODEL_PROFILES: dict[str, dict[str, Any]] = {
     "assistant_default": {
@@ -127,22 +126,10 @@ DEFAULT_KNOWLEDGE: dict[str, Any] = {
     # offline migration produced it (see the private cutover runbook).
     "enabled": False,
     "db_path": "~/.yeoman/data/knowledge/knowledge.db",
-    "legacy_contacts_paths": ["~/.yeoman/data/contacts/contacts.db"],
-    "legacy_memory_paths": ["~/.yeoman/data/memory/memory.db"],
 }
 
 
 DEFAULT_MEMORY: dict[str, Any] = {
-    "enabled": True,
-    "mode": "primary",
-    "db_path": "~/.yeoman/data/memory/memory.db",
-    "shared": {
-        "enabled": False,
-        "extraction_enabled": False,
-        "extractor_version": "shared-facts-v1",
-        "max_jobs_waiting": 64,
-        "require_known_membership": True,
-    },
     "capture": {
         "enabled": True,
         "channels": ["cli", "telegram", "whatsapp", "discord", "feishu"],
@@ -174,10 +161,6 @@ DEFAULT_MEMORY: dict[str, Any] = {
     },
     "acl": {
         "owner_only_preference": True,
-    },
-    "wal": {
-        "enabled": True,
-        "state_dir": DEFAULT_SESSION_STATE_DIR,
     },
 }
 

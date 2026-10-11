@@ -20,7 +20,6 @@ from yeoman_gateway.consciousness.log import SpeakupLog, deterministic_effect_id
 from yeoman_gateway.history.export import secondary_consumer
 from yeoman_gateway.policy.engine import PolicyEngine
 from yeoman_gateway.policy.persona import load_persona_text
-from yeoman_gateway.storage.inbound_archive import InboundArchive
 
 DEFAULT_HELPFUL_ACTIONS = {
     "answer_open_question",
@@ -162,8 +161,7 @@ class ConsciousnessTools:
         policy_engine: PolicyEngine,
         bus: MessageBus,
         log: SpeakupLog,
-        inbound_archive: InboundArchive,
-        memory: object | None,
+        inbound_archive: Any,
         security: object,
         approval_store: SpeakupApprovalStore | None = None,
         service_effects: object | None = None,
@@ -179,7 +177,6 @@ class ConsciousnessTools:
         self._service_effects = service_effects
         self.log = log
         self.inbound_archive: Any = inbound_archive
-        self.memory = memory
         self.security = security
         self.approval_store = approval_store
         self._now = now or (lambda: datetime.now(UTC))
@@ -312,77 +309,6 @@ class ConsciousnessTools:
             latest=True,
         )
         return {"status": "ok", "messages": rows}
-
-    @secondary_consumer
-    async def search_memory(
-        self,
-        query: str,
-        chat_id: str,
-        limit: int = 5,
-        *,
-        channel: str | None = None,
-    ) -> dict[str, object]:
-        eligible = self._resolve_eligible(chat_id, channel=channel)
-        if eligible == "ambiguous_chat_id":
-            return {"status": "rejected", "reason": "ambiguous_chat_id", "hits": []}
-        if eligible is None:
-            return {"status": "rejected", "reason": "chat_not_eligible", "hits": []}
-        if self.config.history.live_projection_enabled and self.config.history.readers.secondary and eligible.channel == 'whatsapp':
-            from yeoman_gateway.knowledge.models import RecallQuery
-            knowledge = getattr(self, 'knowledge', None)
-            if knowledge is None:
-                from yeoman_gateway.history.live import HistoryPaused
-                raise HistoryPaused('secondary_knowledge_required')
-            context = knowledge.owner_read_context(channel=eligible.channel, chat_id=eligible.chat_id)
-            result = knowledge.recall(RecallQuery(query, limit=max(1, min(int(limit), 10))), context=context)
-            return {'status': 'ok', 'hits': [{'content': text} for text in result.entry_texts]}
-        if self.memory is None or not hasattr(self.memory, "search"):
-            return {"status": "ok", "hits": []}
-        hits = self.memory.search(
-            query=query,
-            channel=eligible.channel,
-            chat_id=eligible.chat_id,
-            scope="chat",
-            limit=max(1, min(int(limit), 10)),
-        )
-        rendered: list[dict[str, object]] = []
-        for hit in hits:
-            entry = getattr(hit, "entry", None)
-            content = getattr(entry, "content", str(hit))
-            rendered.append({"content": str(content)})
-        return {"status": "ok", "hits": rendered}
-
-    async def read_learned_chat_taste(
-        self,
-        chat_id: str,
-        limit: int = 5,
-        *,
-        channel: str | None = None,
-    ) -> dict[str, object]:
-        eligible = self._resolve_eligible(chat_id, channel=channel)
-        if eligible == "ambiguous_chat_id":
-            return {"status": "rejected", "reason": "ambiguous_chat_id", "patterns": []}
-        if eligible is None:
-            return {"status": "rejected", "reason": "chat_not_eligible", "patterns": []}
-        if self.memory is None or not hasattr(self.memory, "learned_chat_taste"):
-            return {"status": "ok", "patterns": []}
-        hits = self.memory.learned_chat_taste(
-            channel=eligible.channel,
-            chat_id=eligible.chat_id,
-            limit=max(1, min(int(limit), 10)),
-        )
-        patterns: list[dict[str, object]] = []
-        for hit in hits:
-            entry = getattr(hit, "entry", None)
-            content = getattr(entry, "content", str(hit))
-            patterns.append(
-                {
-                    "content": str(content),
-                    "confidence": getattr(entry, "confidence", None),
-                    "updated_at": getattr(entry, "updated_at", None),
-                }
-            )
-        return {"status": "ok", "patterns": patterns}
 
     async def read_speakup_history(
         self,

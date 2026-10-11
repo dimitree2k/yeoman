@@ -1814,12 +1814,6 @@ class _SanitizingSecurity(_AllowSecurity):
         )
 
 
-class _FakeMemory:
-    def search(self, **kwargs: object) -> list[object]:
-        del kwargs
-        return []
-
-
 class _RecordingEffects:
     """A managed-only service effect producer: ``None`` is never success here."""
 
@@ -1889,8 +1883,9 @@ def _build_tools(tmp_path: Path, *, security: object | None = None, policy: obje
     from yeoman_gateway.consciousness.approval import SpeakupApprovalStore
     from yeoman_gateway.consciousness.tools import ConsciousnessTools
     from yeoman_gateway.policy.engine import PolicyEngine
-    from yeoman_gateway.storage.inbound_archive import InboundArchive
     from yeoman_shared.config.schema import Config, ConsciousnessConfig
+
+    from tests.gateway.synthetic_reply_archive import SyntheticReplyArchive
 
     config = Config(
         consciousness=ConsciousnessConfig.model_validate(
@@ -1912,8 +1907,7 @@ def _build_tools(tmp_path: Path, *, security: object | None = None, policy: obje
         policy_engine=PolicyEngine(policy or _group_policy(), workspace=tmp_path),
         bus=MessageBus(),
         log=log,
-        inbound_archive=InboundArchive(tmp_path / "inbound.db"),
-        memory=_FakeMemory(),
+        inbound_archive=SyntheticReplyArchive(tmp_path / "inbound.db"),
         security=security or _AllowSecurity(),
         approval_store=store,
         now=lambda: _FIXED_NOW,

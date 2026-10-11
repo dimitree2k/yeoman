@@ -20,93 +20,50 @@ from yeoman_gateway.knowledge._snapshot import (
 
 
 def _fixture_dbs(tmp_path: Path) -> tuple[Path, Path]:
-    """Two *closed* writers, so the offline snapshot premise is literally true."""
-    from yeoman_gateway.knowledge.api import open_knowledge_store
-    from yeoman_gateway.knowledge.authority import FakePolicyAuthority, FakeSourceAuthority
-    from yeoman_gateway.knowledge.models import (
-        Identifier,
-        SourceRef,
-        TrustedIdentityObservation,
-    )
+    """Closed, synthetic schema-3 stores for the offline snapshot rehearsal."""
+    from dataclasses import replace
 
-    knowledge_path = tmp_path / "knowledge.db"
-    authority = FakeSourceAuthority()
+    from yeoman_gateway.knowledge.models import AttributeCandidate, AttributeValue
 
-    class _SnapshotPolicy(FakePolicyAuthority):
-        """The composition root's owner decision, without a real policy engine."""
+    from tests.gateway.knowledge.conftest import KnowledgeHarness
 
-        def admin_actor(self) -> str:
-            return "whatsapp:4910000000001"
-
-    policy = _SnapshotPolicy(
-        admins={"whatsapp:4910000000001"}, capture_actors={"whatsapp:4910000000001"}
-    )
-    service = open_knowledge_store(
-        knowledge_path,
-        workspace_id="snapshot-tests",
-        source_authority=authority,
-        policy_authority=policy,
-    )
-    observation = TrustedIdentityObservation(
-        identifiers=(Identifier("whatsapp", "phone_jid", "49183333333@s.whatsapp.net", "acc"),),
-        evidence_ref="snapshot-observation-1",
-        observed_name="Synthetic Snapshot Person",
-    )
-    authority.issue_observation(observation)
-    person = service.resolve_observation(observation)
-    assert person.person_id
-    # A manual name correction must survive the round trip.
-    service.set_preferred_name(person.person_id, "Corrected Name", context=service.admin_context_for(reason="snapshot-tests"))
-
-    from yeoman_gateway.knowledge.models import (
-        AttributeCandidate,
-        AttributeValue,
-        PersonLinkCandidate,
-        StatementCandidate,
-    )
-
-    source = SourceRef(
-        event_id="snapshot-event-1",
-        revision=1,
-        channel="whatsapp",
-        chat_id="group-a",
-        author_principal="whatsapp:49183333333",
-        occurred_at_ms=1,
-    )
-    from yeoman_gateway.knowledge.authority import EvidenceAudience
-
-    authority.issue_source(source, EvidenceAudience.known({"whatsapp:49183333333"}))
-    candidate = StatementCandidate(
-        content="Synthetic residence.",
-        sources=(source,),
-        people=(
-            PersonLinkCandidate(
-                person_id=person.person_id, role="subject", source=source, attribution="extracted"
-            ),
-        ),
+    harness = KnowledgeHarness(tmp_path / "harness")
+    person = harness.person("Snapshot Person")
+    source = harness.source(person)
+    original = harness.capture_text("Synthetic residence evidence.", source).statement_ids[0]
+    replacement = replace(
+        harness.candidate("Corrected synthetic residence evidence.", source, subjects=(person,)),
         attributes=(
             AttributeCandidate(
-                person_id=person.person_id, attribute_key="residence", value=AttributeValue("Köln")
+                person_id=person,
+                attribute_key="residence",
+                value=AttributeValue("Köln"),
             ),
         ),
-        extractor_version="snapshot-test",
-        confidence=0.5,
     )
-    from yeoman_gateway.knowledge.models import TrustedCaptureContext
-
-    request_id = "snapshot-capture-1"
-    policy.issue_capture(request_id)
-    context = TrustedCaptureContext(
-        request_id=request_id,
-        policy_revision=service.policy_revision,
-        capture_basis="user_message",
-        authorized_sources=(source,),
-        actor_principal="whatsapp:4910000000001",
-        authorized=True,
+    harness.service.correct_statement(
+        original,
+        replacement,
+        expected_source=source,
+        context=harness.capture_context(source),
     )
-    captured = service.capture(candidate, context=context)
-    assert captured.statement_ids
-    service.close()
+    revoked_source = harness.source(person, chat="group-revoked")
+    harness.capture_text("Synthetic revoked evidence.", revoked_source)
+    harness.service.invalidate_source(
+        revoked_source, context=harness.capture_context(revoked_source)
+    )
+    harness.close()
+    # A corrected statement retains its old FTS row; snapshot rehearsal requires
+    # locked statements to have no searchable index entry, so model that cleanup.
+    knowledge_path = tmp_path / "harness" / "knowledge-v3.db"
+    connection = sqlite3.connect(knowledge_path)
+    try:
+        connection.execute(
+            "DELETE FROM memory2_nodes_fts WHERE entry_id = ?", (original,)
+        )
+        connection.commit()
+    finally:
+        connection.close()
 
     processing_path = tmp_path / "processing.db"
     connection = sqlite3.connect(processing_path)
@@ -117,7 +74,8 @@ def _fixture_dbs(tmp_path: Path) -> tuple[Path, Path]:
         )
         connection.execute(
             "INSERT INTO events (event_id, chat_id, revision, media_path)"
-            " VALUES ('snapshot-event-1', 'group-a', 1, '/nonexistent/synthetic.pdf')"
+            " VALUES (?, 'group-a', 1, '/nonexistent/synthetic.pdf')",
+            (source.event_id,),
         )
         connection.commit()
     finally:
@@ -175,17 +133,17 @@ def test_snapshot_manifest_is_redacted_and_describes_the_copy(tmp_path: Path) ->
     assert payload["coherent_live_boundary"] is False
     assert payload["identity_revision"]
     assert payload["acl_epoch"]
-    assert payload["revoked_statements"] == 0
+    assert payload["revoked_statements"] == 1
     assert "Corrected Name" not in json.dumps(payload)
     assert "49183333333" not in json.dumps(payload)
     # A missing medium is marked, not silently dropped.
     assert payload["media"] and payload["media"][0][1] == -1
 
 
-def test_restore_rehearsal_preserves_correction_attribute_binding_and_revocation(
+def test_restore_rehearsal_preserves_correction_attribute_and_revocation(
     tmp_path: Path,
 ) -> None:
-    """The rehearsal the plan requires: the restored copy still means the same thing."""
+    """The restore keeps the live statement correction, facet, and revocation state."""
     processing, knowledge = _fixture_dbs(tmp_path)
     create_snapshot(
         processing=processing,
@@ -207,19 +165,25 @@ def test_restore_rehearsal_preserves_correction_attribute_binding_and_revocation
 
     connection = sqlite3.connect(f"file:{verification.restored_path}?mode=ro", uri=True)
     try:
-        name = connection.execute(
-            "SELECT preferred_name FROM contacts WHERE preferred_name IS NOT NULL"
+        statement = connection.execute(
+            "SELECT n.content, s.status FROM knowledge_statements s"
+            " JOIN memory2_nodes n ON n.id = s.statement_id"
+            " WHERE n.content = 'Corrected synthetic residence evidence.'"
         ).fetchone()
-        assert name is not None and str(name[0]) == "Corrected Name"
+        assert statement is not None and str(statement[1]) == "assertion"
         facet = connection.execute(
             "SELECT attribute_key FROM knowledge_person_attributes"
         ).fetchone()
         assert facet is not None and str(facet[0]) == "residence"
-        binding = connection.execute(
-            "SELECT COUNT(*) FROM knowledge_identifier_bindings"
-            " WHERE status = 'active' AND binding_id IS NOT NULL"
+        revoked = connection.execute(
+            "SELECT COUNT(*) FROM knowledge_statements WHERE status = 'revoked'"
         ).fetchone()
-        assert binding is not None and int(binding[0]) == 1
+        assert revoked is not None and int(revoked[0]) == 1
+        # Person identity is History-backed; the frozen Knowledge projection stays empty.
+        bindings = connection.execute(
+            "SELECT COUNT(*) FROM knowledge_identifier_bindings"
+        ).fetchone()
+        assert bindings is not None and int(bindings[0]) == 0
     finally:
         connection.close()
 

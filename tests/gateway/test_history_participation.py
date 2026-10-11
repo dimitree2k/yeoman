@@ -115,14 +115,15 @@ async def test_native_approval_proof_survives_real_staging(tmp_path, with_knowle
     admission = SimpleNamespace(channel='whatsapp', chat_id=CHAT, source_event_ids=('m1',), knowledge_evidence=None)
     context = {'_knowledge_evidence': selection_to_mapping(_statement_selection())} if with_knowledge else {}
     tools, log, archive, effects = _build_tools(tmp_path)
+    tools._history_projector = p
     try:
         async with history_turn(p):
             evidence = _knowledge_evidence_for_admission(admission, context)
-            result = await _stage(tools, knowledge_evidence=evidence)
-            assert result['status'] == 'awaiting_approval', result
-            stored = await _stored_snapshot(log)
-            assert stored['participation_admission']['knowledge_evidence'] == evidence
-            assert 'history' not in str(effects.calls)
+        result = await _stage(tools, knowledge_evidence=evidence)
+        assert result['status'] == 'awaiting_approval', result
+        stored = await _stored_snapshot(log)
+        assert stored['participation_admission']['knowledge_evidence'] == evidence
+        assert 'history' not in str(effects.calls)
     finally:
         archive.close()
         log.close()

@@ -31,65 +31,82 @@ from yeoman_shared.config.schema import Config, WhatsAppConfig
 from yeoman_shared.utils.helpers import get_operational_store_path
 
 
-def test_participation_knowledge_context_uses_verified_single_source_author() -> None:
+@pytest.mark.asyncio
+async def test_participation_knowledge_context_uses_verified_single_source_author() -> None:
+    from history_turn_fixtures import Projector
+    from yeoman_gateway.history.context import history_turn
+
     opportunity = SimpleNamespace(
         channel="whatsapp", chat_id="group@g.us", source_event_ids=("m1", "m2")
     )
-    context = {
-        "messages": [
-            {"event_id": "m1", "sender_id": "anna"},
-            {"event_id": "m2", "sender_id": "anna"},
-        ]
-    }
-    registry = SimpleNamespace(
-        get_chat=lambda channel, chat: {
-            "metadata": {"participants": ["anna", "ben"]}
-        }
+    context = {"messages": [
+        {"event_id": "m1", "sender_id": "whatsapp:491000000001"},
+        {"event_id": "m2", "sender_id": "whatsapp:491000000001"},
+    ]}
+    projector = Projector()
+    projector.db.execute(
+        "INSERT INTO message_events(event_id,kind,channel,chat_id,actor_basis,time_certainty,occurred_ms,payload_json,provenance,source_refs) "
+        "VALUES ('roster','member_snapshot','whatsapp','group@g.us','unknown','provider_timestamp',1700000000000,?,'native','[]')",
+        ('{"complete":true,"participants":[["491000000001@s.whatsapp.net"],["491000000002@s.whatsapp.net"]]}',),
     )
-    readers = _participation_knowledge_readers(
-        opportunity, context, chat_registry=registry, knowledge=SimpleNamespace(policy_revision=7)
-    )
-    assert readers.principals == ("anna",)
-    read, facts = readers.readers[0].read_context, readers.readers[0].fact_context
-    assert read.principal_id == facts.principal_id == "anna"
-    assert read.purpose == "proactive" and read.owner is False and facts.owner is False
-    assert read.recipient_principals == facts.current_members == frozenset({"anna", "ben"})
+    projector.db.commit()
+    registry = SimpleNamespace(get_chat=lambda channel, chat: None)
+    try:
+        async with history_turn(projector):
+            readers = _participation_knowledge_readers(
+                opportunity, context, chat_registry=registry, knowledge=SimpleNamespace(policy_revision=7)
+            )
+        assert readers.principals == ("whatsapp:491000000001",)
+        read = readers.readers[0].read_context
+        assert read.principal_id == "whatsapp:491000000001"
+        assert read.purpose == "proactive" and read.owner is False
+        assert read.recipient_principals == frozenset({"whatsapp:491000000001", "whatsapp:491000000002"})
+    finally:
+        projector.close()
 
 
-def test_participation_knowledge_context_covers_every_trigger_author() -> None:
+@pytest.mark.asyncio
+async def test_participation_knowledge_context_covers_every_trigger_author() -> None:
     """A coalesced multi-author trigger gets one verified reader per distinct author."""
+    from history_turn_fixtures import Projector
+    from yeoman_gateway.history.context import history_turn
+
     opportunity = SimpleNamespace(
         channel="whatsapp", chat_id="group@g.us", source_event_ids=("m1", "m2", "m3")
     )
-    registry = SimpleNamespace(
-        get_chat=lambda channel, chat: {
-            "metadata": {"participants": ["anna", "ben", "carla"]}
-        }
-    )
     knowledge = SimpleNamespace(policy_revision=7)
     shared = {"messages": [
-        {"event_id": "m1", "sender_id": "ben"},
-        {"event_id": "m2", "sender_id": "anna"},
-        {"event_id": "m3", "sender_id": "ben"},
+        {"event_id": "m1", "sender_id": "whatsapp:491000000002"},
+        {"event_id": "m2", "sender_id": "whatsapp:491000000001"},
+        {"event_id": "m3", "sender_id": "whatsapp:491000000002"},
     ]}
-    readers = _participation_knowledge_readers(
-        opportunity, shared, chat_registry=registry, knowledge=knowledge
+    projector = Projector()
+    projector.db.execute(
+        "INSERT INTO message_events(event_id,kind,channel,chat_id,actor_basis,time_certainty,occurred_ms,payload_json,provenance,source_refs) "
+        "VALUES ('roster','member_snapshot','whatsapp','group@g.us','unknown','provider_timestamp',1700000000000,?,'native','[]')",
+        ('{"complete":true,"participants":[["491000000001@s.whatsapp.net"],["491000000002@s.whatsapp.net"],["491000000003@s.whatsapp.net"]]}',),
     )
-    # Sorted, distinct: a repeated author is not read twice, and order cannot matter.
-    assert readers.principals == ("anna", "ben")
-    for reader in readers.readers:
-        assert reader.read_context.recipient_principals == frozenset({"anna", "ben", "carla"})
-        assert reader.fact_context.current_members == frozenset({"anna", "ben", "carla"})
-
-    # An author who is not a current member fails the whole read closed.
-    departed = {"messages": [
-        {"event_id": "m1", "sender_id": "anna"},
-        {"event_id": "m2", "sender_id": "mallory"},
-        {"event_id": "m3", "sender_id": "ben"},
-    ]}
-    assert _participation_knowledge_readers(
-        opportunity, departed, chat_registry=registry, knowledge=knowledge
-    ) == "denied"
+    projector.db.commit()
+    try:
+        async with history_turn(projector):
+            readers = _participation_knowledge_readers(
+                opportunity, shared, chat_registry=SimpleNamespace(), knowledge=knowledge
+            )
+            assert readers.principals == ("whatsapp:491000000001", "whatsapp:491000000002")
+            for reader in readers.readers:
+                assert reader.read_context.recipient_principals == frozenset({
+                    "whatsapp:491000000001", "whatsapp:491000000002", "whatsapp:491000000003"
+                })
+            departed = {"messages": [
+                {"event_id": "m1", "sender_id": "whatsapp:491000000001"},
+                {"event_id": "m2", "sender_id": "whatsapp:491999999999"},
+                {"event_id": "m3", "sender_id": "whatsapp:491000000002"},
+            ]}
+            assert _participation_knowledge_readers(
+                opportunity, departed, chat_registry=SimpleNamespace(), knowledge=knowledge
+            ) == "denied"
+    finally:
+        projector.close()
 
 
 def test_participation_knowledge_context_fails_closed_without_members_or_author() -> None:
@@ -360,11 +377,7 @@ async def test_failed_startup_recovery_blocks_every_ingress() -> None:
         channels=idle,  # type: ignore[arg-type]
         cron=idle,  # type: ignore[arg-type]
         heartbeat=idle,  # type: ignore[arg-type]
-        inbound_archive=idle,  # type: ignore[arg-type]
         responder=idle,  # type: ignore[arg-type]
-        memory=idle,  # type: ignore[arg-type]
-        contacts=idle,  # type: ignore[arg-type]
-        chat_registry=idle,
         gateway_socket=_Socket(),  # type: ignore[arg-type]
         reconciliation=_Recovery(),
     )
@@ -822,7 +835,6 @@ async def test_admin_terminal_dispatch_finishes_exact_overlapping_direct_binding
         orchestrator=_TerminalAdmin(),
         typing_adapter=SimpleNamespace(),
         telemetry=SimpleNamespace(),
-        memory=SimpleNamespace(),
         processing_store=store,
         release_participation_chat=lambda channel, chat_id: released.append(
             (channel, chat_id)
@@ -936,7 +948,8 @@ def test_restart_activation_transition_new_offers_use_new_epoch(
         ActivationEpochTracker,
         SourceOwner,
     )
-    from yeoman_gateway.storage.inbound_archive import InboundArchive
+
+    from tests.gateway.synthetic_reply_archive import SyntheticReplyArchive
 
     class RouteClient:
         def __init__(self, **_: object) -> None:
@@ -1002,7 +1015,7 @@ def test_restart_activation_transition_new_offers_use_new_epoch(
         workspace=tmp_path,
     )
     log = SpeakupLog(db_path)
-    archive = InboundArchive(tmp_path / "inbound.db")
+    archive = SyntheticReplyArchive(tmp_path / "inbound.db")
     processing_store = ProcessingStore(tmp_path / "processing.db")
     tracker = ActivationEpochTracker(store=log)
     adapter = EnginePolicyAdapter(
@@ -1169,7 +1182,8 @@ async def test_bootstrap_reaction_reaches_transport_with_reserved_effect_id(
     from yeoman_gateway.processing.dispatch import ServiceEffectProducer
     from yeoman_gateway.processing.models import ReactionPayload
     from yeoman_gateway.processing.participation import ParticipationOpportunity
-    from yeoman_gateway.storage.inbound_archive import InboundArchive
+
+    from tests.gateway.synthetic_reply_archive import SyntheticReplyArchive
 
     class RouteClient:
         route_key = "participation.judge"
@@ -1268,7 +1282,7 @@ async def test_bootstrap_reaction_reaches_transport_with_reserved_effect_id(
     from yeoman_gateway.consciousness.participation_runtime import ActivationEpochTracker
 
     log = SpeakupLog(tmp_path / "speakups.db")
-    archive = InboundArchive(tmp_path / "inbound.db")
+    archive = SyntheticReplyArchive(tmp_path / "inbound.db")
     store = ProcessingStore(tmp_path / "processing.db")
     adapter = EnginePolicyAdapter(
         engine=engine,
@@ -1540,7 +1554,8 @@ async def test_participation_approval_rechecks_pause_and_submits_once(
     from yeoman_gateway.processing.participation import ParticipationOpportunity
     from yeoman_gateway.providers.base import LLMResponse
     from yeoman_gateway.security import NoopSecurity
-    from yeoman_gateway.storage.inbound_archive import InboundArchive
+
+    from tests.gateway.synthetic_reply_archive import SyntheticReplyArchive
 
     class RouteClient:
         route_key = "participation.judge"
@@ -1649,7 +1664,7 @@ async def test_participation_approval_rechecks_pause_and_submits_once(
         workspace=tmp_path,
     )
     log = SpeakupLog(tmp_path / "speakups.db")
-    archive = InboundArchive(tmp_path / "inbound.db")
+    archive = SyntheticReplyArchive(tmp_path / "inbound.db")
     store = ProcessingStore(tmp_path / "processing.db")
     approval_store = SpeakupApprovalStore(tmp_path / "legacy-approvals.json")
     adapter = EnginePolicyAdapter(
@@ -1706,7 +1721,6 @@ async def test_participation_approval_rechecks_pause_and_submits_once(
         bus=bus,
         log=log,
         inbound_archive=archive,
-        memory=None,
         security=NoopSecurity(),
         approval_store=approval_store,
         service_effects=effects,
@@ -1973,7 +1987,8 @@ async def test_real_effect_transport_denies_participation_after_pause(
         payload_hash,
     )
     from yeoman_gateway.processing.participation_runtime import ParticipationAdmission
-    from yeoman_gateway.storage.inbound_archive import InboundArchive
+
+    from tests.gateway.synthetic_reply_archive import SyntheticReplyArchive
 
     monkeypatch.setenv("YEOMAN_HOME", str(tmp_path))
     chat_id = "group@g.us"
@@ -2021,7 +2036,7 @@ async def test_real_effect_transport_denies_participation_after_pause(
         workspace=tmp_path,
     )
     log = SpeakupLog(tmp_path / "speakups.db")
-    archive = InboundArchive(tmp_path / "inbound.db")
+    archive = SyntheticReplyArchive(tmp_path / "inbound.db")
     store = ProcessingStore(tmp_path / "processing.db")
     tracker = ActivationEpochTracker(store=log)
     adapter = EnginePolicyAdapter(

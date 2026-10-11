@@ -406,7 +406,7 @@ async def test_followup_is_accepted_while_the_provider_call_is_in_flight(tmp_pat
         return "first answer"
 
     task = asyncio.create_task(actor.run_generation(snapshot, _provider))
-    await started.wait()
+    await asyncio.wait_for(started.wait(), timeout=30)
 
     admission = actor.accept(event_id="m2", principal="orderer@s.whatsapp.net", authorized=True)
 
@@ -442,7 +442,7 @@ async def test_manual_new_suppresses_an_in_flight_generation(tmp_path: Path) -> 
         return "stale answer"
 
     task = asyncio.create_task(actor.run_generation(snapshot, _provider))
-    await started.wait()
+    await asyncio.wait_for(started.wait(), timeout=30)
     store.close_chat_threads(channel="whatsapp", chat_id=CHAT, now_ms=T0 + 1)
     release.set()
     outcome = await task
@@ -663,12 +663,59 @@ def _event_model(
     )
 
 
+def _history_projector(store: ProcessingStore):
+    """Publish the synthetic journal messages needed by a responder History lease."""
+    import json
+    import sqlite3
+    from types import SimpleNamespace
+
+    from yeoman_gateway.history.reader import HistorySnapshot
+    from yeoman_gateway.history.schema import create
+
+    async def read_turn():
+        connection = sqlite3.connect(":memory:")
+        create(connection)
+        rows = store._conn.execute(
+            "SELECT event_id, chat_id, source_message_id, occurred_ms, payload_json "
+            "FROM events WHERE kind = 'message'"
+        ).fetchall()
+        for row in rows:
+            payload = json.loads(str(row["payload_json"] or "{}"))
+            connection.execute(
+                "INSERT INTO messages (message_id,channel,chat_id,native_message_id,"
+                "sender_contact_id,sender_identifier,sender_basis,direction,sent_ms,"
+                "time_certainty,text,provenance,source_refs) "
+                "VALUES (?, 'whatsapp', ?, ?, NULL, NULL, 'unknown', 'in', ?, "
+                "'unknown', ?, 'native', '[]')",
+                (
+                    f"test:{row['event_id']}", row["chat_id"] or CHAT,
+                    row["source_message_id"] or row["event_id"], row["occurred_ms"],
+                    payload.get("text", ""),
+                ),
+            )
+        connection.commit()
+        return HistorySnapshot(1, (), connection)
+
+    return SimpleNamespace(
+        read_turn=read_turn,
+        health=lambda: {"status": "ready", "generation": 1},
+    )
+
+
+def _history_inner(inner, store: ProcessingStore):
+    inner._history_projector = _history_projector(store)
+    inner._history_knowledge = None
+    return inner
+
+
 def _wrapper(store: ProcessingStore, inner, registry: ThreadRegistry):
     from yeoman_gateway.processing.actor import ThreadActorRegistry
     from yeoman_gateway.processing.responder import ThreadActorResponder
 
     actors = ThreadActorRegistry(store=store, config=_Config(), clock=_Clock())
-    return ThreadActorResponder(inner=inner, actors=actors, store=store, clock=_Clock())
+    return ThreadActorResponder(
+        inner=_history_inner(inner, store), actors=actors, store=store, clock=_Clock()
+    )
 
 
 @pytest.mark.asyncio
@@ -705,7 +752,7 @@ async def test_direct_admission_finishes_in_responder_terminal_path(tmp_path: Pa
     released: list[tuple[str, str]] = []
     actors = ThreadActorRegistry(store=store, config=_Config(), clock=_Clock())
     wrapper = ThreadActorResponder(
-        inner=_InnerResponder(["direct answer"]),
+        inner=_history_inner(_InnerResponder(["direct answer"]), store),
         actors=actors,
         store=store,
         clock=_Clock(),
@@ -744,7 +791,7 @@ async def test_direct_admission_finishes_when_generation_is_cancelled(tmp_path: 
     started, release = asyncio.Event(), asyncio.Event()
     actors = ThreadActorRegistry(store=store, config=_Config(), clock=_Clock())
     wrapper = ThreadActorResponder(
-        inner=_InnerResponder(["never"], barrier=release, started=started),
+        inner=_history_inner(_InnerResponder(["never"], barrier=release, started=started), store),
         actors=actors,
         store=store,
         clock=_Clock(),
@@ -754,7 +801,7 @@ async def test_direct_admission_finishes_when_generation_is_cancelled(tmp_path: 
     )
     task = asyncio.create_task(wrapper.generate_reply(_event_model(message_id="m1"), object()))
     try:
-        await started.wait()
+        await asyncio.wait_for(started.wait(), timeout=30)
         task.cancel()
         with pytest.raises(asyncio.CancelledError):
             await task
@@ -789,7 +836,7 @@ async def test_direct_admission_finishes_on_generation_error(tmp_path: Path) -> 
     store.note_direct_admission("whatsapp", CHAT, "m1", str(decision.turn_id), now_ms=T0)
     actors = ThreadActorRegistry(store=store, config=_Config(), clock=_Clock())
     wrapper = ThreadActorResponder(
-        inner=BrokenInner(),
+        inner=_history_inner(BrokenInner(), store),
         actors=actors,
         store=store,
         clock=_Clock(),
@@ -820,7 +867,7 @@ async def test_followup_during_generation_produces_no_second_answer(tmp_path: Pa
         store, event_id="m2", thread_id=str(decision.thread_id), turn_id=str(decision.turn_id)
     )
     task = asyncio.create_task(wrapper.generate_reply(_event_model(message_id="m1"), object()))
-    await started.wait()
+    await asyncio.wait_for(started.wait(), timeout=30)
     followup = await wrapper.generate_reply(_event_model(message_id="m2"), object())
     assert followup is None  # accepted into the postbox, no second answer path
     barrier.set()
@@ -850,7 +897,7 @@ async def test_new_context_restarts_the_generation_once(tmp_path: Path) -> None:
         store, event_id="m2", thread_id=str(decision.thread_id), turn_id=str(decision.turn_id)
     )
     task = asyncio.create_task(wrapper.generate_reply(_event_model(message_id="m1"), object()))
-    await started.wait()
+    await asyncio.wait_for(started.wait(), timeout=30)
     await wrapper.generate_reply(_event_model(message_id="m2"), object())
     barrier.set()
     reply = await task
@@ -884,7 +931,7 @@ async def test_superseded_generation_returns_no_reply(tmp_path: Path) -> None:
         store, event_id="m2", thread_id=str(decision.thread_id), turn_id=str(decision.turn_id)
     )
     task = asyncio.create_task(wrapper.generate_reply(_event_model(message_id="m1"), object()))
-    await started.wait()
+    await asyncio.wait_for(started.wait(), timeout=30)
     correction = _event_model(message_id="m2")
     correction.raw_metadata["processing_kind"] = "delete"
     correction.raw_metadata["explicit_correction"] = True
@@ -973,7 +1020,7 @@ async def test_two_threads_do_not_mix_state_or_effects(tmp_path: Path) -> None:
             await self.release.wait()
             return f"answer for {event.chat_id}"
 
-    inner = _Blocking()
+    inner = _history_inner(_Blocking(), store)
     wrapper = ThreadActorResponder(inner=inner, actors=actors, store=store, clock=_Clock())
 
     task_a = asyncio.create_task(
@@ -982,7 +1029,7 @@ async def test_two_threads_do_not_mix_state_or_effects(tmp_path: Path) -> None:
             object(),
         )
     )
-    await inner.started.wait()
+    await asyncio.wait_for(inner.started.wait(), timeout=30)
     task_b = asyncio.create_task(
         wrapper.generate_reply(
             _event_model(message_id="b1", sender="b@s.whatsapp.net", chat_id="chat-b@g.us"),

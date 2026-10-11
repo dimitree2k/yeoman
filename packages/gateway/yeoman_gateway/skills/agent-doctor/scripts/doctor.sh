@@ -171,7 +171,6 @@ discord = channels.get("discord", {}) if isinstance(channels.get("discord"), dic
 feishu = channels.get("feishu", {}) if isinstance(channels.get("feishu"), dict) else {}
 memory = data.get("memory", {}) if isinstance(data.get("memory"), dict) else {}
 memory_embedding = memory.get("embedding", {}) if isinstance(memory.get("embedding"), dict) else {}
-memory_wal = memory.get("wal", {}) if isinstance(memory.get("wal"), dict) else {}
 gateway = data.get("gateway", {}) if isinstance(data.get("gateway"), dict) else {}
 tools = data.get("tools", {}) if isinstance(data.get("tools"), dict) else {}
 tools_exec = tools.get("exec", {}) if isinstance(tools.get("exec"), dict) else {}
@@ -237,8 +236,6 @@ values = {
     "provider_count": str(provider_count),
     "memory_enabled": str(bool(pick(memory, "enabled", default=True))).lower(),
     "memory_embedding_enabled": str(bool(pick(memory_embedding, "enabled", default=True))).lower(),
-    "memory_wal_enabled": str(bool(pick(memory_wal, "enabled", default=True))).lower(),
-    "memory_db_path": str(Path(str(pick(memory, "dbPath", "db_path", default="~/.yeoman/data/memory/memory.db"))).expanduser()),
     "telegram_enabled": str(bool(pick(telegram, "enabled", default=False))).lower(),
     "telegram_token_present": str(telegram_token_present).lower(),
     "whatsapp_enabled": str(bool(pick(whatsapp, "enabled", default=False))).lower(),
@@ -428,7 +425,6 @@ else
     line_ok "yeoman memory status completed"
 
     mem_enabled="$(extract_field "$memory_output" "enabled")"
-    mem_db_path="$(extract_field "$memory_output" "db_path")"
     mem_total_active="$(extract_field "$memory_output" "total_active")"
 
     if [ "$mem_enabled" = "True" ]; then
@@ -450,22 +446,6 @@ else
 
     fi
 
-    if [ -n "$mem_db_path" ] && [ -f "$mem_db_path" ]; then
-        line_ok "memory DB exists at $mem_db_path"
-        db_kb="$(du -k "$mem_db_path" | awk '{print $1}')"
-        if [ "$db_kb" -gt 512000 ]; then
-            add_issue "memory" "WARNING" "MEM-007" "memory DB is larger than 500 MB" \
-                "Current size: $(du -h "$mem_db_path" | awk '{print $1}')" \
-                "Back up the DB, then run sqlite3 \"$mem_db_path\" 'VACUUM;'."
-        else
-            line_ok "memory DB size is within threshold"
-        fi
-    else
-        add_issue "memory" "CRITICAL" "MEM-001" "memory DB path is missing" \
-            "Expected DB path: ${mem_db_path:-unknown}" \
-            "Verify memory.db_path and restart the gateway."
-    fi
-
     if [ "${mem_total_active:-0}" -gt 0 ] 2>/dev/null; then
         line_ok "memory has active entries (${mem_total_active})"
     else
@@ -474,16 +454,6 @@ else
             "Check capture settings and test manual memory insertion."
     fi
 
-    if command -v sqlite3 >/dev/null 2>&1 && [ -n "${mem_db_path:-}" ] && [ -f "${mem_db_path:-}" ]; then
-        journal_mode="$(sqlite3 "$mem_db_path" "PRAGMA journal_mode;" 2>/dev/null || true)"
-        if [ "$journal_mode" = "wal" ]; then
-            line_ok "SQLite journal mode is WAL"
-        elif [ -n "$journal_mode" ]; then
-            add_issue "memory" "WARNING" "MEM-006" "SQLite journal mode is not WAL" \
-                "journal_mode=$journal_mode" \
-                "Run sqlite3 \"$mem_db_path\" 'PRAGMA journal_mode=WAL;'."
-        fi
-    fi
 fi
 
 section "cron"

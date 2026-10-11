@@ -1,12 +1,9 @@
-"""Tests for contacts-based mention resolution in outbound pipeline."""
+"""WhatsApp mention candidates never guess names without a live resolver."""
 
 import pytest
-from pathlib import Path
-
-from yeoman_gateway.knowledge._contacts.service import ContactsService
+from yeoman_gateway.core.intents import SendOutboundIntent
 from yeoman_gateway.core.models import InboundEvent
 from yeoman_gateway.core.pipeline import PipelineContext
-from yeoman_gateway.core.intents import SendOutboundIntent
 from yeoman_gateway.pipeline.outbound import OutboundMiddleware
 
 
@@ -23,34 +20,24 @@ def _make_event(**overrides: object) -> InboundEvent:
     return InboundEvent(**defaults)
 
 
-@pytest.fixture
-def contacts(tmp_path: Path) -> ContactsService:
-    return ContactsService(db_path=tmp_path / "contacts.db")
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    ("metadata", "reply", "expected"),
+    [
+        ({}, "Hey @Alex check this out", None),
+        ({"mentioned_jids": ["491521234567@s.whatsapp.net"]}, "Hey there", ["491521234567@s.whatsapp.net"]),
+    ],
+)
+async def test_without_history_knowledge_only_native_candidates_survive(metadata, reply, expected):
+    middleware = OutboundMiddleware()
+    ctx = PipelineContext(event=_make_event(raw_metadata=metadata))
+    ctx.reply = reply
+    ctx.decision = type("D", (), {"when_to_reply_mode": "all", "voice_output_mode": "text"})()
 
+    async def next_fn(_ctx: PipelineContext) -> None:
+        return None
 
-class TestContactsMentionResolution:
-    @pytest.mark.asyncio
-    async def test_resolves_name_mention_via_contacts(
-        self, contacts: ContactsService,
-    ) -> None:
-        contacts.ensure_contact(
-            channel="whatsapp", identifier="491521234567@s.whatsapp.net",
-            kind="phone_jid", push_name="Alex",
-        )
-        mw = OutboundMiddleware(contacts=contacts)
-        ctx = PipelineContext(event=_make_event())
-        ctx.reply = "Hey @Alex check this out"
-        ctx.decision = type("D", (), {
-            "when_to_reply_mode": "all",
-            "voice_output_mode": "text",
-        })()
-
-        async def next_fn(c: PipelineContext) -> None: pass
-        await mw(ctx, next_fn)
-
-        send_intents = [i for i in ctx.intents if isinstance(i, SendOutboundIntent)]
-        assert len(send_intents) == 1
-        metadata = send_intents[0].event.metadata
-        assert "mention_candidates" in metadata
-        candidates = metadata["mention_candidates"]
-        assert "491521234567@s.whatsapp.net" in candidates
+    await middleware(ctx, next_fn)
+    outbound = [item.event for item in ctx.intents if isinstance(item, SendOutboundIntent)]
+    assert len(outbound) == 1
+    assert outbound[0].metadata.get("mention_candidates") == expected

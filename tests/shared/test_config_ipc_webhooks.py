@@ -191,5 +191,3 @@ def test_run_path_uses_canonical_runtime_root(tmp_path, monkeypatch) -> None:
     assert (runtime / "run").is_dir()
 
 
-def test_memory_session_state_default_is_runtime_owned() -> None:
-    assert Config().memory.wal.state_dir == "data/memory/session-state"

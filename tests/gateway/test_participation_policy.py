@@ -723,8 +723,9 @@ async def test_live_participation_observer_budget_is_not_legacy_planner_only(
     from yeoman_gateway.bus.queue import MessageBus
     from yeoman_gateway.consciousness.log import SpeakupLog
     from yeoman_gateway.consciousness.tools import ConsciousnessTools
-    from yeoman_gateway.storage.inbound_archive import InboundArchive
     from yeoman_shared.config.schema import Config, ConsciousnessConfig
+
+    from tests.gateway.synthetic_reply_archive import SyntheticReplyArchive
 
     policy = PolicyConfig.model_validate(
         {
@@ -746,14 +747,13 @@ async def test_live_participation_observer_budget_is_not_legacy_planner_only(
         }
     )
     log = SpeakupLog(tmp_path / "speakups.db")
-    archive = InboundArchive(tmp_path / "inbound.db")
+    archive = SyntheticReplyArchive(tmp_path / "inbound.db")
     tools = ConsciousnessTools(
         config=config,
         policy_engine=PolicyEngine(policy, workspace=tmp_path),
         bus=MessageBus(),
         log=log,
         inbound_archive=archive,
-        memory=None,
         security=None,
     )
     try:
@@ -786,7 +786,6 @@ def test_consciousness_tools_prefers_shared_activation_provider() -> None:
         bus=object(),
         log=object(),
         inbound_archive=object(),
-        memory=None,
         security=None,
         activation_provider=lambda channel, chat_id: shared,
     )
@@ -836,8 +835,9 @@ def test_consciousness_planner_skips_an_owned_chat(tmp_path: Path) -> None:
     from yeoman_gateway.consciousness.tools import ConsciousnessTools
     from yeoman_gateway.policy.engine import PolicyEngine
     from yeoman_gateway.policy.loader import save_policy
-    from yeoman_gateway.storage.inbound_archive import InboundArchive
     from yeoman_shared.config.schema import Config, ConsciousnessConfig
+
+    from tests.gateway.synthetic_reply_archive import SyntheticReplyArchive
 
     policy = PolicyConfig.model_validate(
         {
@@ -887,8 +887,7 @@ def test_consciousness_planner_skips_an_owned_chat(tmp_path: Path) -> None:
         policy_engine=PolicyEngine(policy, workspace=tmp_path),
         bus=MessageBus(),
         log=SpeakupLog(tmp_path / "speakups.db"),
-        inbound_archive=InboundArchive(tmp_path / "inbound.db"),
-        memory=None,
+        inbound_archive=SyntheticReplyArchive(tmp_path / "inbound.db"),
         security=None,
     )
     eligible = {chat.chat_id for chat in tools._eligible_chats()}  # noqa: SLF001

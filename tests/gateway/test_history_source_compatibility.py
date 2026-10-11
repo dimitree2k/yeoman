@@ -26,7 +26,7 @@ def case(tmp_path):
     source = v2(tmp_path / 'v2.db')
     target = tmp_path / 'v3.db'
     upgrade_history_knowledge(source=source, target=target)
-    service = open_service(target, history_mode=True)
+    service = open_service(target)
     db = sqlite3.connect(':memory:')
     create(db)
     contact(db, 'a')
@@ -175,7 +175,7 @@ async def _edit_round(case, tmp_path, *, coalesced):
         snapshot.close()
         knowledge_path = service.db_path
         service.close()
-        reopened = open_service(knowledge_path, history_mode=True)
+        reopened = open_service(knowledge_path)
         await projector.rebuild(reason='synthetic restart rebuild')
         snapshot = await projector.read_turn()
         q = HistoryQueries(snapshot)
@@ -241,7 +241,7 @@ def test_history_source_ledger_is_shared_and_never_writes_processing(case):
     from yeoman_gateway.knowledge._history_sources import HistorySourceLedger
     path = service.db_path
     service.close()
-    reopened = open_service(path, history_mode=True)
+    reopened = open_service(path)
     try:
         adapter = HistoryKnowledgeSources(q, {}, HistorySourceLedger(reopened._store), sources.legacy_authority)
         assert adapter.verify_source_ref(*ref.key) is None

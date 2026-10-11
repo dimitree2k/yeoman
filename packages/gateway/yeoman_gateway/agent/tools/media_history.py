@@ -163,7 +163,7 @@ class MediaHistoryTool(Tool):
         limit = max(1, min(12, int(kwargs.get("limit") or self._max_results)))
 
         from yeoman_gateway.processing.tool_context import tool_history_snapshot
-        snapshot = tool_history_snapshot(selected=getattr(self, '_history_selected', False))
+        snapshot = tool_history_snapshot()
         if snapshot is not None and target_channel == 'whatsapp':
             from dataclasses import replace
 

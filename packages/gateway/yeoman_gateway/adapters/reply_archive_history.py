@@ -34,8 +34,19 @@ def archive_row(queries: HistoryQueries, row: Row) -> Row:
 
 
 class HistoryReplyArchiveAdapter(ReplyArchivePort):
-    def __init__(self, queries: HistoryQueries):
-        self.queries = queries
+    def __init__(self, queries: HistoryQueries | None = None):
+        self._queries = queries
+
+    @property
+    def queries(self) -> HistoryQueries:
+        if self._queries is not None:
+            return self._queries
+        from yeoman_gateway.history.context import current_history_snapshot, history_effect_metadata
+        snapshot = current_history_snapshot()
+        if snapshot is None:
+            raise HistoryPaused("history_scope_required")
+        history_effect_metadata()
+        return HistoryQueries(snapshot)
 
     def record_inbound(self, event: InboundEvent) -> None:
         raise HistoryPaused('history_archive_read_only')

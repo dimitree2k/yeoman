@@ -5,7 +5,7 @@ import json
 from contextlib import contextmanager
 from datetime import UTC, datetime
 from types import SimpleNamespace
-from unittest.mock import AsyncMock, Mock
+from unittest.mock import AsyncMock
 
 import pytest
 from yeoman_gateway.app.bootstrap import OrchestratorService
@@ -88,8 +88,7 @@ async def reply_case(tmp_path, monkeypatch):
             assert self.bus.publish_outbound.call_args.args[0].metadata['history_generation'] == self.generation
 
     case = ReplyCase()
-    sessions = SessionManager(tmp_path, sessions_dir=tmp_path / 'sessions', history_selected=True,
-                              legacy_history_disabled=True)
+    sessions = SessionManager(tmp_path, sessions_dir=tmp_path / 'sessions')
     def legacy_read(*args, **kwargs):
         case.legacy_history_reads += 1
         raise AssertionError('legacy history read')
@@ -111,8 +110,6 @@ async def reply_case(tmp_path, monkeypatch):
             return 'synthetic/model'
 
     responder = LLMResponder(provider=Provider(), workspace=tmp_path, bus=MessageBus(), session_manager=sessions)
-    responder._history_selected = True
-    responder._history_tools_selected = True
     original = responder.context.build_messages
     def build_messages(**kwargs):
         case.prompt_transcript = kwargs['current_message']
@@ -131,11 +128,10 @@ async def reply_case(tmp_path, monkeypatch):
         await next(ctx)
 
     orchestrator = object.__new__(Orchestrator)
-    orchestrator._history_reply_selected = True
-    orchestrator._pipeline = Pipeline([ContactsMiddleware(history_selected=True), ReplyContextMiddleware(history_selected=True), generate])
+    orchestrator._pipeline = Pipeline([ContactsMiddleware(), ReplyContextMiddleware(), generate])
     case.service = OrchestratorService(bus=case.bus, orchestrator=orchestrator,
-        typing_adapter=AsyncMock(), telemetry=SimpleNamespace(), memory=None,
-        history_projector=case, history_selected=True)
+        typing_adapter=AsyncMock(), telemetry=SimpleNamespace(),
+        history_projector=case)
     yield case
     await responder.aclose()
     case.close()
@@ -522,7 +518,7 @@ class ConsumerCase(IntegratedCase):
         target = self.root / 'alias-v3.db'
         upgrade_history_knowledge(source=source, target=target)
         self.open_service = lambda: open_knowledge_store(target, workspace_id='synthetic',
-            source_authority=legacy_authority, policy_authority=self.policy, history_mode=True)
+            source_authority=legacy_authority, policy_authority=self.policy)
         self.knowledge = self.open_service()
         self.projector.history_knowledge = self.knowledge
         self.p = producer(self.knowledge)
@@ -565,14 +561,14 @@ class ConsumerCase(IntegratedCase):
         return value
 
     async def run_participation(self):
+        from yeoman_gateway.history.export import SecondaryArchive
         from yeoman_gateway.processing.participation import ParticipationOpportunity
         from yeoman_gateway.processing.participation_context import ParticipationContextBuilder
 
         from tests.gateway.test_participation_context import _inputs
         builder = self.runners.setdefault('participation', ParticipationContextBuilder(
-            archive=SimpleNamespace(lookup_messages_in_range=Mock(side_effect=AssertionError('legacy archive'))),
+            archive=SecondaryArchive(),
             policy=self.policy.engine, source_authorizer=lambda row: True))
-        builder._history_selected = True
         opportunity = ParticipationOpportunity(opportunity_id='synthetic-opportunity', channel='whatsapp',
             chat_id=GROUP, trigger='inbound', source_event_ids=('consumer-source',),
             observed_revision=1, activation_epoch=1, created_at_ms=MS)
@@ -591,10 +587,8 @@ class ConsumerCase(IntegratedCase):
         if 'admission' not in self.runners:
             bus = MessageBus()
             channel = WhatsAppChannel(WhatsAppConfig(), bus,
-                media_storage=MediaStorage(self.root / 'incoming', self.root / 'outgoing'),
-                legacy_history_disabled=True)
+                media_storage=MediaStorage(self.root / 'incoming', self.root / 'outgoing'))
             channel._history_projector = self.projector
-            channel._history_selected = True
             channel._history_knowledge = self.knowledge
             store = ProcessingStore(self.root / 'admission.db')
             adapter = EnginePolicyAdapter(engine=self.policy.engine, known_tools=set(),
@@ -626,8 +620,8 @@ class ConsumerCase(IntegratedCase):
         from yeoman_gateway.session.manager import SessionManager
         from yeoman_gateway.session.operational import OperationalSessions
         if 'reply_tools' not in self.runners:
-            sessions = SessionManager(self.root, sessions_dir=self.root / 'sessions', history_selected=True,
-                legacy_history_disabled=True, operational_store=OperationalSessions(self.root / 'sessions.db'))
+            sessions = SessionManager(self.root, sessions_dir=self.root / 'sessions',
+                operational_store=OperationalSessions(self.root / 'sessions.db'))
             self.runners['reply_tools'] = sessions, RecallConversationTool(sessions)
         sessions, tool = self.runners['reply_tools']
         async with history_turn(self.projector) as snapshot:
@@ -669,11 +663,10 @@ class ConsumerCase(IntegratedCase):
         from yeoman_gateway.consciousness.tools import ConsciousnessTools
         from yeoman_gateway.history.export import SecondaryArchive
         if 'secondary' not in self.runners:
-            selected = SimpleNamespace(live_projection_enabled=True, readers=SimpleNamespace(secondary=True))
             tools = object.__new__(ConsciousnessTools)
-            tools.config = SimpleNamespace(history=selected)
+            tools.config = SimpleNamespace()
             tools._history_projector, tools._history_knowledge = self.projector, self.knowledge
-            tools.inbound_archive = SecondaryArchive(Mock(), selected)
+            tools.inbound_archive = SecondaryArchive()
             tools._resolve_eligible = lambda chat_id, channel=None: SimpleNamespace(channel='whatsapp', chat_id=chat_id)
             tools._now = lambda: datetime.fromtimestamp((MS+1000)/1000, UTC)
             tools._chat_window_since_for_trigger = lambda **kwargs: datetime.fromtimestamp(0, UTC)
@@ -744,11 +737,10 @@ class ConsumerCase(IntegratedCase):
             calls.append(ctx)
             raise AssertionError('model reached during pause')
         orchestrator = object.__new__(Orchestrator)
-        orchestrator._history_reply_selected = True
         orchestrator._pipeline = Pipeline([provider])
         bus = MessageBus()
         service = OrchestratorService(bus=bus, orchestrator=orchestrator, typing_adapter=AsyncMock(),
-            telemetry=SimpleNamespace(), memory=None, history_projector=self.projector, history_selected=True)
+            telemetry=SimpleNamespace(), history_projector=self.projector)
         await service._process_message(InboundEvent(channel='whatsapp', chat_id=GROUP,
             sender_id=PHONE, content='Synthetic pause reply'))
         assert calls == [] and bus.outbound_size == 0
@@ -808,189 +800,6 @@ async def consumer_case(tmp_path, capture_case):
         yield case
     finally:
         await case.close()
-
-class ParityCase(IntegratedCase):
-    async def compare(self):
-        from yeoman_gateway.adapters.reply_archive_history import (
-            HistoryReplyArchiveAdapter,
-            archive_row,
-            history_text,
-        )
-        from yeoman_gateway.adapters.reply_archive_sqlite import SqliteReplyArchiveAdapter
-        from yeoman_gateway.agent.tools.media_history import MediaHistoryTool
-        from yeoman_gateway.agent.tools.recall_conversation import RecallConversationTool
-        from yeoman_gateway.media.document_cache import DocumentCache
-        from yeoman_gateway.processing.tool_context import (
-            ToolInvocationContext,
-            reset_tool_context,
-            set_tool_context,
-        )
-        from yeoman_gateway.session.manager import SessionManager
-        from yeoman_gateway.session.operational import OperationalSessions
-        from yeoman_gateway.storage.inbound_archive import InboundArchive
-        self.checked, self.differences = [], []
-        archive = InboundArchive(self.root / 'legacy-inbound.db', retention_days=None)
-        legacy = SessionManager(self.root, sessions_dir=self.root / 'legacy-sessions')
-        operational = OperationalSessions(self.root / 'operational.db')
-        selected = SessionManager(self.root, sessions_dir=self.root / 'selected-sessions',
-                                  history_selected=True, operational_store=operational)
-        cache = DocumentCache(self.root / 'media.db')
-        old_media = MediaHistoryTool(cache=cache, processor=None)
-        new_media = MediaHistoryTool(cache=cache, processor=None)
-        old_media.set_context('whatsapp', GROUP)
-        new_media.set_context('whatsapp', GROUP)
-        conversations = {GROUP: [('p1', 'Synthetic alpha'), ('p2', 'Synthetic literal %_needle'),
-                                 ('p3', 'Synthetic image')],
-                         PHONE: [('d1', 'Synthetic direct one'), ('d2', 'Synthetic direct two')]}
-        try:
-            for chat, pairs in conversations.items():
-                session = legacy.get_or_create(f'whatsapp:{chat}')
-                for i, (mid, text) in enumerate(pairs):
-                    payload = {'media': {'kind': 'image'}} if mid == 'p3' else {}
-                    await self.add(mid, chat=chat, ms=MS+i*1000, text=text, **payload)
-                    archive.record_inbound(channel='whatsapp', chat_id=chat, message_id=mid,
-                        participant=PHONE, sender_id=PHONE, sender_name='Synthetic original',
-                        text=text, timestamp=(MS+i*1000)//1000)
-                    session.add_message('user', text, message_id=mid, timestamp=MS+i*1000, sender_id=PHONE)
-            cache.record_media_item(channel='whatsapp', chat_id=GROUP, message_id='p3',
-                sender_id=PHONE, sender_name='Synthetic original', kind='image', mime_type='image/png',
-                file_name='synthetic.png', local_path=self.root / 'synthetic.png', size_bytes=10,
-                timestamp=(MS+2000)//1000)
-            before, until = datetime.fromtimestamp((MS-1)/1000, UTC), datetime.fromtimestamp((MS+5000)/1000, UTC)
-            old = SqliteReplyArchiveAdapter(archive)
-            async with history_turn(self.projector) as snapshot:
-                q = HistoryQueries(snapshot)
-                new = HistoryReplyArchiveAdapter(q)
-                def fields(rows):
-                    return [{key: row[key] for key in ('message_id', 'text', 'sender_id', 'sender_name', 'timestamp')}
-                            for row in rows]
-                legacy_rows = archive.lookup_messages_in_range('whatsapp', GROUP, before, until)
-                assert fields(new.lookup_messages_in_range('whatsapp', GROUP, before, until)) == fields(legacy_rows)
-                self.checked.extend(('recent', 'ambient'))
-                assert [x.message_id for x in new.lookup_messages_before('whatsapp', GROUP, 'p2', limit=10)] == [
-                    x.message_id for x in old.lookup_messages_before('whatsapp', GROUP, 'p2', limit=10)]
-                assert [r['native_message_id'] for r in q.reply_window(chat_id=GROUP, native_id='p2', before=1, after=1)] == [r['message_id'] for r in legacy_rows]
-                self.checked.append('reply_before_after')
-                for chat in (GROUP, PHONE):
-                    expected = legacy.get_or_create(f'whatsapp:{chat}').get_history()
-                    actual = selected.recent_history(channel='whatsapp', chat_id=chat, snapshot=snapshot, limit=50)
-                    assert actual == expected, {'chat': chat, 'expected': expected, 'actual': actual}
-                self.checked.append('dm')
-                thread = selected.get_or_create('synthetic-thread', channel='whatsapp', chat_id=PHONE,
-                                               thread_id='thread', history_snapshot=snapshot).get_history()
-                assert len(thread) == 1 and thread[0]['role'] == 'system'
-                for _, text in conversations[PHONE]:
-                    assert f'user: {text}' in thread[0]['content']
-                from yeoman_gateway.processing.responder import ThreadActorResponder
-                wrapper = object.__new__(ThreadActorResponder)
-                wrapper._inner = SimpleNamespace(sessions=legacy)
-                wrapper._ensure_legacy_context(channel='whatsapp', chat_id=PHONE, session_key='synthetic-thread')
-                assert thread == [{key: row[key] for key in ('role', 'content')}
-                                  for row in legacy.get_or_create('synthetic-thread').get_history()]
-                self.checked.append('thread')
-                old_tool, new_tool = RecallConversationTool(legacy), RecallConversationTool(selected)
-                old_tool.set_context('whatsapp', GROUP)
-                new_tool.set_context('whatsapp', GROUP)
-                old_text = await old_tool.execute(query='%_needle')
-                token = set_tool_context(ToolInvocationContext(channel='whatsapp', chat_id=GROUP, history_snapshot=snapshot))
-                try:
-                    new_text = await new_tool.execute(query='%_needle')
-                finally:
-                    reset_tool_context(token)
-                assert old_text == new_text
-                self.checked.append('literal_search')
-                assert archive_row(q, q.native_message(chat_id=GROUP, native_id='p1'))['sender_name'] == legacy_rows[0]['sender_name']
-                self.checked.append('speaker')
-                assert [r['native_message_id'] for r in q.media(chat_id=GROUP, limit=10)] == [
-                    row['message_id'] for row in legacy_rows if row['text'] == 'Synthetic image']
-                old_media_text = await old_media.execute()
-                token = set_tool_context(ToolInvocationContext(channel='whatsapp', chat_id=GROUP, history_snapshot=snapshot))
-                try:
-                    assert await new_media.execute() == old_media_text
-                finally:
-                    reset_tool_context(token)
-                self.checked.append('media')
-            self.append('edit', 'p1', ms=MS+6000, text='Synthetic latest edited')
-            self.append('delete', 'p2', ms=MS+7000)
-            await self.add('passive', text='Synthetic passive', ms=MS+8000)
-            self.archive.append_media_transcript({'kind': 'media_transcript', 'channel': 'whatsapp',
-                'native_message_id': 'p3', 'chat_id': GROUP, 'text': 'Synthetic transcript', 'generated_ms': MS+9000})
-            self.append('membership_change', 'later-roster', ms=MS+10000, action='add', participants=[LATER_PHONE])
-            await self.settle()
-            async with history_turn(self.projector) as snapshot:
-                q = HistoryQueries(snapshot)
-                new = HistoryReplyArchiveAdapter(q)
-                assert new.lookup_message('whatsapp', GROUP, 'p1').text == 'Synthetic latest edited'
-                assert old.lookup_message('whatsapp', GROUP, 'p1').text == 'Synthetic alpha'
-                self.differences.append('latest_edit')
-                assert new.lookup_message('whatsapp', GROUP, 'p2') is None
-                assert old.lookup_message('whatsapp', GROUP, 'p2') is not None
-                self.differences.append('delete_purge')
-                row = q.native_message(chat_id=GROUP, native_id='p1')
-                assert row['sender_contact_id'] != old.lookup_message('whatsapp', GROUP, 'p1').sender_id
-                assert q.terminal(row['sender_contact_id']) == row['sender_contact_id']
-                self.differences.append('typed_terminal_identity')
-                assert q.audience(row['message_id']).members == frozenset({self.author, self.member})
-                assert self.later in q.members(chat_id=GROUP, at_ms=MS+11000).members
-                self.differences.append('evidence_audience')
-                assert '[Derived transcript]: Synthetic transcript' in history_text(q.native_message(chat_id=GROUP, native_id='p3'))
-                assert 'transcript' not in old.lookup_message('whatsapp', GROUP, 'p3').text
-                self.differences.append('derived_label')
-                assert new.lookup_message_any_chat('whatsapp', 'd1', preferred_chat_id=GROUP) is None
-                assert old.lookup_message_any_chat('whatsapp', 'd1', preferred_chat_id=GROUP) is not None
-                self.differences.append('authorized_cross_chat')
-                assert new.lookup_message('whatsapp', GROUP, 'passive') is not None
-                assert not any(r.get('message_id') == 'passive' for r in legacy.get_or_create(f'whatsapp:{GROUP}').messages)
-                self.differences.append('passive')
-                operational.set_boundary(channel='whatsapp', chat_id=GROUP, at_ms=MS+8000)
-                legacy.get_or_create(f'whatsapp:{GROUP}').add_boundary()
-                assert selected.recent_history(channel='whatsapp', chat_id=GROUP, snapshot=snapshot, limit=50) == []
-                assert legacy.get_or_create(f'whatsapp:{GROUP}').get_history() == []
-                assert q.search(chat_ids=(GROUP,), query='latest', limit=10)
-                self.differences.append('new_boundary')
-            failed = _raw('outbound_request', 'send_text', {'to': GROUP, 'text': 'Synthetic failed answer'},
-                          direction='out', received=MS+12000, corr='failed')
-            result = _raw('outbound_result', 'send_text', {},
-                          direction='out', received=MS+12000, corr='failed')
-            result['native']['result'] = {'ok': False, 'error': 'synthetic transport refusal'}
-            for row in (failed, result):
-                row['chat_id'] = GROUP
-                append_line(self.native_path, dumps(row))
-            session = legacy.get_or_create(f'whatsapp:{GROUP}')
-            session.add_message('assistant', 'Synthetic failed answer')
-            session.add_message('tool', 'Synthetic tool transcript')
-            await self.settle()
-            async with history_turn(self.projector) as snapshot:
-                text = str(selected.recent_history(channel='whatsapp', chat_id=GROUP, snapshot=snapshot, limit=50))
-                assert 'failed answer' not in text and 'tool transcript' not in text
-                assert 'failed answer' in str(session.get_history())
-                self.differences.append('failed_assistant_and_tools')
-            from yeoman_shared.raw_archive.purge import PurgeSelector, purge
-            await self.projector.rebuild(reason='synthetic parity purge', mutation=lambda fd: purge(
-                self.raw, PurgeSelector('whatsapp', chat_id=GROUP, native_id='p3'), operator='synthetic', projection_owner_fd=fd))
-            with self.snapshot() as snapshot:
-                assert HistoryQueries(snapshot).media(chat_id=GROUP, limit=10) == []
-                assert old.lookup_message('whatsapp', GROUP, 'p3') is not None
-                token = set_tool_context(ToolInvocationContext(channel='whatsapp', chat_id=GROUP, history_snapshot=snapshot))
-                try:
-                    assert 'No cached media' in await new_media.execute()
-                finally:
-                    reset_tool_context(token)
-                assert 'message_id=p3' in await old_media.execute()
-        finally:
-            archive.close()
-            operational.close()
-
-
-@pytest.fixture
-async def parity_case(tmp_path, capture_case):
-    case = ParityCase(tmp_path / 'parity', capture_case)
-    await case.start()
-    try:
-        yield case
-    finally:
-        await case.close()
-
 
 @pytest.fixture
 def refusal_case(continuity_case):

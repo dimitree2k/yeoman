@@ -13,9 +13,8 @@ synthetic.
 
 from __future__ import annotations
 
-from pathlib import Path
-
 import pytest
+from history_turn_fixtures import Projector
 from loguru import logger
 from yeoman_gateway.app.bootstrap import _inbound_message_to_event
 from yeoman_gateway.bus.queue import MessageBus
@@ -42,60 +41,17 @@ BRIDGE_ACCOUNT = DEFAULT_NAMESPACE
 OBSERVED_AT_MS = 1_790_000_000_000
 
 
-@pytest.fixture
-def runtime(tmp_path: Path, monkeypatch: pytest.MonkeyPatch):
-    from yeoman_gateway.app.bootstrap import build_gateway_runtime
-    from yeoman_gateway.policy.engine import PolicyEngine
-    from yeoman_gateway.policy.schema import PolicyConfig
-    from yeoman_shared.config.schema import Config
-
-    class _NeverProvider:
-        async def chat(self, *_args: object, **_kwargs: object) -> None:
-            raise AssertionError("building the runtime must not call a model")
-
-        def get_default_model(self) -> str:
-            return "test/provider"
-
-    monkeypatch.setenv("YEOMAN_HOME", str(tmp_path))
-    config = Config.model_validate(
-        {
-            "knowledge": {
-                "enabled": True,
-                "db_path": str(tmp_path / "knowledge.db"),
-                "legacy_contacts_paths": [str(tmp_path / "legacy-contacts.db")],
-                "legacy_memory_paths": [str(tmp_path / "legacy-memory.db")],
-                "capture_enabled": False,
-            },
-            "personaEvolution": {"enabled": False},
-            "processing": {"enabled": False, "participation": {"enabled": False}},
-            "security": {"enabled": False},
-        }
+def _seed_identity(projector: Projector) -> None:
+    projector.db.execute(
+        "INSERT INTO contacts VALUES ('synthetic-person','person',NULL,'Synthetic Sender','confirmed',NULL,'[]')"
     )
-    # Hermeticity: an unchecked field name would fall back to the real default paths.
-    assert Path(config.knowledge.db_path).expanduser() == tmp_path / "knowledge.db"
-
-    built = build_gateway_runtime(
-        config=config,
-        provider=_NeverProvider(),  # type: ignore[arg-type]
-        policy_engine=PolicyEngine(PolicyConfig(), workspace=tmp_path),
-        policy_path=None,
-        workspace=tmp_path / "workspace",
-        bus=MessageBus(),
-    )
-    try:
-        yield built
-    finally:
-        built.inbound_archive.close()
-        built.chat_registry.close()
-        built.contacts.close()
-        built.memory.close()
-
-
-def _contacts_layer(runtime) -> ContactsMiddleware:
-    layers = runtime.orchestrator._orchestrator._pipeline._layers  # noqa: SLF001 - wiring
-    found = [layer for layer in layers if isinstance(layer, ContactsMiddleware)]
-    assert len(found) == 1, "the knowledge composition must wire identity resolution"
-    return found[0]
+    for kind, value in (("pn_jid", PHONE_JID), ("lid", LID)):
+        projector.db.execute(
+            "INSERT INTO identifier_history(contact_id,channel,kind,value,strength,evidence,source_refs) "
+            "VALUES ('synthetic-person','whatsapp',?,?,'strong','native_pair','[]')",
+            (kind, value),
+        )
+    projector.db.commit()
 
 
 def _whatsapp_event(message_id: str, *, with_lid: bool = True) -> WhatsAppInboundEvent:
@@ -153,29 +109,30 @@ def _identifier(kind: str, value: str) -> Identifier:
 
 
 @pytest.mark.asyncio
-async def test_the_live_composition_creates_a_person_for_an_unknown_sender(runtime) -> None:
-    layer = _contacts_layer(runtime)
-    knowledge = runtime.responder.knowledge
+async def test_live_history_does_not_invent_a_person_for_an_unknown_sender() -> None:
+    from yeoman_gateway.history.context import history_turn
 
-    ctx = await _resolve(layer, await _bus_event(_whatsapp_event("SYN-MSG-1")))
-
-    person_id = ctx.event.raw_metadata.get("contact_id")
-    assert person_id, "a proven, unknown sender must get a person"
-    for kind, value in (("phone_jid", PHONE_JID), ("lid", LID)):
-        resolution = knowledge.resolve_identifier(_identifier(kind, value))
-        assert resolution.person_id == person_id, f"{kind} must be bound in the bridge account"
+    projector = Projector()
+    async with history_turn(projector):
+        ctx = await _resolve(ContactsMiddleware(), await _bus_event(_whatsapp_event("SYN-MSG-1")))
+    assert "contact_id" not in ctx.event.raw_metadata
+    projector.close()
 
 
 @pytest.mark.asyncio
-async def test_a_known_sender_resolves_to_the_same_person_on_the_next_message(runtime) -> None:
-    layer = _contacts_layer(runtime)
+async def test_known_sender_resolves_from_the_current_history_snapshot() -> None:
+    from yeoman_gateway.history.context import history_turn
 
-    first = await _resolve(layer, await _bus_event(_whatsapp_event("SYN-MSG-1")))
-    second = await _resolve(layer, await _bus_event(_whatsapp_event("SYN-MSG-2")))
-
-    assert first.event.raw_metadata.get("contact_id")
-    assert second.event.raw_metadata.get("contact_id") == first.event.raw_metadata["contact_id"]
-    assert second.event.raw_metadata.get("identity_reason") == "existing_binding"
+    projector = Projector()
+    _seed_identity(projector)
+    layer = ContactsMiddleware()
+    async with history_turn(projector):
+        first = await _resolve(layer, await _bus_event(_whatsapp_event("SYN-MSG-1")))
+        second = await _resolve(layer, await _bus_event(_whatsapp_event("SYN-MSG-2")))
+    assert first.event.raw_metadata.get("contact_id") == "synthetic-person"
+    assert second.event.raw_metadata.get("contact_id") == "synthetic-person"
+    assert second.event.raw_metadata.get("identity_reason") == "history"
+    projector.close()
 
 
 @pytest.mark.asyncio
@@ -221,11 +178,16 @@ class _FailingKnowledge:
 
 @pytest.mark.asyncio
 async def test_a_failed_resolution_is_logged_with_a_reason_code_and_no_pii() -> None:
+    from yeoman_gateway.history.context import history_turn
+
     records: list[dict] = []
     sink = logger.add(lambda message: records.append(message.record), level="DEBUG")
     try:
         event = await _bus_event(_whatsapp_event("SYN-MSG-1"))
-        ctx = await _resolve(ContactsMiddleware(knowledge=_FailingKnowledge()), event)
+        projector = Projector()
+        async with history_turn(projector):
+            ctx = await _resolve(ContactsMiddleware(knowledge=_FailingKnowledge()), event)
+        projector.close()
     finally:
         logger.remove(sink)
 

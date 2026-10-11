@@ -62,9 +62,9 @@ def _push_name(channel: str, raw: dict[str, Any]) -> str | None:
 
 
 def build_mention_read_context(
-    event: "InboundEvent", *, chat_registry: Any, knowledge: "KnowledgeService"
+    event: "InboundEvent", *, knowledge: "KnowledgeService"
 ) -> "TrustedReadContext | None":
-    """Build a current read context from bridge identity and the live chat registry."""
+    """Build a current read context from bridge identity and History membership."""
     if event.channel != "whatsapp":
         return None
     raw = event.raw_metadata
@@ -72,40 +72,31 @@ def build_mention_read_context(
     if not account_id:
         return None
 
-    from yeoman_gateway.knowledge._memory.read_gate import registry_members
+    from yeoman_gateway.history.context import current_history_snapshot
+    from yeoman_gateway.history.queries import HistoryQueries
     from yeoman_gateway.knowledge.models import TrustedReadContext
     from yeoman_gateway.policy.identity import canonical_user_id
 
     metadata = {str(key): value for key, value in raw.items()}
     principal = canonical_user_id(event.channel, event.sender_id, metadata)
-    members = registry_members(
-        chat_registry, channel=event.channel, chat_id=str(event.chat_id)
-    )
-    if not principal or principal not in members:
+    snapshot = current_history_snapshot()
+    if snapshot is None:
+        raise HistoryPaused('history_scope_required')
+    at_ms = int(event.timestamp.timestamp() * 1000)
+    audience = HistoryQueries(snapshot).members(chat_id=str(event.chat_id), at_ms=at_ms)
+    if not principal or audience.status != 'known' or principal not in audience.members:
         return None
     revision = getattr(knowledge, "policy_revision", None)
     if isinstance(revision, bool) or not isinstance(revision, int) or revision < 0:
         return None
-    try:
-        record = chat_registry.get_chat(event.channel, str(event.chat_id))
-    except HistoryPaused:
-        raise
-    except Exception:
-        return None
-    membership_revision = None
-    if isinstance(record, dict):
-        membership_revision = str(
-            record.get("last_sync_at")
-            or record.get("last_seen_at")
-            or f"{event.channel}:{event.chat_id}:{len(members)}"
-        )
+    membership_revision = audience.snapshot_id or f"{event.channel}:{event.chat_id}:{len(audience.members)}"
     if not membership_revision:
         return None
     return TrustedReadContext(
         principal_id=principal,
         channel=event.channel,
         chat_id=str(event.chat_id),
-        recipient_principals=frozenset(members),
+        recipient_principals=audience.members,
         membership_revision=membership_revision,
         policy_revision=revision,
         purpose="reply",
@@ -122,12 +113,10 @@ class ContactsMiddleware:
         self,
         *,
         knowledge: "KnowledgeService | None" = None,
-        history_selected: bool = False,
         observation_issuer: "Callable[[TrustedIdentityObservation], object] | None" = None,
         mention_context_factory: "Callable[[InboundEvent], TrustedReadContext | None] | None" = None,
     ) -> None:
         self._knowledge = knowledge
-        self._history_selected = history_selected
         # The source authority only verifies an observation that was issued to it.  The
         # composition root hands its issuer in, because this middleware is where the
         # channel's proven metadata becomes an observation.
@@ -137,7 +126,7 @@ class ContactsMiddleware:
     async def __call__(self, ctx: PipelineContext, next: NextFn) -> None:
         event = ctx.event
 
-        if self._history_selected and event.channel == 'whatsapp':
+        if event.channel == 'whatsapp':
             from yeoman_gateway.history.context import current_history_snapshot
             from yeoman_gateway.history.queries import HistoryQueries
             snapshot = current_history_snapshot()
@@ -219,11 +208,6 @@ class ContactsMiddleware:
             event = replace(event, raw_metadata=new_meta)
             ctx.event = event
 
-        if (self._history_selected and event.channel == 'whatsapp') or (
-            getattr(self._knowledge, 'legacy_history_disabled', False) is True
-        ):
-            await next(ctx)
-            return
         observation = self._observation(event.channel, event.participant, event.sender_id, raw)
         if observation is None:
             await next(ctx)

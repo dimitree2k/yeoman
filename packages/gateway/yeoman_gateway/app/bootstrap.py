@@ -20,7 +20,6 @@ from yeoman_shared.telemetry import InMemoryTelemetry, tracing
 
 from yeoman_gateway.a2a.registry import A2AWorkerRegistry
 from yeoman_gateway.adapters.policy_engine import EnginePolicyAdapter
-from yeoman_gateway.adapters.reply_archive_sqlite import SqliteReplyArchiveAdapter
 from yeoman_gateway.adapters.responder_llm import LLMResponder
 from yeoman_gateway.adapters.typing_channel_manager import ChannelManagerTypingAdapter
 from yeoman_gateway.agent.tools.file_access import build_file_access_resolver
@@ -31,8 +30,6 @@ from yeoman_gateway.core.control_ack import OwnerControlAcknowledgements
 from yeoman_gateway.core.intents import (
     OrchestratorIntent,
     PersistSessionIntent,
-    QueueMemoryNotesCaptureIntent,
-    RecordManualMemoryIntent,
     RecordMetricIntent,
     SendOutboundIntent,
     SendReactionIntent,
@@ -45,8 +42,6 @@ from yeoman_gateway.cron.types import CronJob
 from yeoman_gateway.cron.voice import evaluate_voice_quiet_gate
 from yeoman_gateway.heartbeat.service import HeartbeatService
 from yeoman_gateway.knowledge._capture import ObservedSourceRegistrar
-from yeoman_gateway.knowledge._contacts.service import ContactsService
-from yeoman_gateway.knowledge._memory import MemoryService
 from yeoman_gateway.media.document_cache import DocumentCache
 from yeoman_gateway.media.document_processing import DocumentProcessor
 from yeoman_gateway.media.lazy_resolver import LazyMediaResolver
@@ -76,7 +71,6 @@ from yeoman_gateway.providers.factory import ProviderFactory
 from yeoman_gateway.providers.openai_compatible import resolve_openai_compatible_credentials
 from yeoman_gateway.security import NoopSecurity, SecurityEngine
 from yeoman_gateway.session.manager import SessionManager
-from yeoman_gateway.storage.inbound_archive import InboundArchive
 from yeoman_gateway.storage.private_handoff import PrivateHandoffStore
 
 if TYPE_CHECKING:
@@ -211,27 +205,20 @@ class OrchestratorService:
         orchestrator: Orchestrator,
         typing_adapter: ChannelManagerTypingAdapter,
         telemetry: InMemoryTelemetry,
-        memory: MemoryService | None,
         effect_router: "IntentEffectRouter | None" = None,
         processing_store: object | None = None,
         control_acknowledgements: "OwnerControlAcknowledgements | None" = None,
         release_participation_chat: Callable[[str, str], None] | None = None,
         max_concurrent_messages: int = 4,
         history_projector: Any = None,
-        history_selected: bool = False,
-        history_mentions_selected: bool = False,
         history_knowledge: Any = None,
     ) -> None:
         self._history_projector = history_projector
-        self._history_selected = history_selected
-        self._history_mentions_selected = history_mentions_selected
         self._history_knowledge = history_knowledge
         self._bus = bus
         self._orchestrator = orchestrator
         self._typing_adapter = typing_adapter
         self._telemetry = telemetry
-        self._memory = memory
-        self._retired_manual_memory_logged = False
         self._effect_router = effect_router
         self._processing_store = processing_store
         self._control_acknowledgements = control_acknowledgements
@@ -275,7 +262,7 @@ class OrchestratorService:
         """Run one message through pipeline and dispatch without blocking the loop."""
         async with self._ingest_slots:
             try:
-                if self._history_selected and (event.channel == "whatsapp" or (event.channel == "system" and event.chat_id.startswith("whatsapp:"))):
+                if (event.channel == "whatsapp" or (event.channel == "system" and event.chat_id.startswith("whatsapp:"))):
                     from yeoman_gateway.history.context import history_knowledge_scope, history_turn
                     from yeoman_gateway.history.live import HistoryPaused
                     if self._history_projector is None:
@@ -364,7 +351,7 @@ class OrchestratorService:
         if isinstance(intent, SendOutboundIntent) and proof:
             intent = replace(intent, event=replace(intent.event,
                 metadata={**dict(intent.event.metadata or {}), **proof}))
-        if isinstance(intent, SendOutboundIntent) and self._history_mentions_selected and intent.event.channel == 'whatsapp':
+        if isinstance(intent, SendOutboundIntent) and intent.event.channel == 'whatsapp':
             from yeoman_gateway.channels.whatsapp import resolve_history_mentions
             from yeoman_gateway.history.context import current_history_snapshot
             text, mentions = resolve_history_mentions(intent.event.content, intent.event.metadata,
@@ -441,48 +428,6 @@ class OrchestratorService:
             case PersistSessionIntent():
                 # Sessions are persisted by the responder implementation.
                 return
-            case QueueMemoryNotesCaptureIntent():
-                if self._memory is None:
-                    return
-                self._memory.enqueue_background_note(
-                    channel=intent.channel,
-                    chat_id=intent.chat_id,
-                    sender_id=intent.sender_id,
-                    message_id=intent.message_id,
-                    content=intent.content,
-                    is_group=intent.is_group,
-                    mode=intent.mode,
-                    batch_interval_seconds=intent.batch_interval_seconds,
-                    batch_max_messages=intent.batch_max_messages,
-                )
-            case RecordManualMemoryIntent():
-                if self._memory is None:
-                    from yeoman_gateway.pipeline.idea_capture import RETIRED_MEMORY_MESSAGE
-                    if not self._retired_manual_memory_logged:
-                        logger.info("manual_memory_unavailable_after_history_migration")
-                        self._retired_manual_memory_logged = True
-                    await self._dispatch_intent(SendOutboundIntent(event=OutboundEvent(
-                        channel=intent.channel, chat_id=intent.chat_id,
-                        content=RETIRED_MEMORY_MESSAGE,
-                    )), principal=principal)
-                    return
-                mapped_kind = "decision" if intent.entry_kind == "backlog" else "episodic"
-                salience = 0.9 if intent.entry_kind == "backlog" else 0.8
-                self._memory.record_manual(
-                    channel=intent.channel,
-                    chat_id=intent.chat_id,
-                    sender_id=intent.sender_id,
-                    scope_type="chat",
-                    kind=mapped_kind,
-                    text=intent.content,
-                    importance=salience,
-                    confidence=1.0,
-                )
-                self._memory.record_idea_backlog_capture(
-                    entry_kind=intent.entry_kind,
-                    content=intent.content,
-                    source="orchestrator_manual_capture",
-                )
             case RecordMetricIntent():
                 self._telemetry.incr(intent.name, intent.value, intent.labels)
             case _:
@@ -491,8 +436,6 @@ class OrchestratorService:
 
 def build_history_projector(config: Config, channels: ChannelManager) -> HistoryProjector | None:
     """Check activation before resolving a destination or constructing any history resource."""
-    if not config.history.live_projection_enabled:
-        return None
     from yeoman_shared.raw_archive.writer import RawArchive
 
     from yeoman_gateway.history.live import HistoryProjector, history_db_path
@@ -510,11 +453,7 @@ class GatewayRuntime:
     channels: ChannelManager
     cron: CronService
     heartbeat: HeartbeatService
-    inbound_archive: InboundArchive | None
     responder: LLMResponder
-    memory: MemoryService | None
-    contacts: ContactsService | None
-    chat_registry: object
     bus: MessageBus | None = None
     gateway_socket: "GatewaySocket | None" = None
     speakup_log: object | None = None
@@ -524,7 +463,6 @@ class GatewayRuntime:
     processing: "ProcessingStore | None" = None
     reconciliation: object | None = None
     retention: object | None = None
-    shared_facts: object | None = None
     statement_capture: object | None = None
     startup_hook: Callable[[], Awaitable[None]] | None = None
     history_projector: HistoryProjector | None = None
@@ -575,8 +513,6 @@ class GatewayRuntime:
                     await maintenance_start()
             if self.gateway_socket:
                 await self.gateway_socket.start()
-            if self.shared_facts is not None and hasattr(self.shared_facts, "start"):
-                self.shared_facts.start()
             if self.statement_capture is not None and hasattr(self.statement_capture, "start"):
                 result = self.statement_capture.start()
                 if inspect.isawaitable(result):
@@ -637,23 +573,13 @@ class GatewayRuntime:
                     # cleanup (including the store fence) still runs below.
                     retention_error = exc
             await attempt_async(self.responder.aclose)
-            if self.inbound_archive is not None:
-                attempt_sync(self.inbound_archive.close)
             if self.speakup_log is not None and hasattr(self.speakup_log, "close"):
                 attempt_sync(self.speakup_log.close)
-            if hasattr(self.chat_registry, "close"):
-                attempt_sync(self.chat_registry.close)
-            if self.shared_facts is not None and hasattr(self.shared_facts, "stop"):
-                attempt_sync(self.shared_facts.stop)
             if self.statement_capture is not None and hasattr(self.statement_capture, "stop"):
                 if inspect.iscoroutinefunction(self.statement_capture.stop):
                     await attempt_async(self.statement_capture.stop)
                 else:
                     attempt_sync(self.statement_capture.stop)
-            if self.contacts is not None:
-                attempt_sync(self.contacts.close)
-            if self.memory is not None:
-                attempt_sync(self.memory.close)
             if self.processing is not None:
                 attempt_sync(self.processing.close)
             if self.history_projector is not None:
@@ -756,115 +682,8 @@ def build_processing_store(
         ) from exc
 
 
-@dataclass
-class SharedFactRuntime:
-    """Read gate plus (optionally) the extraction queue for one gateway process."""
-
-    gate: object
-    extraction: object | None
-    memory: object
-    processing: object | None = None
-    chat_registry: object | None = None
-    policy: object | None = None
-    config: object | None = None
-
-    @property
-    def extraction_enabled(self) -> bool:
-        return self.extraction is not None
-
-    def start(self) -> None:
-        if self.extraction is not None:
-            self.extraction.start()
-
-    def stop(self) -> None:
-        if self.extraction is not None:
-            self.extraction.stop()
 
 
-def build_shared_fact_runtime(
-    config: "Config",
-    *,
-    store: "ProcessingStore | None" = None,
-    processing: object | None = None,
-    chat_registry: object | None = None,
-    policy: object | None = None,
-    memory: "MemoryService | None" = None,
-    legacy_history_disabled: bool = False,
-) -> SharedFactRuntime | None:
-    """Shared-fact runtime (Plan 05), or ``None`` when any switch is off.
-
-    Three switches must agree before anything exists: memory, the shared-fact opt-in and
-    the new processing mode. Disabled mode therefore has no worker thread, no job row and
-    no gate object - the same fail-closed shape as :func:`build_processing_store`.
-    """
-    from yeoman_gateway.history.writer_guard import legacy_history_writers_disabled
-    if legacy_history_writers_disabled(legacy_history_disabled) or getattr(getattr(config, "history", None), "legacy_writers_disabled", False) is True:
-        return None
-    if not getattr(getattr(config, "memory", None), "enabled", False):
-        return None
-    shared = getattr(config.memory, "shared", None)
-    if shared is None or not bool(getattr(shared, "enabled", False)):
-        return None
-    if not getattr(getattr(config, "processing", None), "enabled", False):
-        return None
-    if memory is None or store is None:
-        return None
-
-    from yeoman_gateway.knowledge._memory.extraction_jobs import (
-        EXTRACTOR_VERSION,
-        SharedFactExtractionQueue,
-    )
-    from yeoman_gateway.knowledge._memory.read_gate import FactReadGate
-
-    extraction_cfg = getattr(config.processing, "extraction", None)
-    retention_cfg = getattr(config.processing, "retention", None)
-    fact_ttl_ms = (
-        int(retention_cfg.shared_fact_days) * 24 * 3600 * 1000 if retention_cfg else None
-    )
-    extractor = None
-    if bool(getattr(shared, "extraction_enabled", False)):
-        from yeoman_gateway.knowledge._memory.fact_extractor import SharedFactExtractor
-
-        try:
-            tz_name = str(getattr(extraction_cfg, "timezone", "UTC") or "UTC")
-            extractor = SharedFactExtractor(
-                config=config,
-                timezone_name=tz_name,
-                route_key=str(
-                    getattr(
-                        getattr(config.memory, "capture", None),
-                        "extract_route",
-                        "memory.capture.extract",
-                    )
-                ),
-                member_provider=_shared_fact_members(chat_registry),
-            )
-        except Exception:
-            logger.exception("shared fact extractor unavailable; extraction stays off")
-            extractor = None
-    queue = SharedFactExtractionQueue(
-        store=memory.store,
-        legacy_history_disabled=legacy_history_disabled,
-        journal=store,
-        extractor=extractor,
-        embedder=getattr(memory, "embedding", None),
-        idle_ms=int(getattr(extraction_cfg, "idle_seconds", 60)) * 1000,
-        max_delay_ms=int(getattr(extraction_cfg, "max_delay_seconds", 300)) * 1000,
-        max_waiting=int(getattr(shared, "max_jobs_waiting", 64)),
-        fact_ttl_ms=fact_ttl_ms,
-        extractor_version=str(getattr(shared, "extractor_version", EXTRACTOR_VERSION)),
-    )
-    runtime = SharedFactRuntime(
-        gate=FactReadGate(memory.store),
-        extraction=queue if bool(getattr(shared, "extraction_enabled", False)) else None,
-        memory=memory,
-        processing=processing,
-        chat_registry=chat_registry,
-        policy=policy,
-        config=shared,
-    )
-    memory.extraction = runtime.extraction
-    return runtime
 
 
 def build_statement_capture(
@@ -883,18 +702,10 @@ def build_statement_capture(
     """
     if knowledge is None:
         return None
-    selected = config.history.live_projection_enabled and config.history.readers.knowledge
-    if config.history.legacy_writers_disabled is True and not selected:
-        return None
-    if not selected and processing is None:
-        return None
     if not bool(getattr(config.knowledge, "capture_enabled", False)):
         return None
 
-    from yeoman_gateway.knowledge._capture import StatementCaptureProducer
     from yeoman_gateway.knowledge._capture_worker import (
-        STATEMENT_EXTRACTOR_VERSION,
-        StatementCaptureWorker,
         StatementExtractor,
     )
 
@@ -910,29 +721,19 @@ def build_statement_capture(
     except Exception:
         logger.exception("statement capture extractor unavailable; promotion stays off")
         return None
-    if selected:
-        from yeoman_gateway.history.live import HistoryPaused
-        from yeoman_gateway.knowledge._history_capture import (
-            HistoryCaptureProducer,
-            HistoryCaptureWorker,
-        )
-        if projector is None:
-            raise HistoryPaused("capture_projector_required")
-        from yeoman_gateway.knowledge.api import KnowledgeService
-        history_knowledge = cast(KnowledgeService, knowledge)
-        history_producer = HistoryCaptureProducer(history_knowledge, **settings)
-        return HistoryCaptureWorker(projector=projector, knowledge=history_knowledge,
-            producer=history_producer, extractor=extractor,
-            poll_seconds=float(getattr(knowledge_cfg, "capture_poll_seconds", 5.0)))
-    producer = StatementCaptureProducer(knowledge=knowledge, processing=processing,
-        extractor_version=STATEMENT_EXTRACTOR_VERSION, **settings)
-    return StatementCaptureWorker(
-        knowledge=knowledge,
-        processing=processing,
-        extractor=extractor,
-        producer=producer,
-        poll_seconds=float(getattr(knowledge_cfg, "capture_poll_seconds", 5.0)),
+    from yeoman_gateway.history.live import HistoryPaused
+    from yeoman_gateway.knowledge._history_capture import (
+        HistoryCaptureProducer,
+        HistoryCaptureWorker,
     )
+    if projector is None:
+        raise HistoryPaused("capture_projector_required")
+    from yeoman_gateway.knowledge.api import KnowledgeService
+    history_knowledge = cast(KnowledgeService, knowledge)
+    history_producer = HistoryCaptureProducer(history_knowledge, **settings)
+    return HistoryCaptureWorker(projector=projector, knowledge=history_knowledge,
+        producer=history_producer, extractor=extractor,
+        poll_seconds=float(getattr(knowledge_cfg, "capture_poll_seconds", 5.0)))
 
 
 def _build_reaction_action(
@@ -1132,6 +933,21 @@ def _offer_participation_trigger(
     return None
 
 
+def _history_members(*, channel: str, chat_id: str) -> frozenset[str]:
+    from yeoman_gateway.history.context import current_history_snapshot
+    from yeoman_gateway.history.live import HistoryPaused
+    from yeoman_gateway.history.queries import HistoryQueries
+    snapshot = current_history_snapshot()
+    if snapshot is None:
+        raise HistoryPaused("history_scope_required")
+    if channel != "whatsapp":
+        return frozenset()
+    audience = HistoryQueries(snapshot).members(chat_id=chat_id, at_ms=int(time.time() * 1000))
+    if audience.status != "known":
+        raise HistoryPaused("history_membership_unproven")
+    return frozenset(audience.members)
+
+
 def _participation_knowledge_readers(
     opportunity: object,
     context: Mapping[str, object],
@@ -1146,8 +962,6 @@ def _participation_knowledge_readers(
     to recent-only: the selector intersects the authors' protected reads instead, so
     no author's rights are borrowed and none are unioned.
     """
-    from yeoman_gateway.knowledge._memory.read_gate import registry_members
-    from yeoman_gateway.knowledge._memory.shared_facts import FactReadContext
     from yeoman_gateway.knowledge.models import TrustedReadContext
     from yeoman_gateway.processing.participation_knowledge import (
         MAX_EVIDENCE_READERS,
@@ -1175,7 +989,7 @@ def _participation_knowledge_readers(
     if not source_ids or "" in authors:
         return "source_unavailable"
     try:
-        members = frozenset(registry_members(chat_registry, channel=channel, chat_id=chat_id))
+        members = frozenset(_history_members(channel=channel, chat_id=chat_id))
     except Exception:
         return "unknown_membership"
     if not members:
@@ -1211,14 +1025,7 @@ def _participation_knowledge_readers(
         readers.append(
             ParticipationKnowledgeReader(
                 read_context,
-                FactReadContext(
-                    principal_id=principal,
-                    chat_scope_key=read_context.scope_key(),
-                    current_members=members,
-                    now_ms=now,
-                    owner=False,
-                    group_wide=True,
-                ),
+
             )
         )
     return ParticipationKnowledgeReaders(readers=tuple(readers))
@@ -1302,28 +1109,6 @@ def _build_participation_runtime(
         else None
     )
 
-    def _taste_hits(channel: str, chat_id: str) -> list[dict[str, object]]:
-        taste_reader = getattr(responder, "memory", None)
-        if taste_reader is None or not hasattr(taste_reader, "learned_chat_taste"):
-            return []
-        hits = taste_reader.learned_chat_taste(
-            channel=channel,
-            chat_id=chat_id,
-            limit=5,
-            require_meta={"provenance": "participation:v1"},
-        )
-        rendered: list[dict[str, object]] = []
-        for hit in hits:
-            entry = getattr(hit, "entry", None)
-            rendered.append(
-                {
-                    "content": str(getattr(entry, "content", "")),
-                    "provenance": "participation:v1",
-                    "confidence": getattr(entry, "confidence", None),
-                }
-            )
-        return rendered
-
     def _source_authorized(row: Mapping[str, object]) -> bool:
         return participant_is_allowed(
             engine=policy_engine,
@@ -1336,18 +1121,15 @@ def _build_participation_runtime(
     knowledge_context_supplier = None
     revalidate_knowledge = None
     knowledge = getattr(responder, "knowledge", None)
-    memory = getattr(responder, "memory", None)
     if (
         bool(getattr(participation, "knowledge_enabled", False))
         and knowledge is not None
-        and memory is not None
-        and chat_registry is not None
     ):
         from yeoman_gateway.processing.participation_knowledge import (
             ParticipationKnowledgeSelector,
         )
 
-        selector = ParticipationKnowledgeSelector(knowledge=knowledge, memory=memory)
+        selector = ParticipationKnowledgeSelector(knowledge=knowledge)
         knowledge_selector = selector
 
         def _knowledge_contexts(
@@ -1373,7 +1155,6 @@ def _build_participation_runtime(
         archive=inbound_archive,
         policy=policy_engine,
         anchors=anchors,
-        taste=_taste_hits,
         source_authorizer=_source_authorized,
         knowledge_selector=knowledge_selector,
         knowledge_context_supplier=knowledge_context_supplier,
@@ -1612,7 +1393,7 @@ def _build_participation_runtime(
         bind_submission(submission)
     # Same durable validator the pre-dispatch hook uses, so the approval commit and the
     # transport boundary cannot drift apart.
-    if knowledge is not None and memory is not None and chat_registry is not None:
+    if knowledge is not None:
         bind_validator = getattr(
             approval_tools, "set_knowledge_decision_validator", None
         )
@@ -1621,15 +1402,15 @@ def _build_participation_runtime(
                 _knowledge_decision_validator(
                     chat_registry=chat_registry,
                     knowledge=knowledge,
-                    memory=memory,
                 )
             )
-    if knowledge is None and config.history.live_projection_enabled and config.history.readers.participation:
+    if (knowledge is None):
         bind_validator = getattr(approval_tools, 'set_knowledge_decision_validator', None)
         if callable(bind_validator):
             from yeoman_gateway.history.context import validate_history_evidence
             def validate_native_admission(admission: object) -> tuple[bool, str]:
-                allowed = validate_history_evidence(getattr(admission, 'knowledge_evidence', None))
+                evidence = getattr(admission, 'knowledge_evidence', None)
+                allowed = (evidence is None or isinstance(evidence, dict) and set(evidence) == {'history'}) and validate_history_evidence(evidence)
                 return allowed, 'allow' if allowed else 'history_sources_changed'
             bind_validator(validate_native_admission)
     reactor = (
@@ -1638,7 +1419,6 @@ def _build_participation_runtime(
         and bool(getattr(responder, "participation_reaction_available", False))
         else None
     )
-    context_builder._history_selected = config.history.live_projection_enabled and config.history.readers.participation
     decision_runtime = ParticipationDecisionRuntime(
         judge=judge,
         context_builder=context_builder,
@@ -1659,8 +1439,8 @@ def _build_participation_runtime(
         ),
         revalidate_knowledge=revalidate_knowledge,
         history_projector=getattr(responder, "_history_projector", None)
-            if config.history.live_projection_enabled and config.history.readers.participation else None,
-        history_knowledge=knowledge if config.history.live_projection_enabled and config.history.readers.participation else None,
+           ,
+        history_knowledge=knowledge,
     )
 
     async def _handle(opportunity: object) -> None:
@@ -2001,23 +1781,6 @@ def _far_past():
     return datetime(2000, 1, 1, tzinfo=UTC)
 
 
-def _shared_fact_members(chat_registry: object | None):
-    """Proven chat participants, or ``None`` when nothing is proven.
-
-    The audience of a fact must come from a recorded participant list - never from the
-    model and never from a guess. Unknown membership therefore yields no audience, and
-    the fact degrades to ``author_only``.
-    """
-    if chat_registry is None:
-        return None
-
-    def _lookup(channel: str, chat_id: str) -> frozenset[str] | None:
-        from yeoman_gateway.knowledge._memory.read_gate import registry_members
-
-        members = registry_members(chat_registry, channel=channel, chat_id=chat_id)
-        return frozenset(members) if members else None
-
-    return _lookup
 
 
 def build_reconciliation_service(
@@ -2234,7 +1997,6 @@ def _knowledge_decision_validator(
     *,
     chat_registry: object,
     knowledge: object,
-    memory: object,
 ) -> "_KnowledgeDecisionValidator":
     """Compose the durable knowledge validator from the live stores."""
     from yeoman_gateway.processing.participation_knowledge import (
@@ -2242,7 +2004,7 @@ def _knowledge_decision_validator(
     )
 
     return _KnowledgeDecisionValidator(
-        selector=ParticipationKnowledgeSelector(knowledge=knowledge, memory=memory),
+        selector=ParticipationKnowledgeSelector(knowledge=knowledge),
         chat_registry=chat_registry,
         knowledge=knowledge,
     )
@@ -2305,8 +2067,6 @@ class _KnowledgeDecisionValidator:
         self, admission: object, evidence: Mapping[str, Any]
     ) -> object | None:
         """Rebuild one reader per stored author from current membership and policy."""
-        from yeoman_gateway.knowledge._memory.read_gate import registry_members
-        from yeoman_gateway.knowledge._memory.shared_facts import FactReadContext
         from yeoman_gateway.knowledge.models import TrustedReadContext
         from yeoman_gateway.processing.participation_knowledge import (
             ParticipationKnowledgeReader,
@@ -2319,7 +2079,7 @@ class _KnowledgeDecisionValidator:
         channel = str(getattr(admission, "channel", "") or "")
         chat_id = str(getattr(admission, "chat_id", "") or "")
         members = frozenset(
-            registry_members(self._chat_registry, channel=channel, chat_id=chat_id)
+            _history_members(channel=channel, chat_id=chat_id)
         )
         if not members or any(principal not in members for principal in principals):
             return None
@@ -2371,14 +2131,7 @@ class _KnowledgeDecisionValidator:
             readers.append(
                 ParticipationKnowledgeReader(
                     read_context,
-                    FactReadContext(
-                        principal_id=principal,
-                        chat_scope_key=read_context.scope_key(),
-                        current_members=members,
-                        now_ms=now,
-                        owner=False,
-                        group_wide=True,
-                    ),
+
                 )
             )
         return ParticipationKnowledgeReaders(readers=tuple(readers))
@@ -2541,26 +2294,14 @@ def build_effect_router(
         current_senders: dict[str, str] = {}
         from yeoman_gateway.history.context import current_history_snapshot
         history_snapshot = current_history_snapshot()
-        history_selected = config.history.live_projection_enabled and config.history.readers.participation
-        if history_selected:
-            if history_snapshot is not None:
-                from yeoman_gateway.adapters.reply_archive_history import HistoryReplyArchiveAdapter
-                from yeoman_gateway.history.queries import HistoryQueries
-                archive = HistoryReplyArchiveAdapter(HistoryQueries(history_snapshot))
-                for source_id in source_ids:
-                    row = archive.row(channel, chat_id, source_id)
-                    if row is not None and row['sender_id']:
-                        current_senders[source_id] = str(row['sender_id'])
-        elif inbound_archive is not None and hasattr(inbound_archive, "senders_for_messages"):
-            try:
-                current_senders = {
-                    str(key): str(value)
-                    for key, value in inbound_archive.senders_for_messages(
-                        channel, chat_id, source_ids
-                    ).items()
-                }
-            except Exception:
-                current_senders = {}
+        if history_snapshot is not None:
+            from yeoman_gateway.adapters.reply_archive_history import HistoryReplyArchiveAdapter
+            from yeoman_gateway.history.queries import HistoryQueries
+            archive = HistoryReplyArchiveAdapter(HistoryQueries(history_snapshot))
+            for source_id in source_ids:
+                row = archive.row(channel, chat_id, source_id)
+                if row is not None and row['sender_id']:
+                    current_senders[source_id] = str(row['sender_id'])
         exact_sources = bool(
             source_ids
             and len(expected_senders) == len(source_ids)
@@ -2800,7 +2541,7 @@ def build_effect_router(
         return False, reason
 
     executor = BusEffectExecutor(
-        history_mentions_selected=config.history.live_projection_enabled and (config.history.readers.whatsapp or config.history.readers.tools),
+
         bus=bus,
         mark_provenance=True,
         security=security,
@@ -2822,47 +2563,6 @@ def build_effect_router(
     )
 
 
-def _validate_legacy_writer_retirement(config: "Config") -> None:
-    """Validate the prepared replacement set and durable handover before writers exist."""
-    if config.history.legacy_writers_disabled is not True:
-        return
-    import json
-    import sqlite3
-
-    from yeoman_gateway.adapters.reply_archive_history import HistoryReplyArchiveAdapter
-    from yeoman_gateway.agent.tools.history_read import HistoryReadTool
-    from yeoman_gateway.history.export import SecondaryArchive
-    from yeoman_gateway.history.live import HistoryPaused
-    from yeoman_gateway.history.queries import HistoryQueries
-    from yeoman_gateway.knowledge._history_capture import (
-        HistoryCaptureProducer,
-        HistoryCaptureWorker,
-    )
-    from yeoman_gateway.knowledge._history_identity import HistoryIdentityEngine
-
-    adapters = (HistoryReplyArchiveAdapter, HistoryQueries, HistoryReadTool, SecondaryArchive,
-                HistoryIdentityEngine, HistoryCaptureProducer, HistoryCaptureWorker)
-    if config.history.live_projection_enabled is not True or not all(callable(a) for a in adapters):
-        raise HistoryPaused("writer_retirement_replacements_required")
-    if config.knowledge.enabled is not True:
-        raise HistoryPaused("writer_retirement_knowledge_required")
-    path = Path(config.knowledge.db_path).expanduser().resolve()
-    connection = None
-    try:
-        connection = sqlite3.connect(path.as_uri() + "?mode=ro", uri=True)
-        version = connection.execute("SELECT value FROM knowledge_meta WHERE key='schema_version'").fetchone()
-        row = connection.execute("SELECT value_json FROM knowledge_history_capture_state WHERE key='handover'").fetchone()
-        receipt = json.loads(row[0]) if row else None
-        if (version != ('3',) or not isinstance(receipt, dict) or receipt.get('version') != 1
-                or type(receipt.get('generation')) is not int or receipt['generation'] < 1
-                or not all(isinstance(receipt.get(key), list) for key in ('sources', 'pending', 'processed', 'legacy_boundary'))
-                or len(receipt['legacy_boundary']) != 2):
-            raise HistoryPaused("writer_retirement_handover_required")
-    except (OSError, sqlite3.Error, ValueError, TypeError) as exc:
-        raise HistoryPaused("writer_retirement_handover_required") from exc
-    finally:
-        if connection is not None:
-            connection.close()
 
 
 def build_gateway_runtime(
@@ -2876,8 +2576,6 @@ def build_gateway_runtime(
 ) -> GatewayRuntime:
     """Compose full gateway runtime around vNext orchestrator."""
 
-    _validate_legacy_writer_retirement(config)
-    legacy_history_disabled = config.history.legacy_writers_disabled is True
 
     from yeoman_shared.utils.helpers import get_operational_data_path, get_operational_store_path
 
@@ -2918,14 +2616,10 @@ def build_gateway_runtime(
             )
 
     session_manager = SessionManager(workspace,
-        history_selected=config.history.live_projection_enabled and config.history.readers.responder,
-        legacy_history_disabled=config.history.legacy_writers_disabled)
-    # The owner wants a complete inbound record: keep every message, purge nothing.
-    inbound_archive = None if legacy_history_disabled else InboundArchive(
-        db_path=get_operational_data_path() / "inbound" / "reply_context.db",
-        retention_days=None,
-        legacy_history_disabled=legacy_history_disabled,
-    )
+
+        )
+    from yeoman_gateway.history.export import SecondaryArchive
+    inbound_archive = SecondaryArchive()
     model_router = ModelRouter(config.models)
     media_storage = MediaStorage(
         incoming_dir=config.channels.whatsapp.media.incoming_path,
@@ -2975,22 +2669,13 @@ def build_gateway_runtime(
         except Exception as exc:
             logger.warning("security classifier disabled: {}", exc)
 
-    from yeoman_gateway.storage.chat_registry import ChatRegistry
-
-    chat_registry = None if legacy_history_disabled else ChatRegistry(
-        db_path=get_operational_data_path() / "inbound" / "chat_registry.db",
-        legacy_history_disabled=legacy_history_disabled,
-    )
-
+    chat_registry = None
     # ── knowledge storage ownership ──────────────────────────────────────────
     # With knowledge.enabled the consolidated store is the *only* writer: the memory
     # and contacts services join its one connection instead of opening their own.
     # Without it the legacy layout is untouched (no partial cutover, no second writer).
     knowledge_service: object | None = None
     knowledge_sources: object | None = None
-    history_identity_selected = config.history.live_projection_enabled and any((
-        config.history.readers.knowledge, config.history.readers.participation,
-        config.history.readers.whatsapp, config.history.readers.responder, config.history.readers.tools, config.history.readers.secondary))
     if getattr(config.knowledge, "enabled", False):
         from yeoman_gateway.knowledge import open_knowledge_store, workspace_id_for
         from yeoman_gateway.knowledge.runtime import (
@@ -3012,78 +2697,20 @@ def build_gateway_runtime(
         try:
             knowledge_service = open_knowledge_store(
                 Path(config.knowledge.db_path).expanduser(),
-                history_mode=history_identity_selected or legacy_history_disabled,
-                legacy_history_disabled=legacy_history_disabled,
+
                 workspace_id=workspace_id_for(workspace),
                 source_authority=knowledge_sources,
                 policy_authority=knowledge_policy,
-                legacy_sources=tuple(
-                    Path(item).expanduser()
-                    for item in (
-                        list(config.knowledge.legacy_memory_paths)
-                        + list(config.knowledge.legacy_contacts_paths)
-                    )
-                ),
+
             )
         except Exception as exc:
             # Fail closed: never silently fall back to a second, unprotected store.
             logger.error("person knowledge unavailable: {}", exc)
             raise
 
-    if legacy_history_disabled:
-        memory_service = None
-        contacts_service = None
-    elif knowledge_service is not None:
-        memory_service = MemoryService(
-            workspace=workspace,
-            config=config.memory,
-            root_config=config,
-            store=knowledge_service.memory_store(),
-            owns_store=False,
-            legacy_history_disabled=legacy_history_disabled,
-        )
-        if history_identity_selected:
-            contacts_service = None
-        else:
-            contacts_service = ContactsService(store=knowledge_service.contacts_store(), legacy_history_disabled=legacy_history_disabled)
-            contacts_service.mark_owner_from_policy(
-                policy_engine.policy.owners if policy_engine else {},
-            )
-            memory_service.set_contacts(contacts_service)
-    else:
-        memory_service = MemoryService(
-            workspace=workspace, config=config.memory, root_config=config, legacy_history_disabled=legacy_history_disabled
-        )
-        contacts_service = None if history_identity_selected else ContactsService(
-            db_path=get_operational_data_path() / "contacts" / "contacts.db",
-            legacy_history_disabled=legacy_history_disabled,
-        )
-        if contacts_service is not None:
-            contacts_service.mark_owner_from_policy(policy_engine.policy.owners if policy_engine else {})
-            memory_service.set_contacts(contacts_service)
-        try:
-            linked = contacts_service.backfill_memory(memory_service.store) if contacts_service is not None else 0
-            if linked > 0:
-                logger.info("contacts: backfilled {} memory nodes with contact_id", linked)
-        except Exception as e:
-            logger.warning("contacts: memory backfill failed: {}", e)
-
-    # Cut-over consumers resolve people through the knowledge facade, so they receive the
-    # legacy cache only in a composition that has no facade at all: with knowledge open, a
-    # second, unproven cache must not be reachable from those call sites.  The service
-    # itself stays constructed - it still owns the memory scoping and the shutdown path,
-    # and it is retired only together with its last consumer, after the migration.
-    consumer_contacts = None if knowledge_service is not None else contacts_service
-
-    try:
-        imported = memory_service.backfill_from_workspace_files(force=False) if memory_service is not None else 0
-        if imported > 0:
-            logger.info("memory backfill imported {} entries", imported)
-    except Exception as e:
-        logger.warning("memory backfill failed: {}", e)
 
     cron_store_path = get_operational_store_path("cron")
-    cron = CronService(cron_store_path, sessions_dir=get_operational_data_path() / "inbound")
+    cron = CronService(cron_store_path, sessions_dir=session_manager.sessions_dir)
     private_handoffs = PrivateHandoffStore(get_operational_data_path() / "policy" / "private_handoffs.json")
 
     # Create policy adapter first so we can use it for owner_alert_resolver
@@ -3188,7 +2815,7 @@ def build_gateway_runtime(
         _knowledge_decision_validator(
             chat_registry=chat_registry,
             knowledge=knowledge_service,
-            memory=memory_service,
+
         )
         if knowledge_service is not None
         else None
@@ -3236,7 +2863,7 @@ def build_gateway_runtime(
             bus=bus,
             log=speakup_log,
             inbound_archive=inbound_archive,
-            memory=memory_service,
+
             security=security,
             approval_store=speakup_approval_store,
             service_effects=service_effects,
@@ -3268,14 +2895,14 @@ def build_gateway_runtime(
         effect_router=effect_router,
         a2a_delivery=service_effects,
         processing_store=processing_store,
-        memory_service=memory_service,
+
         knowledge=knowledge_service,
         knowledge_sources=knowledge_sources,
         telemetry=telemetry,
         security=security,
         cron_service=cron,
-        contacts_service=consumer_contacts,
-        chat_registry=chat_registry,
+
+
         caldav_service=_caldav_service,
         owner_alert_resolver=policy_adapter.owner_recipients,
         file_access_resolver=file_access_resolver,
@@ -3285,7 +2912,7 @@ def build_gateway_runtime(
         service_effects=service_effects,
         tts=tts,
         whatsapp_tts_outgoing_dir=config.channels.whatsapp.media.outgoing_path,
-        inbound_archive=inbound_archive,
+
         private_handoff_store=private_handoffs,
         a2a_registry=a2a_registry,
         quota_governance=quota_governance,
@@ -3346,7 +2973,7 @@ def build_gateway_runtime(
         config,
         bus,
         session_manager=session_manager,
-        inbound_archive=inbound_archive,
+
         model_router=model_router,
         media_storage=media_storage,
         provider_factory=provider_factory,
@@ -3355,8 +2982,8 @@ def build_gateway_runtime(
         processing_signals=(
             SignalJournalSink(
                 processing_store,
-                memory=memory_service,
-                legacy_history_disabled=legacy_history_disabled,
+
+
                 sources=observed_sources,
                 statements=knowledge_service,
                 identity_observation_issuer=knowledge_sources,
@@ -3364,7 +2991,7 @@ def build_gateway_runtime(
                     SignalInvalidator(
                         store=processing_store,
                         actors=thread_registry,
-                        memory=memory_service,
+
                         statements=knowledge_service,
                     )
                     if processing_store is not None and config.processing.enabled
@@ -3445,9 +3072,7 @@ def build_gateway_runtime(
             channel=next_job.payload.channel or "cli",
             chat_id=next_job.payload.to or "direct",
             model_profile=next_job.payload.model_profile,
-            is_owner=(config.history.live_projection_enabled and config.history.readers.secondary
-                      and not next_job.payload.deliver and not next_job.payload.to
-                      and next_job.payload.channel in {None, "cli"}),
+            is_owner=((not next_job.payload.deliver and not next_job.payload.to and next_job.payload.channel in {None, "cli"})),
         )
         if next_job.payload.deliver and next_job.payload.to:
             delivery_channel = next_job.payload.channel or "cli"
@@ -3467,7 +3092,8 @@ def build_gateway_runtime(
         if next_job.payload.next_job_id and response and not is_chain_failure(response):
             await _handle_chain(next_job, response, run_id)
 
-    archive_adapter = SqliteReplyArchiveAdapter(inbound_archive, legacy_history_disabled=legacy_history_disabled)
+    from yeoman_gateway.adapters.reply_archive_history import HistoryReplyArchiveAdapter
+    archive_adapter = HistoryReplyArchiveAdapter()
     opportunity_scheduler: object | None = None
 
     def _release_participation_chat(channel: str, chat_id: str) -> None:
@@ -3518,54 +3144,40 @@ def build_gateway_runtime(
 
         def mention_context_factory(event):
             return build_mention_read_context(
-                event, chat_registry=chat_registry, knowledge=knowledge_service
+                event,  knowledge=knowledge_service
             )
 
     history_projector = build_history_projector(config, channels)
-    if channels.processing_signals is not None and history_identity_selected:
+    if (channels.processing_signals is not None):
         channels.processing_signals._history_projector = history_projector
         channels.processing_signals._history_knowledge = knowledge_service
-    if effect_router is not None and config.history.live_projection_enabled and any((
-        config.history.readers.participation, config.history.readers.whatsapp,
-        config.history.readers.responder, config.history.readers.tools, config.history.readers.secondary)):
-        effect_router._gateway.set_history_scope(history_projector, knowledge_service if history_identity_selected else None)
+    if (effect_router is not None and any((
+        True, True,
+        True, True, True))):
+        effect_router._gateway.set_history_scope(history_projector, knowledge_service)
     from yeoman_gateway.history.export import SecondaryArchive
-    secondary_inbound_archive = SecondaryArchive(inbound_archive, config.history) if config.history.live_projection_enabled and config.history.readers.secondary else inbound_archive
+    secondary_inbound_archive = SecondaryArchive()
     if consciousness_tools is not None:
         consciousness_tools._history_projector = history_projector
         consciousness_tools._history_knowledge = knowledge_service
         consciousness_tools.knowledge = knowledge_service
         consciousness_tools.inbound_archive = secondary_inbound_archive
-    policy_adapter._history_config = config.history
-    if policy_adapter._policy_admin_service is not None:
-        policy_adapter._policy_admin_service._history_config = config.history
-    responder._history_secondary_selected = config.history.live_projection_enabled and config.history.readers.secondary
-    if config.history.live_projection_enabled and (config.history.readers.tools or config.history.readers.secondary):
-        from yeoman_gateway.agent.tools.history_read import HistoryReadTool
-        responder.tools.register(HistoryReadTool(knowledge_service))
+    from yeoman_gateway.agent.tools.history_read import HistoryReadTool
+    responder.tools.register(HistoryReadTool(knowledge_service))
     responder._history_projector = history_projector
-    responder._history_selected = config.history.live_projection_enabled and config.history.readers.responder
-    responder._history_tools_selected = config.history.live_projection_enabled and config.history.readers.tools
-    for tool_name in ('recall_conversation', 'summarize_history', 'media_history', 'resolve_contact', 'contacts'):
-        tool = responder.tools.get(tool_name)
-        if tool is not None:
-            setattr(tool, "_history_selected", responder._history_tools_selected)
-    responder._history_knowledge = knowledge_service if history_identity_selected else None
+    responder._history_knowledge = knowledge_service
     from yeoman_gateway.channels.whatsapp import WhatsAppChannel
     whatsapp_channel = channels.get_channel("whatsapp")
     if isinstance(whatsapp_channel, WhatsAppChannel):
         whatsapp_channel._history_projector = history_projector
-        whatsapp_channel._history_selected = config.history.live_projection_enabled and config.history.readers.whatsapp
-        whatsapp_channel._history_mentions_selected = config.history.live_projection_enabled and (config.history.readers.whatsapp or config.history.readers.tools)
-        whatsapp_channel._history_knowledge = knowledge_service if history_identity_selected else None
+        whatsapp_channel._history_knowledge = knowledge_service
 
     orchestrator = Orchestrator(
-        history_reply_selected=config.history.live_projection_enabled and config.history.readers.whatsapp,
-        history_secondary_config=config.history,
+
         policy=policy_adapter,
         responder=thread_responder or responder,
         reply_archive=archive_adapter,
-        contacts=consumer_contacts,
+
         knowledge=knowledge_service,
         identity_observation_issuer=(
             knowledge_sources.observe if knowledge_sources is not None else None
@@ -3787,14 +3399,14 @@ def build_gateway_runtime(
             try:
                 result = await run_persona_evolution_cron(
                     history_projector=history_projector,
-                    history_config=config.history,
+
                     knowledge=knowledge_service,
                     policy=policy_engine.policy,
                     workspace=Path(workspace),
                     persona_file=persona_file,
-                    memory=memory_service,
+
                     speakup_log=persona_speakup_log,
-                    inbound_archive=inbound_archive,
+
                     window_days=max(1, int(job.payload.persona_window_days)),
                     limit=max(1, int(job.payload.persona_limit)),
                     output_path=output_path,
@@ -3850,25 +3462,16 @@ def build_gateway_runtime(
                 if not chat_target:
                     raise ValueError("voice_broadcast job has no target chat")
 
-            if config.history.live_projection_enabled and config.history.readers.secondary:
-                from yeoman_gateway.history.context import history_knowledge_scope, history_turn
-                async with history_turn(history_projector) as snapshot:
-                    with history_knowledge_scope(snapshot, knowledge_service):
-                        quiet = evaluate_voice_quiet_gate(
-                            payload=job.payload,
-                            inbound_archive=secondary_inbound_archive,
-                            channel=voice_channel,
-                            chat_id=chat_target,
-                            now=datetime.now(UTC).astimezone(),
-                        )
-            else:
-                quiet = evaluate_voice_quiet_gate(
-                    payload=job.payload,
-                    inbound_archive=inbound_archive,
-                    channel=voice_channel,
-                    chat_id=chat_target,
-                    now=datetime.now(UTC).astimezone(),
-                )
+            from yeoman_gateway.history.context import history_knowledge_scope, history_turn
+            async with history_turn(history_projector) as snapshot:
+                with history_knowledge_scope(snapshot, knowledge_service):
+                    quiet = evaluate_voice_quiet_gate(
+                        payload=job.payload,
+                        inbound_archive=secondary_inbound_archive,
+                        channel=voice_channel,
+                        chat_id=chat_target,
+                        now=datetime.now(UTC).astimezone(),
+                    )
             if quiet.status == "defer":
                 retry_at_ms = quiet.retry_at_ms or int((time.time() + 1800) * 1000)
                 raise CronJobDeferredError(quiet.reason, retry_at_ms=retry_at_ms)
@@ -3911,9 +3514,7 @@ def build_gateway_runtime(
             channel=job.payload.channel or "cli",
             chat_id=job.payload.to or "direct",
             model_profile=job.payload.model_profile,
-            is_owner=(config.history.live_projection_enabled and config.history.readers.secondary
-                      and not job.payload.deliver and not job.payload.to
-                      and job.payload.channel in {None, "cli"}),
+            is_owner=((not job.payload.deliver and not job.payload.to and job.payload.channel in {None, "cli"})),
         )
         if job.payload.deliver and job.payload.to:
             delivery_channel = job.payload.channel or "cli"
@@ -4041,9 +3642,7 @@ def build_gateway_runtime(
                 channel=next_job.payload.channel or "cli",
                 chat_id=next_job.payload.to or "direct",
                 model_profile=next_job.payload.model_profile,
-                is_owner=(config.history.live_projection_enabled and config.history.readers.secondary
-                          and not next_job.payload.deliver and not next_job.payload.to
-                          and next_job.payload.channel in {None, "cli"}),
+                is_owner=((not next_job.payload.deliver and not next_job.payload.to and next_job.payload.channel in {None, "cli"})),
             )
             if next_job.payload.deliver and next_job.payload.to:
                 chain_channel = next_job.payload.channel or "cli"
@@ -4067,14 +3666,12 @@ def build_gateway_runtime(
     async def scoped_cron_job(job: CronJob) -> str | None:
         if job.payload.channel and job.payload.channel not in {"whatsapp", "cli", "system"}:
             return await on_cron_job(job)
-        if config.history.live_projection_enabled and config.history.readers.secondary:
-            from yeoman_gateway.history.context import history_knowledge_scope, history_turn
-            async with history_turn(history_projector) as snapshot:
-                with history_knowledge_scope(snapshot, knowledge_service):
-                    return await on_cron_job(job)
-        if config.history.legacy_writers_disabled:
-            from yeoman_gateway.history.live import HistoryPaused
-            raise HistoryPaused('secondary_reader_unselected')
+        from yeoman_gateway.history.context import history_knowledge_scope, history_turn
+        async with history_turn(history_projector) as snapshot:
+            with history_knowledge_scope(snapshot, knowledge_service):
+                return await on_cron_job(job)
+        from yeoman_gateway.history.live import HistoryPaused
+        raise HistoryPaused('secondary_reader_unselected')
         return await on_cron_job(job)
 
     cron.on_job = scoped_cron_job
@@ -4099,16 +3696,15 @@ def build_gateway_runtime(
         orchestrator=orchestrator,
         typing_adapter=typing_adapter,
         telemetry=telemetry,
-        memory=memory_service,
+
         effect_router=effect_router,
         processing_store=processing_store,
         control_acknowledgements=control_acknowledgements,
         release_participation_chat=_release_participation_chat,
         history_projector=history_projector,
-        history_selected=config.history.live_projection_enabled and (
-            config.history.readers.responder or config.history.readers.whatsapp or config.history.readers.tools or config.history.readers.participation or config.history.readers.secondary),
-        history_knowledge=knowledge_service if history_identity_selected else None,
-        history_mentions_selected=config.history.live_projection_enabled and (config.history.readers.whatsapp or config.history.readers.tools),
+
+        history_knowledge=knowledge_service,
+
     )
 
     # IPC socket for overseer commands
@@ -4282,8 +3878,8 @@ def build_gateway_runtime(
         )
 
         return await process_a2a_invocation(
-            history_projector=history_projector if config.history.live_projection_enabled and config.history.readers.tools else None,
-            history_knowledge=knowledge_service if history_identity_selected else None,
+            history_projector=history_projector,
+            history_knowledge=knowledge_service,
             peer=peer,
             skill=skill,
             input=input,
@@ -4297,7 +3893,6 @@ def build_gateway_runtime(
                 resolve_whatsapp_recipient,
                 policy_adapter=policy_adapter,
                 knowledge=knowledge_service,
-                contacts_service=consumer_contacts,
             ),
             effects=service_effects,
             effect_store=processing_store,
@@ -4341,7 +3936,7 @@ def build_gateway_runtime(
             history_turn,
             require_history_effect,
         )
-        if not (config.history.live_projection_enabled and config.history.readers.secondary) or secondary_knowledge is None or history_projector is None:
+        if (secondary_knowledge is None or history_projector is None):
             return {'status': 'disabled'}
         async with history_turn(history_projector) as snapshot:
             with history_knowledge_scope(snapshot, secondary_knowledge):
@@ -4365,7 +3960,7 @@ def build_gateway_runtime(
         from dataclasses import asdict
 
         from yeoman_gateway.history.context import history_knowledge_scope, history_turn
-        if not (config.history.live_projection_enabled and config.history.readers.secondary) or secondary_knowledge is None or history_projector is None:
+        if (secondary_knowledge is None or history_projector is None):
             return {'status': 'disabled'}
         async with history_turn(history_projector) as snapshot:
             with history_knowledge_scope(snapshot, secondary_knowledge):
@@ -4379,23 +3974,19 @@ def build_gateway_runtime(
             collect_persona_evolution_evidence,
             render_persona_evolution_proposal,
         )
-        if not (config.history.live_projection_enabled and config.history.readers.secondary):
-            return {'status': 'disabled'}
         if history_projector is None or secondary_knowledge is None or speakup_log is None:
             return {'status': 'paused'}
         secondary_knowledge.owner_read_context()
         evidence = await collect_persona_evolution_evidence(policy=policy_engine.policy,
-            workspace=Path(workspace), persona_file=args['persona_file'], memory=memory_service,
-            speakup_log=speakup_log, inbound_archive=inbound_archive,
+            workspace=Path(workspace), persona_file=args['persona_file'],
+            speakup_log=speakup_log,
             window_days=args['window_days'], per_chat_limit=args['limit'],
-            history_projector=history_projector, history_config=config.history, knowledge=secondary_knowledge)
+            history_projector=history_projector,  knowledge=secondary_knowledge)
         return {'status': 'ready', 'report': render_persona_evolution_proposal(evidence)}
 
     async def ipc_history_chats() -> dict[str, Any]:
         from yeoman_gateway.history.context import history_knowledge_scope, history_turn
         from yeoman_gateway.history.queries import HistoryQueries
-        if not (config.history.live_projection_enabled and config.history.readers.secondary):
-            return {'status': 'disabled'}
         if history_projector is None or secondary_knowledge is None:
             return {'status': 'paused'}
         secondary_knowledge.owner_read_context()
@@ -4406,8 +3997,6 @@ def build_gateway_runtime(
     async def ipc_knowledge_read(args: dict[str, Any]) -> dict[str, Any]:
         from yeoman_gateway.history.context import history_knowledge_scope, history_turn
         from yeoman_gateway.knowledge.models import RecallQuery
-        if not (config.history.live_projection_enabled and config.history.readers.secondary):
-            return {'status': 'disabled'}
         if history_projector is None or secondary_knowledge is None:
             return {'status': 'paused'}
         async with history_turn(history_projector) as snapshot:
@@ -4418,8 +4007,6 @@ def build_gateway_runtime(
 
     async def ipc_history_read(args: dict[str, Any]) -> dict[str, Any]:
         from yeoman_gateway.history.export import read_history_export
-        if not (config.history.live_projection_enabled and config.history.readers.secondary):
-            return {'status': 'disabled'}
         if history_projector is None or secondary_knowledge is None:
             return {'status': 'paused'}
         context = secondary_knowledge.owner_read_context(channel='whatsapp', chat_id=args['chat_ids'][0])
@@ -4598,41 +4185,6 @@ def build_gateway_runtime(
             from yeoman_gateway.consciousness.participation_maintenance import (
                 ParticipationMaintenance,
             )
-            from yeoman_gateway.consciousness.taste import ParticipationTasteDistiller
-
-            taste_distiller = None
-            if memory_service is not None:
-                from yeoman_gateway.processing.model_route import RouteClient, RouteUnavailableError
-
-                taste_route = str(
-                    getattr(getattr(config.memory, "capture", None), "extract_route", "")
-                    or "memory.capture.extract"
-                )
-                try:
-                    taste_client = RouteClient(config=config, route_key=taste_route)
-
-                    async def _distill_taste(prompt: str) -> str:
-                        import asyncio
-
-                        timeout_ms = int(getattr(taste_client, "timeout_ms", 0) or 30_000)
-                        return await asyncio.wait_for(
-                            taste_client.chat(
-                                [{"role": "user", "content": prompt}],
-                                max_tokens=160,
-                                response_format={"type": "json_object"},
-                            ),
-                            timeout=min(30_000, max(1, timeout_ms)) / 1000,
-                        )
-
-                    taste_distiller = ParticipationTasteDistiller(
-                        log=speakup_log, memory=memory_service, distiller=_distill_taste
-                    )
-                except RouteUnavailableError as exc:
-                    logger.info(
-                        "participation taste unavailable route={} error_type={}",
-                        taste_route,
-                        type(exc).__name__,
-                    )
             participation_maintenance = ParticipationMaintenance(
                 ledger=speakup_log,
                 # Receipt projection is owned by ReconciliationService. Maintenance
@@ -4645,7 +4197,6 @@ def build_gateway_runtime(
                 ),
                 batch_size=int(getattr(maintenance_config, "batch_size", 20)),
                 interval_seconds=int(getattr(maintenance_config, "interval_seconds", 900)),
-                taste_distiller=taste_distiller,
                 taste_opted_in=lambda channel, chat_id: _participation_taste_opted_in(
                     policy_adapter, channel, chat_id
                 ),
@@ -4754,18 +4305,6 @@ def build_gateway_runtime(
             )
             bus.subscribe_event("InboundObservedEvent", lull_observer.handle)
 
-    shared_fact_runtime = build_shared_fact_runtime(
-        config,
-        legacy_history_disabled=legacy_history_disabled,
-        store=processing_store,
-        processing=processing_store,
-        chat_registry=chat_registry,
-        policy=policy_adapter,
-        memory=memory_service,
-    )
-    if shared_fact_runtime is not None:
-        responder.shared_facts = shared_fact_runtime
-
     if knowledge_service is not None:
         knowledge_policy.capture_policy_provider = policy_adapter.current_policy_snapshot
 
@@ -4787,21 +4326,16 @@ def build_gateway_runtime(
         if observer is not None:
             observer._history_projector = history_projector
             observer._history_knowledge = knowledge_service
-            if config.history.live_projection_enabled and config.history.readers.secondary:
-                observer._session_manager = SessionManager(workspace=responder.sessions.workspace, sessions_dir=responder.sessions.sessions_dir,
-                    history_selected=True, operational_store=responder.sessions.operational_store,
-                    legacy_history_disabled=legacy_history_disabled)
+            observer._session_manager = SessionManager(workspace=responder.sessions.workspace, sessions_dir=responder.sessions.sessions_dir,
+                 operational_store=responder.sessions.operational_store,
+                )
     return GatewayRuntime(
         orchestrator=orchestrator_service,
         channels=channels,
         history_projector=history_projector,
         cron=cron,
         heartbeat=heartbeat,
-        inbound_archive=inbound_archive,
         responder=responder,
-        memory=memory_service,
-        contacts=contacts_service,
-        chat_registry=chat_registry,
         bus=bus,
         gateway_socket=gateway_socket,
         speakup_log=speakup_log,
@@ -4816,7 +4350,6 @@ def build_gateway_runtime(
             recover_pending=pending_participation_recovery,
         ),
         retention=build_retention_service(config, processing_store),
-        shared_facts=shared_fact_runtime,
         statement_capture=statement_capture,
         startup_hook=_notify_pending_persona_evolution_reviews,
     )

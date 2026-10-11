@@ -26,9 +26,6 @@ from yeoman_gateway.knowledge._upgrade import (
     upgrade_v1,
     verify_upgrade,
 )
-from yeoman_gateway.knowledge.api import open_knowledge_store
-from yeoman_gateway.knowledge.authority import FakePolicyAuthority, FakeSourceAuthority
-from yeoman_gateway.knowledge.models import Identifier, TrustedIdentityObservation
 
 BOUND_PHONE = "4910000000101@s.whatsapp.net"
 LEGACY_PHONE = "4910000000102@s.whatsapp.net"
@@ -179,90 +176,6 @@ def test_approved_identifiers_become_active_bindings_and_revive_roles(tmp_path: 
     assert verification.approvals_declared == 2
     assert verification.approvals_found == 2
     assert verification.approvals_ok
-
-
-def test_an_approved_binding_resolves_the_next_observation_to_the_same_person(
-    tmp_path: Path,
-) -> None:
-    """The migration-day acceptance: the person does not have to be re-invented."""
-    source, journal = _live_shaped(tmp_path)
-    proposals = propose_bindings(
-        source=source, processing=journal, out=tmp_path / "proposals.json"
-    ).out_path
-    _approve(proposals, people=(V1_PERSON_BOUND,))
-    upgrade_v1(
-        source=source,
-        processing=journal,
-        target=tmp_path / "v2.db",
-        manifest=tmp_path / "manifest.json",
-        binding_approvals=proposals,
-    )
-
-    authority = FakeSourceAuthority()
-    service = open_knowledge_store(
-        tmp_path / "v2.db",
-        workspace_id="approval-tests",
-        source_authority=authority,
-        policy_authority=FakePolicyAuthority(admins={OWNER}, capture_actors={OWNER}),
-    )
-    try:
-        before = service._store.scalar("SELECT COUNT(*) FROM contacts")  # noqa: SLF001
-        observation = TrustedIdentityObservation(
-            identifiers=(Identifier("whatsapp", "phone_jid", BOUND_PHONE),),
-            evidence_ref="approval-test-observation",
-            observed_name="Boundy",
-            observed_at_ms=service._now(),  # noqa: SLF001 - synthetic clock
-            mapping_verified=True,
-        )
-        authority.issue_observation(observation)
-        resolved = service.resolve_observation(observation)
-        after = service._store.scalar("SELECT COUNT(*) FROM contacts")  # noqa: SLF001
-
-        assert resolved.status == "resolved"
-        assert resolved.person_id == V1_PERSON_BOUND
-        assert resolved.reason == "existing_binding"
-        assert after == before  # no second person was invented
-        assert BOUND_PHONE in {item.value for item in service.person_identifiers(V1_PERSON_BOUND)}
-    finally:
-        service.close()
-
-
-def test_an_unapproved_identifier_still_cannot_bind_itself(tmp_path: Path) -> None:
-    """The documented boundary: no approval, no proof - the projection is not authority."""
-    source, journal = _live_shaped(tmp_path)
-    proposals = propose_bindings(
-        source=source, processing=journal, out=tmp_path / "proposals.json"
-    ).out_path
-    _approve(proposals, people=(V1_PERSON_BOUND,))
-    upgrade_v1(
-        source=source,
-        processing=journal,
-        target=tmp_path / "v2.db",
-        manifest=tmp_path / "manifest.json",
-        binding_approvals=proposals,
-    )
-
-    authority = FakeSourceAuthority()
-    service = open_knowledge_store(
-        tmp_path / "v2.db",
-        workspace_id="approval-tests",
-        source_authority=authority,
-        policy_authority=FakePolicyAuthority(admins={OWNER}, capture_actors={OWNER}),
-    )
-    try:
-        observation = TrustedIdentityObservation(
-            identifiers=(Identifier("whatsapp", "phone_jid", LEGACY_PHONE),),
-            evidence_ref="approval-test-unapproved",
-            observed_name="Synthetic Legacy",
-            observed_at_ms=service._now(),  # noqa: SLF001 - synthetic clock
-            mapping_verified=True,
-        )
-        authority.issue_observation(observation)
-        with pytest.raises(sqlite3.IntegrityError):
-            service.resolve_observation(observation)
-        assert service.person_identifiers(V1_PERSON_LEGACY_ONLY) == ()
-    finally:
-        service.close()
 
 
 def test_an_approval_that_names_someone_elses_identifier_is_refused(tmp_path: Path) -> None:

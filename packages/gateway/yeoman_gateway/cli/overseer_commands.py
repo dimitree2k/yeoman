@@ -263,7 +263,6 @@ def trigger(
             comms=comms,
             data_dir=data_dir,
             sandbox=sandbox,
-            memory_db=yeoman_home / "data" / "memory" / "memory.db",
             git=git,
             runbook_name=runbook.meta.name,
             domain=runbook.meta.domain,

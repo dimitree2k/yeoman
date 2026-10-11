@@ -24,8 +24,8 @@ from yeoman_gateway.knowledge.runtime import RuntimeKnowledgePolicy
 
 NOW = 1_736_899_200_000  # 2025-01-15 UTC
 GROUP = "history-group@g.us"
-DIRECT = "reader@s.whatsapp.net"
-READER = "whatsapp:reader@s.whatsapp.net"
+DIRECT = "10001@s.whatsapp.net"
+READER = "whatsapp:10001"
 
 
 class _Registry:
@@ -46,7 +46,7 @@ def _context(
     recipient: str = READER,
     additional_recipients: tuple[str, ...] = (),
     policy_revision: int = 7,
-    membership_revision: str | None = "roster-r1",
+    membership_revision: str | None = None,
     chat_id: str = GROUP,
     is_direct: bool = False,
 ) -> TrustedReadContext:
@@ -289,17 +289,92 @@ def _reader(
     members: set[str] | None = None,
     policy_revision: int = 7,
     registry: _Registry | None = None,
+    source_authority: Any = None,
 ) -> Any:
+    from history_turn_fixtures import Projector
+    from yeoman_gateway.history.reader import HistorySnapshot
     from yeoman_gateway.knowledge._history_reader import HistoryReader
+    from yeoman_gateway.knowledge._history_upgrade import upgrade_history_knowledge
+    from yeoman_gateway.knowledge._store import KnowledgeStore
+    from yeoman_gateway.knowledge.runtime import RuntimeKnowledgeSources
 
-    return HistoryReader(
-        journal,
-        policy=RuntimeKnowledgePolicy(
-            engine=None,
-            chat_registry=registry or _Registry(members),
-            policy_revision=policy_revision,
-        ),
+    configured = members if members is not None else (registry.members if registry else {READER})
+    chat_id = registry.chat_id if registry else GROUP
+    projector = Projector()
+    participant_values = [principal.removeprefix("whatsapp:") + "@s.whatsapp.net" for principal in configured]
+    projector.db.execute(
+        "INSERT INTO message_events(event_id,kind,channel,chat_id,occurred_ms,time_certainty,"
+        "payload_json,provenance,actor_basis,source_refs) VALUES (?,?,?,?,?,?,?,?,?,?)",
+        ("current-roster", "member_snapshot", "whatsapp", chat_id, NOW + 1,
+         "provider_timestamp", json.dumps({"complete": True, "participants": [[value] for value in participant_values]}),
+         "native", "unknown", "[]"),
     )
+    if chat_id == DIRECT:
+        projector.db.execute(
+            "INSERT INTO contacts VALUES ('owner','person','owner','Owner','confirmed',NULL,'[]')"
+        )
+        projector.db.execute(
+            "INSERT INTO identifier_history(contact_id,channel,kind,value,strength,evidence,source_refs) "
+            "VALUES ('owner','whatsapp','pn_jid',?,'strong','owner_attested','[]')",
+            (DIRECT,),
+        )
+    projector.db.commit()
+    snapshot = HistorySnapshot(1, (), projector.db)
+    knowledge_dir = journal.target_home / f"test-knowledge-{id(projector)}"
+    knowledge_dir.mkdir()
+    source = knowledge_dir / "v2.db"
+    target = knowledge_dir / "v3.db"
+    old = KnowledgeStore(source)
+    old.set_meta("migration_complete", "1")
+    old.close()
+    upgrade_history_knowledge(source=source, target=target)
+    policy = RuntimeKnowledgePolicy(engine=None, policy_revision=policy_revision)
+    knowledge = open_knowledge_store(
+        target,
+        workspace_id=workspace_id_for(knowledge_dir),
+        source_authority=(RuntimeKnowledgeSources() if source_authority is None else source_authority),
+        policy_authority=policy,
+    )
+
+    class ScopedReader:
+        def __init__(self) -> None:
+            self.reader = HistoryReader(journal, policy=policy)
+            self.snapshot = snapshot
+            self.projector = projector
+            self.knowledge = knowledge
+
+        def in_scope(self, function: Any, *args: Any, knowledge_store: Any = knowledge, **kwargs: Any) -> Any:
+            from yeoman_gateway.history.context import _HISTORY, _PROJECTOR, history_knowledge_scope
+
+            history_token = _HISTORY.set(snapshot)
+            projector_token = _PROJECTOR.set(projector)
+            try:
+                scoped_store = kwargs.get("knowledge", knowledge_store)
+                with history_knowledge_scope(snapshot, scoped_store):
+                    return function(*args, **kwargs)
+            finally:
+                _PROJECTOR.reset(projector_token)
+                _HISTORY.reset(history_token)
+
+        def __getattr__(self, name: str) -> Any:
+            value = getattr(self.reader, name)
+            if not callable(value):
+                return value
+
+            def invoke(*args: Any, **kwargs: Any) -> Any:
+                return self.in_scope(value, *args, **kwargs)
+
+            return invoke
+
+        def __del__(self) -> None:
+            try:
+                knowledge.close()
+                snapshot.close()
+                projector.close()
+            except Exception:
+                pass
+
+    return ScopedReader()
 
 
 def _add_current_alias_event(
@@ -583,28 +658,37 @@ def _attest_reader(journal: HistoricalJournal, *, start: int = NOW - 1_000) -> t
     return proof_id, policy
 
 
+def _revoke_during_history_read(
+    reader: Any,
+    journal: HistoricalJournal,
+    proof_id: str,
+    policy: RuntimeKnowledgePolicy,
+    *,
+    on_call: int,
+) -> list[int]:
+    calls = [0]
+    resolve = reader.reader.audience.resolve
+
+    def revoke(event: Any, **kwargs: Any) -> Any:
+        calls[0] += 1
+        if calls[0] == on_call:
+            HistoryAudience(journal).revoke(
+                proof_id,
+                context=TrustedAdminContext(READER, 7, "synthetic-review-owner", owner=True),
+                policy=policy,
+            )
+        return resolve(event, **kwargs)
+
+    reader.reader.audience.resolve = revoke
+    return calls
+
+
 def test_native_proof_survives_withdrawal_of_separate_roster(tmp_path: Path) -> None:
     with HistoricalJournal(tmp_path / "history") as journal:
         _add_event(journal)
         proof_id, owner_policy = _attest_reader(journal)
-        class _RevokingRegistry(_Registry):
-            def __init__(self) -> None:
-                super().__init__()
-                self.calls = 0
-
-            def get_chat(self, channel: str, chat_id: str) -> dict[str, Any]:
-                self.calls += 1
-                if self.calls == 3:
-                    HistoryAudience(journal).revoke(
-                        proof_id,
-                        context=TrustedAdminContext(
-                            READER, 7, "synthetic-review-owner", owner=True
-                        ),
-                        policy=owner_policy,
-                    )
-                return super().get_chat(channel, chat_id)
-
-        reader = _reader(journal, registry=_RevokingRegistry())
+        reader = _reader(journal)
+        _revoke_during_history_read(reader, journal, proof_id, owner_policy, on_call=1)
 
         result = reader.excerpt("wa-history-1", 1, context=_context())
         assert result is not None
@@ -615,122 +699,68 @@ def test_revoked_roster_blocks_actual_derived_knowledge_context(tmp_path: Path) 
     with HistoricalJournal(tmp_path / "history") as journal:
         _add_event(journal, audience=None)
         proof_id, owner_policy = _attest_reader(journal)
-
-        class _RevokingRegistry(_Registry):
-            def __init__(self) -> None:
-                super().__init__()
-                self.calls = 0
-                self.revoke_on_call: int | None = None
-
-            def get_chat(self, channel: str, chat_id: str) -> dict[str, Any]:
-                self.calls += 1
-                if self.calls == self.revoke_on_call:
-                    HistoryAudience(journal).revoke(
-                        proof_id,
-                        context=TrustedAdminContext(
-                            READER, 7, "synthetic-review-owner", owner=True
-                        ),
-                        policy=owner_policy,
-                    )
-                return super().get_chat(channel, chat_id)
-
-        registry = _RevokingRegistry()
         authority = HistorySourceAuthority(journal)
+        reader = _reader(journal, source_authority=authority)
         source = authority.verify_source_ref("wa-history-1", 1)
         assert source is not None
-        policy = RuntimeKnowledgePolicy(
-            engine=None,
-            chat_registry=registry,
-            policy_revision=7,
+        knowledge = reader.knowledge
+        receipt = reader.in_scope(
+            knowledge.capture,
+            StatementCandidate(
+                content="Derived broker note from a roster-authorized message",
+                sources=(source,),
+                extractor_version="history-reader-test",
+                confidence=0.9,
+            ),
+            context=TrustedCaptureContext(
+                request_id="history-reader-test",
+                policy_revision=7,
+                capture_basis="history_test",
+                authorized_sources=(source,),
+            ),
         )
-        knowledge = open_knowledge_store(
-            tmp_path / "knowledge.db",
-            workspace_id=workspace_id_for(tmp_path),
-            source_authority=authority,
-            policy_authority=policy,
+        assert receipt.statement_ids
+        prepared = reader.in_scope(
+            knowledge.recall,
+            RecallQuery(text="derived broker note", limit=5),
+            context=_context(),
         )
-        try:
-            receipt = knowledge.capture(
-                StatementCandidate(
-                    content="Derived broker note from a roster-authorized message",
-                    sources=(source,),
-                    extractor_version="history-reader-test",
-                    confidence=0.9,
-                ),
-                context=TrustedCaptureContext(
-                    request_id="history-reader-test",
-                    policy_revision=7,
-                    capture_basis="history_test",
-                    authorized_sources=(source,),
-                ),
-            )
-            assert receipt.statement_ids
-            prepared = knowledge.recall(
-                RecallQuery(text="derived broker note", limit=5), context=_context()
-            )
-            assert isinstance(prepared, KnowledgeContext)
-            assert not prepared.empty
-            assert "Derived broker note" in prepared.text
+        assert isinstance(prepared, KnowledgeContext)
+        assert not prepared.empty
+        assert "Derived broker note" in prepared.text
 
-            with journal.store._write() as connection:
-                connection.execute(
-                    "UPDATE events SET payload_purged_ms=? WHERE event_id=?",
-                    (NOW + 1, "wa-history-1"),
-                )
-            assert authority.verify_source_ref("wa-history-1", 1) is None
-            retention_checked = _reader(journal, registry=registry).revalidate(
-                prepared,
-                knowledge=knowledge,
-                context=_context(),
+        with journal.store._write() as connection:
+            connection.execute(
+                "UPDATE events SET payload_purged_ms=? WHERE event_id=?",
+                (NOW + 1, "wa-history-1"),
             )
-            assert retention_checked.empty
+        assert authority.verify_source_ref("wa-history-1", 1) is None
+        retention_checked = reader.revalidate(
+            prepared, knowledge=knowledge, context=_context()
+        )
+        assert retention_checked.empty
 
-            with journal.store._write() as connection:
-                connection.execute(
-                    "UPDATE events SET payload_purged_ms=NULL WHERE event_id=?",
-                    ("wa-history-1",),
-                )
-            registry.calls = 0
-            registry.revoke_on_call = 3
-            checked = _reader(journal, registry=registry).revalidate(
-                prepared, knowledge=knowledge, context=_context()
+        with journal.store._write() as connection:
+            connection.execute(
+                "UPDATE events SET payload_purged_ms=NULL WHERE event_id=?",
+                ("wa-history-1",),
             )
+        calls = _revoke_during_history_read(
+            reader, journal, proof_id, owner_policy, on_call=1
+        )
+        checked = reader.revalidate(prepared, knowledge=knowledge, context=_context())
 
-            assert checked.empty
-            assert checked.text == ""
-            assert registry.calls >= 3
-        finally:
-            knowledge.close()
+        assert checked.empty
+        assert checked.text == ""
+        assert calls[0] >= 1
 
 
 def test_proof_change_during_read_is_rechecked_before_output(tmp_path: Path) -> None:
-    class _RevokingRegistry(_Registry):
-        def __init__(self) -> None:
-            super().__init__()
-            self.calls = 0
-            self.journal: HistoricalJournal | None = None
-            self.proof_id = ""
-            self.admin_policy: RuntimeKnowledgePolicy | None = None
-
-        def get_chat(self, channel: str, chat_id: str) -> dict[str, Any]:
-            self.calls += 1
-            if self.calls == 3:
-                assert self.journal is not None and self.admin_policy is not None
-                HistoryAudience(self.journal).revoke(
-                    self.proof_id,
-                    context=TrustedAdminContext(READER, 7, "trusted-test-owner", owner=True),
-                    policy=self.admin_policy,
-                )
-            return super().get_chat(channel, chat_id)
-
     with HistoricalJournal(tmp_path / "history") as journal:
         _add_event(journal, audience=None)
         proof_id, owner_policy = _attest_reader(journal)
-        registry = _RevokingRegistry()
-        registry.journal = journal
-        registry.proof_id = proof_id
-        registry.admin_policy = owner_policy
-        reader = _reader(journal, registry=registry)
+        reader = _reader(journal)
+        _revoke_during_history_read(reader, journal, proof_id, owner_policy, on_call=2)
 
         assert reader.search(
             "broker",
@@ -742,32 +772,12 @@ def test_proof_change_during_read_is_rechecked_before_output(tmp_path: Path) -> 
 
 
 def test_earlier_result_proof_withdrawn_during_multi_result_read(tmp_path: Path) -> None:
-    class _RevokingRegistry(_Registry):
-        def __init__(self, journal: HistoricalJournal, proof_id: str, policy: RuntimeKnowledgePolicy):
-            super().__init__()
-            self.calls = 0
-            self.journal = journal
-            self.proof_id = proof_id
-            self.admin_policy = policy
-
-        def get_chat(self, channel: str, chat_id: str) -> dict[str, Any]:
-            self.calls += 1
-            if self.calls == 5:
-                HistoryAudience(self.journal).revoke(
-                    self.proof_id,
-                    context=TrustedAdminContext(
-                        READER, 7, "synthetic-review-owner", owner=True
-                    ),
-                    policy=self.admin_policy,
-                )
-            return super().get_chat(channel, chat_id)
-
     with HistoricalJournal(tmp_path / "history") as journal:
         _add_event(journal, event_id="first-event", audience=None)
         _add_event(journal, event_id="second-event", audience=None)
         proof_id, owner_policy = _attest_reader(journal)
-        registry = _RevokingRegistry(journal, proof_id, owner_policy)
-        reader = _reader(journal, registry=registry)
+        reader = _reader(journal)
+        calls = _revoke_during_history_read(reader, journal, proof_id, owner_policy, on_call=3)
 
         results = reader.search(
             "broker",
@@ -777,7 +787,7 @@ def test_earlier_result_proof_withdrawn_during_multi_result_read(tmp_path: Path)
             chat_id=GROUP,
         )
 
-        assert registry.calls >= 5
+        assert calls[0] >= 3
         assert results == ()
 
 

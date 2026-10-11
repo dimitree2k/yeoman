@@ -19,6 +19,8 @@ Three properties matter more than throughput:
 from __future__ import annotations
 
 import asyncio
+import json
+import re
 import threading
 import time
 from collections.abc import Callable, Iterable, Mapping, Sequence
@@ -34,7 +36,7 @@ from yeoman_gateway.knowledge._capture import (
     observed_event,
     promoter_reason,
 )
-from yeoman_gateway.knowledge._memory.extraction_jobs import (
+from yeoman_gateway.knowledge._capture_screen import (
     REJECT_BASES,
     is_hedged,
     screen_capture_input,
@@ -197,8 +199,6 @@ class StatementExtractor:
         return drafts
 
     def _ask_model(self, listing: str) -> list[Mapping[str, Any]]:
-        from yeoman_gateway.knowledge._memory.fact_extractor import _extract_json
-
         messages = [
             {"role": "system", "content": STATEMENT_SYSTEM_PROMPT},
             {"role": "user", "content": f"Messages:\n{listing}"},
@@ -215,7 +215,7 @@ class StatementExtractor:
         content = str(getattr(response, "content", "") or "").strip()
         if not content:
             return []
-        payload = _extract_json(content)
+        payload = _extract_json_payload(content)
         if payload is None:
             logger.warning("statement extractor returned unparseable content")
             return []
@@ -242,6 +242,25 @@ class StatementExtractor:
             valid_until_ms=_parse_iso_ms(row.get("valid_until")),
         )
 
+
+def _extract_json_payload(text: str) -> dict[str, Any] | list[object] | None:
+    """Parse a JSON object/list from model output, including fenced or wrapped JSON."""
+    stripped = text.strip()
+    candidates = [stripped]
+    fenced = re.findall(r"```(?:json)?\s*(.*?)```", text, flags=re.IGNORECASE | re.DOTALL)
+    candidates.extend(chunk.strip() for chunk in fenced if chunk.strip())
+    for opening, closing in (("{", "}"), ("[", "]")):
+        first, last = text.find(opening), text.rfind(closing)
+        if 0 <= first < last:
+            candidates.append(text[first : last + 1])
+    for candidate in candidates:
+        try:
+            parsed = json.loads(candidate)
+        except json.JSONDecodeError:
+            continue
+        if isinstance(parsed, (dict, list)):
+            return parsed
+    return None
 
 @dataclass(slots=True)
 class WorkerReport(CaptureReport):

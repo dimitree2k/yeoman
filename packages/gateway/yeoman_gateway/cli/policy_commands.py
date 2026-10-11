@@ -74,7 +74,6 @@ _DECLARED_POLICY_TOOLS = {
     "message",
     "delete_message",
     "send_voice",
-    "summarize_history",
     "spawn",
     "cron",
     "a2a_delegate",

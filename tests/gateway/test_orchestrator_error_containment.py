@@ -6,6 +6,7 @@ from datetime import UTC, datetime
 from typing import Any
 
 import pytest
+from history_turn_fixtures import Projector
 from yeoman_gateway.app.bootstrap import OrchestratorService
 from yeoman_gateway.bus.events import InboundMessage, OutboundMessage
 from yeoman_gateway.core.intents import SendOutboundIntent
@@ -39,10 +40,6 @@ class _Bus:
 
     async def publish_reaction(self, message: Any) -> None:
         self.reactions.append(message)
-
-
-class _Memory:
-    pass
 
 
 class _ForwardRouter:
@@ -124,7 +121,7 @@ async def test_orchestrator_error_is_silent_and_next_message_is_processed() -> N
         orchestrator=orchestrator,
         typing_adapter=lambda channel, chat_id, enabled: None,
         telemetry=InMemoryTelemetry(),
-        memory=_Memory(),
+        history_projector=Projector(),
     )
     orchestrator.service = service
 
@@ -144,7 +141,7 @@ async def test_partial_dispatch_does_not_replay_or_publish_error_text() -> None:
         orchestrator=orchestrator,
         typing_adapter=lambda channel, chat_id, enabled: None,
         telemetry=InMemoryTelemetry(),
-        memory=_Memory(),
+        history_projector=Projector(),
     )
     orchestrator.service = service
 
@@ -156,42 +153,47 @@ async def test_partial_dispatch_does_not_replay_or_publish_error_text() -> None:
 
 @pytest.mark.asyncio
 async def test_forward_dispatch_failure_is_reported_through_managed_text() -> None:
+    from yeoman_gateway.history.context import history_turn
+
     bus = _Bus([])
     router = _ForwardRouter()
+    projector = Projector()
     service = OrchestratorService(
         bus=bus,
         orchestrator=None,  # type: ignore[arg-type]
         typing_adapter=lambda channel, chat_id, enabled: None,
         telemetry=InMemoryTelemetry(),
-        memory=_Memory(),
+        history_projector=projector,
         effect_router=router,  # type: ignore[arg-type]
     )
 
-    await service._dispatch_intents(
-        [
-            SendOutboundIntent(
-                event=OutboundEvent(
-                    channel="whatsapp",
-                    chat_id="target@g.us",
-                    content="",
-                    metadata={
-                        "message_id": "command-1",
-                        "forward_message": {
-                            "source_chat_id": "source@g.us",
-                            "source_message_id": "source-1",
+    async with history_turn(projector):
+        await service._dispatch_intents(
+            [
+                SendOutboundIntent(
+                    event=OutboundEvent(
+                        channel="whatsapp",
+                        chat_id="target@g.us",
+                        content="",
+                        metadata={
+                            "message_id": "command-1",
+                            "forward_message": {
+                                "source_chat_id": "source@g.us",
+                                "source_message_id": "source-1",
+                            },
                         },
-                    },
+                    )
                 )
-            )
-        ],
-        principal="owner",
-    )
+            ],
+            principal="owner",
+        )
 
     assert len(router.calls) == 2
     assert router.calls[1].event.chat_id == "source@g.us"
     assert router.calls[1].event.content == "safe forward error"
     assert "forward_message" not in router.calls[1].event.metadata
     assert bus.outbound == []
+    projector.close()
 
 
 @pytest.mark.asyncio
@@ -226,7 +228,7 @@ async def test_f03_a_second_message_is_ingested_during_a_running_generation() ->
         orchestrator=_Orchestrator(),
         typing_adapter=lambda channel, chat_id, enabled: None,
         telemetry=InMemoryTelemetry(),
-        memory=_Memory(),
+        history_projector=Projector(),
     )
     orchestrator = service._orchestrator
     orchestrator.service = service  # type: ignore[attr-defined]

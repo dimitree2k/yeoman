@@ -17,13 +17,7 @@ from pathlib import Path
 from typing import Iterator
 
 import pytest
-from yeoman_gateway.knowledge.api import KnowledgeService, open_knowledge_store
-from yeoman_gateway.knowledge.authority import (
-    EvidenceAudience,
-    FakeClock,
-    FakePolicyAuthority,
-    FakeSourceAuthority,
-)
+from yeoman_gateway.knowledge.authority import EvidenceAudience
 from yeoman_gateway.knowledge.models import (
     CONVERSATION_ORIGINS,
     CONVERSATION_RELATIONS,
@@ -49,22 +43,17 @@ class ConversationHarness:
     tmp_path: Path
 
     def __post_init__(self) -> None:
-        self.clock = FakeClock()
-        self.authority = FakeSourceAuthority()
-        self.policy = FakePolicyAuthority(admins={OWNER}, capture_actors={OWNER})
-        self.service: KnowledgeService = open_knowledge_store(
-            self.tmp_path / "knowledge.db",
-            workspace_id=WORKSPACE_ID,
-            source_authority=self.authority,
-            policy_authority=self.policy,
-            clock=self.clock,
-        )
+        from tests.gateway.knowledge.conftest import KnowledgeHarness
+
+        self._base = KnowledgeHarness(self.tmp_path)
+        self.clock = self._base.clock
+        self.authority = self._base.authority
+        self.policy = self._base.policy
+        self.service = self._base.service
         self._counter = 0
 
-    # ── lifecycle ────────────────────────────────────────────────────────────
-
     def close(self) -> None:
-        self.service.close()
+        self._base.close()
 
     # ── sources ──────────────────────────────────────────────────────────────
 
@@ -80,24 +69,17 @@ class ConversationHarness:
         channel: str = "whatsapp",
     ) -> SourceRef:
         self._counter += 1
-        source = SourceRef(
-            event_id=f"event-{self._counter}",
-            revision=int(revision),
+        author_person = self._base.person_for(author, f"Conversation person {author}")
+        source = self._base.source(
+            author_person,
+            chat=chat,
             channel=channel,
-            chat_id=chat,
-            author_principal=author,
-            occurred_at_ms=self.clock.now_ms(),
+            audience=audience,
+            revision=revision,
+            author_only=author_only,
+            unknown_audience=unknown_audience,
+            when_ms=self.clock.now_ms(),
         )
-        if unknown_audience:
-            self.authority.issue_source(source, EvidenceAudience.unknown())
-        elif author_only:
-            self.authority.issue_source(source, EvidenceAudience.author_only())
-        else:
-            members = set(audience) if audience is not None else {author}
-            self.authority.issue_source(
-                source,
-                EvidenceAudience.known(members, snapshot_id=f"snap-{source.event_id}"),
-            )
         return source
 
     def unknown_source(self, *, chat: str = GROUP_A, author: str = TOM) -> SourceRef:

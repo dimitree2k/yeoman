@@ -8,28 +8,18 @@ from yeoman_gateway.core.pipeline import PipelineContext
 from yeoman_gateway.knowledge.models import (
     Identifier,
     PersonResolution,
-    TrustedIdentityObservation,
 )
 from yeoman_gateway.pipeline.contacts import ContactsMiddleware
 
-ACCOUNT = "synthetic-whatsapp-account"
+ACCOUNT = "whatsapp"
 OWNER = "whatsapp:4910000000001"
 
 
 def _observe_pair(h, phone: str, lid: str, *, name: str) -> PersonResolution:
-    observation = TrustedIdentityObservation(
-        identifiers=(
-            Identifier("whatsapp", "phone_jid", phone, namespace=ACCOUNT),
-            Identifier("whatsapp", "lid", lid, namespace=ACCOUNT),
-        ),
-        evidence_ref=f"mention-observation:{phone}",
-        observed_name=name,
-        observed_at_ms=h.clock.now_ms(),
-        mapping_verified=True,
-        account_namespace=ACCOUNT,
+    return h.observe(
+        "whatsapp", "phone_jid", phone, name=name, mapping=True,
+        extra=(Identifier("whatsapp", "lid", lid, namespace=ACCOUNT),),
     )
-    h.authority.issue_observation(observation)
-    return h.service.resolve_person(observation)
 
 
 def _mention_context(h, *member_principals: str, chat: str = "mention-room"):
@@ -63,18 +53,13 @@ def test_typed_mention_uses_historical_binding_and_never_creates_unknown_person(
 ):
     h = knowledge_harness
     lid = "8420000043@lid"
-    member_id = h.person_for("whatsapp:4910000000043", "Niko")
-    context = _mention_context(h, "whatsapp:4910000000043")
-    h.authority.issue_evidence_ref("mention-lid-binding")
-    known = Identifier("whatsapp", "lid", lid, namespace=ACCOUNT)
-    h.service.add_or_end_binding(
-        person_id=member_id,
-        identifier=known,
-        evidence_ref="mention-lid-binding",
-        mapping_verified=True,
-        context=h.admin_context(),
-        valid_from_ms=h.clock.now_ms(),
+    member = _observe_pair(
+        h, "4910000000043@s.whatsapp.net", lid, name="Niko"
     )
+    member_id = member.person_id
+    assert member_id is not None
+    context = _mention_context(h, "whatsapp:4910000000043")
+    known = Identifier("whatsapp", "lid", lid, namespace=ACCOUNT)
     before = h.service.stats(context=h.admin_context()).people_count
 
     resolved = h.service.resolve_mentions(
@@ -301,235 +286,3 @@ def test_whatsapp_core_event_preserves_native_mention_jids(account_id):
 
     assert core_event.raw_metadata["mentioned_jids"] == [lid]
     assert core_event.raw_metadata["account_id"] == account_id
-
-
-@pytest.mark.parametrize("account_id", [ACCOUNT, "default"])
-async def test_runtime_context_rechecks_registry_members_and_qualified_principal(
-    tmp_path, account_id
-):
-    from dataclasses import replace
-    from pathlib import Path
-
-    from yeoman_gateway.knowledge.api import open_knowledge_store
-    from yeoman_gateway.knowledge.authority import FakeSourceAuthority
-    from yeoman_gateway.knowledge.runtime import RuntimeKnowledgePolicy
-    from yeoman_gateway.pipeline.contacts import build_mention_read_context
-    from yeoman_gateway.policy.identity import registry_member_principals
-    from yeoman_gateway.storage.chat_registry import ChatRegistry
-
-    sender = "whatsapp:4910000000050"
-    member = "whatsapp:4910000000051"
-
-    registry = ChatRegistry(Path(":memory:"))
-    registry.sync_from_bridge_metadata(
-        "whatsapp",
-        [
-            {
-                "chatJid": "synthetic@g.us",
-                "participants": [
-                    {
-                        "id": "8420000050@lid",
-                        "phoneNumber": "4910000000050@s.whatsapp.net",
-                    },
-                    {
-                        "id": "8420000051@lid",
-                        "phoneNumber": "4910000000051@s.whatsapp.net",
-                    },
-                    {
-                        "id": "8420000052@lid",
-                        "phoneNumber": "4910000000052@s.whatsapp.net",
-                        "phoneJid": "4910000000053@s.whatsapp.net",
-                    },
-                    {"id": "8420000054@lid"},
-                    "whatsapp:4910000000055",
-                ],
-            }
-        ],
-    )
-    authority = FakeSourceAuthority()
-    policy = RuntimeKnowledgePolicy(engine=None, chat_registry=registry)
-    service = open_knowledge_store(
-        tmp_path / "runtime-knowledge.db",
-        workspace_id="synthetic-mention-workspace",
-        source_authority=authority,
-        policy_authority=policy,
-    )
-    try:
-        phone = "4910000000051@s.whatsapp.net"
-        lid = "8420000051@lid"
-        member_resolution = _observe_pair_for_service(
-            service, authority, phone, lid, name="Runtime Member", account=account_id
-        )
-        sender_phone = "4910000000050@s.whatsapp.net"
-        _observe_pair_for_service(
-            service,
-            authority,
-            sender_phone,
-            "8420000050@lid",
-            name="Runtime Sender",
-            account=account_id,
-        )
-        event = InboundEvent(
-            channel="whatsapp",
-            chat_id="synthetic@g.us",
-            sender_id="4910000000050",
-            participant="4910000000050@s.whatsapp.net",
-            content="hello",
-            is_group=True,
-            raw_metadata={
-                "account_id": account_id,
-                "sender_phone_jid": sender_phone,
-                "message_id": "synthetic-runtime-message",
-                "mentioned_jids": [lid],
-                "statement_roles": [{"role": "speaker", "principal": sender}],
-                "source_ref": {"event_id": "synthetic-runtime-event"},
-                "source_audience": {"status": "known", "members": [sender, member]},
-            },
-        )
-        context = build_mention_read_context(
-            event, chat_registry=registry, knowledge=service
-        )
-        assert context is not None
-        assert context.principal_id == sender
-        expected_members = frozenset(
-            {
-                sender,
-                member,
-                "8420000052@lid",
-                "8420000054@lid",
-                "whatsapp:4910000000055",
-            }
-        )
-        assert context.recipient_principals == expected_members
-        assert context.membership_revision
-        from yeoman_gateway.knowledge._memory.read_gate import registry_members
-
-        current_registry_members = registry_members(
-            registry, channel="whatsapp", chat_id="synthetic@g.us"
-        )
-        assert current_registry_members == set(expected_members)
-        membership = policy.membership(context)
-        assert membership is not None
-        assert membership.members == expected_members
-        assert "whatsapp:4910000000052" not in current_registry_members
-        assert "whatsapp:4910000000053" not in current_registry_members
-        assert registry_member_principals(
-            "telegram",
-            [{"id": "telegram:synthetic-user", "phoneNumber": sender_phone}],
-        ) == frozenset({"telegram:synthetic-user"})
-        missing_account_event = replace(
-            event,
-            raw_metadata={
-                key: value
-                for key, value in event.raw_metadata.items()
-                if key != "account_id"
-            },
-        )
-        assert (
-            build_mention_read_context(
-                missing_account_event, chat_registry=registry, knowledge=service
-            )
-            is None
-        )
-        assert member_resolution.person_id is not None
-
-        pipeline_context = PipelineContext(event=event)
-        reached_next = False
-
-        async def next_middleware(_ctx):
-            nonlocal reached_next
-            reached_next = True
-
-        middleware = ContactsMiddleware(
-            knowledge=service,
-            observation_issuer=authority.issue_observation,
-            mention_context_factory=lambda current: build_mention_read_context(
-                current, chat_registry=registry, knowledge=service
-            ),
-        )
-        await middleware(pipeline_context, next_middleware)
-        assert reached_next
-        runtime_candidate = pipeline_context.event.raw_metadata[
-            "mentioned_person_candidates"
-        ][0]
-        assert runtime_candidate["person_id"] == member_resolution.person_id
-        assert runtime_candidate["status"] == "ambiguous"
-        assert pipeline_context.event.raw_metadata["mentioned_jids"] == [lid]
-        for metadata_key in ("statement_roles", "source_ref", "source_audience"):
-            assert pipeline_context.event.raw_metadata[metadata_key] == event.raw_metadata[
-                metadata_key
-            ]
-
-        result = service.resolve_mentions(
-            (Identifier("whatsapp", "lid", lid, namespace=account_id),),
-            at_ms=None,
-            context=context,
-            account_namespace=account_id,
-        )[0]
-        mismatch = service.resolve_mentions(
-            (Identifier("whatsapp", "lid", lid, namespace=account_id),),
-            context=context,
-            account_namespace=ACCOUNT if account_id == "default" else "other-account",
-        )[0]
-        assert mismatch.status == "unresolved"
-        assert mismatch.reason == "account_namespace_mismatch"
-        registry.sync_from_bridge_metadata(
-            "whatsapp",
-            [
-                {
-                    "chatJid": "synthetic@g.us",
-                    "participants": [
-                        {
-                            "id": "8420000050@lid",
-                            "phoneNumber": "4910000000050@s.whatsapp.net",
-                        }
-                    ],
-                }
-            ],
-        )
-        after_membership_change = service.resolve_mentions(
-            (Identifier("whatsapp", "lid", lid, namespace=ACCOUNT),),
-            at_ms=None,
-            context=context,
-        )[0]
-
-        unqualified_registry = ChatRegistry(Path(":memory:"))
-        unqualified_registry.sync_from_bridge_metadata(
-            "whatsapp",
-            [
-                {
-                    "chatJid": "synthetic@g.us",
-                    "participants": [{"id": "4910000000050"}],
-                }
-            ],
-        )
-        unqualified = build_mention_read_context(
-            event, chat_registry=unqualified_registry, knowledge=service
-        )
-        assert result.status == "ambiguous"
-        assert result.person_id == member_resolution.person_id
-        assert after_membership_change.status == "denied"
-        assert after_membership_change.person_id is None
-        assert unqualified is None
-        unqualified_registry.close()
-    finally:
-        service.close()
-        registry.close()
-
-
-def _observe_pair_for_service(
-    service, authority, phone: str, lid: str, *, name: str, account: str = ACCOUNT
-):
-    observation = TrustedIdentityObservation(
-        identifiers=(
-            Identifier("whatsapp", "phone_jid", phone, namespace=account),
-            Identifier("whatsapp", "lid", lid, namespace=account),
-        ),
-        evidence_ref=f"mention-observation:{phone}",
-        observed_name=name,
-        observed_at_ms=1_700_000_000_000,
-        mapping_verified=True,
-        account_namespace=account,
-    )
-    authority.issue_observation(observation)
-    return service.resolve_person(observation)

@@ -131,7 +131,6 @@ class EnginePolicyAdapter(PolicyPort):
     ) -> None:
         self._engine = engine
         self._known_tools = policy_known_tools(known_tools)
-        self._history_config: Any = None
         self._policy_path = policy_path
         self._processing_config = processing_config
         self._models_config = models_config
@@ -1070,41 +1069,18 @@ class EnginePolicyAdapter(PolicyPort):
         return bool(self._owner_policy_for_context(ctx))
 
     def _get_group_name(self, chat_id: str) -> str | None:
-        """Get group name from chat_registry or bridge."""
-        history = getattr(self, '_history_config', None)
-        if history is not None and (history.live_projection_enabled and history.readers.secondary or history.legacy_writers_disabled):
-            from yeoman_gateway.history.context import current_history_snapshot
-            from yeoman_gateway.history.live import HistoryPaused
-            from yeoman_gateway.history.queries import HistoryQueries
-            snapshot = current_history_snapshot()
-            if snapshot is None or not (history.live_projection_enabled and history.readers.secondary):
-                raise HistoryPaused('secondary_history_scope_required')
-            return next((row['subject'] for row in HistoryQueries(snapshot).chats() if row['chat_id'] == chat_id), None)
-        # Try chat_registry first
-        try:
-            from yeoman_gateway.storage.chat_registry import ChatRegistry
+        """Read the group subject from the current WhatsApp history scope."""
+        from yeoman_gateway.history.context import current_history_snapshot
+        from yeoman_gateway.history.live import HistoryPaused
+        from yeoman_gateway.history.queries import HistoryQueries
 
-            registry = ChatRegistry()
-            try:
-                chat_info = registry.get_chat("whatsapp", chat_id)
-                if chat_info:
-                    name = chat_info.get("readable_name")
-                    if name:
-                        return name
-            finally:
-                registry.close()
-        except Exception:
-            pass
-
-        # Try bridge lookup
-        try:
-            names = self._list_group_subjects_from_bridge([chat_id])
-            if names.get(chat_id):
-                return names[chat_id]
-        except Exception:
-            pass
-
-        return None
+        snapshot = current_history_snapshot()
+        if snapshot is None:
+            raise HistoryPaused("history_scope_required")
+        return next(
+            (row["subject"] for row in HistoryQueries(snapshot).chats() if row["chat_id"] == chat_id),
+            None,
+        )
 
     def _handle_group_approval_reply(self, event: InboundEvent) -> AdminCommandResult | None:
         choice = event.content.strip().casefold()
@@ -1466,7 +1442,7 @@ class EnginePolicyAdapter(PolicyPort):
 
         session_key = f"{ctx.channel}:{ctx.chat_id}"
         try:
-            if self._session_manager.uses_history(ctx.channel):
+            if ctx.channel == "whatsapp":
                 session = self._session_manager.get_or_create(
                     session_key, channel=ctx.channel, chat_id=ctx.chat_id)
                 assert self._session_manager.operational_store is not None

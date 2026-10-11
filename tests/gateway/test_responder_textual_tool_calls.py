@@ -9,16 +9,71 @@ from yeoman_gateway.adapters.responder_llm import LLMResponder
 from yeoman_gateway.agent.tools.base import Tool
 from yeoman_gateway.bus.queue import MessageBus
 from yeoman_gateway.core.models import InboundEvent, PolicyDecision
-from yeoman_gateway.knowledge._contacts.service import ContactsService
 from yeoman_gateway.media.router import ModelRouter
 from yeoman_gateway.policy.engine import PolicyEngine
 from yeoman_gateway.policy.schema import PolicyConfig
 from yeoman_gateway.providers.base import LLMProvider, LLMResponse, ToolCallRequest
 from yeoman_gateway.session.manager import SessionManager
-from yeoman_gateway.storage.chat_registry import ChatRegistry
 from yeoman_gateway.storage.private_handoff import PrivateHandoffStore
 from yeoman_shared.config.schema import ModelProfile, ModelRoutingConfig
 
+
+
+@pytest.fixture(autouse=True)
+def _history_scope_for_whatsapp_responder(monkeypatch: pytest.MonkeyPatch, tmp_path: Path):
+    """Give responder unit tests a real, isolated SQLite History snapshot per turn."""
+    import sqlite3
+    from types import SimpleNamespace
+
+    from yeoman_gateway.history.context import history_knowledge_scope, history_turn
+    from yeoman_gateway.history.reader import HistorySnapshot
+    from yeoman_gateway.history.schema import create as create_history
+
+    history_path = tmp_path / "synthetic-history.db"
+    with sqlite3.connect(history_path) as connection:
+        create_history(connection)
+
+    async def read_turn():
+        connection = sqlite3.connect(f"file:{history_path}?mode=ro", uri=True)
+        return HistorySnapshot(1, (), connection)
+
+    projector = SimpleNamespace(
+        read_turn=read_turn,
+        health=lambda: {"status": "ready", "generation": 1},
+    )
+    original_init = LLMResponder.__init__
+    original_generate = LLMResponder.generate_reply
+
+    def init_with_history(self, *args, **kwargs):
+        original_init(self, *args, **kwargs)
+        self._history_projector = projector
+        self._history_knowledge = None
+
+    async def generate_in_history(self, event, decision, *args, **kwargs):
+        if getattr(event, "channel", "") != "whatsapp":
+            return await original_generate(self, event, decision, *args, **kwargs)
+        timestamp = getattr(event, "timestamp", None)
+        occurred_ms = int(timestamp.timestamp() * 1000) if timestamp is not None else 0
+        event_id = str(getattr(event, "message_id", "") or f"unit-{occurred_ms}")
+        with sqlite3.connect(history_path) as connection:
+            connection.execute(
+                "INSERT OR REPLACE INTO messages (message_id,channel,chat_id,native_message_id,"
+                "sender_contact_id,sender_identifier,sender_basis,direction,sent_ms,"
+                "time_certainty,text,provenance,source_refs) "
+                "VALUES (?, 'whatsapp', ?, ?, NULL, ?, 'unknown', 'in', ?, 'unknown', ?, 'native', '[]')",
+                (
+                    f"unit:{event_id}", str(getattr(event, "chat_id", "")), event_id,
+                    str(getattr(event, "sender_id", "")), occurred_ms,
+                    str(getattr(event, "content", "") or ""),
+                ),
+            )
+        async with history_turn(projector) as snapshot:
+            with history_knowledge_scope(snapshot, self._history_knowledge):
+                kwargs.setdefault("history_snapshot", snapshot)
+                return await original_generate(self, event, decision, *args, **kwargs)
+
+    monkeypatch.setattr(LLMResponder, "__init__", init_with_history)
+    monkeypatch.setattr(LLMResponder, "generate_reply", generate_in_history)
 
 class _TextualToolThenAnswerProvider(LLMProvider):
     def __init__(self, first_response: str) -> None:
@@ -979,96 +1034,6 @@ async def test_group_request_cannot_silently_dm_without_private_intent(tmp_path:
     assert voice_tool.calls == []
 
 
-@pytest.mark.asyncio
-async def test_pending_voice_delivery_resolves_followup_mention_to_private_contact(
-    tmp_path: Path,
-) -> None:
-    workspace = tmp_path / "ws"
-    workspace.mkdir()
-    sessions = SessionManager(workspace, sessions_dir=workspace / "sessions")
-    contacts = ContactsService(db_path=tmp_path / "contacts.db")
-    contacts.ensure_contact(
-        channel="whatsapp",
-        identifier="4917632625469@s.whatsapp.net",
-        kind="phone_jid",
-        push_name="Frank Taeger",
-    )
-    chat_registry = ChatRegistry(db_path=tmp_path / "chat_registry.db")
-    chat_registry.register_chat(
-        channel="whatsapp",
-        chat_id="finance@g.us",
-        chat_type="group",
-        readable_name="Finanzgruppe",
-        metadata={
-            "participants": [
-                {
-                    "id": "46918273106072@lid",
-                    "phoneNumber": "4917632625469@s.whatsapp.net",
-                }
-            ]
-        },
-    )
-    voice_tool = _HandoffDeliveredVoiceTool()
-    responder = LLMResponder(
-        bus=MessageBus(),
-        provider=_TextualToolThenAnswerProvider("Welche Nummer hat Frank?"),
-        workspace=workspace,
-        session_manager=sessions,
-        contacts_service=contacts,
-        chat_registry=chat_registry,
-    )
-    responder.tools.register(voice_tool)
-    decision = PolicyDecision(
-        accept_message=True,
-        should_respond=True,
-        allowed_tools=frozenset({"send_voice", "resolve_contact"}),
-        reason="test",
-    )
-
-    first = await responder.generate_reply(
-        InboundEvent(
-            channel="whatsapp",
-            chat_id="finance@g.us",
-            sender_id="491757070305",
-            content="@203075365150770 sag es als Sprachnachricht, und schicke es an Frank",
-            message_id="request-1",
-            is_group=True,
-            mentioned_bot=True,
-            reply_to_message_id="threat-1",
-            reply_to_text="Ich pruegel die Scheisse aus euch raus",
-        ),
-        decision,
-    )
-    second = await responder.generate_reply(
-        InboundEvent(
-            channel="whatsapp",
-            chat_id="finance@g.us",
-            sender_id="491757070305",
-            content="das ist der Frank hier @46918273106072",
-            message_id="request-2",
-            is_group=True,
-            mentioned_bot=False,
-            reply_to_bot=True,
-            raw_metadata={"mentioned_jids": ["46918273106072@lid"]},
-        ),
-        decision,
-    )
-
-    await responder.aclose()
-    contacts.close()
-    chat_registry.close()
-
-    assert first is not None
-    assert "Frank" in first
-    assert second is None
-    assert voice_tool.calls == [
-        {
-            "content": "Ich pruegel die Scheisse aus euch raus",
-            "chat_id": "4917632625469@s.whatsapp.net",
-        }
-    ]
-    session = sessions.get_or_create("whatsapp:finance@g.us")
-    assert "pending_delivery" not in session.metadata
 
 
 @pytest.mark.asyncio

@@ -12,12 +12,12 @@ from __future__ import annotations
 from pathlib import Path
 
 import pytest
-from yeoman_gateway.knowledge._capture_worker import StatementDraft
-from yeoman_gateway.knowledge._memory.extraction_jobs import (
+from yeoman_gateway.knowledge._capture_screen import (
     is_hedged,
     screen_content,
     screen_statement_content,
 )
+from yeoman_gateway.knowledge._capture_worker import StatementDraft
 from yeoman_gateway.knowledge._statements import rescreen_statements
 
 from tests.gateway.capture_harness import AUTHOR, GROUP, CaptureHarness
@@ -118,7 +118,7 @@ def _publish_legacy_and_real(harness: CaptureHarness) -> tuple[str, str]:
     The content screens run in the promotion worker, not in ``capture()``, so a row that
     was published before the rule existed is reproduced here exactly as history left it.
     """
-    from yeoman_gateway.knowledge.models import SourceRef, StatementCandidate, TrustedCaptureContext
+    from yeoman_gateway.knowledge.models import StatementCandidate, TrustedCaptureContext
 
     harness.activate()
     harness.observe("Es wird gefragt, wie alt die Person war.", message_id="3EB0A00")
@@ -131,16 +131,11 @@ def _publish_legacy_and_real(harness: CaptureHarness) -> tuple[str, str]:
         event = harness.store.events_by_provider_identity(
             channel="whatsapp", chat_id=GROUP, provider_message_id=provider_id
         )[0]
-        sources.append(
-            SourceRef(
-                event_id=event.event_id,
-                revision=1,
-                channel="whatsapp",
-                chat_id=GROUP,
-                author_principal=AUTHOR,
-                occurred_at_ms=int(event.occurred_ms or harness.now),
-            )
-        )
+        # CaptureHarness issues the canonical source from its History projection; do not
+        # reconstruct a principal or source identity from the processing journal row.
+        source = harness.history_sources.issue(event.event_id)
+        assert source.revision == 1
+        sources.append(source)
     context = TrustedCaptureContext(
         request_id="legacy-rows",
         policy_revision=1,
@@ -224,7 +219,7 @@ def test_rescreen_apply_hides_only_the_refused_statement(harness: CaptureHarness
 # somebody said is perfectly good input - the reporting vocabulary is only a reason to
 # refuse a *candidate* that turned out to be nothing but that report.
 
-from yeoman_gateway.knowledge._memory.extraction_jobs import (  # noqa: E402
+from yeoman_gateway.knowledge._capture_screen import (  # noqa: E402
     screen_capture_input,
     screen_statement_candidate,
 )

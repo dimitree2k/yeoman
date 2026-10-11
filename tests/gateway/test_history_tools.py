@@ -515,9 +515,8 @@ async def test_a2a_pause_and_retired_contacts_fail_closed(tmp_path):
     p, knowledge = contact_case(tmp_path)
     policy = _AliasPolicy()
     policy.evaluate = lambda _: SimpleNamespace(accept_message=True, should_respond=True, allowed_tools={'message'})
-    legacy = SimpleNamespace(store=SimpleNamespace(search_by_alias=Mock(side_effect=AssertionError('legacy'))))
     def resolver(kind, alias):
-        return resolve_whatsapp_recipient(kind, alias, policy_adapter=policy, knowledge=knowledge, contacts_service=legacy)
+        return resolve_whatsapp_recipient(kind, alias, policy_adapter=policy, knowledge=knowledge)
     kwargs = dict(input=_input(recipient={'type': 'contact', 'alias': 'synthetic-contact'}), policy=policy,
                   resolver=resolver, history_projector=p, history_knowledge=knowledge)
     p.status = 'rebuilding'
@@ -529,7 +528,6 @@ async def test_a2a_pause_and_retired_contacts_fail_closed(tmp_path):
     knowledge.released = False
     result, _, _, effects = await _invoke(**kwargs)
     assert effects.calls == []
-    legacy.store.search_by_alias.assert_not_called()
     assert set(tmp_path.iterdir()) == {p.path} and p.live_snapshot_count == 0
     p.close()
 

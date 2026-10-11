@@ -15,10 +15,7 @@ from collections.abc import Iterator
 from contextlib import contextmanager
 from typing import TYPE_CHECKING
 
-from yeoman_gateway.history.writer_guard import (
-    legacy_history_writers_disabled,
-    require_legacy_history_writer,
-)
+from yeoman_gateway.history.live import HistoryPaused
 
 if TYPE_CHECKING:
     from yeoman_gateway.history.queries import HistoryQueries
@@ -35,8 +32,6 @@ from typing import Any, Iterable
 
 from yeoman_gateway.knowledge._conversations import ConversationEngine
 from yeoman_gateway.knowledge._episodes import EpisodeConsolidator
-from yeoman_gateway.knowledge._identity import IdentityEngine
-from yeoman_gateway.knowledge._identity_candidates import IdentityCandidateEngine
 from yeoman_gateway.knowledge._migration import (
     LegacyCanonicalApplyReport,
     LegacyLinkApplyReport,
@@ -54,8 +49,8 @@ from yeoman_gateway.knowledge._migration import (
     reconstruct_legacy_statements,
 )
 from yeoman_gateway.knowledge._retrieval import RetrievalEngine
-from yeoman_gateway.knowledge._statements import StatementEngine, token_re
-from yeoman_gateway.knowledge._store import SCHEMA_VERSION, KnowledgeStore
+from yeoman_gateway.knowledge._statements import StatementEngine
+from yeoman_gateway.knowledge._store import KnowledgeStore
 from yeoman_gateway.knowledge.authority import (
     PolicyAuthority,
     SourceAuthority,
@@ -77,8 +72,6 @@ from yeoman_gateway.knowledge.models import (
     EpisodeBuildReport,
     EpisodeView,
     Identifier,
-    IdentityCandidate,
-    IdentityCandidateWeights,
     KnowledgeContext,
     KnowledgeError,
     KnowledgeStats,
@@ -94,18 +87,13 @@ from yeoman_gateway.knowledge.models import (
     StatementSummary,
     TrustedAdminContext,
     TrustedCaptureContext,
-    TrustedIdentityObservation,
     TrustedReadContext,
     ValidationError,
-    normalize_alias_value,
-    validate_name,
 )
 
 __all__ = [
     "KnowledgeService",
     "KnowledgeStartupError",
-    "IdentityCandidate",
-    "IdentityCandidateWeights",
     "LegacyLinkApplyReport",
     "LegacyCanonicalApplyReport",
     "LegacyLinkCandidate",
@@ -200,11 +188,7 @@ def open_knowledge_store(
     source_authority: SourceAuthority,
     policy_authority: PolicyAuthority,
     clock: Any | None = None,
-    create: bool = True,
     retention_ms: int | None = None,
-    legacy_sources: Iterable[Path] = (),
-    history_mode: bool = False,
-    legacy_history_disabled: bool = False,
 ) -> "KnowledgeService":
     """Open (or create) the knowledge store and return the public service.
 
@@ -213,68 +197,30 @@ def open_knowledge_store(
     when the file carries a different schema version.  Both are explicit states, never
     a silent fallback to an older store.
 
-    The order matters: the existing file is probed *read-only* before anything opens it
-    for writing.  A v1 store is therefore refused byte-for-byte unchanged - no tables, no
-    meta rows, no WAL side file.  Only a file that does not exist at all is created as a
-    fresh v2 store; the normal start never migrates, and it never upgrades in place.
+    The existing file is probed read-only and must already be a published schema-3
+    store. Runtime startup never creates, migrates, or upgrades a store in place.
     """
-    legacy_history_disabled = legacy_history_writers_disabled(legacy_history_disabled)
-    if legacy_history_disabled and history_mode is not True:
-        from yeoman_gateway.history.live import HistoryPaused
-        raise HistoryPaused("retired_knowledge_requires_history_schema")
     path = Path(db_path).expanduser()
-    legacy = [Path(item).expanduser() for item in legacy_sources]
     probe = _probe_schema(path)
-    fresh = not probe.exists
-    expected_schema = 3 if history_mode else SCHEMA_VERSION
-    if history_mode and fresh:
-        raise KnowledgeStartupError("migration_required", "history mode requires an offline schema-3 copy")
-    if fresh and any(item.exists() for item in legacy):
-        # The consolidated store is missing while legacy data exists.  Migrate
-        # explicitly, never write an empty store next to the old data.
+    if not probe.exists:
         raise KnowledgeStartupError(
             "migration_required",
-            "legacy memory/contacts data exists but no verified knowledge store was built",
+            "a published schema-3 knowledge store is required",
         )
-    if not fresh:
-        if not probe.is_knowledge_store:
-            # An occupied path without a knowledge schema is not a knowledge store: for
-            # example a legacy memory file configured directly as the target.
-            raise KnowledgeStartupError(
-                "migration_required",
-                "the target file carries no knowledge schema and was not migrated",
-            )
-        if probe.schema_version < expected_schema:
-            # An *older* knowledge store is not corruption: it is data that needs the
-            # explicit, audited snapshot upgrade.  Anything newer or non-numeric stays
-            # ``schema_incompatible``.
-            raise KnowledgeStartupError(
-                "migration_required",
-                f"knowledge schema version {probe.schema_version} needs an explicit"
-                f" snapshot upgrade to {expected_schema}; the normal start never migrates",
-            )
-        if probe.schema_version != expected_schema:
-            raise KnowledgeStartupError(
-                "schema_incompatible",
-                f"knowledge schema version {probe.schema_version} is not supported"
-                f" (need {expected_schema}); an explicit snapshot upgrade is required",
-            )
-        if not probe.migration_complete:
-            raise KnowledgeStartupError(
-                "migration_required",
-                "knowledge store exists but carries no complete migration manifest;"
-                " an explicit snapshot upgrade is required",
-            )
+    if not probe.is_knowledge_store:
+        raise KnowledgeStartupError("migration_required", "the target file carries no knowledge schema")
+    if probe.schema_version < 3:
+        raise KnowledgeStartupError(
+            "migration_required", f"knowledge schema version {probe.schema_version} needs an explicit snapshot upgrade to 3"
+        )
+    if probe.schema_version != 3:
+        raise KnowledgeStartupError("schema_incompatible", f"knowledge schema version {probe.schema_version} is not supported (need 3)")
+    if not probe.migration_complete:
+        raise KnowledgeStartupError("migration_required", "knowledge store exists but carries no complete migration manifest")
     try:
-        store = KnowledgeStore(path, create=create and not history_mode)
+        store = KnowledgeStore(path, create=False)
     except sqlite3.Error as exc:  # pragma: no cover - defensive
         raise KnowledgeStartupError("storage_unavailable", str(exc)) from exc
-    if fresh and create:
-        # A brand-new installation with no legacy data is complete by construction.
-        store.set_meta("migration_complete", "1")
-        store.set_meta("migration_id", "fresh-install")
-        store.set_meta("semantic_digest", "")
-        store.commit_if_idle()
     return KnowledgeService(
         store=store,
         workspace_id=workspace_id,
@@ -282,8 +228,6 @@ def open_knowledge_store(
         policy_authority=policy_authority,
         clock=clock,
         retention_ms=retention_ms,
-        history_mode=history_mode,
-        legacy_history_disabled=legacy_history_disabled,
     )
 
 
@@ -377,27 +321,20 @@ class KnowledgeService:
         policy_authority: PolicyAuthority,
         clock: Any | None = None,
         retention_ms: int | None = None,
-        history_mode: bool = False,
-        legacy_history_disabled: bool = False,
     ) -> None:
-        self.legacy_history_disabled = legacy_history_writers_disabled(legacy_history_disabled)
-        if self.legacy_history_disabled is True and store.schema_version != 3:
-            from yeoman_gateway.history.live import HistoryPaused
-            raise HistoryPaused("retired_knowledge_requires_history_schema")
+        if store.schema_version != 3:
+            raise KnowledgeStartupError("schema_incompatible", "runtime requires Knowledge schema 3")
         self._store = store
         # One wrapper so administrative sources registered later are visible to the
         # statement engine through the very same object.
         from yeoman_gateway.knowledge._history_identity import ScopedKnowledgeAdapter
-        self._history_mode = history_mode
         self._legacy_authority = _RecordingSourceAuthority(source_authority)
-        self._authority = ScopedKnowledgeAdapter(store, self._legacy_authority, 'sources', selected=history_mode)
+        self._base_authority = self._legacy_authority
+        self._authority = ScopedKnowledgeAdapter(store, 'sources')
         self._policy = policy_authority
         self.workspace_id = str(workspace_id)
         self._clock = clock
-        self._identity = ScopedKnowledgeAdapter(store,
-            IdentityEngine(store, authority=self._authority, policy=policy_authority, legacy_history_disabled=self.legacy_history_disabled),
-            'identity', selected=history_mode)
-        self._identity_candidates = IdentityCandidateEngine(store, identity=self._identity)
+        self._identity = ScopedKnowledgeAdapter(store, 'identity')
         self._statements = StatementEngine(
             store,
             identity=self._identity,
@@ -443,11 +380,6 @@ class KnowledgeService:
         finally:
             _scopes.reset(token)
 
-    def _require_legacy_identity(self) -> None:
-        require_legacy_history_writer(disabled=self.legacy_history_disabled, channel="whatsapp")
-        from yeoman_gateway.knowledge._history_identity import current_history_scope
-        if self._history_mode or current_history_scope(self._store) is not None:
-            raise KnowledgeError('history_identity_read_only', 'use the local owner-attestation CLI')
 
     @property
     def history_source_ledger(self) -> HistorySourceLedger:
@@ -483,8 +415,7 @@ class KnowledgeService:
         """Server-side refresh of the trusted read context (never from a model)."""
         if not isinstance(context, TrustedReadContext):
             raise ValidationError("read context must be a TrustedReadContext")
-        if self._history_mode and context.channel == 'whatsapp':
-            from yeoman_gateway.history.live import HistoryPaused
+        if context.channel == 'whatsapp':
             from yeoman_gateway.knowledge._history_identity import current_history_scope
             if current_history_scope(self._store) is None:
                 raise HistoryPaused('knowledge_history_scope_required')
@@ -494,19 +425,6 @@ class KnowledgeService:
 
     # ── identity ─────────────────────────────────────────────────────────────
 
-    def resolve_person(
-        self,
-        observation: TrustedIdentityObservation,
-        *,
-        context: TrustedReadContext | None = None,
-    ) -> PersonResolution:
-        """Resolve a verified platform observation.  Creates at most one stub."""
-        if not isinstance(observation, TrustedIdentityObservation):
-            raise ValidationError("observation must be a TrustedIdentityObservation")
-        with self._store.transaction():
-            return self._identity.resolve_observation(
-                observation, context=context, create_stub=True
-            )
 
     def search_people(
         self, name: str, *, context: TrustedReadContext
@@ -684,46 +602,7 @@ class KnowledgeService:
             context=checked,
         )
 
-    def set_preferred_name(
-        self,
-        person_id: str,
-        name: str,
-        *,
-        context: TrustedAdminContext,
-        source: str = "owner_confirmed",
-        visibility: str = "public",
-        observed_name: str | None = None,
-    ) -> ChangeReceipt:
-        require_legacy_history_writer(disabled=self.legacy_history_disabled, channel="whatsapp")
-        with self._store.transaction():
-            receipt = self._identity.set_preferred_name(
-                person_id,
-                name,
-                context=context,
-                source=source,
-                visibility=visibility,
-                observed_name=observed_name,
-            )
-        return receipt
 
-    def bind_identifier(
-        self,
-        person_id: str,
-        identifier: Identifier,
-        *,
-        evidence_ref: str,
-        mapping_verified: bool,
-        context: TrustedAdminContext,
-    ) -> ChangeReceipt:
-        require_legacy_history_writer(disabled=self.legacy_history_disabled, channel="whatsapp")
-        with self._store.transaction():
-            return self._identity.add_binding(
-                person_id=person_id,
-                identifier=identifier,
-                evidence_ref=evidence_ref,
-                mapping_verified=mapping_verified,
-                context=context,
-            )
 
     def resolve_endpoint(
         self,
@@ -836,64 +715,11 @@ class KnowledgeService:
 
     # ── identity changes ─────────────────────────────────────────────────────
 
-    def merge_people(
-        self,
-        target_id: str,
-        source_id: str,
-        *,
-        expected_revision: int,
-        context: TrustedAdminContext,
-    ) -> ChangeReceipt:
-        require_legacy_history_writer(disabled=self.legacy_history_disabled, channel="whatsapp")
-        with self._store.transaction():
-            return self._identity.merge_people(
-                target_id,
-                source_id,
-                expected_revision=expected_revision,
-                context=context,
-            )
 
-    def undo_merge(
-        self, operation_id: str, *, expected_revision: int, context: TrustedAdminContext
-    ) -> ChangeReceipt:
-        require_legacy_history_writer(disabled=self.legacy_history_disabled, channel="whatsapp")
-        with self._store.transaction():
-            return self._identity.undo_merge(
-                operation_id, expected_revision=expected_revision, context=context
-            )
 
     # ── temporal bindings, aliases and platform observations ────────────────
 
-    def resolve_observation(
-        self,
-        observation: TrustedIdentityObservation,
-        *,
-        context: TrustedReadContext | None = None,
-        create_stub: bool = True,
-    ) -> PersonResolution:
-        """Resolve a verified platform observation to exactly one person.
 
-        The public spelling of the identity path.  Ambiguity, an unproven multi-identifier
-        mapping and two people claiming one identifier are results, never a first-match
-        merge.  A verified unknown platform identity may create a stub; model text never
-        reaches this method.
-        """
-        require_legacy_history_writer(disabled=self.legacy_history_disabled, channel="whatsapp")
-        with self._store.transaction():
-            return self._identity.resolve_observation(
-                observation, context=context, create_stub=create_stub
-            )
-
-    def record_provider_pair(
-        self,
-        observation: TrustedIdentityObservation,
-    ) -> PersonResolution:
-        """Persist and resolve one issuer-verified WhatsApp phone/LID pairing."""
-        require_legacy_history_writer(disabled=self.legacy_history_disabled, channel="whatsapp")
-        if not isinstance(observation, TrustedIdentityObservation):
-            raise ValidationError("observation must be a TrustedIdentityObservation")
-        with self._store.transaction():
-            return self._identity.record_provider_pair(observation)
 
     def provider_merge_protection_reason(
         self,
@@ -906,58 +732,8 @@ class KnowledgeService:
             person_ids, additional_identifiers=additional_identifiers
         )
 
-    def propose_identity_candidates(
-        self,
-        *,
-        context: TrustedAdminContext,
-        weights: IdentityCandidateWeights | None = None,
-        persist: bool = True,
-    ) -> tuple[IdentityCandidate, ...]:
-        """Refresh the owner-only duplicate queue using available structured evidence."""
-        self._require_legacy_identity()
-        self._require_admin_context(context)
-        if persist:
-            with self._store.transaction():
-                return self._identity_candidates.propose(
-                    context=context, weights=weights, persist=True
-                )
-        return self._identity_candidates.propose(
-            context=context, weights=weights, persist=False
-        )
 
-    def list_identity_candidates(
-        self,
-        *,
-        context: TrustedAdminContext,
-        statuses: tuple[str, ...] = (),
-    ) -> tuple[IdentityCandidate, ...]:
-        """List owner-only candidate summaries; ordinary read contexts are rejected."""
-        self._require_legacy_identity()
-        self._require_admin_context(context)
-        return self._identity_candidates.list_candidates(context=context, statuses=statuses)
 
-    def decide_identity_candidate(
-        self,
-        candidate_id: str,
-        *,
-        decision: str,
-        expected_candidate_revision: int,
-        expected_identity_revision: int,
-        context: TrustedAdminContext,
-        target_id: str | None = None,
-    ) -> IdentityCandidate:
-        """Record an owner decision, routing merges through the existing redirect API."""
-        self._require_legacy_identity()
-        self._require_admin_context(context)
-        with self._store.transaction():
-            return self._identity_candidates.decide(
-                candidate_id,
-                decision=decision,
-                expected_candidate_revision=expected_candidate_revision,
-                expected_identity_revision=expected_identity_revision,
-                context=context,
-                target_id=target_id,
-            )
 
     def resolve_identifier(
         self, identifier: Identifier, *, at_ms: int | None = None
@@ -965,139 +741,10 @@ class KnowledgeService:
         """Resolve one fully typed identifier, optionally at a proven past instant."""
         return self._identity.resolve_identifier(identifier, at_ms=at_ms)
 
-    def add_or_end_binding(
-        self,
-        *,
-        person_id: str,
-        identifier: Identifier,
-        evidence_ref: str,
-        context: TrustedAdminContext,
-        expected_revision: int | None = None,
-        mapping_verified: bool = True,
-        valid_from_ms: int | None = None,
-        end_binding_id: str | None = None,
-        end_at_ms: int | None = None,
-        change_kind: str = "binding",
-    ) -> ChangeReceipt:
-        """Claim, extend or hand over one temporal identifier binding."""
-        require_legacy_history_writer(disabled=self.legacy_history_disabled, channel="whatsapp")
-        with self._store.transaction():
-            return self._identity.add_or_end_binding(
-                change_kind=change_kind,
-                person_id=person_id,
-                identifier=identifier,
-                evidence_ref=evidence_ref,
-                mapping_verified=mapping_verified,
-                context=context,
-                expected_revision=(
-                    self._store.identity_revision
-                    if expected_revision is None
-                    else int(expected_revision)
-                ),
-                valid_from_ms=valid_from_ms,
-                end_binding_id=end_binding_id,
-                end_at_ms=end_at_ms,
-            )
 
-    def end_binding(
-        self,
-        *,
-        binding_id: str,
-        context: TrustedAdminContext,
-        expected_revision: int | None = None,
-        end_at_ms: int | None = None,
-    ) -> ChangeReceipt:
-        """End exactly one binding; its proven period stays as history."""
-        require_legacy_history_writer(disabled=self.legacy_history_disabled, channel="whatsapp")
-        with self._store.transaction():
-            return self._identity.end_binding(
-                binding_id=binding_id,
-                expected_revision=(
-                    self._store.identity_revision
-                    if expected_revision is None
-                    else int(expected_revision)
-                ),
-                context=context,
-                end_at_ms=end_at_ms,
-            )
 
-    def observe_alias(
-        self,
-        *,
-        person_id: str,
-        name: str,
-        alias_kind: str = "other_name",
-        scope_key: str = "",
-        evidence_ref: str = "",
-        status: str = "observed",
-        address_allowed: bool = False,
-        supporting_statement_id: str | None = None,
-        visibility: str = "public",
-        valid_until_ms: int | None = None,
-        source: str = "observed",
-    ) -> NameObservation:
-        """Record one alias with an explicit kind, context and evidence."""
-        require_legacy_history_writer(disabled=self.legacy_history_disabled, channel="whatsapp")
-        with self._store.transaction():
-            return self._identity.observe_alias(
-                person_id=person_id,
-                name=name,
-                alias_kind=alias_kind,
-                scope_key=scope_key,
-                evidence_ref=evidence_ref,
-                status=status,
-                address_allowed=address_allowed,
-                supporting_statement_id=supporting_statement_id,
-                visibility=visibility,
-                valid_until_ms=valid_until_ms,
-                source=source,
-            )
 
-    def set_alias_preference(
-        self,
-        *,
-        alias_id: int,
-        context: TrustedAdminContext,
-        expected_revision: int | None = None,
-        address_allowed: bool = True,
-    ) -> ChangeReceipt:
-        """Make one alias the preferred address in its own context."""
-        require_legacy_history_writer(disabled=self.legacy_history_disabled, channel="whatsapp")
-        with self._store.transaction():
-            return self._identity.set_alias_preference(
-                alias_id=int(alias_id),
-                expected_revision=(
-                    self._store.identity_revision
-                    if expected_revision is None
-                    else int(expected_revision)
-                ),
-                context=context,
-                address_allowed=address_allowed,
-            )
 
-    def retire_alias(
-        self,
-        *,
-        alias_id: int,
-        context: TrustedAdminContext,
-        expected_revision: int | None = None,
-        reason: str = "not_wanted",
-        correct_mapping: bool = False,
-    ) -> ChangeReceipt:
-        """Withdraw the addressing permission, or retract the mapping itself."""
-        require_legacy_history_writer(disabled=self.legacy_history_disabled, channel="whatsapp")
-        with self._store.transaction():
-            return self._identity.retire_alias(
-                alias_id=int(alias_id),
-                expected_revision=(
-                    self._store.identity_revision
-                    if expected_revision is None
-                    else int(expected_revision)
-                ),
-                context=context,
-                reason=reason,
-                correct_mapping=correct_mapping,
-            )
 
     def aliases_of(self, person_id: str) -> tuple[NameObservation, ...]:
         """Every stored alias of a person, including retired ones (for inspection)."""
@@ -1509,43 +1156,7 @@ class KnowledgeService:
             changed_ids=(statement_id,),
         )
 
-    def reindex(self, *, context: TrustedAdminContext) -> MaintenanceReport:
-        require_legacy_history_writer(disabled=self.legacy_history_disabled, channel="whatsapp")
-        self._require_admin_context(context)
-        rows = self._store.query(
-            "SELECT id, content FROM memory2_nodes WHERE is_deleted = 0"
-        )
-        examined = len(rows)
-        with self._store.transaction():
-            self._store.execute("DELETE FROM memory2_nodes_fts")
-            for row in rows:
-                content = str(row["content"] or "")
-                if content:
-                    self._store.execute(
-                        "INSERT INTO memory2_nodes_fts (entry_id, content) VALUES (?, ?)",
-                        (str(row["id"]), content),
-                    )
-        return MaintenanceReport(examined=examined, changed=examined, denied=0)
 
-    def backfill_alias_search_keys(
-        self, *, context: TrustedAdminContext
-    ) -> MaintenanceReport:
-        """Populate missing normalized alias keys on this owner-authorized store."""
-        self._require_legacy_identity()
-        self._require_admin_context(context)
-        with self._store.transaction():
-            rows = self._store.query(
-                "SELECT id, alias FROM contact_aliases WHERE normalized_alias = '' ORDER BY id"
-            )
-            changed = 0
-            for row in rows:
-                cursor = self._store.execute(
-                    "UPDATE contact_aliases SET normalized_alias = ?"
-                    " WHERE id = ? AND normalized_alias = ''",
-                    (normalize_alias_value(str(row["alias"])), int(row["id"])),
-                )
-                changed += max(0, cursor.rowcount)
-        return MaintenanceReport(examined=len(rows), changed=changed, denied=0)
 
     def prune(self, *, before_ms: int, context: TrustedAdminContext) -> MaintenanceReport:
         """Expire statements whose validity window passed.  Counts only, no content."""
@@ -1576,25 +1187,6 @@ class KnowledgeService:
             state="ready",
         )
 
-    # ── private storage bindings for the internal runtime adapters ───────────
-    #
-    # These return sub-stores that *join* this service's connection.  They exist for the
-    # two internal adapters (session notes/backlog and the contacts cache) and for the
-    # composition root.  They are not part of the consumer contract: external callers
-    # use the typed methods above and never receive a store handle.
-
-    def memory_store(self) -> Any:
-        """The session/notes adapter's view of the shared store.  Internal use only."""
-        from yeoman_gateway.knowledge._memory.store import MemoryStore
-
-        return MemoryStore(owner=self._store, legacy_history_disabled=self.legacy_history_disabled)
-
-    def contacts_store(self) -> Any:
-        """The contacts cache adapter's view of the shared store.  Internal use only."""
-        from yeoman_gateway.knowledge._contacts.store import ContactsStore
-
-        return ContactsStore(owner=self._store, legacy_history_disabled=self.legacy_history_disabled)
-
     # ── internal helpers used by the runtime adapters ────────────────────────
 
     def register_turn_source(
@@ -1617,7 +1209,7 @@ class KnowledgeService:
         if scope is not None and source.channel == 'whatsapp':
             issued = scope.sources.issue(source.event_id)
             return issued == source
-        register = getattr(self._authority, "register_source", None)
+        register = getattr(self._base_authority, "register_source", None)
         if register is None or not source.event_id:
             return False
         if author_only:
@@ -1668,101 +1260,7 @@ class KnowledgeService:
             return ()
         return self._identity.eligible_people_for_context(checked)
 
-    def recall_context(
-        self,
-        text: str,
-        *,
-        context: TrustedReadContext,
-        reply_to_text: str | None = None,
-        reply_to_person: str | None = None,
-        limit: int = 12,
-    ) -> KnowledgeContext:
-        """Scoped recall of ordinary, non-personal memories for one verified reader.
 
-        This is the only read path for memories that carry no statement shell.  It is
-        *not* a fallback around the statement gate: the caller has already been checked
-        against current membership and audience, and the returned rows are restricted to
-        scopes derived server-side from that same verified context.
-        """
-        checked = self._read_context(context)
-        decision = self._retrieval.decide(checked)
-        if not decision.allowed:
-            return KnowledgeContext(
-                reason=decision.reason,
-                identity_revision=self._store.identity_revision,
-                acl_epoch=self._store.acl_epoch,
-            )
-        query = " ".join(str(text or "").split()) or " ".join(str(reply_to_text or "").split())
-        if not query:
-            return KnowledgeContext(
-                reason="empty",
-                identity_revision=self._store.identity_revision,
-                acl_epoch=self._store.acl_epoch,
-            )
-        scope_keys = self._allowed_scope_keys(checked, decision, reply_to_person)
-        if not scope_keys:
-            return KnowledgeContext(
-                reason="empty",
-                identity_revision=self._store.identity_revision,
-                acl_epoch=self._store.acl_epoch,
-            )
-        placeholders = ",".join("?" for _ in scope_keys)
-        tokens = [token for token in token_re().findall(query.lower()) if len(token) > 1][:16]
-        if not tokens:
-            return KnowledgeContext(
-                reason="empty",
-                identity_revision=self._store.identity_revision,
-                acl_epoch=self._store.acl_epoch,
-            )
-        match = " OR ".join(tokens)
-        rows = self._store.query(
-            "SELECT n.id AS id, n.content AS content FROM memory2_nodes_fts"
-            " JOIN memory2_nodes n ON n.id = memory2_nodes_fts.entry_id"
-            f" WHERE n.workspace_id = ? AND n.is_deleted = 0 AND n.scope_key IN ({placeholders})"
-            " AND memory2_nodes_fts MATCH ?"
-            " AND n.id NOT IN (SELECT statement_id FROM knowledge_statements WHERE status <> 'revoked')"
-            " ORDER BY bm25(memory2_nodes_fts) ASC, n.updated_at DESC LIMIT ?",
-            (self.workspace_id, *scope_keys, match, int(max(1, min(limit, 50)))),
-        )
-        lines: list[str] = []
-        ids: list[str] = []
-        for row in rows:
-            content = str(row["content"] or "").strip()
-            if not content:
-                continue
-            lines.append(content)
-            ids.append(str(row["id"]))
-        return KnowledgeContext(
-            text="\n".join(lines),
-            statement_ids=tuple(ids),
-            identity_revision=self._store.identity_revision,
-            acl_epoch=self._store.acl_epoch,
-            context_revision=f"legacy:{self._store.acl_epoch}:{len(ids)}",
-            reason="ok" if ids else "empty",
-        )
-
-    def _allowed_scope_keys(
-        self,
-        context: TrustedReadContext,
-        decision: Any,
-        reply_to_person: str | None,
-    ) -> tuple[str, ...]:
-        """Scope keys this exact reader may search, derived from the verified context."""
-        keys = [context.scope_key()]
-        keys.append(f"channel:{context.channel}:user:{context.principal_id.split(':')[-1]}")
-        keys.append(f"workspace:{self.workspace_id}:global")
-        for candidate in (reply_to_person,):
-            if not candidate:
-                continue
-            person_id = self.person_for_principal(str(candidate)) or self._identity.canonical_id(
-                str(candidate)
-            )
-            if person_id and self._identity.get_person(person_id) is not None:
-                keys.append(f"contact:{person_id}")
-        principal_person = self.person_for_principal(context.principal_id)
-        if principal_person:
-            keys.append(f"contact:{principal_person}")
-        return tuple(dict.fromkeys(keys))
 
     def admin_context_for(self, *, reason: str) -> TrustedAdminContext:
         """Issue an admin context from Policy's own owner decision.
@@ -1780,141 +1278,8 @@ class KnowledgeService:
             owner=True,
         )
 
-    def maintenance_scope_keys(
-        self,
-        *,
-        scope: str,
-        channel: str | None = None,
-        chat_id: str | None = None,
-        sender_id: str | None = None,
-    ) -> tuple[str, ...]:
-        """Scope keys for an authorized maintenance query.
 
-        Administrative diagnostics may filter by scope; the key layout stays inside the
-        module so no consumer builds these strings itself.
-        """
-        keys: list[str] = []
-        if scope in {"chat", "all"} and channel and chat_id:
-            keys.append(f"channel:{channel}:chat:{chat_id}")
-        if scope in {"user", "all"} and channel and (sender_id or chat_id):
-            keys.append(f"channel:{channel}:user:{(sender_id or chat_id or '').strip()}")
-        if scope in {"global", "all"}:
-            keys.append(f"workspace:{self.workspace_id}:global")
-        return tuple(keys)
 
-    def bind_identifier_for_migration(
-        self,
-        *,
-        person_id: str,
-        channel: str,
-        kind: str,
-        value: str,
-        namespace: str | None = None,
-    ) -> None:
-        """Record one identifier during the transitional legacy co-existence.
-
-        Only the composition/transitional path uses this.  It writes the compatibility
-        projection and an *unproven candidate* binding with ``legacy-import`` evidence; it
-        never mints an active authority, because no channel adapter proved the mapping.
-        A later audited admin operation or a real platform observation promotes it.
-        """
-        require_legacy_history_writer(disabled=self.legacy_history_disabled, channel="whatsapp")
-        self._require_legacy_identity()
-        identifier = Identifier(
-            channel=str(channel), kind=str(kind), value=str(value), namespace=namespace
-        )
-        self._identity.record_unproven_identifier(
-            person_id=str(person_id), identifier=identifier, evidence_ref="legacy-import"
-        )
-        self._store.commit_if_idle()
-
-    def promote_legacy_person(
-        self,
-        *,
-        person_id: str,
-        display_name: str,
-        identifiers: tuple[Any, ...] = (),
-        aliases: tuple[Any, ...] = (),
-        fields: tuple[Any, ...] = (),
-    ) -> None:
-        """Register a person that already exists in the legacy contacts layout.
-
-        Used by the transitional runtime while the two layouts coexist: the ids are
-        preserved, names become observed aliases and profile text stays quarantined
-        instead of being promoted to a readable statement.
-        """
-        self._require_legacy_identity()
-        from yeoman_gateway.knowledge._store import QUARANTINE_REASONS
-
-        ts = self._now()
-        self._store.execute(
-            "INSERT INTO contacts (id, display_name, phone_number, is_owner, created_at,"
-            " updated_at, revision, status, preferred_name_visibility)"
-            " VALUES (?, ?, NULL, 0, ?, ?, 1, 'active', 'public')"
-            " ON CONFLICT(id) DO UPDATE SET display_name = excluded.display_name,"
-            " updated_at = excluded.updated_at",
-            (str(person_id), str(display_name), _iso_from_ms(ts), _iso_from_ms(ts)),
-        )
-        for item in identifiers:
-            channel = str(getattr(item, "channel", "") or "")
-            value = str(getattr(item, "identifier", "") or "")
-            kind = str(getattr(item, "kind", "") or "handle")
-            namespace = str(getattr(item, "namespace", "") or "") or None
-            if not channel or not value:
-                continue
-            try:
-                identifier = Identifier(
-                    channel=channel, kind=kind, value=value, namespace=namespace
-                )
-            except KnowledgeError:
-                # An unparseable legacy identifier is not silently reinterpreted.
-                continue
-            self._identity.record_unproven_identifier(
-                person_id=str(person_id),
-                identifier=identifier,
-                evidence_ref="legacy-import",
-            )
-        for item in aliases:
-            alias = str(getattr(item, "alias", "") or "")
-            source = str(getattr(item, "source", "") or "observed")
-            if not alias:
-                continue
-            try:
-                clean = validate_name(alias)
-            except KnowledgeError:
-                continue
-            self._store.execute(
-                "INSERT INTO contact_aliases (contact_id, alias, source, first_seen,"
-                " last_seen, normalized_alias, scope_key, status, address_allowed,"
-                " is_preferred, revision)"
-                " VALUES (?, ?, ?, ?, ?, ?, 'global', 'observed', 0, 0, 1)"
-                " ON CONFLICT(contact_id, alias, source) DO NOTHING",
-                (
-                    str(person_id),
-                    clean,
-                    source,
-                    _iso_from_ms(ts),
-                    _iso_from_ms(ts),
-                    normalize_alias_value(clean),
-                ),
-            )
-        for item in fields:
-            value = str(getattr(item, "value", "") or "")
-            if not value:
-                continue
-            # Legacy profile text has no proven source or ACL: keep it quarantined.
-            self._store.execute(
-                "INSERT INTO knowledge_quarantine (quarantine_id, source_table, source_pk,"
-                " reason, detail_json, created_ms) VALUES (?, 'contact_fields', ?, ?, '{}', ?)"
-                " ON CONFLICT(source_table, source_pk, reason) DO NOTHING",
-                (
-                    self._store.new_id(),
-                    f"{person_id}:{getattr(item, 'kind', '')}",
-                    QUARANTINE_REASONS[0],
-                    ts,
-                ),
-            )
-        self._store.commit_if_idle()
 
     def person_id_for_value(self, value: str) -> str | None:
         """One canonical person for a proven active identifier value.
@@ -1962,42 +1327,9 @@ class KnowledgeService:
             return None
         from yeoman_gateway.knowledge._history_identity import current_history_scope
         scope = current_history_scope(self._store)
-        if self._history_mode and scope is None:
-            from yeoman_gateway.history.live import HistoryPaused
+        if scope is None:
             raise HistoryPaused('knowledge_history_scope_required')
-        if scope is not None:
-            candidates = list(scope.identity.delivery_identifiers_for_alias(query, channel=channel, scope_key='global'))
-            if prefer_kind is not None:
-                candidates = [item for item in candidates if item.kind == prefer_kind] or candidates
-            if prefer:
-                candidates = [item for item in candidates if item.value in prefer] or candidates
-            return candidates[0] if len(candidates) == 1 else None
-        rows = self._store.query(
-            """
-            SELECT DISTINCT c.id AS id FROM contacts c
-             LEFT JOIN contact_aliases a ON a.contact_id = c.id
-             WHERE c.status = 'active'
-               AND (c.display_name = ? COLLATE NOCASE
-                    OR c.preferred_name = ? COLLATE NOCASE
-                    OR a.alias = ? COLLATE NOCASE)
-             ORDER BY c.id
-            """,
-            (query, query, query),
-        )
-        people = [self.canonical_id(str(row["id"])) for row in rows]
-        people = list(dict.fromkeys(people))
-        if len(people) != 1:
-            return None
-        channel_key = str(channel).strip().lower()
-        candidates: list[Identifier] = []
-        seen: set[tuple[str, str, str, str]] = set()
-        for member in self._identity.merged_member_ids(people[0]):
-            for binding in self._identity.active_bindings_of(member):
-                identifier = binding.identifier
-                if identifier.channel != channel_key or identifier.full_key in seen:
-                    continue
-                seen.add(identifier.full_key)
-                candidates.append(identifier)
+        candidates = list(scope.identity.delivery_identifiers_for_alias(query, channel=channel, scope_key='global'))
         if prefer_kind is not None:
             narrowed = [item for item in candidates if item.kind == prefer_kind]
             if narrowed:
@@ -2074,7 +1406,7 @@ class KnowledgeService:
         )
         from yeoman_gateway.knowledge.authority import EvidenceAudience
 
-        self._authority.register_source(
+        self._base_authority.register_source(
             source, EvidenceAudience.author_only(snapshot_id="owner_note")
         )
         candidate = StatementCandidate(
@@ -2150,57 +1482,9 @@ class KnowledgeService:
             erased += 1
         return erased
 
-    def merge_people_with_policy(
-        self, target_id: str, source_id: str, *, reason: str = "admin"
-    ) -> ChangeReceipt:
-        """Reversible merge with a Policy-issued admin context."""
-        require_legacy_history_writer(disabled=self.legacy_history_disabled, channel="whatsapp")
-        context = self.admin_context_for(reason=reason)
-        with self._store.transaction():
-            return self._identity.merge_people(
-                target_id,
-                source_id,
-                expected_revision=self._store.identity_revision,
-                context=context,
-            )
 
-    def undo_merge_with_policy(
-        self, operation_id: str, *, reason: str = "admin"
-    ) -> ChangeReceipt:
-        """Undo one reversible merge with a Policy-issued admin context."""
-        require_legacy_history_writer(disabled=self.legacy_history_disabled, channel="whatsapp")
-        context = self.admin_context_for(reason=reason)
-        with self._store.transaction():
-            return self._identity.undo_merge(
-                operation_id,
-                expected_revision=self._store.identity_revision,
-                context=context,
-            )
 
-    def retire_alias_with_policy(
-        self, alias_id: int, *, correct_mapping: bool, reason: str = "admin"
-    ) -> ChangeReceipt:
-        """Retire one alias with a Policy-issued admin context."""
-        require_legacy_history_writer(disabled=self.legacy_history_disabled, channel="whatsapp")
-        return self.retire_alias(
-            alias_id=int(alias_id),
-            context=self.admin_context_for(reason=reason),
-            reason="wrong_mapping" if correct_mapping else "not_wanted",
-            correct_mapping=correct_mapping,
-        )
 
-    def undo_alias_retire_with_policy(
-        self, operation_id: str, *, reason: str = "admin"
-    ) -> ChangeReceipt:
-        """Reverse one alias retirement with a Policy-issued admin context."""
-        require_legacy_history_writer(disabled=self.legacy_history_disabled, channel="whatsapp")
-        context = self.admin_context_for(reason=reason)
-        with self._store.transaction():
-            return self._identity.undo_alias_retire(
-                operation_id,
-                expected_revision=self._store.identity_revision,
-                context=context,
-            )
 
     def owner_read_context(
         self,
@@ -2276,29 +1560,6 @@ class KnowledgeService:
             facts.append(("statement", summary.content, summary.status))
         return tuple(facts)
 
-    def set_preferred_name_with_policy(
-        self,
-        person_id: str,
-        name: str,
-        *,
-        reason: str = "tool",
-        visibility: str = "public",
-    ) -> ChangeReceipt:
-        """Owner path for name changes requested from an authorized runtime surface.
-
-        The admin context is issued here from the Policy authority's own owner decision -
-        never from tool arguments - and the caller only supplies the person and the name.
-        """
-        actor = self._policy.admin_actor() if hasattr(self._policy, "admin_actor") else ""
-        if not actor:
-            raise KnowledgeError("unauthorized", "no owner actor is available from policy")
-        context = TrustedAdminContext(
-            actor_principal=str(actor),
-            policy_revision=self.policy_revision,
-            authorization_ref=f"policy:{reason}",
-            owner=True,
-        )
-        return self.set_preferred_name(person_id, name, context=context, visibility=visibility)
 
     def roster_for_chat(
         self,
@@ -2339,19 +1600,13 @@ class KnowledgeService:
         a delivery target look "known".
         """
         from yeoman_gateway.knowledge._history_identity import current_history_scope
+
         scope = current_history_scope(self._store)
-        if self._history_mode and scope is None:
-            from yeoman_gateway.history.live import HistoryPaused
+        if scope is None:
             raise HistoryPaused('knowledge_history_scope_required')
-        if scope is not None:
-            rows = scope.queries._rows("SELECT DISTINCT value FROM identifier_history"
-                                       " WHERE channel='whatsapp' AND strength='strong' AND valid_until_ms IS NULL ORDER BY value")
-            return tuple(row['value'] for row in rows if scope.identity.owners_of_identifier_value(row['value']))
-        rows = self._store.query(
-            "SELECT value FROM knowledge_identifier_bindings WHERE status = 'active'"
-            " ORDER BY 1"
-        )
-        return tuple(str(row[0]) for row in rows)
+        rows = scope.queries._rows("SELECT DISTINCT value FROM identifier_history"
+                                   " WHERE channel='whatsapp' AND strength='strong' AND valid_until_ms IS NULL ORDER BY value")
+        return tuple(row['value'] for row in rows if scope.identity.owners_of_identifier_value(row['value']))
 
     def roster(
         self, *, context: TrustedReadContext, participant_ids: tuple[str, ...]

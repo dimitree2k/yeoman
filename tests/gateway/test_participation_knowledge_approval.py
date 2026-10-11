@@ -24,7 +24,6 @@ from typing import Any
 
 import pytest
 from yeoman_gateway.consciousness.log import SpeakupLog, deterministic_effect_id
-from yeoman_gateway.knowledge._memory.shared_facts import FactReadContext, FactRetrievalResult
 from yeoman_gateway.knowledge.models import (
     KnowledgeContext,
     SourceRef,
@@ -80,24 +79,15 @@ DISPATCH_POLICY_HASH = "a" * 32
 
 
 def _contexts(*, principal: str = "alice"):
-    return (
-        TrustedReadContext(
-            principal_id=principal,
-            channel=CHANNEL,
-            chat_id=CHAT,
-            recipient_principals=MEMBERS,
-            membership_revision="membership-v3",
-            policy_revision=8,
-            purpose="proactive",
-            now_ms=NOW,
-        ),
-        FactReadContext(
-            principal_id=principal,
-            chat_scope_key=f"channel:{CHANNEL}:chat:{CHAT}",
-            current_members=MEMBERS,
-            epoch=4,
-            now_ms=NOW,
-        ),
+    return TrustedReadContext(
+        principal_id=principal,
+        channel=CHANNEL,
+        chat_id=CHAT,
+        recipient_principals=MEMBERS,
+        membership_revision="membership-v3",
+        policy_revision=8,
+        purpose="proactive",
+        now_ms=NOW,
     )
 
 
@@ -114,55 +104,23 @@ class _Knowledge:
         return self.result
 
 
-@dataclass
-class _Memory:
-    result: FactRetrievalResult
-
-    def retrieve_for_context(self, **kwargs):
-        del kwargs
-        return self.result
-
-    def revalidate_for_context(self, result, **kwargs):
-        del kwargs
-        return self.result
-
-
-def _selector(*, statement_text: str = "", fact_text: str = ""):
-    # The statement id is its source event id, so a selected statement also carries the
-    # source revision a revalidation has to find again.
+def _selector(*, statement_text: str = ""):
     ref = SourceRef("ev-1", 1, CHANNEL, CHAT, "alice", NOW - 7 * 86_400_000)
     knowledge = _Knowledge(
         KnowledgeContext(
             text=statement_text,
-            statement_ids=("ev-1",) if statement_text else (),
-            source_refs=(ref,) if statement_text else (),
+            statement_ids=("ev-1", "ev-2") if "\n" in statement_text else (("ev-1",) if statement_text else ()),
+            source_refs=(ref, replace(ref, event_id="ev-2")) if "\n" in statement_text else ((ref,) if statement_text else ()),
             context_revision="statement-r1",
-            source_refs_by_statement=(("ev-1", (ref,)),) if statement_text else (),
+            source_refs_by_statement=(("ev-1", (ref,)), ("ev-2", (replace(ref, event_id="ev-2"),))) if "\n" in statement_text else (("ev-1", (ref,)),) if statement_text else (),
         )
     )
-    memory = _Memory(
-        FactRetrievalResult(
-            text=f"- {fact_text}" if fact_text else "",
-            hits=(
-                SimpleNamespace(entry=SimpleNamespace(id="fact-1", content=fact_text)),
-            )
-            if fact_text
-            else (),
-            used_source_refs={"fact-1": (("ev-2", 1),)} if fact_text else {},
-        )
-    )
-    return ParticipationKnowledgeSelector(knowledge=knowledge, memory=memory)
+    return ParticipationKnowledgeSelector(knowledge=knowledge)
 
 
-def _selected(
-    *,
-    statement_text: str = "",
-    fact_text: str = "",
-    query: str = "Wann ist der Stammtisch?",
-):
-    read_context, fact_context = _contexts()
-    return _selector(statement_text=statement_text, fact_text=fact_text).select(
-        query=query, read_context=read_context, fact_context=fact_context
+def _selected(*, statement_text: str = "", query: str = "Wann ist der Stammtisch?"):
+    return _selector(statement_text=statement_text).select(
+        query=query, read_context=_contexts()
     )
 
 
@@ -170,38 +128,25 @@ def _statement_selection():
     return _selected(statement_text=f"Stammtisch donnerstags. {MARKER}")
 
 
-def _fact_selection():
-    return _selected(fact_text="Gegessen wird um sieben.")
-
-
 def _multiline_selection():
     return _selected(
-        statement_text=f"Stammtisch donnerstags. {MARKER}",
-        fact_text="Gegessen wird um sieben.",
+        statement_text=f"Stammtisch donnerstags. {MARKER}\nWird davor gegessen?",
         query="Wann ist der Stammtisch?\nWird davor gegessen?",
     )
 
 
 class _PerReader:
-    def __init__(self, per_reader, kind: str) -> None:
+    def __init__(self, per_reader) -> None:
         self._per_reader = per_reader
-        self._kind = kind
 
     def _target(self, context):
-        target = self._per_reader[str(context.principal_id)]
-        return target[0] if self._kind == "knowledge" else target[1]
+        return self._per_reader[str(context.principal_id)]
 
     def recall(self, query, **kwargs):
         return self._target(kwargs["context"])
 
     def revalidate(self, result, **kwargs):
         return self._target(kwargs["context"])
-
-    def retrieve_for_context(self, **kwargs):
-        return self._target(kwargs["read_context"])
-
-    def revalidate_for_context(self, result, **kwargs):
-        return self._target(kwargs["read_context"])
 
 
 def _multi_author_selection():
@@ -215,28 +160,14 @@ def _multi_author_selection():
             source_refs_by_statement=((statement_id, (source,)),) if text else (),
         )
 
-    def memory(text: str) -> FactRetrievalResult:
-        return FactRetrievalResult(
-            text=f"- {text}" if text else "",
-            hits=(
-                SimpleNamespace(entry=SimpleNamespace(id="fact-shared", content=text)),
-            )
-            if text
-            else (),
-            used_source_refs={"fact-shared": (("ev-shared", 1),)} if text else {},
-        )
-
-    shared = f"Both hear this. {MARKER}"
     per_reader = {
-        "alice": (knowledge("Alice only hears this.", "stmt-alice"), memory(shared)),
-        "bob": (knowledge("Bob only hears this.", "stmt-bob"), memory(shared)),
+        "alice": knowledge("Alice only hears this.", "stmt-alice"),
+        "bob": knowledge("Bob only hears this.", "stmt-bob"),
     }
-    selector = ParticipationKnowledgeSelector(
-        knowledge=_PerReader(per_reader, "knowledge"), memory=_PerReader(per_reader, "memory")
-    )
+    selector = ParticipationKnowledgeSelector(knowledge=_PerReader(per_reader))
     readers = ParticipationKnowledgeReaders(
         readers=tuple(
-            ParticipationKnowledgeReader(*_contexts(principal=principal))
+            ParticipationKnowledgeReader(_contexts(principal=principal))
             for principal in ("alice", "bob")
         )
     )
@@ -248,9 +179,9 @@ def _multi_author_selection():
 
 def test_codec_round_trips_a_statements_only_selection() -> None:
     selection = _statement_selection()
-    assert selection.text and not selection.facts.used_source_refs
+    assert selection.text and all(record.kind == "statement" for record in selection.records)
     assert selection.records[0].refs == (("ev-1", 1),)
-    assert selection.reader_keys == (reader_key(*_contexts()),)
+    assert selection.reader_keys == (reader_key(_contexts()),)
 
     restored = selection_from_mapping(selection_to_mapping(selection))
 
@@ -275,20 +206,6 @@ def test_codec_does_not_invent_source_author_from_reader_identity() -> None:
     assert restored.statements.source_refs == ()
 
 
-def test_codec_round_trips_a_shared_facts_only_selection() -> None:
-    selection = _fact_selection()
-    assert selection.text == "- Gegessen wird um sieben."
-    assert not selection.statements.statement_ids
-
-    restored = selection_from_mapping(selection_to_mapping(selection))
-
-    assert restored.text == selection.text
-    assert restored.records == selection.records
-    assert restored.reader_keys == selection.reader_keys
-    assert restored.revision == selection.revision
-    assert restored.facts.text == selection.facts.text
-    assert dict(restored.facts.used_source_refs) == dict(selection.facts.used_source_refs)
-    assert restored.statements.statement_ids == ()
 
 
 def test_codec_round_trips_multiline_text_and_query() -> None:
@@ -305,9 +222,7 @@ def test_codec_round_trips_multiline_text_and_query() -> None:
     assert restored.statements.text == "\n".join(
         record.text for record in selection.records if record.kind == "statement"
     )
-    assert restored.facts.text == "\n".join(
-        record.text for record in selection.records if record.kind == "fact"
-    )
+    assert all(record.kind == "statement" for record in restored.records)
 
 
 def test_codec_preserves_a_multiline_query_verbatim() -> None:
@@ -317,7 +232,7 @@ def test_codec_preserves_a_multiline_query_verbatim() -> None:
         reason="selected",
         records=(
             ParticipationKnowledgeRecord(
-                kind="fact", record_id="fact-1", text="- Zeile eins", refs=(("ev-1", 1),)
+                kind="statement", record_id="ev-1", text="Zeile eins", refs=(("ev-1", 1),)
             ),
         ),
         reader_keys=(
@@ -391,7 +306,7 @@ def test_codec_mapping_is_json_native_bounded_and_deterministic() -> None:
     assert mapping["reader_prerequisites"]["is_direct"] is False
     for record in mapping["records"]:
         assert set(record) == {"kind", "record_id", "text", "refs"}
-        assert record["kind"] in {"statement", "fact"}
+        assert record["kind"] == "statement"
         assert all(len(ref) == 2 for ref in record["refs"])
 
 
@@ -725,8 +640,9 @@ def _build_tools(tmp_path: Path):
     from yeoman_gateway.bus.queue import MessageBus
     from yeoman_gateway.consciousness.approval import SpeakupApprovalStore
     from yeoman_gateway.consciousness.tools import ConsciousnessTools
-    from yeoman_gateway.storage.inbound_archive import InboundArchive
     from yeoman_shared.config.schema import Config, ConsciousnessConfig
+
+    from tests.gateway.synthetic_reply_archive import SyntheticReplyArchive
 
     config = Config(
         consciousness=ConsciousnessConfig.model_validate(
@@ -740,7 +656,8 @@ def _build_tools(tmp_path: Path):
         )
     )
     log = SpeakupLog(tmp_path / "speakups.db")
-    archive = InboundArchive(tmp_path / "inbound.db")
+    archive = SyntheticReplyArchive(tmp_path / "inbound.db")
+    projector = _membership_projector()
     effects = _RecordingEffects()
     tools = ConsciousnessTools(
         config=config,
@@ -748,7 +665,6 @@ def _build_tools(tmp_path: Path):
         bus=MessageBus(),
         log=log,
         inbound_archive=archive,
-        memory=None,
         security=_AllowSecurity(),
         approval_store=SpeakupApprovalStore(
             tmp_path / "approvals.json", now=lambda: FIXED_NOW.timestamp()
@@ -756,7 +672,16 @@ def _build_tools(tmp_path: Path):
         service_effects=effects,
         now=lambda: FIXED_NOW,
     )
+    tools._history_projector = projector
+    archive._history_projector = projector
     tools.begin_run(trigger="cron")
+    original_close = archive.close
+
+    def close_archive_and_projector() -> None:
+        original_close()
+        projector.close()
+
+    archive.close = close_archive_and_projector
     return tools, log, archive, effects
 
 
@@ -984,7 +909,27 @@ async def test_changed_draft_target_or_revision_cannot_retain_the_approval(
 
 REAL_TEXT = "The shared Stammtisch note."
 REAL_KEY = "3EB0R01"
-REAL_AUDIENCE = frozenset({f"{AUTHOR}@s.whatsapp.net", f"{OTHER}@s.whatsapp.net"})
+REAL_AUDIENCE = frozenset({f"whatsapp:{AUTHOR}", f"whatsapp:{OTHER}"})
+
+
+def _membership_projector(members=REAL_AUDIENCE, chat_id=GROUP):
+    """Build a synthetic native History roster for current reader authorization."""
+    import json
+
+    from history_turn_fixtures import Projector
+
+    projector = Projector()
+    values = [
+        [f"{principal.removeprefix('whatsapp:')}@s.whatsapp.net"]
+        for principal in sorted(members)
+    ]
+    projector.db.execute(
+        "INSERT INTO message_events(event_id,kind,channel,chat_id,actor_basis,time_certainty,occurred_ms,payload_json,provenance,source_refs) "
+        "VALUES ('approval-roster','member_snapshot','whatsapp',?,'unknown','provider_timestamp',?,?,'native','[]')",
+        (chat_id, int(time.time() * 1000) - 1_000, json.dumps({"complete": True, "participants": values})),
+    )
+    projector.db.commit()
+    return projector
 
 
 def _capture_shared_statement(
@@ -1026,13 +971,6 @@ def _real_readers(harness: CaptureHarness) -> ParticipationKnowledgeReaders:
                     now_ms=harness.now,
                     is_direct=False,
                 ),
-                FactReadContext(
-                    principal_id=principal,
-                    chat_scope_key=f"channel:{CHANNEL}:chat:{GROUP}",
-                    current_members=REAL_AUDIENCE,
-                    epoch=harness.memory.store.acl_epoch(),
-                    now_ms=harness.now,
-                ),
             )
             for principal in sorted(REAL_AUDIENCE)
         )
@@ -1040,7 +978,7 @@ def _real_readers(harness: CaptureHarness) -> ParticipationKnowledgeReaders:
 
 
 def _real_selector(harness: CaptureHarness) -> ParticipationKnowledgeSelector:
-    return ParticipationKnowledgeSelector(knowledge=harness.knowledge, memory=harness.memory)
+    return ParticipationKnowledgeSelector(knowledge=harness.knowledge)
 
 
 def _real_evidence(harness: CaptureHarness) -> dict[str, Any]:
@@ -1059,7 +997,6 @@ def _real_validator(harness: CaptureHarness):
     return _knowledge_decision_validator(
         chat_registry=harness.registry,
         knowledge=harness.knowledge,
-        memory=harness.memory,
     )
 
 
@@ -1192,13 +1129,28 @@ def _case_source_event_unknown(harness, evidence, admission):
     return _real_validator(harness), replace(admission, knowledge_evidence=changed)
 
 
+def _replace_projector_members(projector, members):
+    import json
+
+    values = [[f"{item.removeprefix('whatsapp:')}@s.whatsapp.net"] for item in sorted(members)]
+    projector.db.execute(
+        "UPDATE message_events SET payload_json=? WHERE event_id='approval-roster'",
+        (json.dumps({"complete": True, "participants": values}),),
+    )
+    projector.db.commit()
+
+
 def _case_reader_author_departed(harness, evidence, admission):
     harness.registry.chats[(CHANNEL, GROUP)] = [OTHER]
+    _replace_projector_members(harness._history_projector, {f"whatsapp:{OTHER}"})
     return _real_validator(harness), admission
 
 
 def _case_proven_member_added(harness, evidence, admission):
     harness.registry.chats[(CHANNEL, GROUP)] = [AUTHOR, OTHER, "491700000000"]
+    _replace_projector_members(harness._history_projector, {
+        f"whatsapp:{AUTHOR}", f"whatsapp:{OTHER}", "whatsapp:491700000000"
+    })
     return _real_validator(harness), admission
 
 
@@ -1256,7 +1208,7 @@ def _case_registry_unreadable(harness, evidence, admission):
 
 def _case_knowledge_store_unavailable(harness, evidence, admission):
     selector = ParticipationKnowledgeSelector(
-        knowledge=_BrokenKnowledge(), memory=harness.memory
+        knowledge=_BrokenKnowledge()
     )
     validator = _custom_validator(
         selector=selector, chat_registry=harness.registry, knowledge=harness.knowledge
@@ -1361,27 +1313,33 @@ _VALIDATOR_TABLE: list[tuple[str, Any, tuple[bool, str]]] = [
 ]
 
 
+@pytest.mark.asyncio
 @pytest.mark.parametrize(
     "mutate,expected", [(case, expected) for _, case, expected in _VALIDATOR_TABLE],
     ids=[name for name, _, _ in _VALIDATOR_TABLE],
 )
-def test_knowledge_validator_decision_table(tmp_path: Path, mutate, expected) -> None:
+async def test_knowledge_validator_decision_table(tmp_path: Path, mutate, expected) -> None:
     """Every situation resolves to the decision the validator really returns."""
+    from yeoman_gateway.history.context import history_turn
+
     harness = CaptureHarness(tmp_path)
+    projector = _membership_projector()
+    harness._history_projector = projector
     try:
         _capture_shared_statement(harness)
         evidence = _real_evidence(harness)
         baseline = _real_admission(evidence)
-        # Every case starts from evidence this same validator accepts.
-        assert _real_validator(harness)(baseline) == (True, "allow")
-
-        validator, admission = mutate(harness, evidence, baseline)
-
-        assert validator(admission) == expected
+        async with history_turn(projector):
+            # Every case starts from evidence this same validator accepts.
+            assert _real_validator(harness)(baseline) == (True, "allow")
+            validator, admission = mutate(harness, evidence, baseline)
+            assert validator(admission) == expected
     finally:
+        projector.close()
         harness.close()
 
 
+@pytest.mark.asyncio
 @pytest.mark.parametrize(
     "mutate",
     [
@@ -1401,22 +1359,25 @@ def test_knowledge_validator_decision_table(tmp_path: Path, mutate, expected) ->
         "policy_revision_unavailable",
     ],
 )
-def test_knowledge_validator_fails_closed_when_it_cannot_read_authority(
+async def test_knowledge_validator_fails_closed_when_it_cannot_read_authority(
     tmp_path: Path, mutate
 ) -> None:
     """An unreadable authority never becomes an approval."""
+    from yeoman_gateway.history.context import history_turn
+
     harness = CaptureHarness(tmp_path)
+    projector = _membership_projector()
     try:
         _capture_shared_statement(harness)
         evidence = _real_evidence(harness)
         baseline = _real_admission(evidence)
-
-        validator, admission = mutate(harness, evidence, baseline)
-        allowed, reason = validator(admission)
-
-        assert allowed is False
-        assert reason != "allow"
+        async with history_turn(projector):
+            validator, admission = mutate(harness, evidence, baseline)
+            allowed, reason = validator(admission)
+            assert allowed is False
+            assert reason != "allow"
     finally:
+        projector.close()
         harness.close()
 
 
@@ -1427,53 +1388,57 @@ async def test_approval_commit_refuses_a_revoked_statement(tmp_path: Path) -> No
     """The owner approval is revalidated at the commit, before any send."""
     harness = CaptureHarness(tmp_path)
     tools, log, archive, effects = _build_tools(tmp_path)
+    projector = archive._history_projector
+    harness._history_projector = projector
+    from yeoman_gateway.history.context import history_turn
     try:
-        _capture_shared_statement(harness)
-        evidence = _real_evidence(harness)
-        validator = _real_validator(harness)
-        assert validator(_real_admission(evidence)) == (True, "allow")
-        assert (await _stage(tools, knowledge_evidence=evidence, chat=GROUP))["status"] == (
-            "awaiting_approval"
-        )
-        snapshot = await _stored_snapshot(log)
-        await _claim(log, snapshot)
-        assert await log.reserve_delivery(
-            proposal_id="opp-1",
-            effect_id=_effect_id(GROUP),
-            channel=CHANNEL,
-            chat_id=GROUP,
-            now_ms=NOW,
-            limits=(("comment", 1, 3_600_000),),
-            origin="participation",
-            lane="production",
-        )
+        async with history_turn(projector):
+            _capture_shared_statement(harness)
+            evidence = _real_evidence(harness)
+            validator = _real_validator(harness)
+            assert validator(_real_admission(evidence)) == (True, "allow")
+            assert (await _stage(tools, knowledge_evidence=evidence, chat=GROUP))["status"] == (
+                "awaiting_approval"
+            )
+            snapshot = await _stored_snapshot(log)
+            await _claim(log, snapshot)
+            assert await log.reserve_delivery(
+                proposal_id="opp-1",
+                effect_id=_effect_id(GROUP),
+                channel=CHANNEL,
+                chat_id=GROUP,
+                now_ms=NOW,
+                limits=(("comment", 1, 3_600_000),),
+                origin="participation",
+                lane="production",
+            )
 
-        submission = _Submission()
-        tools.set_participation_submission(submission)
-        tools.set_knowledge_decision_validator(validator)
-        preview_calls = list(effects.calls)
+            submission = _Submission()
+            tools.set_participation_submission(submission)
+            tools.set_knowledge_decision_validator(validator)
+            preview_calls = list(effects.calls)
 
-        # Knowledge changed after the owner approved and before the commit.
-        assert harness.delete(REAL_KEY) == (REAL_KEY,)
+            # Knowledge changed after the owner approved and before the commit.
+            assert harness.delete(REAL_KEY) == (REAL_KEY,)
 
-        outcome = await tools.submit_proposal("opp-1")
+            outcome = await tools.submit_proposal("opp-1")
 
-        assert outcome == {
-            "status": "rejected",
-            "reason": "knowledge_approval_knowledge_changed",
-        }
-        assert submission.calls == []
-        assert effects.calls == preview_calls
-        record = await log.delivery_record(proposal_id="opp-1", effect_id=_effect_id(GROUP))
-        assert record is not None
-        assert record["delivery_state"] == "failed"
-        assert record["attempt_state"] == "released"
-        assert record["evidence_ref"] == "knowledge_approval_knowledge_changed"
-        row = await log.proposal_row("opp-1")
-        assert row is not None
-        assert row["status"] == "rejected"
-        stored = (await _stored_snapshot(log))["participation_admission"]
-        assert stored["knowledge_evidence"] == evidence
+            assert outcome == {
+                "status": "rejected",
+                "reason": "knowledge_approval_knowledge_changed",
+            }
+            assert submission.calls == []
+            assert effects.calls == preview_calls
+            record = await log.delivery_record(proposal_id="opp-1", effect_id=_effect_id(GROUP))
+            assert record is not None
+            assert record["delivery_state"] == "failed"
+            assert record["attempt_state"] == "released"
+            assert record["evidence_ref"] == "knowledge_approval_knowledge_changed"
+            row = await log.proposal_row("opp-1")
+            assert row is not None
+            assert row["status"] == "rejected"
+            stored = (await _stored_snapshot(log))["participation_admission"]
+            assert stored["knowledge_evidence"] == evidence
     finally:
         log.close()
         archive.close()
@@ -1561,6 +1526,8 @@ async def test_persisted_evidence_revalidates_after_a_full_restart(tmp_path: Pat
 
     restarted = CaptureHarness(tmp_path)
     restarted_tools, restarted_log, restarted_archive, _ = _build_tools(tmp_path)
+    restarted._history_projector = restarted_archive._history_projector
+    from yeoman_gateway.history.context import history_turn
     try:
         validator = _real_validator(restarted)
         stored = (await _stored_snapshot(restarted_log))["participation_admission"]
@@ -1571,7 +1538,8 @@ async def test_persisted_evidence_revalidates_after_a_full_restart(tmp_path: Pat
         )
         reconstruction = ParticipationAdmission(**values)
         assert reconstruction.knowledge_evidence == evidence
-        assert validator(reconstruction) == (True, "allow")
+        async with history_turn(restarted._history_projector):
+            assert validator(reconstruction) == (True, "allow")
 
         restarted_tools.set_knowledge_decision_validator(validator)
         submission = _Submission()
@@ -1798,17 +1766,23 @@ def test_pre_dispatch_blocks_transport_when_the_validator_refuses(tmp_path: Path
         store.close()
 
 
-def test_invalidated_evidence_between_approval_and_dispatch_blocks_transport(
+@pytest.mark.asyncio
+async def test_invalidated_evidence_between_approval_and_dispatch_blocks_transport(
     tmp_path: Path,
 ) -> None:
     """Evidence true at approval time, revoked before transport: the send is blocked."""
+    from yeoman_gateway.history.context import history_turn
+
     harness = CaptureHarness(tmp_path)
+    projector = _membership_projector()
+    harness._history_projector = projector
     try:
         _capture_shared_statement(harness)
         evidence = _real_evidence(harness)
         validator = _real_validator(harness)
         admission = _real_admission(evidence)
-        assert validator(admission) == (True, "allow")
+        async with history_turn(projector):
+            assert validator(admission) == (True, "allow")
 
         router, envelope, transport = _dispatch_router(
             tmp_path, store=harness.store, validator=validator, evidence=evidence
@@ -1817,9 +1791,9 @@ def test_invalidated_evidence_between_approval_and_dispatch_blocks_transport(
         # The statement is revoked after the owner approved and before dispatch.
         assert harness.delete(REAL_KEY) == (REAL_KEY,)
         assert any(row["status"] == "revoked" for row in harness.statements())
-        assert validator(admission) == (False, "knowledge_changed")
-
-        receipt = asyncio.run(router._gateway.execute_ready(envelope.effect_id))
+        async with history_turn(projector):
+            assert validator(admission) == (False, "knowledge_changed")
+            receipt = await router._gateway.execute_ready(envelope.effect_id)
 
         assert receipt.state == "failed"
         assert transport == []
@@ -1829,6 +1803,7 @@ def test_invalidated_evidence_between_approval_and_dispatch_blocks_transport(
             for detail in _effect_evidence(harness.store, envelope.effect_id)
         )
     finally:
+        projector.close()
         harness.close()
 
 
@@ -1932,3 +1907,69 @@ async def test_legacy_recent_only_proposal_still_queues_without_the_kwarg(
         assert submission.calls[0]["admission"].knowledge_evidence is None
     finally:
         runtime._ledger.close()
+
+
+def test_native_runtime_binds_exact_history_only_approval_validator(monkeypatch) -> None:
+    """Without Knowledge, native History admissions still bind a narrow validator."""
+    from yeoman_gateway.app import bootstrap
+    from yeoman_gateway.history import context as history_context
+
+    class _Stub:
+        def __init__(self, *args, **kwargs) -> None:
+            self.args = args
+            self.kwargs = kwargs
+
+    class _ApprovalTools:
+        validator = None
+
+        def set_knowledge_decision_validator(self, validator) -> None:
+            self.validator = validator
+
+    monkeypatch.setattr(history_context, "validate_history_evidence", lambda evidence: evidence in (None, {"history": {"generation": 7}}))
+    monkeypatch.setattr(bootstrap, "ModelRouter", lambda models: SimpleNamespace(resolve_primary=lambda route: (_ for _ in ()).throw(ValueError("no writer route"))))
+    from yeoman_gateway.consciousness import delivery, opportunities, participation_runtime
+    from yeoman_gateway.processing import model_route, participation, participation_context
+    from yeoman_gateway.processing import participation_runtime as decision_runtime
+    monkeypatch.setattr(delivery, "DeliveryAnchorReader", _Stub)
+    monkeypatch.setattr(opportunities, "OpportunityScheduler", _Stub)
+    monkeypatch.setattr(participation_runtime, "ParticipationRuntime", _Stub)
+    monkeypatch.setattr(model_route, "RouteClient", _Stub)
+    monkeypatch.setattr(participation, "ParticipationJudge", _Stub)
+    monkeypatch.setattr(participation_context, "ParticipationContextBuilder", _Stub)
+    monkeypatch.setattr(decision_runtime, "ParticipationRuntime", _Stub)
+
+    config = SimpleNamespace(
+        processing=SimpleNamespace(
+            enabled=True,
+            participation=SimpleNamespace(enabled=True, judge_route="synthetic"),
+            reaction_emojis=(),
+            reply_actions={},
+        ),
+        consciousness=SimpleNamespace(default_daily_cap=3),
+        models=SimpleNamespace(),
+    )
+    log = SimpleNamespace(activation_epoch_sync=lambda _: 1)
+    approval_tools = _ApprovalTools()
+    bootstrap._build_participation_runtime(
+        config=config,
+        source_owner=object(),
+        log=log,
+        policy_engine=None,
+        inbound_archive=None,
+        processing_store=None,
+        responder=SimpleNamespace(knowledge=None, _history_projector=None),
+        policy_adapter=SimpleNamespace(),
+        approval_tools=approval_tools,
+    )
+
+    assert callable(approval_tools.validator)
+    assert approval_tools.validator(SimpleNamespace(knowledge_evidence=None)) == (True, "allow")
+    assert approval_tools.validator(
+        SimpleNamespace(knowledge_evidence={"history": {"generation": 7}})
+    ) == (True, "allow")
+    assert approval_tools.validator(
+        SimpleNamespace(knowledge_evidence={"history": {"generation": 7}, "records": []})
+    ) == (False, "history_sources_changed")
+    assert approval_tools.validator(
+        SimpleNamespace(knowledge_evidence={"history": {"generation": 6}})
+    ) == (False, "history_sources_changed")

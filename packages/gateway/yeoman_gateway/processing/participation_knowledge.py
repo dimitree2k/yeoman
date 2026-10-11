@@ -11,7 +11,7 @@ from types import MappingProxyType
 from typing import Any
 
 from yeoman_gateway.history.live import HistoryPaused
-from yeoman_gateway.knowledge._memory.shared_facts import FactReadContext, FactRetrievalResult
+from yeoman_gateway.knowledge._memory.shared_facts import FactRetrievalResult
 from yeoman_gateway.knowledge.models import (
     KnowledgeContext,
     RecallQuery,
@@ -151,7 +151,6 @@ class ParticipationKnowledgeReader:
     """One verified trigger author's protected read of the same chat."""
 
     read_context: TrustedReadContext
-    fact_context: FactReadContext
 
     @property
     def principal_id(self) -> str:
@@ -181,7 +180,7 @@ class ParticipationKnowledgeReaders:
 
 
 def reader_key(
-    read_context: TrustedReadContext, fact_context: FactReadContext
+    read_context: TrustedReadContext
 ) -> tuple[str, str, str, str, str, str, int]:
     """The reader-identity tuple a bundle shares and a selection records."""
     return (
@@ -189,41 +188,34 @@ def reader_key(
         str(read_context.channel),
         str(read_context.chat_id),
         str(read_context.membership_revision or ""),
-        str(fact_context.chat_scope_key),
+        f"channel:{read_context.channel}:chat:{read_context.chat_id}",
         str(read_context.purpose),
         int(read_context.policy_revision),
     )
 
 
 def readers_from_single(
-    read_context: TrustedReadContext, fact_context: FactReadContext
+    read_context: TrustedReadContext
 ) -> ParticipationKnowledgeReaders:
     """Wrap one verified reader pair for the multi-reader entry points."""
     return ParticipationKnowledgeReaders(
-        readers=(ParticipationKnowledgeReader(read_context, fact_context),)
+        readers=(ParticipationKnowledgeReader(read_context),)
     )
 
 
 class ParticipationKnowledgeSelector:
-    def __init__(self, *, knowledge: Any, memory: Any) -> None:
+    def __init__(self, *, knowledge: Any) -> None:
         self._knowledge = knowledge
-        self._memory = memory
 
     def select(
-        self,
-        *,
-        query: str,
-        read_context: TrustedReadContext,
-        fact_context: FactReadContext,
+        self, *, query: str, read_context: TrustedReadContext
     ) -> ParticipationKnowledgeSelection:
         text = _normalize_query(query)
         if not text:
             return _empty("empty")
-        if not _contexts_match(read_context, fact_context):
+        if not _contexts_match(read_context):
             return _empty("denied")
-
         group_wide = not read_context.is_direct
-        scoped_fact_context = replace(fact_context, group_wide=group_wide)
         try:
             statements = self._knowledge.recall(
                 RecallQuery(text=text, limit=MAX_ENTRIES),
@@ -232,89 +224,39 @@ class ParticipationKnowledgeSelector:
                 group_wide=group_wide,
                 require_match=True,
             )
-            statement_lines = _statement_lines(statements)
-            remaining_entries = max(0, MAX_ENTRIES - len(statement_lines))
-            remaining_chars = max(
-                0, MAX_TEXT_CHARS - len(statements.text) - (1 if statements.text else 0)
-            )
-            facts = FactRetrievalResult()
-            if remaining_entries and remaining_chars:
-                facts = self._memory.retrieve_for_context(
-                    query=text,
-                    read_context=scoped_fact_context,
-                    limit=remaining_entries,
-                    lexical_only=True,
-                    max_chars=remaining_chars,
-                )
         except HistoryPaused:
             raise
         except Exception:
             return _empty("error")
-
-        statement_values = [line.strip() for line in statement_lines]
-        statement_ids = tuple(statements.statement_ids[: len(statement_values)])
-        if len(statement_ids) != len(statement_values):
-            statement_values = []
+        values = _statement_lines(statements)
+        statement_ids = tuple(statements.statement_ids[:len(values)])
+        if len(statement_ids) != len(values):
+            values = []
             statement_ids = ()
             statements = KnowledgeContext(reason="unrendered_metadata")
-
-        fact_text, facts = _bounded_facts(
-            facts,
-            exclude={_normalize_entry(item) for item in statement_values},
-            remaining_entries=MAX_ENTRIES - len(statement_values),
-            max_chars=max(
-                0,
-                MAX_TEXT_CHARS - len("\n".join(statement_values)) - (1 if statement_values else 0),
-            ),
-        )
-        rendered = "\n".join([*statement_values, *([fact_text] if fact_text else [])])
         if statement_ids != statements.statement_ids:
             statements = replace(statements, statement_ids=statement_ids)
-        reason = "selected" if rendered else "empty"
+        rendered = "\n".join(values)
         return ParticipationKnowledgeSelection(
             text=rendered,
             statements=statements,
-            facts=facts,
-            revision=_revision(rendered, statements, facts, read_context),
-            reason=reason,
-            records=_selection_records(statements, facts),
-            reader_keys=(reader_key(read_context, fact_context),),
+            revision=_revision(rendered, statements, FactRetrievalResult(), read_context),
+            reason="selected" if rendered else "empty",
+            records=_selection_records(statements, FactRetrievalResult()),
+            reader_keys=(reader_key(read_context),),
             query=text,
-            **_reader_prerequisites(read_context, fact_context),
+            **_reader_prerequisites(read_context),
         )
 
     def select_for_readers(
         self, *, query: str, readers: ParticipationKnowledgeReaders
     ) -> ParticipationKnowledgeSelection:
-        """Select once per verified trigger author and keep only the intersection.
-
-        Every author is verified independently against the whole current recipient
-        set, and only entries permitted *and* selected for all of them survive. This
-        is deliberately conservative: it never unions authors' rights, and it never
-        picks one privileged author. See the plan's documented intersection ceiling.
-        """
         ordered = _ordered_readers(readers)
         if not ordered:
-            # An empty or inconsistent reader bundle is a refusal, not a no-hit: the
-            # caller must be able to tell "nobody may read" from "nothing matched".
             return _empty("denied")
-        if len(ordered) == 1:
-            reader = ordered[0]
-            return self.select(
-                query=query,
-                read_context=reader.read_context,
-                fact_context=reader.fact_context,
-            )
-        selections: list[ParticipationKnowledgeSelection] = []
-        for reader in ordered:
-            selection = self.select(
-                query=query,
-                read_context=reader.read_context,
-                fact_context=reader.fact_context,
-            )
-            if selection.reason == "error":
-                return _empty("error")
-            selections.append(selection)
+        selections = [self.select(query=query, read_context=reader.read_context) for reader in ordered]
+        if any(selection.reason == "error" for selection in selections):
+            return _empty("error")
         if not any(selection.text for selection in selections):
             return _empty("empty")
         return _combine_records(selections, ordered)
@@ -325,66 +267,23 @@ class ParticipationKnowledgeSelector:
         *,
         readers: ParticipationKnowledgeReaders,
     ) -> ParticipationKnowledgeSelection:
-        """Re-read every original reader and require the same records back.
-
-        A record that merely still exists is not enough: its rendered text and its
-        source revisions have to match the persisted evidence, and every original
-        reader has to still produce it. Anything else is invalidation.
-
-        The early return is for a genuinely empty selection only. A selection that
-        carries records must always be re-read, even if its rendered text is empty:
-        otherwise suppressing the text would silently skip the store read and report
-        "unchanged" for a draft that claims it used knowledge.
-        """
         if not selection.text and not selection.records:
             return selection
         ordered = _ordered_readers(readers)
         if not ordered:
             raise ParticipationKnowledgeInvalidatedError("no trusted readers remain")
-        if tuple(reader_key(r.read_context, r.fact_context) for r in ordered) != tuple(
-            selection.reader_keys
-        ):
+        if tuple(reader_key(r.read_context) for r in ordered) != tuple(selection.reader_keys):
             raise ParticipationKnowledgeInvalidatedError("trigger author set changed")
-        revalidated: list[ParticipationKnowledgeSelection] = []
         try:
-            for reader in ordered:
-                group_wide = not reader.read_context.is_direct
-                statements = self._knowledge.revalidate(
-                    selection.statements,
-                    context=reader.read_context,
-                    max_chars=MAX_TEXT_CHARS,
-                    group_wide=group_wide,
-                )
-                scoped_fact_context = replace(reader.fact_context, group_wide=group_wide)
-                facts = (
-                    self._memory.revalidate_for_context(
-                        selection.facts,
-                        read_context=scoped_fact_context,
-                        max_chars=max(
-                            0,
-                            MAX_TEXT_CHARS - len(statements.text) - (1 if statements.text else 0),
-                        ),
-                    )
-                    if selection.facts.used_source_refs
-                    else FactRetrievalResult()
-                )
-                revalidated.append(
-                    self._combine(
-                        statements,
-                        facts,
-                        reader.read_context,
-                        reader.fact_context,
-                        query=selection.query,
-                    )
-                )
+            revalidated = [
+                self.revalidate(selection, read_context=reader.read_context)
+                for reader in ordered
+            ]
         except HistoryPaused:
             raise
         except Exception as exc:
             raise ParticipationKnowledgeInvalidatedError("revalidation unavailable") from exc
-
-        current = (
-            revalidated[0] if len(revalidated) == 1 else _combine_records(revalidated, ordered)
-        )
+        current = revalidated[0] if len(revalidated) == 1 else _combine_records(revalidated, ordered)
         if current.records != selection.records or current.text != selection.text:
             raise ParticipationKnowledgeInvalidatedError("selected knowledge changed")
         return current
@@ -394,56 +293,41 @@ class ParticipationKnowledgeSelector:
         selection: ParticipationKnowledgeSelection,
         *,
         read_context: TrustedReadContext,
-        fact_context: FactReadContext,
     ) -> ParticipationKnowledgeSelection:
-        if not selection.text:
+        if not selection.text and not selection.records:
             return selection
-        if not _contexts_match(read_context, fact_context):
+        if not _contexts_match(read_context):
             raise ParticipationKnowledgeInvalidatedError("trusted reader context changed")
-        group_wide = not read_context.is_direct
-        scoped_fact_context = replace(fact_context, group_wide=group_wide)
-        statements = self._knowledge.revalidate(
-            selection.statements,
-            context=read_context,
-            max_chars=MAX_TEXT_CHARS,
-            group_wide=group_wide,
-        )
-        facts = (
-            self._memory.revalidate_for_context(
-                selection.facts,
-                read_context=scoped_fact_context,
-                max_chars=max(0, MAX_TEXT_CHARS - len(statements.text)),
+        try:
+            statements = self._knowledge.revalidate(
+                selection.statements,
+                context=read_context,
+                max_chars=MAX_TEXT_CHARS,
+                group_wide=not read_context.is_direct,
             )
-            if selection.facts.used_source_refs
-            else FactRetrievalResult()
-        )
-        return self._combine(statements, facts, read_context, fact_context, query=selection.query)
+        except HistoryPaused:
+            raise
+        except Exception as exc:
+            raise ParticipationKnowledgeInvalidatedError("revalidation unavailable") from exc
+        return self._combine(statements, FactRetrievalResult(), read_context, query=selection.query)
 
     @staticmethod
     def _combine(
         statements: KnowledgeContext,
         facts: FactRetrievalResult,
         read_context: TrustedReadContext,
-        fact_context: FactReadContext,
         *,
         query: str = "",
     ) -> ParticipationKnowledgeSelection:
-        statement_lines = _statement_lines(statements)
-        statement_ids = tuple(statements.statement_ids[: len(statement_lines)])
-        if len(statement_ids) != len(statement_lines):
+        values = _statement_lines(statements)
+        ids = tuple(statements.statement_ids[:len(values)])
+        if len(ids) != len(values):
             statements = KnowledgeContext(reason="unrendered_metadata")
-            statement_lines = []
-            statement_ids = ()
-        fact_text, facts = _bounded_facts(
-            facts,
-            exclude={_normalize_entry(line) for line in statement_lines},
-            remaining_entries=max(0, MAX_ENTRIES - len(statement_lines)),
-            max_chars=max(0, MAX_TEXT_CHARS - len("\n".join(statement_lines)) -
-                          (1 if statement_lines else 0)),
-        )
-        rendered = "\n".join([*statement_lines, *([fact_text] if fact_text else [])])
-        if statement_ids != statements.statement_ids:
-            statements = replace(statements, statement_ids=statement_ids)
+            values = []
+            ids = ()
+        if ids != statements.statement_ids:
+            statements = replace(statements, statement_ids=ids)
+        rendered = "\n".join(values)
         return ParticipationKnowledgeSelection(
             text=rendered,
             statements=statements,
@@ -451,9 +335,9 @@ class ParticipationKnowledgeSelector:
             revision=_revision(rendered, statements, facts, read_context),
             reason="selected" if rendered else "empty",
             records=_selection_records(statements, facts),
-            reader_keys=(reader_key(read_context, fact_context),),
+            reader_keys=(reader_key(read_context),),
             query=query,
-            **_reader_prerequisites(read_context, fact_context),
+            **_reader_prerequisites(read_context),
         )
 
 
@@ -691,17 +575,10 @@ def _validate_evidence_consistency(
         raise ParticipationKnowledgeEvidenceError("evidence records have no reader identity")
 
 
-def _reader_prerequisites(
-    read_context: TrustedReadContext, fact_context: FactReadContext
-) -> dict[str, Any]:
-    """The reader inputs a revalidation needs and a reader key does not carry."""
+def _reader_prerequisites(read_context: TrustedReadContext) -> dict[str, Any]:
     return {
-        "recipient_principals": tuple(
-            sorted(str(item) for item in (read_context.recipient_principals or ()))
-        ),
-        "current_members": tuple(
-            sorted(str(item) for item in (fact_context.current_members or ()))
-        ),
+        "recipient_principals": tuple(sorted(str(item) for item in (read_context.recipient_principals or ()))),
+        "current_members": tuple(sorted(str(item) for item in (read_context.recipient_principals or ()))),
         "now_ms": int(read_context.now_ms),
         "is_direct": bool(read_context.is_direct),
     }
@@ -772,17 +649,17 @@ def _ordered_readers(
     unique: dict[tuple[str, str, str, str, str, str, int], ParticipationKnowledgeReader] = {}
     scopes: set[tuple[str, str, str, str]] = set()
     for reader in readers.readers:
-        if not _contexts_match(reader.read_context, reader.fact_context):
+        if not _contexts_match(reader.read_context):
             return []
         scopes.add(
             (
                 str(reader.read_context.chat_id),
                 str(reader.read_context.membership_revision or ""),
-                str(reader.fact_context.chat_scope_key),
+                str(f"channel:{reader.read_context.channel}:chat:{reader.read_context.chat_id}"),
                 str(reader.read_context.purpose),
             )
         )
-        unique.setdefault(reader_key(reader.read_context, reader.fact_context), reader)
+        unique.setdefault(reader_key(reader.read_context), reader)
     if len(scopes) != 1:
         return []
     return [unique[key] for key in sorted(unique)]
@@ -801,7 +678,6 @@ def _combine_records(
         return _empty("empty")
     ordered = [common[key] for key in sorted(common)]
     statement_records = [record for record in ordered if record.kind == "statement"]
-    fact_records = [record for record in ordered if record.kind == "fact"]
     # Keep the actual protected source metadata, including each statement's association.
     source_map = dict(selections[0].statements.source_refs_by_statement)
     statement_source_refs = tuple(
@@ -830,15 +706,10 @@ def _combine_records(
         acl_epoch=int(selections[0].statements.acl_epoch),
         entry_texts=tuple(record.text for record in statement_records),
     )
-    fact_refs = {record.record_id: record.refs for record in fact_records}
-    facts = FactRetrievalResult(
-        text="\n".join(record.text for record in fact_records),
-        used_source_refs=fact_refs,
-        denied_count=int(selections[0].facts.denied_count),
-    )
+    facts = FactRetrievalResult()
     text = "\n".join(record.text for record in ordered)
     reader_keys = tuple(
-        reader_key(reader.read_context, reader.fact_context) for reader in readers
+        reader_key(reader.read_context) for reader in readers
     )
     return ParticipationKnowledgeSelection(
         text=text,
@@ -849,27 +720,18 @@ def _combine_records(
         records=tuple(ordered),
         reader_keys=reader_keys,
         query=str(selections[0].query),
-        **_reader_prerequisites(readers[0].read_context, readers[0].fact_context),
+        **_reader_prerequisites(readers[0].read_context),
     )
 
 
-def _contexts_match(
-    read_context: TrustedReadContext, fact_context: FactReadContext
-) -> bool:
+def _contexts_match(read_context: TrustedReadContext) -> bool:
     recipients = read_context.recipient_principals
-    members = fact_context.current_members
-    expected_scope = f"channel:{read_context.channel}:chat:{read_context.chat_id}"
     return bool(
         read_context.purpose == "proactive"
         and not read_context.owner
-        and not fact_context.owner
         and recipients
         and read_context.membership_revision
         and read_context.principal_id in recipients
-        and members is not None
-        and recipients == members
-        and fact_context.principal_id == read_context.principal_id
-        and fact_context.chat_scope_key == expected_scope
     )
 
 

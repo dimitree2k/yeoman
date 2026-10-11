@@ -891,7 +891,6 @@ async def test_older_knowledge_reaches_real_renderers_and_revocation_blocks_effe
     from yeoman_gateway.app.bootstrap import _ParticipationSubmission
     from yeoman_gateway.bus.queue import MessageBus
     from yeoman_gateway.knowledge._capture_worker import StatementDraft
-    from yeoman_gateway.knowledge._memory.shared_facts import FactReadContext
     from yeoman_gateway.knowledge.models import TrustedReadContext
     from yeoman_gateway.media.router import ModelRouter
     from yeoman_gateway.processing.model_route import RouteReply
@@ -899,14 +898,13 @@ async def test_older_knowledge_reaches_real_renderers_and_revocation_blocks_effe
     from yeoman_gateway.processing.participation_context import ParticipationContextBuilder
     from yeoman_gateway.processing.participation_knowledge import ParticipationKnowledgeSelector
     from yeoman_gateway.providers.base import LLMResponse
-    from yeoman_gateway.storage.inbound_archive import InboundArchive
     from yeoman_shared.config.schema import Config
 
     from tests.gateway.capture_harness import CaptureHarness, Registry
+    from tests.gateway.synthetic_reply_archive import SyntheticReplyArchive
 
     older_fact = "The group meetup is every Friday."
     knowledge_now_ms = int(time() * 1000)
-    members = frozenset({"anna@s.whatsapp.net", "ben@s.whatsapp.net"})
     harness = CaptureHarness(
         tmp_path / "protected",
         registry=Registry({("whatsapp", CHAT): ["anna", "ben"]}),
@@ -925,7 +923,7 @@ async def test_older_knowledge_reaches_real_renderers_and_revocation_blocks_effe
     assert harness.run_capture().published == 1
     assert harness.source_row(old_source)["audience_status"] == "known"
 
-    archive = InboundArchive(tmp_path / "inbound.db")
+    archive = SyntheticReplyArchive(tmp_path / "inbound.db")
     archive.record_inbound(
         channel=CHANNEL,
         chat_id=CHAT,
@@ -948,29 +946,20 @@ async def test_older_knowledge_reaches_real_renderers_and_revocation_blocks_effe
             text=oversized_text,
             timestamp=knowledge_now_ms // 1000 - 60,
         )
-    selector = ParticipationKnowledgeSelector(knowledge=harness.knowledge, memory=harness.memory)
+    selector = ParticipationKnowledgeSelector(knowledge=harness.knowledge)
 
     def trusted_contexts(opportunity, context):
         del opportunity, context
-        return (
-            TrustedReadContext(
-                principal_id="anna@s.whatsapp.net",
-                channel=CHANNEL,
-                chat_id=CHAT,
-                recipient_principals=members,
-                membership_revision="members-v1",
-                policy_revision=1,
-                purpose="proactive",
-                now_ms=knowledge_now_ms,
-                is_direct=False,
-            ),
-            FactReadContext(
-                principal_id="anna@s.whatsapp.net",
-                chat_scope_key=f"channel:{CHANNEL}:chat:{CHAT}",
-                current_members=members,
-                epoch=harness.memory.store.acl_epoch(),
-                now_ms=knowledge_now_ms,
-            ),
+        return TrustedReadContext(
+            principal_id="whatsapp:anna",
+            channel=CHANNEL,
+            chat_id=CHAT,
+            recipient_principals=frozenset({"whatsapp:anna", "whatsapp:ben"}),
+            membership_revision="members-v1",
+            policy_revision=1,
+            purpose="proactive",
+            now_ms=knowledge_now_ms,
+            is_direct=False,
         )
 
     builder = ParticipationContextBuilder(
@@ -1057,10 +1046,16 @@ async def test_older_knowledge_reaches_real_renderers_and_revocation_blocks_effe
     submission = _ParticipationSubmission(
         responder=responder, writer_profile="participation_writer"
     )
+    from history_turn_fixtures import Projector
+    from yeoman_gateway.history.context import history_turn
+
+    projector = Projector()
+    projector.add("m1", chat=CHAT, text="When is the group meetup?")
     runtime, _judge, _context, log = _runtime(
         tmp_path, decision=COMMENT, submission=submission
     )
     runtime._context_builder = builder
+    runtime._history_projector = projector
     judge_client = JudgeClient()
     finalized_contexts = []
 
@@ -1072,14 +1067,13 @@ async def test_older_knowledge_reaches_real_renderers_and_revocation_blocks_effe
     runtime._judge = InspectingJudge(client=judge_client)
 
     def revalidate(opportunity, context, selection):
-        read_context, fact_context = trusted_contexts(opportunity, context)
-        return selector.revalidate(
-            selection, read_context=read_context, fact_context=fact_context
-        )
+        read_context = trusted_contexts(opportunity, context)
+        return selector.revalidate(selection, read_context=read_context)
 
     runtime._revalidate_knowledge = revalidate
     try:
-        result = await runtime.evaluate_participation(_opportunity("m1"))
+        async with history_turn(projector):
+            result = await runtime.evaluate_participation(_opportunity("m1"))
         assert writer_requests
         assert len(writer_requests) == 1
         judge_prompt = "\n".join(item["content"] for item in judge_client.requests[0])
@@ -1120,9 +1114,9 @@ async def test_older_knowledge_reaches_real_renderers_and_revocation_blocks_effe
             assert selector.revalidate(
                 finalized_contexts[0]["_knowledge_selection"],
                 read_context=trusted_contexts(_opportunity("m1"), {})[0],
-                fact_context=trusted_contexts(_opportunity("m1"), {})[1],
             ).text == older_fact
     finally:
+        projector.close()
         archive.close()
         harness.close()
         log.close()
@@ -1149,16 +1143,16 @@ async def test_two_author_trigger_consults_the_multi_reader_knowledge_selector(
         ParticipationKnowledgeSelection,
         reader_key,
     )
-    from yeoman_gateway.storage.inbound_archive import InboundArchive
 
     from tests.gateway.capture_harness import Registry
+    from tests.gateway.synthetic_reply_archive import SyntheticReplyArchive
 
     shared_fact = "The group meetup is every Friday."
     now_ms = int(time() * 1000)
-    archive = InboundArchive(tmp_path / "inbound.db")
+    archive = SyntheticReplyArchive(tmp_path / "inbound.db")
     for message_id, sender, name, text in (
-        ("m1", "anna@s.whatsapp.net", "Anna", "When is the group meetup?"),
-        ("m2", "ben@s.whatsapp.net", "Ben", "And what time?"),
+        ("m1", "491000000002@s.whatsapp.net", "Anna", "When is the group meetup?"),
+        ("m2", "491000000003@s.whatsapp.net", "Ben", "And what time?"),
     ):
         archive.record_inbound(
             channel=CHANNEL,
@@ -1170,7 +1164,7 @@ async def test_two_author_trigger_consults_the_multi_reader_knowledge_selector(
             text=text,
             timestamp=now_ms // 1000,
         )
-    registry = Registry({("whatsapp", CHAT): ["anna", "ben"]})
+    registry = Registry({("whatsapp", CHAT): ["491000000002", "491000000003"]})
 
     class RecordingSelector:
         """Records the verified principals the production supplier handed over."""
@@ -1203,12 +1197,25 @@ async def test_two_author_trigger_consults_the_multi_reader_knowledge_selector(
                     ),
                 ),
                 reader_keys=tuple(
-                    reader_key(reader.read_context, reader.fact_context)
+                    reader_key(reader.read_context)
                     for reader in readers.readers
                 ),
                 query=query,
             )
 
+    from history_turn_fixtures import Projector
+    from yeoman_gateway.history.context import history_turn
+
+    projector = Projector()
+    roster_ms = now_ms - 1_000
+    projector.db.execute(
+        "INSERT INTO message_events(event_id,kind,channel,chat_id,actor_basis,time_certainty,occurred_ms,payload_json,provenance,source_refs) "
+        "VALUES ('roster','member_snapshot','whatsapp',?,'unknown','provider_timestamp',?,?,'native','[]')",
+        (CHAT, roster_ms, json.dumps({"complete": True, "participants": [
+            ["491000000002@s.whatsapp.net"], ["491000000003@s.whatsapp.net"]
+        ]})),
+    )
+    projector.db.commit()
     selector = RecordingSelector()
     builder = ParticipationContextBuilder(
         archive=archive,
@@ -1238,14 +1245,16 @@ async def test_two_author_trigger_consults_the_multi_reader_knowledge_selector(
     runtime._context_builder = builder
     runtime._revalidate_knowledge = lambda opportunity, context, selection: selection
     try:
-        result = await runtime.evaluate_participation(_opportunity("m1", "m2"))
+        async with history_turn(projector):
+            result = await runtime.evaluate_participation(_opportunity("m1", "m2"))
 
-        assert selector.calls == [("anna@s.whatsapp.net", "ben@s.whatsapp.net")]
+        assert selector.calls == [("whatsapp:491000000002", "whatsapp:491000000003")]
         assert built[0]["knowledge_selection_status"] == "selected"
         assert built[0]["selected_knowledge_text"] == shared_fact
         assert judge.calls == 1
         assert result["status"] == "submitted", result
     finally:
+        projector.close()
         archive.close()
         log.close()
 
@@ -2743,9 +2752,10 @@ async def test_private_records_never_enter_the_participation_context(tmp_path: P
         ParticipationContextBuilder,
         ParticipationDecisionInputs,
     )
-    from yeoman_gateway.storage.inbound_archive import InboundArchive
 
-    archive = InboundArchive(tmp_path / "inbound.db")
+    from tests.gateway.synthetic_reply_archive import SyntheticReplyArchive
+
+    archive = SyntheticReplyArchive(tmp_path / "inbound.db")
     archive.record_inbound(
         channel=CHANNEL,
         chat_id=CHAT,
@@ -3427,9 +3437,9 @@ async def test_social_continuation_cannot_modify_another_participants_task(
 @pytest.mark.asyncio
 async def test_denied_source_principal_blocks_participation(tmp_path: Path) -> None:
     """A denied originating participant cannot authorize a purpose (A30)."""
-    from yeoman_gateway.storage.inbound_archive import InboundArchive
+    from tests.gateway.synthetic_reply_archive import SyntheticReplyArchive
 
-    archive = InboundArchive(tmp_path / "inbound.db")
+    archive = SyntheticReplyArchive(tmp_path / "inbound.db")
     archive.record_inbound(
         channel=CHANNEL,
         chat_id=CHAT,
@@ -3453,10 +3463,7 @@ async def test_denied_source_principal_blocks_participation(tmp_path: Path) -> N
         tmp_path, decision=COMMENT, submission=_SpySubmission()
     )
     runtime._source_principals = lambda channel, chat_id, sources: tuple(
-        (source_id, sender)
-        for source_id, sender in archive.senders_for_messages(
-            channel, chat_id, tuple(sources)
-        ).items()
+        (str(source_id), "mallory@s.whatsapp.net") for source_id in sources
     )
     runtime._is_participant_allowed = lambda channel, chat_id, sender: False
     result = await runtime.evaluate_participation(_opportunity("m1"))
@@ -3537,14 +3544,21 @@ async def test_writer_budget_keeps_required_target_and_complete_shared_knowledge
         "advisory_taste": [{"content": "Prefer concise replies.", "provenance": "participation:v1"}],
         "_knowledge_selection": selection,
     }
+    from history_turn_fixtures import Projector
     from yeoman_gateway.app.bootstrap import _ParticipationSubmission
+    from yeoman_gateway.history.context import history_turn
 
+    projector = Projector()
+    projector.add("current", chat=CHAT, text=target)
+    projector.add("optional", chat=CHAT, text="optional context " * 600)
     submission = _ParticipationSubmission(responder=responder, writer_profile="test")
-    await submission.generate_draft(
-        opportunity=SimpleNamespace(channel=CHANNEL, chat_id=CHAT, opportunity_id="opp-writer"),
-        decision=SimpleNamespace(target_message_id="current", purpose="brief response"),
-        context=context,
-    )
+    async with history_turn(projector):
+        await submission.generate_draft(
+            opportunity=SimpleNamespace(channel=CHANNEL, chat_id=CHAT, opportunity_id="opp-writer"),
+            decision=SimpleNamespace(target_message_id="current", purpose="brief response"),
+            context=context,
+        )
+    projector.close()
     assert len(provider.calls) == 1
     assert provider.calls[0]["tools"] == []
     prompt = "\n".join(

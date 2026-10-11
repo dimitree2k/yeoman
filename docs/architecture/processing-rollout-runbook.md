@@ -170,9 +170,9 @@ are untouched, so returning to the new mode later reconstructs the same state.
 
 ## 5. Backup — do not use `cp`
 
-The processing and memory databases run in **WAL mode**. A plain `cp` of the `.db` file
-misses everything still in the `-wal` file and silently produces an older state (observed
-in practice: a copy showed schema 2 with 4 events while the live database was at schema 4
+The processing database runs in **WAL mode**. A plain `cp` of the `.db` file misses
+everything still in the `-wal` file and silently produces an older state (observed in
+practice: a copy showed schema 2 with 4 events while the live database was at schema 4
 with 19 events). Use SQLite's own backup API:
 
 ```bash
@@ -180,12 +180,12 @@ python - <<'PY'
 import sqlite3, time, os
 home = os.path.expanduser("~/.yeoman/data")
 stamp = time.strftime("%Y%m%d-%H%M%S")
-for name in ("ops/processing.db", "memory/memory.db"):
-    src = sqlite3.connect(f"file:{home}/{name}?mode=ro", uri=True)
-    dst = sqlite3.connect(f"{home}/{name}.walsafe-{stamp}.bak")
-    src.backup(dst)
-    dst.close(); src.close()
-    print("backed up", name)
+name = "ops/processing.db"
+src = sqlite3.connect(f"file:{home}/{name}?mode=ro", uri=True)
+dst = sqlite3.connect(f"{home}/{name}.walsafe-{stamp}.bak")
+src.backup(dst)
+dst.close(); src.close()
+print("backed up", name)
 PY
 ```
 

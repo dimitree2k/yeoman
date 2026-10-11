@@ -42,9 +42,6 @@ from yeoman_gateway.channels.base import BaseChannel
 from yeoman_gateway.channels.whatsapp_runtime import WhatsAppRuntimeManager
 from yeoman_gateway.core.models import InboundEvent as CoreInboundEvent
 from yeoman_gateway.history.live import HistoryPaused
-from yeoman_gateway.history.writer_guard import (
-    legacy_history_writers_disabled,
-)
 from yeoman_gateway.implicit_addressing import (
     DEFAULT_BOT_NAME_ALIASES,
     contains_bot_name,
@@ -93,8 +90,6 @@ if TYPE_CHECKING:
     from yeoman_gateway.media.document_cache import DocumentCache
     from yeoman_gateway.media.router import ModelRouter
     from yeoman_gateway.providers.factory import ProviderFactory
-    from yeoman_gateway.storage.chat_registry import ChatRegistry
-    from yeoman_gateway.storage.inbound_archive import InboundArchive
 
 
 def _markdown_to_whatsapp(text: str) -> str:
@@ -329,7 +324,6 @@ class WhatsAppChannel(BaseChannel):
         self,
         config: WhatsAppConfig,
         bus: MessageBus,
-        inbound_archive: "InboundArchive | None" = None,
         model_router: "ModelRouter | None" = None,
         media_storage: MediaStorage | None = None,
         provider_factory: "ProviderFactory | None" = None,
@@ -338,16 +332,11 @@ class WhatsAppChannel(BaseChannel):
         openai_api_key: str | None = None,
         openai_api_base: str | None = None,
         openai_extra_headers: dict[str, str] | None = None,
-        legacy_history_disabled: bool = False,
     ):
-        self.legacy_history_disabled = legacy_history_writers_disabled(legacy_history_disabled)
         super().__init__(config, bus)
         self.config: WhatsAppConfig = config
         self._history_projector: Any = None
-        self._history_selected = False
-        self._history_mentions_selected = False
         self._history_knowledge: Any = None
-        self.inbound_archive = inbound_archive
         self._model_router = model_router
         self._media_storage = media_storage or MediaStorage(
             incoming_dir=self.config.media.incoming_path,
@@ -422,14 +411,6 @@ class WhatsAppChannel(BaseChannel):
         self._presence_supported = True
         self._presence_unsupported_logged = False
         self._runtime = WhatsAppRuntimeManager()
-        self._chat_registry: ChatRegistry | None = None
-        try:
-            from yeoman_gateway.storage.chat_registry import ChatRegistry
-
-            if not self.legacy_history_disabled:
-                self._chat_registry = ChatRegistry(legacy_history_disabled=self.legacy_history_disabled)
-        except Exception as e:
-            logger.warning(f"Failed to initialize chat registry: {e}")
 
     def _require_token(self) -> str:
         token = (self.config.bridge_token or "").strip()
@@ -634,10 +615,6 @@ class WhatsAppChannel(BaseChannel):
                     if not work.completion.done():
                         work.completion.set_result(False)
                 self._bridge_inflight.clear()
-        if self._chat_registry is not None:
-            with contextlib.suppress(Exception):
-                self._chat_registry.close()
-            self._chat_registry = None
 
     async def send(self, msg: OutboundMessage) -> None:
         from yeoman_gateway.history.context import (
@@ -648,7 +625,7 @@ class WhatsAppChannel(BaseChannel):
         generation = msg.metadata.get('history_generation')
         if generation is None:
             generation = history_effect_metadata().get('history_generation')
-        if getattr(self, '_history_mentions_selected', getattr(self, '_history_selected', False)) and not msg.metadata.get('historyMentionsResolved'):
+        if not msg.metadata.get('historyMentionsResolved'):
             snapshot = current_history_snapshot()
             if snapshot is None:
                 # Bus consumers own no turn; prepare identity before waiting on transport.
@@ -802,8 +779,6 @@ class WhatsAppChannel(BaseChannel):
                     max_attempts=self._send_attempts(msg.metadata),
                 )
                 media_receipt = _receipt_from_bridge(media_result)
-                if caption:
-                    self._archive_sent_text(msg, caption, media_receipt)
                 sent_any_media = True
 
                 # Best-effort cleanup for generated TTS voice notes.
@@ -842,27 +817,7 @@ class WhatsAppChannel(BaseChannel):
             max_attempts=self._send_attempts(msg.metadata),
         )
         receipt = _receipt_from_bridge(text_result)
-        self._archive_sent_text(msg, text, receipt)
         return receipt
-
-    def _archive_sent_text(
-        self, msg: OutboundMessage, text: str, receipt: dict[str, Any] | None
-    ) -> None:
-        """Project confirmed bot text into the same context window as incoming text."""
-        archive = getattr(self, "inbound_archive", None)
-        message_id = str((receipt or {}).get("provider_message_id") or "")
-        if archive is None or not message_id:
-            return
-        try:
-            archive.record_inbound(
-                channel=self.name, chat_id=msg.chat_id, message_id=message_id,
-                participant=None, sender_id="assistant", sender_name="Arvid",
-                text=text, timestamp=int(datetime.now(UTC).timestamp()), reply_to_message_id=msg.reply_to,
-            )
-        except Exception as exc:
-            # Sending already succeeded. A projection failure must not trigger a resend.
-            logger.warning("sent_context_projection_failed message_id={} error_type={}",
-                           message_id, type(exc).__name__)
 
     async def start_typing(self, chat_id: str) -> None:
         """Public typing API used by policy-aware orchestration."""
@@ -1865,16 +1820,14 @@ class WhatsAppChannel(BaseChannel):
         return "\n".join(part for part in parts if part)
 
     async def _maybe_answer_ambient(self, event: InboundEvent) -> _AmbientOutcome:
-        if self._history_selected:
-            from yeoman_gateway.history.context import history_knowledge_scope, history_turn
-            from yeoman_gateway.history.live import HistoryPaused
-            try:
-                async with history_turn(self._history_projector) as snapshot:
-                    with history_knowledge_scope(snapshot, self._history_knowledge):
-                        return await self._answer_ambient_scoped(event)
-            except HistoryPaused:
-                return _AmbientOutcome()
-        return await self._answer_ambient_scoped(event)
+        from yeoman_gateway.history.context import history_knowledge_scope, history_turn
+        from yeoman_gateway.history.live import HistoryPaused
+        try:
+            async with history_turn(self._history_projector) as snapshot:
+                with history_knowledge_scope(snapshot, self._history_knowledge):
+                    return await self._answer_ambient_scoped(event)
+        except HistoryPaused:
+            return _AmbientOutcome()
 
     async def _answer_ambient_scoped(self, event: InboundEvent) -> _AmbientOutcome:
         """Ask the judge about an unaddressed message.
@@ -2123,16 +2076,12 @@ class WhatsAppChannel(BaseChannel):
 
         from yeoman_gateway.history.context import history_knowledge_scope, history_turn
         from yeoman_gateway.history.live import HistoryPaused
-        if self._history_selected:
-            try:
-                async with history_turn(self._history_projector) as snapshot:
-                    with history_knowledge_scope(snapshot, self._history_knowledge):
-                        event, ambient_candidate, denied = await self._admit_inbound_event(event)
-            except HistoryPaused:
-                self._archive_inbound_event(event)
-                return
-        else:
-            event, ambient_candidate, denied = await self._admit_inbound_event(event)
+        try:
+            async with history_turn(self._history_projector) as snapshot:
+                with history_knowledge_scope(snapshot, self._history_knowledge):
+                    event, ambient_candidate, denied = await self._admit_inbound_event(event)
+        except HistoryPaused:
+            return
         if denied:
             return
         await self._enrich_and_publish_inbound(event, ambient_candidate)
@@ -2178,9 +2127,6 @@ class WhatsAppChannel(BaseChannel):
                     verdict.reason,
                     verdict.decision.decision_id if verdict.decision else "-",
                 )
-                # The owner wants a complete inbound record, so a refused message is
-                # archived before the pipeline drops it.
-                self._archive_inbound_event(event)
                 return event, ambient_candidate, True
         return event, ambient_candidate, False
 
@@ -2208,8 +2154,6 @@ class WhatsAppChannel(BaseChannel):
                 # acknowledgement branches must stand down all the same.
                 event = replace(event, processing_reacted=True)
         self._record_document_cache_item(event)
-        self._archive_inbound_event(event)
-        self._sync_chat_registry(event)
 
         effective_debounce = (
             self.config.debounce_media_ms
@@ -2498,71 +2442,6 @@ class WhatsAppChannel(BaseChannel):
                 event.message_id,
                 e,
             )
-
-    def _archive_inbound_event(self, event: InboundEvent) -> None:
-        if self.inbound_archive is None:
-            return
-        try:
-            self.inbound_archive.record_inbound(
-                channel=self.name,
-                chat_id=event.chat_jid,
-                message_id=event.message_id,
-                participant=event.sender_phone_jid or event.participant_jid,
-                sender_id=(
-                    _whatsapp_jid_user_token(event.sender_phone_jid)
-                    if event.sender_phone_jid
-                    else event.sender_id
-                ) or event.sender_id,
-                sender_name=event.sender_name,
-                text=event.text,
-                timestamp=event.timestamp,
-                reply_to_message_id=event.reply_to_message_id,
-            )
-            # Seed quoted target text when available so reply lookups can work
-            # even if the original inbound message was not captured by this runtime.
-            if not self._history_selected and event.reply_to_message_id and event.reply_to_text:
-                self.inbound_archive.record_inbound(
-                    channel=self.name,
-                    chat_id=event.chat_jid,
-                    message_id=event.reply_to_message_id,
-                    participant=event.reply_to_participant,
-                    sender_id=None,
-                    text=event.reply_to_text,
-                    timestamp=event.timestamp,
-                )
-        except Exception as e:
-            logger.warning(f"Failed to archive inbound WhatsApp message {event.message_id}: {e}")
-
-    def _sync_chat_registry(self, event: InboundEvent) -> None:
-        if self._chat_registry is None:
-            return
-        try:
-            self._chat_registry.register_chat(
-                channel=self.name,
-                chat_id=event.chat_jid,
-                chat_type="group" if event.is_group else "dm",
-                readable_name=(
-                    self._policy_comment_for_chat(event.chat_jid) if event.is_group else None
-                ),
-            )
-        except Exception as e:
-            logger.warning(f"Failed to update chat registry for {event.chat_jid}: {e}")
-
-    def _policy_comment_for_chat(self, chat_id: str) -> str | None:
-        try:
-            from yeoman_gateway.policy.loader import load_policy
-
-            policy = load_policy()
-            channel_policy = policy.channels.get(self.name)
-            if channel_policy is None:
-                return None
-            override = channel_policy.chats.get(str(chat_id))
-            if override is None:
-                return None
-            comment = str(override.comment or "").strip()
-            return comment or None
-        except Exception:
-            return None
 
     async def _enrich_media_event(self, event: InboundEvent) -> InboundEvent:
         event = await self._enrich_primary_media_event(event)

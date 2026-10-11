@@ -125,7 +125,6 @@ class BusEffectExecutor:
         delete_handler: Callable[[EffectEnvelope], Awaitable[bool]] | None = None,
         external_handler: Callable[[EffectEnvelope], Awaitable[bool]] | None = None,
         mark_provenance: bool = False,
-        history_mentions_selected: bool = False,
         security: Any | None = None,
         security_block_message: str = "\U0001f602",
         direct_sender: Callable[[OutboundMessage], Awaitable[None]] | None = None,
@@ -136,7 +135,6 @@ class BusEffectExecutor:
     ) -> None:
         self._bus = bus
         self._mark_provenance = mark_provenance
-        self._history_mentions_selected = history_mentions_selected
         self._security = security
         self._security_block_message = security_block_message
         self._direct_sender = direct_sender
@@ -244,7 +242,7 @@ class BusEffectExecutor:
                 reply_to=payload.reply_to,
                 metadata=dict(provenance),
             )
-            if self._history_mentions_selected and target.channel == 'whatsapp':
+            if target.channel == 'whatsapp':
                 from yeoman_gateway.channels.whatsapp import resolve_history_mentions
                 from yeoman_gateway.history.context import current_history_snapshot
                 text, mentions = resolve_history_mentions(message.content, message.metadata,
@@ -285,7 +283,7 @@ class BusEffectExecutor:
                 media=list(payload.media),
                 metadata=dict(provenance),
             )
-            if self._history_mentions_selected and target.channel == 'whatsapp':
+            if target.channel == 'whatsapp':
                 from yeoman_gateway.channels.whatsapp import resolve_history_mentions
                 from yeoman_gateway.history.context import current_history_snapshot
                 text, mentions = resolve_history_mentions(message.content, message.metadata,

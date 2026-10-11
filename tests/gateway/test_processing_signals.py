@@ -158,15 +158,11 @@ async def test_observed_registration_uses_live_history_snapshot(
             sqlite3.connect(f"file:{history_path}?mode=ro", uri=True),
         )
 
-    sink = SignalJournalSink(
-        processing,
-        sources=register,
-        history_projector=SimpleNamespace(
-            read_turn=read_turn,
-            health=lambda: {"status": "ready", "generation": 1},
-        ),
-        history_knowledge=knowledge,
+    projector = SimpleNamespace(
+        read_turn=read_turn,
+        health=lambda: {"status": "ready", "generation": 1},
     )
+    sink = SignalJournalSink(processing)
     sink.capture(
         "message",
         {
@@ -187,7 +183,11 @@ async def test_observed_registration_uses_live_history_snapshot(
     assert registration_scopes == []
 
     try:
-        assert await sink.register_observed_source_live(event_id) is (lookup == "known")
+        from yeoman_gateway.history.context import history_knowledge_scope, history_turn
+
+        async with history_turn(projector) as snapshot:
+            with history_knowledge_scope(snapshot, knowledge):
+                assert register(event_id) is (lookup == "known")
         assert registration_scopes == [True]
         source = knowledge.history_source_ledger.lookup(message_id, 1)
         if lookup == "known":

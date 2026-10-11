@@ -28,18 +28,6 @@ Problem: memory has zero active entries.
 Likely cause: fresh install or capture not working.
 Fix: verify capture settings and test with `yeoman memory add --text "test" --kind fact`.
 
-### MEM-006
-Severity: WARNING
-Problem: SQLite journal mode is not WAL.
-Likely cause: DB recreated outside the normal yeoman path or altered manually.
-Fix: `sqlite3 ~/.yeoman/data/memory/memory.db "PRAGMA journal_mode=WAL;"`
-
-### MEM-007
-Severity: WARNING
-Problem: memory DB is large.
-Likely cause: long retention with no compaction.
-Fix: back up the DB, then run `sqlite3 ~/.yeoman/data/memory/memory.db "VACUUM;"`
-
 ## Cron
 
 ### CRON-001

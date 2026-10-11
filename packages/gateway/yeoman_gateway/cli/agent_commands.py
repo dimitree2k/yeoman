@@ -8,7 +8,7 @@ import typer
 
 from yeoman_gateway import __logo__
 
-from .core import app, console, make_memory_service, make_provider
+from .core import app, console, make_provider
 
 
 @app.command()
@@ -28,7 +28,6 @@ def agent(
     from yeoman_gateway.security import NoopSecurity, SecurityEngine
 
     config = load_config()
-    memory_service = make_memory_service(config)
     telemetry = InMemoryTelemetry()
 
     bus = MessageBus(
@@ -62,7 +61,6 @@ def agent(
         web_config=config.tools.web,
         exec_config=exec_config,
         restrict_to_workspace=restrict_to_workspace,
-        memory_service=memory_service,
         telemetry=telemetry,
         security=security,
         file_access_resolver=file_access_resolver,
@@ -79,7 +77,6 @@ def agent(
             asyncio.run(run_once())
         finally:
             responder.close()
-            memory_service.close()
     else:
         console.print(f"{__logo__} Interactive mode (Ctrl+C to exit)\n")
 
@@ -100,4 +97,3 @@ def agent(
             asyncio.run(run_interactive())
         finally:
             responder.close()
-            memory_service.close()

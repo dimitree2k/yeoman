@@ -1,5 +1,11 @@
 # WhatsApp Outbound Reply Archive Implementation Plan
 
+Historical document (G6, 2026-10-11): the standalone WhatsApp history stores, legacy history tools and cutover scripts referenced here have been retired. Current runtime reads use canonical History and Knowledge schema 3; old store examples describe the previous implementation.
+
+
+Historical note: `summarize_history` was retired in G6. References below to its
+test describe the original implementation and are not runnable current checks.
+
 > **For agentic workers:** REQUIRED SUB-SKILL: Use superpowers:subagent-driven-development (recommended) or superpowers:executing-plans to implement this plan task-by-task. Steps use checkbox (`- [ ]`) syntax for tracking.
 
 **Goal:** Persist successful WhatsApp outbound messages as direction-tagged reply anchors so delayed explicit replies resolve to their original thread without changing inbound-only history, activity, persona, or long-memory consumers.

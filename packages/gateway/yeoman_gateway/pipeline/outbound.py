@@ -28,7 +28,6 @@ from yeoman_gateway.history.live import HistoryPaused
 
 if TYPE_CHECKING:
     from yeoman_gateway.core.models import InboundEvent
-    from yeoman_gateway.knowledge._contacts.service import ContactsService
     from yeoman_gateway.media.router import ModelRouter
     from yeoman_gateway.media.tts import TTSSynthesizer
 
@@ -167,8 +166,6 @@ class OutboundMiddleware:
     def __init__(
         self,
         *,
-        contacts: "ContactsService | None" = None,
-        history_selected: bool = False,
         security: SecurityPort | None = None,
         security_block_message: str = "😂",
         tts: "TTSSynthesizer | None" = None,
@@ -180,9 +177,7 @@ class OutboundMiddleware:
         allowed_reaction_emojis: Sequence[str] | None = None,
         knowledge: object | None = None,
     ) -> None:
-        self._contacts = contacts
-        self._history_selected = history_selected
-        #: Public knowledge facade; used in preference to the legacy contacts cache.
+        #: Public History-backed Knowledge facade for mention identity.
         self._knowledge = knowledge
         self._security = security
         self._security_block_message = security_block_message
@@ -305,8 +300,8 @@ class OutboundMiddleware:
         outbound_metadata: dict[str, object] = {}
         if outbound_channel == "whatsapp":
             mention_candidates = _collect_whatsapp_mention_candidates(event)
-            # Resolve @Name mentions via contacts DB
-            if (self._knowledge is not None or self._contacts is not None) and ctx.reply:
+            # Resolve @Name mentions through History-backed Knowledge.
+            if self._knowledge is not None and ctx.reply:
                 seen = set(mention_candidates)
                 for match in re.finditer(r"(?<!\w)@(\w+)", ctx.reply):
                     name = match.group(1)
@@ -332,11 +327,6 @@ class OutboundMiddleware:
                             )
                             identifier = None
                         jid = None if identifier is None else identifier.value
-                    elif self._contacts is not None and not self._history_selected:
-                        jid = self._contacts.resolve_name_to_jid(
-                            name, channel="whatsapp",
-                            group_participants=list(seen),
-                        )
                     if jid and jid not in seen:
                         mention_candidates.append(jid)
                         seen.add(jid)

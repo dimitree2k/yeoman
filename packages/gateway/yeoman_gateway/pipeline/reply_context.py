@@ -7,9 +7,7 @@ them into ``event.raw_metadata``.
 
 from __future__ import annotations
 
-import re
 from dataclasses import replace
-from typing import TYPE_CHECKING
 
 from loguru import logger
 
@@ -17,15 +15,6 @@ from yeoman_gateway.core.models import ArchivedMessage, InboundEvent
 from yeoman_gateway.core.pipeline import NextFn, PipelineContext
 from yeoman_gateway.core.ports import ReplyArchivePort
 from yeoman_gateway.history.live import HistoryPaused
-
-if TYPE_CHECKING:
-    from yeoman_gateway.knowledge._contacts.service import ContactsService
-
-# Bridge placeholders that are not meaningful reply text — the archive
-# transcript (if available) should take precedence.
-_MEDIA_PLACEHOLDER_RE = re.compile(
-    r"^\[(?:Voice Message|Video|Image|Document|Sticker|Audio)\]$"
-)
 
 
 class ReplyContextMiddleware:
@@ -35,16 +24,12 @@ class ReplyContextMiddleware:
         self,
         *,
         archive: ReplyArchivePort | None = None,
-        contacts: "ContactsService | None" = None,
         knowledge: object | None = None,
         reply_context_window_limit: int = 6,
         reply_context_line_max_chars: int = 500,
         ambient_window_limit: int = 30,
-        history_selected: bool = False,
     ) -> None:
-        self._legacy_archive = archive
-        self._history_selected = history_selected
-        self._contacts = contacts
+        self._archive_adapter = archive
         #: Public knowledge facade; used in preference to the legacy contacts cache.
         self._knowledge = knowledge
         self._reply_window_limit = max(1, int(reply_context_window_limit))
@@ -53,16 +38,7 @@ class ReplyContextMiddleware:
 
     @property
     def _archive(self) -> ReplyArchivePort | None:
-        if self._history_selected:
-            from yeoman_gateway.adapters.reply_archive_history import HistoryReplyArchiveAdapter
-            from yeoman_gateway.history.context import current_history_snapshot
-            from yeoman_gateway.history.live import HistoryPaused
-            from yeoman_gateway.history.queries import HistoryQueries
-            snapshot = current_history_snapshot()
-            if snapshot is None:
-                raise HistoryPaused('history_scope_required')
-            return HistoryReplyArchiveAdapter(HistoryQueries(snapshot))
-        return self._legacy_archive
+        return self._archive_adapter
 
     async def __call__(self, ctx: PipelineContext, next: NextFn) -> None:
         event, lookup_attempted, archive_hit = self._resolve_reply_context(ctx.event)
@@ -79,71 +55,28 @@ class ReplyContextMiddleware:
     def _resolve_reply_context(
         self, event: InboundEvent
     ) -> tuple[InboundEvent, bool, bool]:
-        if event.channel != "whatsapp" or self._archive is None:
+        if event.channel != "whatsapp":
             return event, False, False
 
         reply_to_message_id = (event.reply_to_message_id or "").strip()
-        from yeoman_gateway.adapters.reply_archive_history import HistoryReplyArchiveAdapter
-        selected = isinstance(self._archive, HistoryReplyArchiveAdapter)
-        if selected:
-            raw = {key: value for key, value in event.raw_metadata.items() if key not in {
-                'reply_context_source', 'reply_context_window', 'ambient_context_window', 'ambient_context_rows'}}
-            event = replace(event, reply_to_text=None, raw_metadata=raw)
-        payload_reply_text = (event.reply_to_text or "").strip()
-        # Bridge re-extracts quoted text from the proto, so voice messages
-        # arrive as "[Voice Message]" even if the archive has a transcript.
-        is_media_placeholder = bool(
-            payload_reply_text and _MEDIA_PLACEHOLDER_RE.match(payload_reply_text)
-        )
-        has_payload_reply_text = bool(payload_reply_text) and not is_media_placeholder
-        ambient_lines = self._build_ambient_window(event)
-
-        if not reply_to_message_id:
-            if has_payload_reply_text or ambient_lines:
-                raw = dict(event.raw_metadata)
-                if has_payload_reply_text:
-                    raw.setdefault("reply_context_source", "payload")
-                if ambient_lines:
-                    raw["ambient_context_window"] = ambient_lines
-                    raw["ambient_context_rows"] = self._build_ambient_context_rows(event)
-                return replace(event, raw_metadata=raw), False, False
+        raw = {key: value for key, value in event.raw_metadata.items() if key not in {
+            "reply_context_source", "reply_context_window", "ambient_context_window", "ambient_context_rows",
+        }}
+        event = replace(event, reply_to_text=None, raw_metadata=raw)
+        if self._archive is None:
             return event, False, False
-
-        row = self._archive.lookup_message(
-            event.channel, event.chat_id, reply_to_message_id
-        )
-        if row is None and not selected:
-            row = self._archive.lookup_message_any_chat(
-                event.channel,
-                reply_to_message_id,
-                preferred_chat_id=event.chat_id,
-            )
-        if row is None:
-            if has_payload_reply_text or ambient_lines:
-                raw = dict(event.raw_metadata)
-                if has_payload_reply_text:
-                    raw.setdefault("reply_context_source", "payload")
-                if ambient_lines:
-                    raw["ambient_context_window"] = ambient_lines
-                    raw["ambient_context_rows"] = self._build_ambient_context_rows(event)
-                return replace(event, raw_metadata=raw), True, False
-            return event, True, False
-
-        raw = dict(event.raw_metadata)
-        raw.setdefault(
-            "reply_context_source",
-            "payload" if has_payload_reply_text else "archive",
-        )
-        window_lines = self._build_reply_context_window(event, row)
-        if window_lines:
-            raw["reply_context_window"] = window_lines
+        ambient_lines = self._build_ambient_window(event)
         if ambient_lines:
             raw["ambient_context_window"] = ambient_lines
             raw["ambient_context_rows"] = self._build_ambient_context_rows(event)
-
-        if has_payload_reply_text:
-            return replace(event, raw_metadata=raw), True, True
-
+        if not reply_to_message_id:
+            return replace(event, raw_metadata=raw), False, False
+        row = self._archive.lookup_message(event.channel, event.chat_id, reply_to_message_id)
+        if row is None:
+            return replace(event, raw_metadata=raw), True, False
+        window_lines = self._build_reply_context_window(event, row)
+        if window_lines:
+            raw["reply_context_window"] = window_lines
         text = row.text.strip()
         if not text:
             return replace(event, raw_metadata=raw), True, False
@@ -248,10 +181,6 @@ class ReplyContextMiddleware:
                         getattr(exc, "code", type(exc).__name__),
                     )
                     name = None
-                if name:
-                    return name
-            elif self._contacts is not None:
-                name = self._contacts.resolve_jid_to_name(row.sender_id)
                 if name:
                     return name
         return (

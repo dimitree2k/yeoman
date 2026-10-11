@@ -5,6 +5,7 @@ from datetime import UTC, datetime
 from pathlib import Path
 
 import pytest
+from history_turn_fixtures import Projector
 from yeoman_gateway.core.models import InboundEvent
 from yeoman_gateway.core.pipeline import PipelineContext
 from yeoman_gateway.pipeline.new_chat import NewChatNotifyMiddleware, merge_seen_chat_files
@@ -104,6 +105,10 @@ def test_merge_fails_closed_without_writing_partial_output(
 
 
 def test_fresh_turn_writes_only_canonical_seen_chats(tmp_path: Path, monkeypatch) -> None:
+    import asyncio
+
+    from yeoman_gateway.history.context import history_turn
+
     monkeypatch.setenv("YEOMAN_HOME", str(tmp_path))
     canonical = get_operational_store_path("seen_chats")
     middleware = NewChatNotifyMiddleware(owner_alert_resolver=lambda _channel: ["123"])
@@ -116,7 +121,13 @@ def test_fresh_turn_writes_only_canonical_seen_chats(tmp_path: Path, monkeypatch
         raw_metadata={"group_name": "New group"},
     )
 
-    middleware._maybe_notify(PipelineContext(event=event))
+    projector = Projector()
+
+    async def notify() -> None:
+        async with history_turn(projector):
+            middleware._maybe_notify(PipelineContext(event=event))
+
+    asyncio.run(notify())
 
     assert canonical.exists()
     assert json.loads(canonical.read_text()) == {
@@ -125,3 +136,4 @@ def test_fresh_turn_writes_only_canonical_seen_chats(tmp_path: Path, monkeypatch
     }
     assert not (tmp_path / "seen_chats.json").exists()
     assert not (tmp_path / "data" / "seen_chats.json").exists()
+    projector.close()

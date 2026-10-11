@@ -11,6 +11,7 @@ from dataclasses import replace
 from pathlib import Path
 
 import pytest
+from history_turn_fixtures import Projector
 from yeoman_gateway.bus.queue import MessageBus
 from yeoman_gateway.channels.whatsapp import InboundEvent, WhatsAppChannel
 from yeoman_shared.config.schema import WhatsAppConfig
@@ -65,6 +66,7 @@ def _channel(monkeypatch: pytest.MonkeyPatch, tmp_path: Path) -> tuple[WhatsAppC
         WhatsAppConfig(enabled=True, bridge_url="ws://localhost:3001", bridge_token="secret"),
         MessageBus(),
     )
+    channel._history_projector = Projector()
     gate = _RecordingGate()
     channel._processing_gate = gate
     return channel, gate

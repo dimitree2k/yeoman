@@ -1,4 +1,4 @@
-"""Prune memory.db entries by age/salience -- snapshot-first."""
+"""Prune an explicitly supplied isolated legacy memory database."""
 from __future__ import annotations
 
 import shutil
@@ -6,6 +6,7 @@ import sqlite3
 import time
 from datetime import datetime, timezone
 from pathlib import Path
+from typing import Any
 
 from yeoman_overseer.audit.logger import AuditEntry
 
@@ -15,15 +16,13 @@ def prune_memory(
     age_days: int | None = None,
     salience_below: float | None = None,
     domain: str | None = None,
-    ctx: object,
-) -> dict:
-    """Delete memory nodes matching criteria after snapshotting the DB first."""
-    db_path: Path = ctx.memory_db
-
+    ctx: Any,
+) -> dict[str, object]:
+    """Delete matching nodes only after refusing retired and runtime stores."""
+    db_path = getattr(ctx, "memory_db", None)
     from yeoman_overseer.agent.tools.query_db import history_path_refused
-    if (getattr(ctx, "history_selected", False) is True
-            or getattr(ctx, "legacy_history_disabled", False) is True) and history_path_refused(db_path, ctx):
-        return {'ok': False, 'error': 'legacy history prune refused; use Knowledge maintenance'}
+    if not isinstance(db_path, Path) or history_path_refused(db_path, ctx):
+        return {'ok': False, 'error': 'legacy memory prune refused; use Knowledge maintenance'}
     ts = datetime.now(timezone.utc).strftime("%Y%m%d-%H%M%S")
     snapshot = db_path.with_name(f"{db_path.name}.snapshot-{ts}")
     shutil.copy2(db_path, snapshot)
@@ -31,7 +30,7 @@ def prune_memory(
     cutoff_ts = time.time() - (age_days * 86400) if age_days is not None else None
 
     clauses: list[str] = []
-    params: list = []
+    params: list[object] = []
 
     if cutoff_ts is not None:
         clauses.append("created_at < ?")

@@ -16,7 +16,6 @@ from pathlib import Path
 
 from yeoman_gateway.cli.memory_commands import (
     MEDIA_AGE_BUCKETS,
-    MEDIA_STATES,
     collect_media_references,
     media_age_bucket,
     media_growth_rows,
@@ -91,7 +90,7 @@ def test_missing_files_are_reported_not_deleted(tmp_path: Path) -> None:
 
     rows = media_growth_rows(references, now_ms=NOW, stat_size=stat_size)
     states = {row.state: row for row in rows}
-    assert set(states) == set(MEDIA_STATES)
+    assert set(states) == {"present", "missing"}
     assert states["present"].bytes == 42
     assert states["missing"].count == 1
     # Nothing was removed: both the file and the report survive.

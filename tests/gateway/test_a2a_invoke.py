@@ -12,7 +12,7 @@ from yeoman_gateway.bus.events import OutboundMessage
 from yeoman_gateway.bus.queue import MessageBus
 from yeoman_gateway.channels.whatsapp import WhatsAppChannel
 from yeoman_gateway.ipc import a2a_invoke
-from yeoman_gateway.ipc.a2a_invoke import process_a2a_invocation
+from yeoman_gateway.ipc.a2a_invoke import _process_a2a_invocation, process_a2a_invocation
 from yeoman_gateway.ipc.gateway_socket import GatewaySocket
 from yeoman_gateway.processing.dispatch import EffectNotDeliveredError
 from yeoman_gateway.processing.models import EffectReceipt, TransportReceipt
@@ -160,7 +160,8 @@ async def _invoke(**changes: object) -> tuple[dict[str, object], _Policy, _Resol
         "sender_account": "default",
     }
     arguments.update(changes)
-    result = await process_a2a_invocation(**arguments)
+    invoke = process_a2a_invocation if "history_projector" in arguments else _process_a2a_invocation
+    result = await invoke(**arguments)
     return result, policy, resolver, effects
 
 
@@ -544,6 +545,10 @@ async def test_whatsapp_staged_artifacts_preserve_safe_suffix_mime(
     channel = WhatsAppChannel(
         WhatsAppConfig(media={"outgoing_dir": str(tmp_path)}), MessageBus()
     )
+    from tests.gateway.history_turn_fixtures import Projector
+
+    projector = Projector()
+    channel._history_projector = projector
     channel._connected = True
     calls: list[tuple[str, dict[str, object]]] = []
 
@@ -552,11 +557,14 @@ async def test_whatsapp_staged_artifacts_preserve_safe_suffix_mime(
         return {"messageId": "provider-1"}
 
     channel._send_command_with_retry = send  # type: ignore[method-assign]
-    await channel.send(
-        OutboundMessage(
-            channel="whatsapp", chat_id="private-group@g.us", content="", media=[str(path)]
+    try:
+        await channel.send(
+            OutboundMessage(
+                channel="whatsapp", chat_id="private-group@g.us", content="", media=[str(path)]
+            )
         )
-    )
+    finally:
+        projector.close()
 
     assert calls[0][0] == "send_media"
     assert calls[0][1]["mimeType"] == mime_type
@@ -841,7 +849,7 @@ async def test_real_socket_composes_with_a2a_invocation_validation_and_identity(
     store = _EffectStore()
 
     async def handler(**kwargs: object) -> dict[str, object]:
-        return await process_a2a_invocation(
+        return await _process_a2a_invocation(
             **kwargs,
             configured_peer="hermes",
             advertised_skills=frozenset({"whatsapp.send"}),
@@ -925,7 +933,8 @@ class _AliasStore:
 
 
 class _Contacts:
-    store = _AliasStore()
+    def delivery_identifiers_for_alias(self, alias, *, channel, scope_key):
+        return [SimpleNamespace(value="private-contact@lid")] if alias == "contact-alice" else []
 
 
 class _AliasPolicy:
@@ -957,7 +966,20 @@ def test_recipient_resolution_uses_only_exact_typed_policy_aliases(
             kind,
             alias,
             policy_adapter=_AliasPolicy(),
-            contacts_service=_Contacts(),
+            knowledge=_Contacts(),
         )
         == expected
     )
+
+
+@pytest.mark.asyncio
+async def test_public_whatsapp_invocation_requires_history_before_resolution():
+    policy, resolver, effects = _Policy(), _Resolver(), _Effects()
+    result = await process_a2a_invocation(
+        peer="overseer", configured_peer="overseer", skill="whatsapp.send",
+        advertised_skills={"whatsapp.send"}, input=_input(), task_id="task-1",
+        context_id="context-1", effect_id=_EFFECT_ID, policy_adapter=policy, recipient_resolver=resolver,
+        effects=effects, effect_store=_EffectStore(), sender_account="overseer",
+    )
+    assert result["error"]["code"] == "HISTORY_PAUSED"
+    assert not resolver.calls and not effects.calls

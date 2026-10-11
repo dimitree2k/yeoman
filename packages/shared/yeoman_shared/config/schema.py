@@ -5,7 +5,7 @@ from typing import Any, Literal
 from urllib.parse import urlparse
 
 from pydantic import BaseModel, ConfigDict, Field, field_validator, model_validator
-from pydantic_settings import BaseSettings, EnvSettingsSource, PydanticBaseSettingsSource
+from pydantic_settings import BaseSettings
 
 from yeoman_shared.config.defaults import (
     DEFAULT_KNOWLEDGE,
@@ -380,33 +380,8 @@ class MemoryAclConfig(BaseModel):
     owner_only_preference: bool = bool(DEFAULT_MEMORY["acl"]["owner_only_preference"])
 
 
-class MemoryWalConfig(BaseModel):
-    """Session-state WAL config."""
-
-    model_config = ConfigDict(extra="ignore")
-
-    enabled: bool = bool(DEFAULT_MEMORY["wal"]["enabled"])
-    state_dir: str = str(DEFAULT_MEMORY["wal"]["state_dir"])
 
 
-class MemorySharedConfig(BaseModel):
-    """Shared chat facts (Plan 05). Every switch is off by default."""
-
-    model_config = ConfigDict(extra="ignore")
-
-    enabled: bool = bool(DEFAULT_MEMORY["shared"]["enabled"])
-    extraction_enabled: bool = bool(DEFAULT_MEMORY["shared"]["extraction_enabled"])
-    extractor_version: str = str(DEFAULT_MEMORY["shared"]["extractor_version"])
-    max_jobs_waiting: int = Field(
-        default=int(DEFAULT_MEMORY["shared"]["max_jobs_waiting"]), ge=1
-    )
-    require_known_membership: bool = bool(DEFAULT_MEMORY["shared"]["require_known_membership"])
-
-    @model_validator(mode="after")
-    def _validate_switches(self) -> "MemorySharedConfig":
-        if self.extraction_enabled and not self.enabled:
-            raise ValueError("memory.shared.extractionEnabled requires memory.shared.enabled")
-        return self
 
 
 class KnowledgeConfig(BaseModel):
@@ -429,12 +404,6 @@ class KnowledgeConfig(BaseModel):
 
     enabled: bool = bool(DEFAULT_KNOWLEDGE["enabled"])
     db_path: str = str(DEFAULT_KNOWLEDGE["db_path"])
-    legacy_contacts_paths: list[str] = Field(
-        default_factory=lambda: list(DEFAULT_KNOWLEDGE["legacy_contacts_paths"])
-    )
-    legacy_memory_paths: list[str] = Field(
-        default_factory=lambda: list(DEFAULT_KNOWLEDGE["legacy_memory_paths"])
-    )
     capture_enabled: bool = False
     capture_idle_seconds: int = 60
     capture_max_delay_seconds: int = 300
@@ -448,16 +417,11 @@ class MemoryConfig(BaseModel):
 
     model_config = ConfigDict(extra="ignore")
 
-    enabled: bool = bool(DEFAULT_MEMORY["enabled"])
-    mode: Literal["primary", "shadow"] = str(DEFAULT_MEMORY["mode"])
-    db_path: str = str(DEFAULT_MEMORY["db_path"])
-    shared: MemorySharedConfig = Field(default_factory=MemorySharedConfig)
     capture: MemoryCaptureConfig = Field(default_factory=MemoryCaptureConfig)
     recall: MemoryRecallConfig = Field(default_factory=MemoryRecallConfig)
     embedding: MemoryEmbeddingConfig = Field(default_factory=MemoryEmbeddingConfig)
     scoring: MemoryScoringConfig = Field(default_factory=MemoryScoringConfig)
     acl: MemoryAclConfig = Field(default_factory=MemoryAclConfig)
-    wal: MemoryWalConfig = Field(default_factory=MemoryWalConfig)
 
 
 class ExecIsolationConfig(BaseModel):
@@ -1011,26 +975,6 @@ class RawArchiveConfig(BaseModel):
     media: RawArchiveMediaConfig = Field(default_factory=RawArchiveMediaConfig)
 
 
-class HistoryReaderConfig(BaseModel):
-    """File-only selectors; effective selection also requires live projection."""
-
-    participation: bool = False
-    whatsapp: bool = False
-    responder: bool = False
-    tools: bool = False
-    secondary: bool = False
-    knowledge: bool = False
-
-
-class HistoryConfig(BaseModel):
-    """Dormant projection capability; activation requires file/initializer data."""
-
-    model_config = ConfigDict(populate_by_name=True)
-    live_projection_enabled: bool = Field(default=False, alias="liveProjectionEnabled")
-    readers: HistoryReaderConfig = Field(default_factory=HistoryReaderConfig)
-    legacy_writers_disabled: bool = Field(default=False, alias="legacyWritersDisabled")
-
-
 class Config(BaseSettings):
     """Root configuration for yeoman."""
 
@@ -1038,21 +982,7 @@ class Config(BaseSettings):
         extra="ignore", populate_by_name=True, env_prefix="YEOMAN_", env_nested_delimiter="__"
     )
 
-    @classmethod
-    def settings_customise_sources(
-        cls, settings_cls: type[BaseSettings],
-        init_settings: PydanticBaseSettingsSource, env_settings: PydanticBaseSettingsSource,
-        dotenv_settings: PydanticBaseSettingsSource, file_secret_settings: PydanticBaseSettingsSource,
-    ) -> tuple[PydanticBaseSettingsSource, ...]:
-        for source in (env_settings, dotenv_settings):
-            if isinstance(source, EnvSettingsSource):
-                source.env_vars = {key: value for key, value in source.env_vars.items()
-                                   if key.casefold() != "yeoman_history"
-                                   and not key.casefold().startswith("yeoman_history__")}
-        return init_settings, env_settings, dotenv_settings, file_secret_settings
-
-    history: HistoryConfig = Field(default_factory=HistoryConfig)
-    config_version: int = 2
+    config_version: int = 3
     models: ModelRoutingConfig = Field(default_factory=ModelRoutingConfig)
     agents: AgentsConfig = Field(default_factory=AgentsConfig)
     channels: ChannelsConfig = Field(default_factory=ChannelsConfig)

@@ -9,22 +9,14 @@ import typer
 from yeoman_shared.config.loader import load_config
 from yeoman_shared.utils.helpers import (
     ensure_dir,
-    get_operational_data_path,
     get_operational_store_path,
     safe_filename,
 )
 
-from yeoman_gateway.consciousness.log import SpeakupLog
-from yeoman_gateway.knowledge._memory import MemoryService
 from yeoman_gateway.persona_evolution import (
     apply_persona_evolution_proposal,
-    build_persona_evolution_status,
-    collect_persona_evolution_evidence,
     deny_persona_evolution_proposal,
-    render_persona_evolution_proposal,
 )
-from yeoman_gateway.policy.loader import load_policy
-from yeoman_gateway.storage.inbound_archive import InboundArchive
 
 from .core import app, console
 
@@ -49,49 +41,18 @@ def persona_evolution_propose(
 ) -> None:
     """Generate a private persona evolution proposal from runtime evidence."""
     config = load_config()
-    if config.history.live_projection_enabled and config.history.readers.secondary:
-        from yeoman_gateway.history.export import cli_secondary_request
-        result = cli_secondary_request('persona_evolution_read', dict(persona_file=persona_file,
-                                       window_days=window_days, limit=limit))
-        path = output or config.workspace_path / 'persona-evolution' / 'proposals' / (safe_filename(persona_file) + '.md')
-        ensure_dir(path.parent)
-        path.write_text(result['report'], encoding='utf-8')
-        console.print(f'proposal: {path}')
-        return
-    if config.history.legacy_writers_disabled:
-        raise typer.BadParameter('secondary reader unselected')
-    policy = load_policy()
-    memory = MemoryService(workspace=config.workspace_path, config=config.memory, root_config=config)
-    speakup_log = SpeakupLog(get_operational_store_path("speakups"))
-    inbound_archive = InboundArchive(get_operational_data_path() / "inbound" / "reply_context.db")
-    try:
-        evidence = _run_async(
-            collect_persona_evolution_evidence(
-                policy=policy,
-                workspace=config.workspace_path,
-                persona_file=persona_file,
-                memory=memory,
-                speakup_log=speakup_log,
-                inbound_archive=inbound_archive,
-                window_days=window_days,
-                per_chat_limit=limit,
-            )
-        )
-        rendered = render_persona_evolution_proposal(evidence)
-        target = output or _default_output_path(persona_file)
-        if not target.is_absolute():
-            target = Path.cwd() / target
-        ensure_dir(target.parent)
-        target.write_text(rendered, encoding="utf-8")
-    finally:
-        memory.close()
-        speakup_log.close()
-        inbound_archive.close()
+    from yeoman_gateway.history.export import cli_secondary_request
 
-    console.print("[green]✓[/green] Wrote persona evolution proposal.")
-    console.print(f"path: {target}")
-    console.print(f"persona: {persona_file}")
-    console.print(f"chats: {len(evidence.chats)}")
+    result = cli_secondary_request(
+        "persona_evolution_read",
+        dict(persona_file=persona_file, window_days=window_days, limit=limit),
+    )
+    path = output or config.workspace_path / "persona-evolution" / "proposals" / (
+        safe_filename(persona_file) + ".md"
+    )
+    ensure_dir(path.parent)
+    path.write_text(result["report"], encoding="utf-8")
+    console.print(f"proposal: {path}")
 
 
 @persona_evolution_app.command("status")
@@ -106,89 +67,13 @@ def persona_evolution_status(
     limit: int = typer.Option(5, "--limit", "-n", min=1, max=50),
 ) -> None:
     """Show compact persona-evolution and learned-taste status."""
-    from rich.table import Table
+    from yeoman_gateway.history.export import cli_secondary_request
 
-    config = load_config()
-    if config.history.legacy_writers_disabled or (config.history.live_projection_enabled and config.history.readers.secondary):
-        from yeoman_gateway.history.export import cli_secondary_request
-        result = cli_secondary_request('persona_evolution_read', dict(persona_file=persona_file, window_days=1, limit=limit))
-        console.print(result['report'])
-        return
-    policy = load_policy()
-    memory = MemoryService(workspace=config.workspace_path, config=config.memory, root_config=config)
-    speakup_log = SpeakupLog(get_operational_store_path("speakups"))
-    try:
-        status = _run_async(
-            build_persona_evolution_status(
-                policy=policy,
-                workspace=config.workspace_path,
-                memory=memory,
-                speakup_log=speakup_log,
-                state_db_path=_state_db_path(config.workspace_path),
-                persona_file=persona_file,
-                channel=channel,
-                chat_id=chat_id,
-                limit=limit,
-            )
-        )
-    finally:
-        memory.close()
-        speakup_log.close()
-
-    console.print("[bold]Persona Evolution Status[/bold]")
-    console.print(f"persona: {status['persona_file']}")
-    console.print(f"persona_path: {status['persona_path']}")
-    cron_status = _persona_evolution_cron_status(persona_file)
-    if cron_status:
-        console.print(f"cron_job: {cron_status['id']} enabled={cron_status['enabled']}")
-        console.print(f"next_run: {cron_status['next_run'] or '-'}")
-        console.print(f"last_run: {cron_status['last_run'] or '-'}")
-        console.print(f"last_status: {cron_status['last_status'] or '-'}")
-    metrics = status["metrics"]
-    console.print(f"proposal_metrics: {metrics['proposals']}")
-    console.print(f"scan_metrics: {metrics['scans']}")
-
-    pending_table = Table(title="Pending Proposals")
-    pending_table.add_column("ID")
-    pending_table.add_column("Created")
-    pending_table.add_column("Messages", justify="right")
-    pending_table.add_column("Score", justify="right")
-    pending_table.add_column("Path")
-    for proposal in status["pending_proposals"]:
-        pending_table.add_row(
-            str(proposal["proposal_id"]),
-            str(proposal["created_at"]),
-            str(proposal["total_message_count"]),
-            f"{float(proposal['signal_score'] or 0.0):.2f}",
-            str(proposal["proposal_path"]),
-        )
-    console.print(pending_table)
-
-    scans_table = Table(title="Latest Scans")
-    scans_table.add_column("Scanned")
-    scans_table.add_column("Result")
-    scans_table.add_column("Reason")
-    scans_table.add_column("Messages", justify="right")
-    scans_table.add_column("Score", justify="right")
-    for scan in status["latest_scans"]:
-        scans_table.add_row(
-            str(scan["scanned_at"]),
-            str(scan["result"]),
-            str(scan["reason"] or "-"),
-            str(scan["total_message_count"]),
-            f"{float(scan['signal_score'] or 0.0):.2f}",
-        )
-    console.print(scans_table)
-
-    chat = status.get("chat")
-    if chat:
-        console.print("[bold]Chat Learning[/bold]")
-        console.print(f"channel: {chat['channel']}")
-        console.print(f"chat_id: {chat['chat_id']}")
-        console.print(f"sent_speakups: {chat['sent_speakups']}")
-        console.print(f"labeled_outcomes: {chat['labeled_outcomes']}")
-        console.print(f"taste_distillations: {chat['taste_distillations']}")
-        console.print(f"last_learned_taste: {chat['last_learned_taste'] or '-'}")
+    result = cli_secondary_request(
+        "persona_evolution_read",
+        dict(persona_file=persona_file, window_days=1, limit=limit),
+    )
+    console.print(result["report"])
 
 
 @persona_evolution_app.command("approve")
@@ -272,7 +157,3 @@ def _print_decision_result(status: str, message: str, persona_file: str | None) 
         raise typer.Exit(1)
 
 
-def _run_async(coro):
-    import asyncio
-
-    return asyncio.run(coro)

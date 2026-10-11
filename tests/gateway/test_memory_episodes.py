@@ -17,13 +17,7 @@ from pathlib import Path
 from typing import Iterator
 
 import pytest
-from yeoman_gateway.knowledge.api import KnowledgeService, open_knowledge_store
-from yeoman_gateway.knowledge.authority import (
-    EvidenceAudience,
-    FakeClock,
-    FakePolicyAuthority,
-    FakeSourceAuthority,
-)
+from yeoman_gateway.knowledge.api import KnowledgeService
 from yeoman_gateway.knowledge.models import (
     DAY_MS,
     EPISODE_CLOSURE_MS,
@@ -50,42 +44,27 @@ class EpisodeHarness:
     tmp_path: Path
 
     def __post_init__(self) -> None:
-        self.clock = FakeClock()
-        self.authority = FakeSourceAuthority()
-        self.policy = FakePolicyAuthority(admins={OWNER}, capture_actors={OWNER})
-        self.service: KnowledgeService = open_knowledge_store(
-            self.tmp_path / "knowledge.db",
-            workspace_id=WORKSPACE_ID,
-            source_authority=self.authority,
-            policy_authority=self.policy,
-            clock=self.clock,
-        )
+        from tests.gateway.knowledge.conftest import KnowledgeHarness
+
+        self.history = KnowledgeHarness(self.tmp_path / "history")
+        self.clock = self.history.clock
+        self.authority = self.history.authority
+        self.policy = self.history.policy
+        self.service: KnowledgeService = self.history.service
         self._counter = 0
         self._people: dict[str, str] = {}
 
     def close(self) -> None:
-        self.service.close()
+        self.history.close()
 
     # ── people ───────────────────────────────────────────────────────────────
 
     def person(self, principal: str) -> str:
-        from yeoman_gateway.knowledge.models import Identifier, TrustedIdentityObservation
-
         if principal in self._people:
             return self._people[principal]
-        number = principal.split(":", 1)[-1]
-        observation = TrustedIdentityObservation(
-            identifiers=(
-                Identifier(channel="whatsapp", kind="phone_jid", value=f"{number}@s.whatsapp.net"),
-            ),
-            evidence_ref=f"obs-{number}",
-            observed_at_ms=self.clock.now_ms(),
-        )
-        self.authority.issue_observation(observation)
-        resolved = self.service.resolve_person(observation)
-        assert resolved.person_id, resolved.reason
-        self._people[principal] = resolved.person_id
-        return resolved.person_id
+        person_id = self.history.person_for(principal, principal)
+        self._people[principal] = person_id
+        return person_id
 
     # ── sources and statements ───────────────────────────────────────────────
 
@@ -98,35 +77,13 @@ class EpisodeHarness:
         when_ms: int | None = None,
         revision: int = 1,
     ) -> SourceRef:
-        self._counter += 1
-        source = SourceRef(
-            event_id=f"event-{self._counter}",
-            revision=int(revision),
-            channel="whatsapp",
-            chat_id=chat,
-            author_principal=author,
-            occurred_at_ms=int(when_ms if when_ms is not None else self.clock.now_ms()),
+        return self.history.source(
+            self.person(author), chat=chat, audience=set(audience) if audience is not None else {author},
+            when_ms=when_ms,
         )
-        self.authority.issue_source(
-            source,
-            EvidenceAudience.known(
-                set(audience) if audience is not None else {author},
-                snapshot_id=f"snap-{source.event_id}",
-            ),
-        )
-        return source
 
     def capture_context(self, *sources: SourceRef) -> TrustedCaptureContext:
-        request_id = f"cap-{'/'.join(item.event_id for item in sources)}"
-        self.policy.issue_capture(request_id)
-        return TrustedCaptureContext(
-            request_id=request_id,
-            policy_revision=self.policy.revision,
-            capture_basis="user_message",
-            authorized_sources=tuple(sources),
-            actor_principal=OWNER,
-            authorized=True,
-        )
+        return self.history.capture_context(*sources)
 
     def capture(
         self,
@@ -447,45 +404,6 @@ def test_passive_pdf_reference_is_ignored(h: EpisodeHarness) -> None:
     assert report.created == 1
     # A bare media reference is not a source of its own.
     assert all(item.statement_id for item in h.episodes()[0].sources)
-
-
-def test_authorized_bounded_pdf_text_behaves_like_ordinary_source_text(
-    h: EpisodeHarness,
-) -> None:
-    from yeoman_gateway.processing.models import CanonicalEvent
-    from yeoman_gateway.knowledge._memory.store import MemoryStore
-
-    event = CanonicalEvent(
-        event_id="pdf-1",
-        event_key="whatsapp:group-a:pdf-1",
-        trace_id="trace-pdf",
-        kind="message",
-        origin="whatsapp_bridge",
-        principal=TOM,
-        channel="whatsapp",
-        chat_id=CHAT,
-        revision=1,
-        occurred_ms=_long_ago_ms(h),
-        source_message_id="provider-pdf-1",
-        payload={
-            "media": {"kind": "document", "mimeType": "application/pdf"},
-            "approved_enrichments": [
-                {"kind": "document_text", "text": "page one body", "approved": True, "page_number": 1}
-            ],
-        },
-    )
-    memory = MemoryStore(owner=h.service._store)  # noqa: SLF001 - same file, one owner
-    entries = memory.index_canonical_event(event, audience=EvidenceAudience.known({TOM}))
-    assert [entry.kind for entry in entries] == ["whatsapp_enrichment"]
-
-    import json
-
-    metadata = json.loads(entries[0].meta_json)
-    assert metadata["page_number"] == 1
-    assert metadata["source_event_id"] == "pdf-1"
-    # The episode path treats it exactly like any other source-linked text.
-    report = h.build()
-    assert report.created == 0 or report.created == 1
 
 
 def test_episode_constant_contract() -> None:

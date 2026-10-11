@@ -13,10 +13,7 @@ class ArchiveMiddleware:
         self._archive = archive
 
     async def __call__(self, ctx: PipelineContext, next: NextFn) -> None:
-        if self._archive is not None and not (
-            ctx.event.channel == "whatsapp"
-            and getattr(self._archive, "legacy_history_disabled", False) is True
-        ):
+        if self._archive is not None:
             self._archive.record_inbound(ctx.event)
 
         await next(ctx)
