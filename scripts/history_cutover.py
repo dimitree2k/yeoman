@@ -606,7 +606,10 @@ def validate_host_inventory(inventory: Mapping[str, Any], *, mode: str) -> None:
 
 def _load(record: Path, home: Path, *, apply: bool) -> dict[str, Any]:
     _paths(record, home)
-    value = json.loads(record.read_bytes())
+    return _validate_record(json.loads(record.read_bytes()), home, apply=apply)
+
+
+def _validate_record(value: dict[str, Any], home: Path, *, apply: bool, window: bool = True) -> dict[str, Any]:
     if value.get('version') != 1 or value.get('home') != str(home) or value.get('digest') != record_digest(value):
         raise ValueError('record_pin_mismatch')
     if apply and (value.get('approved') is not True or not value.get('approval') or _CONTROLS.get() is None):
@@ -638,7 +641,8 @@ def _load(record: Path, home: Path, *, apply: bool) -> dict[str, Any]:
     expected_jobs = value['inventory'].get('expected_gateway_jobs')
     if type(expected_jobs) is not int or expected_jobs < 0 or value['inventory'].get('gateway_jobs') != expected_jobs:
         raise ValueError('cron_inventory_drift')
-    check_window_timing(value['inventory'])
+    if window:
+        check_window_timing(value['inventory'])
     _paths(Path(value['output']), Path(value['receipts']))
     return value
 
@@ -687,6 +691,147 @@ def _sequence(value: Mapping[str, Any]) -> list[str]:
             'drain-durable-tails', 'all-committed-barrier', 'verify-effect-deduplication',
             'release-fence', 'functional-smoke', 'frozen-watermarks', 'resume-vetted-manual-routes', 'start-overseer', 'start-timers']
 
+
+
+RESUMABLE_FROM = frozenset(_sequence({})[_sequence({}).index('deploy'):])
+
+
+def _resume_parent(parent: Mapping[str, Any]) -> str:
+    if parent.get('ok') is not False or parent.get('fenced') is not True:
+        raise ValueError('resume_parent_not_failed')
+    if parent.get('fence_unverified'):
+        raise ValueError('resume_fence_unverified')
+    failed_phase = parent.get('failed_phase')
+    if failed_phase == 'resume-preflight':
+        if (type(parent.get('resume_index')) is not int or parent['resume_index'] < 1
+                or any(p.get('action') != 'resume-preflight' and 'receipt' in p for p in parent.get('phases', []))):
+            raise ValueError('resume_chain_broken')
+        failed_phase = parent.get('resume_from')
+    if failed_phase not in RESUMABLE_FROM:
+        raise ValueError('resume_phase_not_resumable')
+    if any(p.get('action') in ('start-bridge', 'start-gateway', 'release-fence') for p in parent.get('phases', [])):
+        if parent.get('refence', {}).get('ok') is not True:
+            raise ValueError('resume_refence_required')
+    return failed_phase
+
+
+def _resume_chain(resume: Mapping[str, Any]) -> list[dict[str, Any]]:
+    """Authenticate immutable parent journals and their completed phase files."""
+    base = resume['base']
+    root = Path(base['receipts'])
+    index = resume.get('resume_index')
+    if type(index) is not int or index < 1:
+        raise ValueError('resume_chain_broken')
+    path, digest = Path(resume['parent_journal']), resume['parent_journal_sha256']
+    chain = []
+    for k in range(index - 1, -1, -1):
+        expected = root / (f'resume-{k}.json' if k else 'cutover.json')
+        _paths(path)
+        if path != expected or not path.is_file():
+            raise ValueError('resume_chain_broken')
+        if _hash(path) != digest:
+            raise ValueError('resume_parent_sha_mismatch')
+        journal = json.loads(path.read_bytes())
+        if journal.get('record_digest') != base['digest']:
+            raise ValueError('resume_base_digest_mismatch')
+        if k and journal.get('resume_index') != k:
+            raise ValueError('resume_chain_broken')
+        for number, phase in enumerate(journal.get('phases', []), 1):
+            if 'receipt' not in phase:
+                continue
+            receipt = root / f'{"resume-" + str(k) if k else "cutover"}-{number:02}.json'
+            _paths(receipt)
+            if (phase.get('record_digest') != base['digest'] or not receipt.is_file()
+                    or receipt.read_bytes() != (canonical_json(phase) + '\n').encode()):
+                raise ValueError('resume_phase_receipt_mismatch')
+        chain.append(journal)
+        if k:
+            try:
+                path, digest = Path(journal['parent_journal']), journal['parent_journal_sha256']
+            except (KeyError, TypeError) as exc:
+                raise ValueError('resume_chain_broken') from exc
+    chain.reverse()
+    for previous, journal in zip(chain, chain[1:]):
+        if journal.get('failed_phase') == 'resume-preflight' and _resume_parent(journal) != _resume_parent(previous):
+            raise ValueError('resume_chain_broken')
+    if resume.get('resume_from') != _resume_parent(chain[-1]):
+        raise ValueError('resume_phase_mismatch')
+    return chain
+
+
+def resume_preflight(resume: Mapping[str, Any], home: Path, *, apply: bool = False) -> dict[str, Any]:
+    """Checks requiring no service controls, also used by the host preflight action."""
+    base = resume['base']
+    if resume.get('version') != 1 or resume.get('kind') != 'resume' or resume.get('digest') != record_digest(resume):
+        raise ValueError('resume_record_pin_mismatch')
+    if resume.get('base_digest') != base.get('digest') or base.get('digest') != record_digest(base):
+        raise ValueError('resume_base_digest_mismatch')
+    _validate_record(base, home, apply=False, window=False)
+    if apply:
+        if resume.get('approved') is not True or not resume.get('approval'):
+            raise ValueError('approved_record_and_local_controls_required')
+        token = Path(resume['confirmation_token'])
+        _paths(token)
+        expected = Path(base['receipts']) / f'resume-{resume["resume_index"]}-confirmation.token'
+        if (token != expected or not token.is_file() or token.stat().st_mode & 0o777 != 0o600
+                or token.read_text().strip() != resume['digest']):
+            raise ValueError('resume_confirmation_token_required')
+    chain = _resume_chain(resume)
+    root = Path(base['inventory']['source_dir'])
+    _paths(root)
+    pins = resume.get('pinned_files', {})
+    if not pins or set(pins) != set(base['inventory']['pinned_files']):
+        raise ValueError('resume_pin_mismatch')
+    for name, digest in pins.items():
+        path = Path(name)
+        _paths(path)
+        if root not in path.parents or not path.is_file() or _hash(path) != digest:
+            raise ValueError('resume_pin_mismatch')
+    facts = pause_facts(Path(base['inventory']['pause_path']), expectation='fenced')
+    phases = [p for journal in chain for p in journal['phases'] if 'receipt' in p and not p.get('failed')]
+    _verify_release_binding(dict(phases=phases), dict(prior_pauses_sha256=facts['sha256']), restore=False)
+    cron = dict(base['inventory']['host_crontab'], window_start_ms=resume['window_start_ms'], window_end_ms=resume['window_end_ms'])
+    check_window_timing(dict(host_crontab=cron))
+    return dict(ok=True, pause_baseline_sha256=facts['sha256'])
+
+
+def _resume_plan(resume: Mapping[str, Any], chain: list[dict[str, Any]]) -> tuple[str, list[str]]:
+    actions = _sequence(resume['base'])
+    start = actions.index(resume['resume_from'])
+    parent = next(journal for journal in reversed(chain) if journal.get('failed_phase') != 'resume-preflight')
+    candidate = parent.get('candidate', resume['base']['candidate'])
+    if resume['candidate'] != candidate:
+        start = min(start, actions.index('verify-deploy-suppression'))
+    elif any(p.get('action') in ('start-bridge', 'start-gateway') for p in parent['phases']):
+        start = min(start, actions.index('validate-capture-handover'))
+    return actions[start], ['resume-preflight', *actions[start:]]
+
+
+def _load_resume(record: Path, home: Path, *, apply: bool) -> dict[str, Any]:
+    _paths(record, home)
+    resume = json.loads(record.read_bytes())
+    resume_preflight(resume, home, apply=apply)
+    if apply:
+        control = _CONTROLS.get()
+        if control is None:
+            raise ValueError('approved_record_and_local_controls_required')
+        if getattr(control, 'mode', None) != resume['base']['mode']:
+            raise ValueError('control_record_mode_mismatch')
+    prefix = f'resume-{resume["resume_index"]}'
+    root = Path(resume['base']['receipts'])
+    if (root / (prefix + '.json')).exists() or any(root.glob(prefix + '-*.json')):
+        raise ValueError('resume_already_recorded_no_retry')
+    return resume
+
+
+def run_resume(*, record: Path, home: Path, apply: bool = False) -> dict[str, Any]:
+    resume = _load_resume(record, home, apply=apply)
+    chain = _resume_chain(resume)
+    start, actions = _resume_plan(resume, chain)
+    if not apply:
+        return dict(ok=True, planned=True, resume_index=resume['resume_index'], resume_from=resume['resume_from'], start=start, actions=actions)
+    phases = [p for journal in chain for p in journal['phases'] if 'receipt' in p and not p.get('failed')]
+    return _run(resume['base'], home, actions, record_dir=record.parent, resume=resume, prior_phases=phases)
 
 def _execute(action: str, payload: dict[str, Any]) -> dict[str, Any]:
     control = _CONTROLS.get()
@@ -780,26 +925,43 @@ def _verify_release_binding(journal: Mapping[str, Any], release: Mapping[str, An
 
 
 def _run(value: dict[str, Any], home: Path, actions: list[str], *, restore: bool = False,
-         failed_snapshot: Path | None = None, record_dir: Path) -> dict[str, Any]:
+         failed_snapshot: Path | None = None, record_dir: Path, resume: dict[str, Any] | None = None,
+         prior_phases: list[dict[str, Any]] | None = None) -> dict[str, Any]:
     receipt_root = Path(value['receipts'])
-    receipt_path = receipt_root / ('restore.json' if restore else 'cutover.json')
-    if receipt_path.exists() or any(receipt_root.glob(('restore' if restore else 'cutover') + '-*.json')):
-        raise ValueError('attempt_already_recorded_no_retry')
+    prefix = f'resume-{resume["resume_index"]}' if resume else ('restore' if restore else 'cutover')
+    receipt_path = receipt_root / (prefix + '.json')
+    if receipt_path.exists() or any(receipt_root.glob(prefix + '-*.json')):
+        raise ValueError('resume_already_recorded_no_retry' if resume else 'attempt_already_recorded_no_retry')
     receipt_root.mkdir(parents=True, mode=0o700, exist_ok=True)
     journal: dict[str, Any] = dict(version=1, mode=value['mode'], record_digest=value['digest'], phases=[], ok=False, fenced=True)
     selection: dict[str, Any] = dict(legacyWritersDisabled=True, liveProjectionEnabled=True, readers=dict.fromkeys(READER_ORDER, False))
     sources = []
     generation = None
+    prior_phases = prior_phases or []
+    if resume:
+        journal.update(**{k: resume[k] for k in ('resume_index', 'parent_journal', 'parent_journal_sha256', 'candidate', 'resume_from')}, resume_digest=resume['digest'])
+        for phase in prior_phases:
+            action, receipt = phase['action'], phase['receipt']
+            if action in ('acquire', 'freeze-verification-prefix') and 'sources' in receipt:
+                sources = receipt['sources']
+            if action.startswith('select-'):
+                selection['readers'][action.removeprefix('select-')] = True
+            if action.startswith('smoke-reader-') and 'generation' in receipt:
+                generation = receipt['generation']
     try:
         for action in actions:
             started = time.time_ns()
             phase: dict[str, Any] = dict(action=action, started_ns=started, record_digest=value['digest'])
+            if resume:
+                phase['resume_digest'] = resume['digest']
             journal['phases'].append(phase)
-            _private_json(receipt_root / f'{"restore" if restore else "cutover"}-{len(journal["phases"]):02}-started.json', phase)
+            _private_json(receipt_root / f'{prefix}-{len(journal["phases"]):02}-started.json', phase)
             if action.startswith('select-'):
                 selection['readers'][action.removeprefix('select-')] = True
             payload = dict(record=value, home=str(home), operation='restore' if restore else 'cutover', argv=command_for(action, value),
                            selection=json.loads(canonical_json(selection)), sources=sources, receipts=journal['phases'][:-1])
+            if resume:
+                payload.update(resume=resume, receipts=prior_phases + [p for p in journal['phases'][:-1] if 'receipt' in p and not p.get('failed')])
             if action == 'acquire':
                 result = acquire_cutover_snapshot(home=home, output=Path(value['output']), inventory=value['inventory'])
                 sources = result['sources']
@@ -818,7 +980,7 @@ def _run(value: dict[str, Any], home: Path, actions: list[str], *, restore: bool
                     _execute('frozen-watermarks',payload)
                 result = _execute(action, payload)
                 if action == 'release-fence':
-                    _verify_release_binding(journal, result, restore=restore)
+                    _verify_release_binding(dict(phases=prior_phases + journal['phases']) if resume else journal, result, restore=restore)
             if action.startswith('smoke-reader-'):
                 if generation is not None and result['generation'] != generation:
                     raise ValueError('offline_reader_generation_changed')
@@ -827,7 +989,7 @@ def _run(value: dict[str, Any], home: Path, actions: list[str], *, restore: bool
                 sources = result['sources']
             phase.update(ended_ns=time.time_ns(), receipt=result)
             # Persist each receipt before the next phase, including release proof.
-            _private_json(receipt_root / f'{"restore" if restore else "cutover"}-{len(journal["phases"]):02}.json', phase)
+            _private_json(receipt_root / f'{prefix}-{len(journal["phases"]):02}.json', phase)
             if action == 'release-fence':
                 journal['fenced'] = False
         journal['ok'] = True
@@ -836,12 +998,15 @@ def _run(value: dict[str, Any], home: Path, actions: list[str], *, restore: bool
         journal['failed_phase'] = action
         journal['error_code'] = str(exc) if isinstance(exc, ValueError) and re.fullmatch(r'[a-z0-9_]+', str(exc)) else f'unexpected_{type(exc).__name__}'
         journal['fenced'] = True
-        if not any(p['action'] == 'fence-effects' and 'receipt' in p for p in journal['phases']):
+        if not any(p['action'] == 'fence-effects' and 'receipt' in p for p in prior_phases + journal['phases']):
             journal['fence_unverified'] = True
         # A failed startup or post-release phase must stop writers again, never retry.
         if any(p['action'] in ('start-bridge','start-gateway','release-fence') for p in journal['phases']):
             try:
-                journal['refence'] = _execute('fence-effects', dict(record=value, home=str(home), operation='restore' if restore else 'cutover', argv=command_for('fence-effects', value)))
+                refence_payload = dict(record=value, home=str(home), operation='restore' if restore else 'cutover', argv=command_for('fence-effects', value))
+                if resume:
+                    refence_payload.update(resume=resume, receipts=prior_phases + [p for p in journal['phases'] if 'receipt' in p and not p.get('failed')])
+                journal['refence'] = _execute('fence-effects', refence_payload)
             except Exception:
                 journal['fence_unverified'] = True
         journal['phases'][-1]['failed'] = True
@@ -982,7 +1147,7 @@ def restore_prior_set(*, record: Path, home: Path, failed_snapshot: Path,
 
 def main() -> int:
     parser = argparse.ArgumentParser(description=__doc__)
-    parser.add_argument('operation', choices=('cutover', 'restore'))
+    parser.add_argument('operation', choices=('cutover', 'restore', 'resume'))
     parser.add_argument('--record', type=Path, required=True)
     parser.add_argument('--home', type=Path, required=True)
     parser.add_argument('--failed-snapshot', type=Path)
@@ -991,7 +1156,8 @@ def main() -> int:
     args = parser.parse_args()
     value = None
     try:
-        value = _load(args.record, args.home, apply=False)
+        value = (_load_resume(args.record, args.home, apply=False)['base'] if args.operation == 'resume'
+                 else _load(args.record, args.home, apply=False))
         if value['mode'] == 'rehearsal':
             _rehearsal_environment(args.home)
         if args.controls:
@@ -1016,16 +1182,23 @@ def main() -> int:
             controls = None
         with injected_controls(controls):
             result = _cli_run(args)
+        if args.operation == 'resume':
+            print(canonical_json(result))
+            return 0 if result['ok'] else 1
         print(canonical_json(dict(ok=result['ok'], planned=result.get('planned', False), fenced=result.get('fenced', False), fence_verified=result.get('fence_verified', False), phases=len(result.get('actions', [])))))
         return 0 if result['ok'] else 1
     except Exception as exc:
         _write_refusal(exc, receipts=Path(value['receipts']) if value else None, record_dir=args.record.parent)
         error = str(exc) if isinstance(exc, ValueError) and re.fullmatch(r'missing_inventory_key:[a-z_]+',str(exc)) else 'cutover_refused'
+        if args.operation == 'resume' and isinstance(exc, ValueError) and re.fullmatch(r'[a-z0-9_]+', str(exc)):
+            error = str(exc)
         print(canonical_json(dict(ok=False,error=error)))
         return 1
 
 
 def _cli_run(args):
+    if args.operation == 'resume':
+        return run_resume(record=args.record, home=args.home, apply=args.apply)
     if args.operation == 'restore':
         if args.failed_snapshot is None:
             raise ValueError('failed_snapshot_required')

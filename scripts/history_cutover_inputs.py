@@ -7,6 +7,7 @@ import hashlib
 import json
 import re
 import sqlite3
+import subprocess
 from collections import Counter, defaultdict
 from collections.abc import Mapping
 from contextlib import closing
@@ -31,6 +32,7 @@ try:
         _paths,
         _private_json,
         _rehearsal_paths,
+        _resume_parent,
         check_window_timing,
         record_digest,
         require_pause_restore_member,
@@ -47,6 +49,7 @@ except ModuleNotFoundError:
         _paths,
         _private_json,
         _rehearsal_paths,
+        _resume_parent,
         check_window_timing,
         record_digest,
         require_pause_restore_member,
@@ -533,6 +536,44 @@ def build_cutover_record(*, inventory: Path, layout: Mapping[str,str],
     return record
 
 
+
+def build_resume_record(*, base_record: Path, parent_journal: Path, inventory_pins_from: Path,
+                        window: tuple[int, int]) -> dict:
+    _paths(base_record, parent_journal, inventory_pins_from)
+    base = json.loads(base_record.read_bytes())
+    if (base.get('digest') != record_digest(base) or base.get('approved') is not True
+            or not base.get('approval')):
+        raise ValueError('approved_base_record_required')
+    parent = json.loads(parent_journal.read_bytes())
+    resume_from = _resume_parent(parent)
+    if parent.get('record_digest') != base['digest']:
+        raise ValueError('resume_base_digest_mismatch')
+    k = parent.get('resume_index', 0) + 1
+    expected = Path(base['receipts']) / (f'resume-{k-1}.json' if k > 1 else 'cutover.json')
+    if parent_journal != expected:
+        raise ValueError('resume_chain_broken')
+    source = Path(base['inventory']['source_dir'])
+    pinned = {}
+    for name in base['inventory']['pinned_files']:
+        path = Path(name)
+        if source not in path.parents:
+            raise ValueError('resume_pin_mismatch')
+        current = inventory_pins_from / path.relative_to(source)
+        _paths(current)
+        pinned[name] = _hash(current)
+    candidate = subprocess.run(['git', '-C', str(inventory_pins_from), 'rev-parse', 'HEAD'],
+                               capture_output=True, text=True, check=True).stdout.strip()
+    cron = dict(base['inventory']['host_crontab'], window_start_ms=window[0], window_end_ms=window[1])
+    check_window_timing(dict(host_crontab=cron))
+    value = dict(version=1, kind='resume', base=base, base_digest=base['digest'],
+                 parent_journal=str(parent_journal), parent_journal_sha256=_hash(parent_journal),
+                 resume_index=k, resume_from=resume_from, candidate=candidate,
+                 pinned_files=pinned, window_start_ms=window[0], window_end_ms=window[1],
+                 approved=False, approval=None,
+                 confirmation_token=str(Path(base['receipts']) / f'resume-{k}-confirmation.token'))
+    value['digest'] = record_digest(value)
+    return value
+
 def main(argv=None) -> int:
     parser = argparse.ArgumentParser(description=__doc__)
     sub = parser.add_subparsers(dest='operation',required=True)
@@ -549,6 +590,11 @@ def main(argv=None) -> int:
     record.add_argument('--expected-gateway-jobs',type=int,required=True)
     record.add_argument('--owner-ack-timeout-seconds',type=int,default=1200)
     record.add_argument('--readiness-timeout-seconds',type=int,default=360)
+    resume = sub.add_parser('resume-record')
+    for name in ('base-record', 'parent-journal', 'inventory-pins-from', 'output'):
+        resume.add_argument('--'+name, type=Path, required=True)
+    resume.add_argument('--window-start-ms', type=int, required=True)
+    resume.add_argument('--window-end-ms', type=int, required=True)
     args = parser.parse_args(argv)
     try:
         if args.operation=='inputs':
@@ -557,6 +603,12 @@ def main(argv=None) -> int:
                 preflight_isolated_paths(args.record)
                 kwargs['record'] = json.loads(args.record.read_bytes())
             result = build_cutover_inputs(**kwargs)
+        elif args.operation == 'resume-record':
+            _paths(args.output)
+            value = build_resume_record(base_record=args.base_record, parent_journal=args.parent_journal,
+                inventory_pins_from=args.inventory_pins_from, window=(args.window_start_ms, args.window_end_ms))
+            _private_json(args.output, value)
+            result = dict(ok=True, resume_index=value['resume_index'], resume_from=value['resume_from'])
         else:
             preflight_isolated_paths(args.layout,args.output)
             value = build_cutover_record(inventory=args.inventory,layout=json.loads(args.layout.read_bytes()),
@@ -571,6 +623,8 @@ def main(argv=None) -> int:
         return 1
     except Exception as exc:
         code = str(exc) if isinstance(exc, ValueError) and re.fullmatch(r'missing_inventory_key:[a-z_]+',str(exc)) else 'cutover_inputs_refused'
+        if args.operation == 'resume-record' and isinstance(exc, ValueError) and re.fullmatch(r'[a-z0-9_]+', str(exc)):
+            code = str(exc)
         print(json.dumps(dict(ok=False,error=code),sort_keys=True))
         return 1
 

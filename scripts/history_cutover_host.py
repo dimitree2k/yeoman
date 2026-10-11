@@ -38,10 +38,10 @@ from yeoman_shared.raw_archive.records import (
 )
 
 try:
-    from scripts.history_cutover import _attempt_pause_digests
+    from scripts.history_cutover import _attempt_pause_digests, resume_preflight
     from scripts.history_maintenance_guard import preflight_isolated_paths, runtime_homes
 except ModuleNotFoundError:
-    from history_cutover import _attempt_pause_digests
+    from history_cutover import _attempt_pause_digests, resume_preflight
     from history_maintenance_guard import preflight_isolated_paths, runtime_homes
 
 SHOW = '--property=ActiveState,Result,UnitFileState,Restart,ActiveEnterTimestampMonotonic,InactiveEnterTimestampMonotonic,ExecMainStartTimestampMonotonic,ExecMainExitTimestampMonotonic,LoadState,NeedDaemonReload,DropInPaths'
@@ -339,6 +339,8 @@ def _ack(action: str, payload: dict, *, wait: bool = False, clock=time) -> dict:
         raise ValueError('invalid_owner_ack')
     if wait:
         releases = [p for p in payload.get('receipts', []) if p.get('action') == 'release-fence' and p.get('receipt', {}).get('ok') is True]
+        if payload.get('resume'):
+            releases = releases[-1:]
         if (len(releases) != 1 or type(releases[0].get('ended_ns')) is not int
                 or not releases[0]['ended_ns'] // 1_000_000 <= evidence['observed_ms'] <= int(clock.time() * 1000)):
             raise ValueError('stale_owner_ack')
@@ -826,6 +828,17 @@ def _verify_frozen_baseline(payload):
     return dict(ok=True,baseline_digest=baseline['digest'])
 
 
+def _verify_import_origins(payload, inventory, run):
+    code = "import json,yeoman_gateway,yeoman_shared,yeoman_overseer;print(json.dumps([m.__file__ for m in (yeoman_gateway,yeoman_shared,yeoman_overseer)]))"
+    response = run([inventory['tool_python'], '-c', code], payload)
+    if response.returncode:
+        raise ValueError('import_origins_unproven')
+    paths = json.loads(response.stdout)
+    root = inventory['prior_source_dir' if payload.get('operation') == 'restore' else 'source_dir']
+    verified = len(paths) == 3 and all(_path(root) in _path(p).parents for p in paths)
+    return dict(ok=verified, imports_verified=verified, origins=paths)
+
+
 def live_host_controls(*, inventory: Mapping[str, Any],
                        runner: Callable[[list[str]], subprocess.CompletedProcess] = _subprocess,
                        ipc: Callable[[dict], dict] = gateway_socket_client,
@@ -1266,12 +1279,7 @@ def live_host_controls(*, inventory: Mapping[str, Any],
         elif action == 'apply-prepared-texts':
             result = _apply_texts(payload, inventory, copy_home=None)
         elif action == 'verify-import-origins':
-            code = "import json,yeoman_gateway,yeoman_shared,yeoman_overseer;print(json.dumps([m.__file__ for m in (yeoman_gateway,yeoman_shared,yeoman_overseer)]))"
-            response = run([inventory['tool_python'], '-c', code], payload)
-            paths = json.loads(response.stdout)
-            root = inventory['prior_source_dir' if payload.get('operation') == 'restore' else 'source_dir']
-            verified = len(paths) == 3 and all(_path(root) in _path(p).parents for p in paths)
-            result = dict(ok=verified, imports_verified=verified, origins=paths)
+            result = _verify_import_origins(payload, inventory, run)
         elif action == 'validate-capture-handover':
             def capture_sample(p):
                 response=run([p['record']['python'],'-m','yeoman_gateway','raw','check-capture'],p)
@@ -1282,6 +1290,15 @@ def live_host_controls(*, inventory: Mapping[str, Any],
             result=wait_ready(capture_sample,payload)
             return dict(result,mode='live')
 
+        elif action == 'resume-preflight':
+            result = resume_preflight(payload['resume'], Path(payload['home']), apply=True)
+            origins = _verify_import_origins(payload, inventory, run)
+            if not origins['ok']:
+                raise ValueError('import_origins_unproven')
+            pause_before = pause_bytes()
+            if hashlib.sha256(pause_before).hexdigest() != result['pause_baseline_sha256']:
+                raise ValueError('pause_baseline_drift')
+            result.update(origins)
         elif action == 'preflight':
             pinned = inventory['pinned_files']
             verified = bool(pinned) and all(_hash(_path(p)) == digest for p, digest in pinned.items())
@@ -1601,6 +1618,12 @@ def rehearsal_host_controls(*, copy_home: Path, inventory: Mapping[str, Any], re
             result = _suppression_delta(action, payload, local)
         elif action == 'validate-capture-handover':
             result = dict(ok=_capture_ready(payload), capture_ready=_capture_ready(payload))
+        elif action == 'resume-preflight':
+            result = resume_preflight(payload['resume'], copy_home, apply=True)
+            origins = _verify_import_origins(payload, local, run)
+            if not origins['ok']:
+                raise ValueError('import_origins_unproven')
+            result.update(origins)
         elif action in ('preflight', 'verify-import-origins', 'restore-software-install-config-units'):
             result = dict(ok=True, simulated=True, imports_verified=True)
         elif action == 'capture-frozen-baseline':
