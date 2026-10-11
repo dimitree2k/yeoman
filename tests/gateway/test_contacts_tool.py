@@ -1,13 +1,20 @@
 """Tests for the contacts LLM tool."""
 
 import json
+import time
 from pathlib import Path
 
 import pytest
 from yeoman_gateway.agent.tools.contacts import ContactsTool
 from yeoman_gateway.agent.tools.resolve_contact import ResolveContactTool
 from yeoman_gateway.knowledge._contacts.service import ContactsService
-from yeoman_gateway.storage.chat_registry import ChatRegistry
+
+from tests.gateway.history_test_helpers import (
+    ProjectedHistory,
+    prepare_history_retirement_knowledge,
+)
+
+_OWNER = "4915000000000@s.whatsapp.net"
 
 
 @pytest.fixture
@@ -100,23 +107,62 @@ def tool(contacts: ContactsService, knowledge: object) -> ContactsTool:
 
 
 @pytest.fixture
-def chat_registry(tmp_path: Path) -> ChatRegistry:
-    registry = ChatRegistry(db_path=tmp_path / "chat_registry.db")
-    registry.register_chat(
-        channel="whatsapp",
-        chat_id="finance@g.us",
-        chat_type="group",
-        readable_name="Finanzgruppe",
-        metadata={
-            "participants": [
-                {
-                    "id": "46918273106072@lid",
-                    "phoneNumber": "4917632625469@s.whatsapp.net",
-                }
-            ]
-        },
+def selected_history(tmp_path: Path):
+    from yeoman_gateway.knowledge.api import open_knowledge_store
+    from yeoman_gateway.knowledge.authority import FakeSourceAuthority
+    from yeoman_gateway.knowledge.runtime import RuntimeKnowledgePolicy
+
+    policy = RuntimeKnowledgePolicy(
+        engine=None,
+        admin_principals=frozenset({f"whatsapp:{_OWNER}"}),
     )
-    return registry
+    knowledge = open_knowledge_store(
+        prepare_history_retirement_knowledge(tmp_path, "selected"),
+        workspace_id="contacts-selected-tests",
+        source_authority=FakeSourceAuthority(),
+        policy_authority=policy,
+        history_mode=True,
+    )
+    history = ProjectedHistory(tmp_path / "selected-history")
+    try:
+        yield history, knowledge
+    finally:
+        history.close()
+        knowledge.close()
+
+
+def _add_person(history: ProjectedHistory, *, phone: str, name: str, lid: str | None = None) -> None:
+    timestamp = time.time_ns() // 1_000_000 - 1000
+    history.add_contact(identifiers=[_OWNER], name="Synthetic owner", timestamp=timestamp)
+    identifiers = [phone, *([lid] if lid else [])]
+    history.add_contact(identifiers=identifiers, name=name, timestamp=timestamp)
+    participants = [_OWNER, {"lid": lid, "phoneJid": phone}] if lid else [_OWNER, phone]
+    history.add_group(
+        chat_id="finance@g.us",
+        participants=participants,
+        timestamp=timestamp,
+        name="Finanzgruppe",
+    )
+
+
+async def _resolve(history: ProjectedHistory, knowledge: object, resolver: ResolveContactTool, query: str) -> str:
+    from yeoman_gateway.history.context import history_knowledge_scope
+    from yeoman_gateway.processing.tool_context import (
+        ToolInvocationContext,
+        reset_tool_context,
+        set_tool_context,
+    )
+
+    async with history.turn() as snapshot:
+        with history_knowledge_scope(snapshot, knowledge):
+            token = set_tool_context(ToolInvocationContext(
+                channel="whatsapp", chat_id="finance@g.us", history_snapshot=snapshot,
+            ))
+            try:
+                resolver._history_selected = True
+                return await resolver.execute(query=query)
+            finally:
+                reset_tool_context(token)
 
 
 class TestContactsTool:
@@ -194,12 +240,13 @@ class TestResolveContactTool:
     async def test_resolves_partial_name_without_disclosing_fields(
         self,
         contacts: ContactsService,
-        knowledge: object,
-        chat_registry: ChatRegistry,
+        selected_history,
     ) -> None:
+        history, knowledge = selected_history
+        phone = "4917632625469@s.whatsapp.net"
         contact_id = contacts.ensure_contact(
             channel="whatsapp",
-            identifier="4917632625469@s.whatsapp.net",
+            identifier=phone,
             kind="phone_jid",
             push_name="Frank Taeger",
         )
@@ -210,13 +257,13 @@ class TestResolveContactTool:
         )
         # A proven platform observation is what makes this person resolvable; the legacy
         # row above only proves the tool never reads its private fields.
-        knowledge.issue_person("4917632625469@s.whatsapp.net", name="Frank Taeger")
+        _add_person(history, phone=phone, name="Frank Taeger")
         resolver = ResolveContactTool(
-            contacts=contacts, knowledge=knowledge, chat_registry=chat_registry
+            contacts=contacts, knowledge=knowledge, chat_registry=None
         )
         resolver.set_context(channel="whatsapp", chat_id="finance@g.us")
 
-        result = await resolver.execute(query="Frank")
+        result = await _resolve(history, knowledge, resolver, "Frank")
 
         payload = json.loads(result)
         assert payload["ok"] is True
@@ -228,14 +275,14 @@ class TestResolveContactTool:
     async def test_an_unproven_legacy_contact_is_not_a_delivery_target(
         self,
         contacts: ContactsService,
-        knowledge: object,
-        chat_registry: ChatRegistry,
+        selected_history,
     ) -> None:
         """Knowledge is the sole authority: the legacy cache is not a second opinion.
 
         The same row still resolves for a composition that has no knowledge facade at
         all - that transitional path is the only reason the legacy cache is still wired.
         """
+        history, knowledge = selected_history
         contacts.ensure_contact(
             channel="whatsapp",
             identifier="4917632625469@s.whatsapp.net",
@@ -243,38 +290,35 @@ class TestResolveContactTool:
             push_name="Frank Taeger",
         )
         resolver = ResolveContactTool(
-            contacts=contacts, knowledge=knowledge, chat_registry=chat_registry
+            contacts=contacts, knowledge=knowledge, chat_registry=None
         )
         resolver.set_context(channel="whatsapp", chat_id="finance@g.us")
 
-        payload = json.loads(await resolver.execute(query="Frank"))
+        payload = json.loads(await _resolve(history, knowledge, resolver, "Frank"))
         assert payload["ok"] is False
         assert payload["error_code"] == "contact_not_resolved"
-
-        legacy = ResolveContactTool(contacts=contacts, chat_registry=chat_registry)
-        legacy.set_context(channel="whatsapp", chat_id="finance@g.us")
-        legacy_payload = json.loads(await legacy.execute(query="Frank"))
-        assert legacy_payload["ok"] is True
-        assert legacy_payload["contact"]["jid"] == "4917632625469@s.whatsapp.net"
+        # The selected reader has no legacy-cache-only resolution path.
 
     @pytest.mark.asyncio
     async def test_resolves_lid_mention_to_phone_jid_in_current_group(
         self,
         contacts: ContactsService,
-        chat_registry: ChatRegistry,
-        knowledge: object,
+        selected_history,
     ) -> None:
+        history, knowledge = selected_history
+        phone = "4917632625469@s.whatsapp.net"
+        lid = "46918273106072@lid"
         contacts.ensure_contact(
             channel="whatsapp",
-            identifier="4917632625469@s.whatsapp.net",
+            identifier=phone,
             kind="phone_jid",
             push_name="Frank Taeger",
         )
-        _promote(knowledge, contacts, "4917632625469@s.whatsapp.net")
-        resolver = ResolveContactTool(contacts=contacts, knowledge=knowledge, chat_registry=chat_registry)
+        _add_person(history, phone=phone, lid=lid, name="Frank Taeger")
+        resolver = ResolveContactTool(contacts=contacts, knowledge=knowledge, chat_registry=None)
         resolver.set_context(channel="whatsapp", chat_id="finance@g.us")
 
-        result = await resolver.execute(query="@46918273106072")
+        result = await _resolve(history, knowledge, resolver, "@46918273106072")
 
         payload = json.loads(result)
         assert payload["contact"]["display_name"] == "Frank Taeger"
@@ -283,44 +327,28 @@ class TestResolveContactTool:
 
     @pytest.mark.asyncio
     async def test_name_resolution_does_not_use_substring_only_match(
-        self,
-        contacts: ContactsService,
-        tmp_path: Path,
+        self, contacts: ContactsService, selected_history,
     ) -> None:
+        history, knowledge = selected_history
+        phone = "4917000000000@s.whatsapp.net"
         contacts.ensure_contact(
             channel="whatsapp",
-            identifier="4917000000000@s.whatsapp.net",
+            identifier=phone,
             kind="phone_jid",
             push_name="Joanne Miller",
         )
-        registry = ChatRegistry(db_path=tmp_path / "substring_registry.db")
-        registry.register_chat(
-            channel="whatsapp",
-            chat_id="substring@g.us",
-            chat_type="group",
-            readable_name="Substring",
-            metadata={
-                "participants": [
-                    {
-                        "id": "10000000000000@lid",
-                        "phoneNumber": "4917000000000@s.whatsapp.net",
-                    }
-                ]
-            },
-        )
+        _add_person(history, phone=phone, name="Joanne Miller")
         resolver = ResolveContactTool(
             contacts=contacts,
-            chat_registry=registry,
+            knowledge=knowledge,
+            chat_registry=None,
         )
         resolver.set_context(
             channel="whatsapp",
             chat_id="substring@g.us",
         )
 
-        result = await resolver.execute(query="Ann")
-
-        registry.close()
-        payload = json.loads(result)
+        payload = json.loads(await _resolve(history, knowledge, resolver, "Ann"))
         assert payload["ok"] is False
         assert payload["error_code"] == "contact_not_resolved"
 
@@ -339,24 +367,26 @@ class TestResolveContactTool:
     async def test_identifier_resolution_requires_token_boundaries(
         self,
         contacts: ContactsService,
-        knowledge: object,
-        chat_registry: ChatRegistry,
+        selected_history,
         query: str,
     ) -> None:
+        history, knowledge = selected_history
+        phone = "4917632625469@s.whatsapp.net"
         contacts.ensure_contact(
             channel="whatsapp",
-            identifier="4917632625469@s.whatsapp.net",
+            identifier=phone,
             kind="phone_jid",
             push_name="Frank Taeger",
         )
         resolver = ResolveContactTool(
             contacts=contacts,
             knowledge=knowledge,
-            chat_registry=chat_registry,
+            chat_registry=None,
         )
         resolver.set_context(channel="whatsapp", chat_id="finance@g.us")
 
-        result = await resolver.execute(query=query)
+        _add_person(history, phone=phone, name="Frank Taeger")
+        result = await _resolve(history, knowledge, resolver, query)
 
         payload = json.loads(result)
         assert payload["ok"] is False

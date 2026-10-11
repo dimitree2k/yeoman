@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import json
+import sys
 from datetime import UTC, datetime, timedelta
 from pathlib import Path
 
@@ -10,6 +11,35 @@ import pytest
 from yeoman_gateway.bus.events import InboundObservedEvent
 from yeoman_gateway.consciousness.burst import BurstObserver
 from yeoman_shared.config.schema import Config, ConsciousnessConfig
+
+
+@pytest.fixture(autouse=True)
+def projected_burst_history(tmp_path, monkeypatch):
+    from tests.gateway.history_test_helpers import ProjectedHistory
+
+    history = ProjectedHistory(tmp_path / "burst-history")
+    initialize = BurstObserver.__init__
+    make_event = _event
+    counter = 0
+
+    def initialize_selected(observer, *args, **kwargs):
+        initialize(observer, *args, **kwargs)
+        history.wire(observer)
+
+    def projected_event(**kwargs):
+        nonlocal counter
+        event = make_event(**kwargs)
+        counter += 1
+        history.add_message(chat_id=event.chat_id, message_id=f"burst-{counter}",
+                            text=event.content, timestamp=event.timestamp, sender_id=event.sender_id)
+        return event
+
+    monkeypatch.setattr(BurstObserver, "__init__", initialize_selected)
+    monkeypatch.setattr(sys.modules[__name__], "_event", projected_event)
+    try:
+        yield history
+    finally:
+        history.close()
 
 
 def _config(**overrides: object) -> Config:
@@ -29,7 +59,7 @@ def _event(
     *,
     at: datetime,
     chat_id: str = "group@g.us",
-    sender_id: str = "user@s.whatsapp.net",
+    sender_id: str = "10001@s.whatsapp.net",
     content: str = "message",
     mentioned_bot: bool = False,
     reply_to_bot: bool = False,

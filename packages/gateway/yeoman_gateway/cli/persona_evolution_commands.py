@@ -9,7 +9,6 @@ import typer
 from yeoman_shared.config.loader import load_config
 from yeoman_shared.utils.helpers import (
     ensure_dir,
-    get_operational_data_path,
     get_operational_store_path,
     safe_filename,
 )
@@ -19,12 +18,9 @@ from yeoman_gateway.knowledge._memory import MemoryService
 from yeoman_gateway.persona_evolution import (
     apply_persona_evolution_proposal,
     build_persona_evolution_status,
-    collect_persona_evolution_evidence,
     deny_persona_evolution_proposal,
-    render_persona_evolution_proposal,
 )
 from yeoman_gateway.policy.loader import load_policy
-from yeoman_gateway.storage.inbound_archive import InboundArchive
 
 from .core import app, console
 
@@ -58,40 +54,7 @@ def persona_evolution_propose(
         path.write_text(result['report'], encoding='utf-8')
         console.print(f'proposal: {path}')
         return
-    if config.history.legacy_writers_disabled:
-        raise typer.BadParameter('secondary reader unselected')
-    policy = load_policy()
-    memory = MemoryService(workspace=config.workspace_path, config=config.memory, root_config=config)
-    speakup_log = SpeakupLog(get_operational_store_path("speakups"))
-    inbound_archive = InboundArchive(get_operational_data_path() / "inbound" / "reply_context.db")
-    try:
-        evidence = _run_async(
-            collect_persona_evolution_evidence(
-                policy=policy,
-                workspace=config.workspace_path,
-                persona_file=persona_file,
-                memory=memory,
-                speakup_log=speakup_log,
-                inbound_archive=inbound_archive,
-                window_days=window_days,
-                per_chat_limit=limit,
-            )
-        )
-        rendered = render_persona_evolution_proposal(evidence)
-        target = output or _default_output_path(persona_file)
-        if not target.is_absolute():
-            target = Path.cwd() / target
-        ensure_dir(target.parent)
-        target.write_text(rendered, encoding="utf-8")
-    finally:
-        memory.close()
-        speakup_log.close()
-        inbound_archive.close()
-
-    console.print("[green]✓[/green] Wrote persona evolution proposal.")
-    console.print(f"path: {target}")
-    console.print(f"persona: {persona_file}")
-    console.print(f"chats: {len(evidence.chats)}")
+    raise typer.BadParameter('secondary reader unselected; legacy history mode is unsupported')
 
 
 @persona_evolution_app.command("status")

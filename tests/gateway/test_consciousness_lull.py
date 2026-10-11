@@ -14,8 +14,9 @@ from yeoman_gateway.consciousness.lull import LullObserver
 from yeoman_gateway.consciousness.tools import ConsciousnessTools
 from yeoman_gateway.policy.engine import PolicyEngine
 from yeoman_gateway.policy.schema import PolicyConfig
-from yeoman_gateway.storage.inbound_archive import InboundArchive
 from yeoman_shared.config.schema import Config, ConsciousnessConfig
+
+from tests.gateway.history_test_helpers import ProjectedHistory
 
 
 def _config(**overrides: object) -> Config:
@@ -30,7 +31,7 @@ def _config(**overrides: object) -> Config:
         "ownerDmDefaultEnabled": False,
     }
     payload.update(overrides)
-    return Config(consciousness=ConsciousnessConfig.model_validate(payload))
+    return Config(history={"readers": {"secondary": True}}, consciousness=ConsciousnessConfig.model_validate(payload))
 
 
 class _FakeSecurity:
@@ -70,6 +71,12 @@ def _policy(*, group_enabled: bool = True, daily_cap: int = 1) -> PolicyConfig:
     )
 
 
+def _observer(tmp_path: Path, **kwargs: object) -> LullObserver:
+    observer = LullObserver(**kwargs)
+    ProjectedHistory(tmp_path / f"history-{len(list(tmp_path.glob('history-*')))}").wire(observer)
+    return observer
+
+
 def _event(
     *,
     at: datetime,
@@ -103,7 +110,7 @@ async def test_lull_observer_fires_after_silence_following_recent_activity(
     base = datetime(2026, 4, 26, 12, 0, tzinfo=UTC)
     now_holder = {"value": base.timestamp()}
 
-    observer = LullObserver(
+    observer = _observer(tmp_path,
         config=_config(),
         state_path=tmp_path / "lull.json",
         on_lull=lambda channel, chat_id: calls.append((channel, chat_id)),
@@ -129,7 +136,7 @@ async def test_lull_observer_clears_activity_after_callback(tmp_path: Path) -> N
     base = datetime(2026, 4, 26, 12, 0, tzinfo=UTC)
     now_holder = {"value": base.timestamp()}
 
-    observer = LullObserver(
+    observer = _observer(tmp_path,
         config=_config(),
         state_path=tmp_path / "lull.json",
         on_lull=lambda channel, chat_id: calls.append((channel, chat_id))
@@ -155,7 +162,7 @@ async def test_lull_observer_skips_when_too_few_recent_activity(tmp_path: Path) 
     base = datetime(2026, 4, 26, 12, 0, tzinfo=UTC)
     now_holder = {"value": base.timestamp()}
 
-    observer = LullObserver(
+    observer = _observer(tmp_path,
         config=_config(lullMinRecentActivity=5),
         state_path=tmp_path / "lull.json",
         on_lull=lambda channel, chat_id: calls.append((channel, chat_id)),
@@ -177,7 +184,7 @@ async def test_lull_observer_skips_direct_bot_interaction(tmp_path: Path) -> Non
     base = datetime(2026, 4, 26, 12, 0, tzinfo=UTC)
     now_holder = {"value": base.timestamp()}
 
-    observer = LullObserver(
+    observer = _observer(tmp_path,
         config=_config(),
         state_path=tmp_path / "lull.json",
         on_lull=lambda channel, chat_id: calls.append((channel, chat_id)),
@@ -200,7 +207,7 @@ async def test_lull_observer_skips_plain_name_interaction(tmp_path: Path) -> Non
     base = datetime(2026, 4, 26, 12, 0, tzinfo=UTC)
     now_holder = {"value": base.timestamp()}
 
-    observer = LullObserver(
+    observer = _observer(tmp_path,
         config=_config(),
         state_path=tmp_path / "lull.json",
         on_lull=lambda channel, chat_id: calls.append((channel, chat_id)),
@@ -223,7 +230,7 @@ async def test_lull_observer_respects_daily_cap(tmp_path: Path) -> None:
     base = datetime(2026, 4, 26, 12, 0, tzinfo=UTC)
     now_holder = {"value": base.timestamp()}
 
-    observer = LullObserver(
+    observer = _observer(tmp_path,
         config=_config(defaultDailyCap=2, lullMinRecentActivity=2),
         state_path=tmp_path / "lull.json",
         on_lull=lambda channel, chat_id: calls.append((channel, chat_id)),
@@ -247,7 +254,7 @@ async def test_lull_observer_disabled_when_flag_off(tmp_path: Path) -> None:
     base = datetime(2026, 4, 26, 12, 0, tzinfo=UTC)
     now_holder = {"value": base.timestamp()}
 
-    observer = LullObserver(
+    observer = _observer(tmp_path,
         config=_config(lullEnabled=False),
         state_path=tmp_path / "lull.json",
         on_lull=lambda channel, chat_id: calls.append((channel, chat_id)),
@@ -270,7 +277,7 @@ async def test_lull_observer_persists_count(tmp_path: Path) -> None:
     now_holder = {"value": base.timestamp()}
     calls: list[tuple[str, str]] = []
 
-    first = LullObserver(
+    first = _observer(tmp_path,
         config=_config(),
         state_path=state_path,
         on_lull=lambda channel, chat_id: calls.append((channel, chat_id)),
@@ -291,24 +298,27 @@ async def test_lull_observer_persists_count(tmp_path: Path) -> None:
 async def test_lull_rejects_reply_to_outside_activity_window(tmp_path: Path) -> None:
     cfg = _config(lullActivityWindowMinutes=60)
     now = datetime(2026, 5, 2, 7, 30, tzinfo=UTC)
+    from yeoman_gateway.history.export import SecondaryArchive
+
     tools = ConsciousnessTools(
         config=cfg,
         policy_engine=PolicyEngine(_policy(), workspace=tmp_path),
         bus=MessageBus(),
         log=SpeakupLog(tmp_path / "speakups.db"),
-        inbound_archive=InboundArchive(tmp_path / "inbound.db"),
+        inbound_archive=SecondaryArchive(object(), cfg.history),
         memory=None,
         security=_FakeSecurity(),
         approval_store=None,
         now=lambda: now,
     )
+    history = ProjectedHistory(tmp_path / "history")
+    history.wire(tools)
     tools.begin_run(trigger="lull")
-    tools.inbound_archive.record_inbound(
-        channel="whatsapp",
+    history.add_message(
         chat_id="group@g.us",
         message_id="yesterday-options",
-        participant="timo@s.whatsapp.net",
-        sender_id="timo@s.whatsapp.net",
+        participant="4691000000001@s.whatsapp.net",
+        sender_id="4691000000001@s.whatsapp.net",
         text="31 Win Streak options trader from yesterday",
         timestamp=int((now - timedelta(days=1)).timestamp()),
         sender_name="Timo",
@@ -324,3 +334,4 @@ async def test_lull_rejects_reply_to_outside_activity_window(tmp_path: Path) -> 
     )
 
     assert result == {"status": "rejected", "reason": "stale_reply_to_message"}
+    history.close()

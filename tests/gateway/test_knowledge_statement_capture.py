@@ -555,6 +555,8 @@ def test_capture_gate_builds_a_worker_only_when_the_switch_is_on(
     from yeoman_gateway.knowledge import _capture_worker
     from yeoman_shared.config.schema import Config
 
+    from tests.gateway.history_test_helpers import ProjectedHistory
+
     built: list[dict[str, object]] = []
 
     class _FakeExtractor:
@@ -576,13 +578,21 @@ def test_capture_gate_builds_a_worker_only_when_the_switch_is_on(
         )
         is None
     )
+    projector = ProjectedHistory(tmp_path / "history")
     worker = bootstrap_module.build_statement_capture(
-        on, knowledge=harness.knowledge, processing=harness.store
+        on,
+        knowledge=harness.knowledge,
+        processing=harness.store,
+        projector=projector,
     )
     assert worker is not None
+    from yeoman_gateway.knowledge._history_capture import HistoryCaptureWorker
+
+    assert isinstance(worker, HistoryCaptureWorker)
     assert built, "the enabled switch must reach the extractor construction"
     worker.start()
     worker.stop()
+    projector.close()
 
 
 def test_capture_enabled_is_read_only_in_the_composition_root() -> None:

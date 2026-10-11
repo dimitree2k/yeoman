@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import time
 from pathlib import Path
 from typing import Any
 
@@ -9,15 +10,23 @@ from yeoman_gateway.adapters.responder_llm import LLMResponder
 from yeoman_gateway.agent.tools.base import Tool
 from yeoman_gateway.bus.queue import MessageBus
 from yeoman_gateway.core.models import InboundEvent, PolicyDecision
+from yeoman_gateway.history.context import history_knowledge_scope
 from yeoman_gateway.knowledge._contacts.service import ContactsService
+from yeoman_gateway.knowledge.api import open_knowledge_store
+from yeoman_gateway.knowledge.authority import FakeSourceAuthority
+from yeoman_gateway.knowledge.runtime import RuntimeKnowledgePolicy
 from yeoman_gateway.media.router import ModelRouter
 from yeoman_gateway.policy.engine import PolicyEngine
 from yeoman_gateway.policy.schema import PolicyConfig
 from yeoman_gateway.providers.base import LLMProvider, LLMResponse, ToolCallRequest
 from yeoman_gateway.session.manager import SessionManager
-from yeoman_gateway.storage.chat_registry import ChatRegistry
 from yeoman_gateway.storage.private_handoff import PrivateHandoffStore
 from yeoman_shared.config.schema import ModelProfile, ModelRoutingConfig
+
+from tests.gateway.history_test_helpers import (
+    ProjectedHistory,
+    prepare_history_retirement_knowledge,
+)
 
 
 class _TextualToolThenAnswerProvider(LLMProvider):
@@ -987,26 +996,34 @@ async def test_pending_voice_delivery_resolves_followup_mention_to_private_conta
     workspace.mkdir()
     sessions = SessionManager(workspace, sessions_dir=workspace / "sessions")
     contacts = ContactsService(db_path=tmp_path / "contacts.db")
+    phone = "4917632625469@s.whatsapp.net"
+    lid = "46918273106072@lid"
     contacts.ensure_contact(
         channel="whatsapp",
-        identifier="4917632625469@s.whatsapp.net",
+        identifier=phone,
         kind="phone_jid",
         push_name="Frank Taeger",
     )
-    chat_registry = ChatRegistry(db_path=tmp_path / "chat_registry.db")
-    chat_registry.register_chat(
-        channel="whatsapp",
+    history = ProjectedHistory(tmp_path / "history")
+    timestamp = time.time_ns() // 1_000_000 - 1000
+    owner = "4915000000000@s.whatsapp.net"
+    history.add_contact(identifiers=[owner], name="Synthetic owner", timestamp=timestamp)
+    history.add_contact(identifiers=[phone, lid], name="Frank Taeger", timestamp=timestamp)
+    history.add_group(
         chat_id="finance@g.us",
-        chat_type="group",
-        readable_name="Finanzgruppe",
-        metadata={
-            "participants": [
-                {
-                    "id": "46918273106072@lid",
-                    "phoneNumber": "4917632625469@s.whatsapp.net",
-                }
-            ]
-        },
+        participants=[owner, {"lid": lid, "phoneJid": phone}],
+        timestamp=timestamp,
+        name="Finanzgruppe",
+    )
+    knowledge = open_knowledge_store(
+        prepare_history_retirement_knowledge(tmp_path, "selected"),
+        workspace_id="responder-selected-tests",
+        source_authority=FakeSourceAuthority(),
+        policy_authority=RuntimeKnowledgePolicy(
+            engine=None,
+            admin_principals=frozenset({f"whatsapp:{owner}"}),
+        ),
+        history_mode=True,
     )
     voice_tool = _HandoffDeliveredVoiceTool()
     responder = LLMResponder(
@@ -1015,8 +1032,12 @@ async def test_pending_voice_delivery_resolves_followup_mention_to_private_conta
         workspace=workspace,
         session_manager=sessions,
         contacts_service=contacts,
-        chat_registry=chat_registry,
+        chat_registry=None,
+        knowledge=knowledge,
     )
+    responder._history_projector = history
+    responder._history_knowledge = knowledge
+    responder._history_tools_selected = True
     responder.tools.register(voice_tool)
     decision = PolicyDecision(
         accept_message=True,
@@ -1025,38 +1046,41 @@ async def test_pending_voice_delivery_resolves_followup_mention_to_private_conta
         reason="test",
     )
 
-    first = await responder.generate_reply(
-        InboundEvent(
-            channel="whatsapp",
-            chat_id="finance@g.us",
-            sender_id="491757070305",
-            content="@203075365150770 sag es als Sprachnachricht, und schicke es an Frank",
-            message_id="request-1",
-            is_group=True,
-            mentioned_bot=True,
-            reply_to_message_id="threat-1",
-            reply_to_text="Ich pruegel die Scheisse aus euch raus",
-        ),
-        decision,
-    )
-    second = await responder.generate_reply(
-        InboundEvent(
-            channel="whatsapp",
-            chat_id="finance@g.us",
-            sender_id="491757070305",
-            content="das ist der Frank hier @46918273106072",
-            message_id="request-2",
-            is_group=True,
-            mentioned_bot=False,
-            reply_to_bot=True,
-            raw_metadata={"mentioned_jids": ["46918273106072@lid"]},
-        ),
-        decision,
-    )
+    async with history.turn() as snapshot:
+        with history_knowledge_scope(snapshot, knowledge):
+            first = await responder.generate_reply(
+                InboundEvent(
+                    channel="whatsapp",
+                    chat_id="finance@g.us",
+                    sender_id="491757070305",
+                    content="@203075365150770 sag es als Sprachnachricht, und schicke es an Frank",
+                    message_id="request-1",
+                    is_group=True,
+                    mentioned_bot=True,
+                    reply_to_message_id="threat-1",
+                    reply_to_text="Ich pruegel die Scheisse aus euch raus",
+                ),
+                decision,
+            )
+            second = await responder.generate_reply(
+                InboundEvent(
+                    channel="whatsapp",
+                    chat_id="finance@g.us",
+                    sender_id="491757070305",
+                    content="das ist der Frank hier @46918273106072",
+                    message_id="request-2",
+                    is_group=True,
+                    mentioned_bot=False,
+                    reply_to_bot=True,
+                    raw_metadata={"mentioned_jids": ["46918273106072@lid"]},
+                ),
+                decision,
+            )
 
     await responder.aclose()
     contacts.close()
-    chat_registry.close()
+    history.close()
+    knowledge.close()
 
     assert first is not None
     assert "Frank" in first

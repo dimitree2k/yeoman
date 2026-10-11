@@ -34,6 +34,9 @@ from yeoman_shared.config.schema import Config
 CHAT = "pilot@g.us"
 OTHER = "second@g.us"
 T0 = 1_700_000_000_000
+ORDERER = "10001@s.whatsapp.net"
+OWNER = "10002@s.whatsapp.net"
+GUEST = "10003@s.whatsapp.net"
 
 
 class _Clock:
@@ -128,7 +131,7 @@ def _policy(
     return PolicyConfig.model_validate(
         {
             "defaults": {"allowedTools": {"mode": "allowlist", "tools": ["message"]}},
-            "owners": {"whatsapp": ["owner@s.whatsapp.net"]},
+            "owners": {"whatsapp": [OWNER]},
             "runtime": {"reloadOnChange": True},
             "channels": {"whatsapp": {"default": default}},
         }
@@ -146,6 +149,8 @@ class _Runtime:
     policy_path: Path
     workspace: Path
     config: Config
+    history: object
+    history_ids: set[tuple[str, str]]
 
     def reload_policy(self, policy: PolicyConfig) -> None:
         """Write and pick up a new policy, bypassing the production check interval."""
@@ -153,12 +158,16 @@ class _Runtime:
         self.adapter._last_reload_check = 0.0  # test-only: skip the throttle window
         self.adapter._maybe_reload()
 
+    def close(self) -> None:
+        self.history.close()
+        self.store.close()
+
 
 @pytest.fixture()
 def runtime(tmp_path: Path):
     _rt = _make_runtime(tmp_path)
     yield _rt
-    _rt.store.close()
+    _rt.close()
 
 
 def _make_runtime(
@@ -200,6 +209,10 @@ def _make_runtime(
     assert registry is not None and gate is not None and router is not None
     transport = _Transport()
     router.set_direct_transport(transport.send_now, transport.send_reaction_now)
+    from tests.gateway.history_test_helpers import ProjectedHistory
+
+    history = ProjectedHistory(tmp_path / "history")
+    router._gateway.set_history_scope(history, None)
     return _Runtime(
         store=store,
         registry=registry,
@@ -210,6 +223,8 @@ def _make_runtime(
         policy_path=policy_path,
         workspace=workspace,
         config=config,
+        history=history,
+        history_ids=set(),
     )
 
 
@@ -219,7 +234,7 @@ def _event(
     content: str = "hi",
     chat: str = CHAT,
     mentioned: bool = True,
-    sender: str = "orderer@s.whatsapp.net",
+    sender: str = ORDERER,
 ) -> InboundEvent:
     return InboundEvent(
         channel="whatsapp",
@@ -240,7 +255,7 @@ def _admit(
     chat: str = CHAT,
     content: str = "hi",
     mentioned: bool = True,
-    sender: str = "orderer@s.whatsapp.net",
+    sender: str = ORDERER,
 ):
     return runtime.gate.admit(
         IngestRequest(
@@ -307,6 +322,19 @@ async def _dispatch(
     reply_to: str | None = None,
 ):
     """Dispatch one managed reply. ``principal`` comes from the runtime, never metadata."""
+    source = runtime.store.get_event(message_id)
+    if source is not None and source.payload is not None:
+        native_id = source.source_message_id or source.event_id
+        key = (source.chat_id, native_id)
+        if key not in runtime.history_ids:
+            runtime.history.add_message(
+                chat_id=source.chat_id,
+                message_id=native_id,
+                text=str(source.payload.get("text") or ""),
+                sender_id=source.principal,
+                timestamp=source.occurred_ms or T0,
+            )
+            runtime.history_ids.add(key)
     dispatcher = ManagedOutboundDispatcher(
         router=runtime.router,
         bus=MessageBus(),
@@ -383,11 +411,10 @@ async def test_semantic_context_excludes_denied_observations(runtime):
 
     stamp = runtime.gate._clock()
     runtime.reload_policy(_policy(mode="owner_only", when_to_reply="mention_only"))
-    _admit(runtime, message_id="owner-question", sender="owner@s.whatsapp.net")
+    _admit(runtime, message_id="owner-question", sender=OWNER)
     await _dispatch(runtime, message_id="owner-question", reply_to="owner-question",
-                    principal="owner@s.whatsapp.net", content="Which price?")
-    for sender, message_id in [("guest@s.whatsapp.net", "denied"),
-                               ("owner@s.whatsapp.net", "allowed")]:
+                    principal=OWNER, content="Which price?")
+    for sender, message_id in [(GUEST, "denied"), (OWNER, "allowed")]:
         result = runtime.gate.admit(IngestRequest(
             event_key=message_id, event_id=message_id, trace_id=message_id,
             event=replace(_event(message_id=message_id, sender=sender,
@@ -404,7 +431,7 @@ async def test_semantic_context_excludes_denied_observations(runtime):
     )
     result = await runtime.gate.admit_async(IngestRequest(
         event_key="followup", event_id="followup", trace_id="followup",
-        event=replace(_event(message_id="followup", sender="owner@s.whatsapp.net",
+        event=replace(_event(message_id="followup", sender=OWNER,
                              content="295k", mentioned=False),
                       timestamp=datetime.fromtimestamp(stamp / 1000, UTC)),
     ))
@@ -490,12 +517,12 @@ async def test_semantic_continuation_never_guesses_authority(runtime, case):
         request = IngestRequest(event_key="bind", event_id="bind", trace_id="bind",
                                event=_event(message_id="bind"))
         candidate = resolver.candidates(runtime.gate._canonical_event(request), aliases=(), now_ms=runtime.gate._clock())[0]
-        resolver.bind(candidate, principal="orderer@s.whatsapp.net", now_ms=runtime.gate._clock())
+        resolver.bind(candidate, principal=ORDERER, now_ms=runtime.gate._clock())
         runtime.store.close_chat_threads(channel="whatsapp", chat_id=CHAT, now_ms=runtime.gate._clock())
     result = await runtime.gate.admit_async(IngestRequest(
         event_key="follow", event_id="follow", trace_id="follow",
         event=_event(message_id="follow", content="295k", mentioned=False,
-                     sender="stranger" if case == "other_sender" else "orderer@s.whatsapp.net",
+                     sender=GUEST if case == "other_sender" else ORDERER,
                      chat=OTHER if case == "other_chat" else CHAT),
     ))
     assert result is None or result.outcome.value != "react"
@@ -515,7 +542,7 @@ async def test_participation_reply_keeps_its_sources_existing_thread(runtime):
     request = IngestRequest(event_key="next", event_id="next", trace_id="next", event=_event(message_id="next"))
     candidate = resolver.candidates(runtime.gate._canonical_event(request), aliases=(), now_ms=runtime.gate._clock())[0]
     assert candidate.thread_id == original_thread
-    resolver.bind(candidate, principal="orderer@s.whatsapp.net", now_ms=runtime.gate._clock())
+    resolver.bind(candidate, principal=ORDERER, now_ms=runtime.gate._clock())
     assert runtime.store.resolve_reference("participation-bot")[0] == original_thread
 
 
@@ -534,7 +561,7 @@ async def test_an_unmarked_follow_up_needs_a_positive_signal(tmp_path: Path) -> 
         assert first.assignment is not None and other.assignment is not None
         assert other.assignment.thread_id != first.assignment.thread_id
     finally:
-        fresh.store.close()
+        fresh.close()
 
     # Half 2: an explicit call-back to the subject continues the thread.
     runtime = _make_runtime(tmp_path / "call-back")
@@ -555,7 +582,7 @@ async def test_an_unmarked_follow_up_needs_a_positive_signal(tmp_path: Path) -> 
         assert {effect.state for effect in effects} == {"sent"}
         assert len({effect.turn_id for effect in effects}) == 1  # one bundled turn
     finally:
-        runtime.store.close()
+        runtime.close()
 
 
 @pytest.mark.asyncio
@@ -572,7 +599,7 @@ async def test_two_chats_keep_their_own_budget_and_effects(tmp_path: Path) -> No
         assert len({effect.target_hash for effect in effects}) == 2
         assert runtime.store.count_send_budget_reservations() == 2
     finally:
-        runtime.store.close()
+        runtime.close()
 
 
 @pytest.mark.asyncio
@@ -600,7 +627,7 @@ async def test_policy_change_before_the_effect_blocks_the_send(runtime) -> None:
 
     # The reply is produced for the sender, so the new policy decides its egress.
     with pytest.raises(EffectNotDeliveredError) as denied:
-        await _dispatch(runtime, message_id="m1", principal="orderer@s.whatsapp.net")
+        await _dispatch(runtime, message_id="m1", principal=ORDERER)
 
     assert "blocked" in str(denied.value)
     effects = runtime.store.list_effects()
@@ -634,7 +661,7 @@ async def test_queue_overflow_blocks_with_a_reason(tmp_path: Path) -> None:
         assert states == ["blocked", "queued"]
         assert runtime.transport.sent == []
     finally:
-        runtime.store.close()
+        runtime.close()
 
 
 @pytest.mark.asyncio
@@ -677,7 +704,7 @@ async def test_restart_never_resends_a_proven_send(tmp_path: Path) -> None:
     await _dispatch(runtime, message_id="m1")
     effect = runtime.store.list_effects()[0]
     assert effect.state == "sent"
-    runtime.store.close()
+    runtime.close()
 
     reopened = build_processing_store(runtime.config)
     assert reopened is not None
@@ -713,7 +740,7 @@ async def test_soft_thread_limit_is_measured_by_default(tmp_path: Path) -> None:
         assert len(sent) == 3
         assert len({effect.turn_id for effect in sent}) == 1  # one chatty thread
     finally:
-        runtime.store.close()
+        runtime.close()
 
 
 @pytest.mark.asyncio
@@ -730,7 +757,7 @@ async def test_soft_thread_limit_refuses_only_when_explicitly_enabled(tmp_path: 
         assert "thread soft limit" in str(limited.value)
         assert runtime.transport.sent == ["one", "two"]
     finally:
-        runtime.store.close()
+        runtime.close()
 
 
 def test_the_session_guard_keeps_stores_away_from_the_runtime_tree() -> None:
@@ -761,14 +788,14 @@ async def test_f02_a_final_reply_keeps_its_frozen_turn(runtime, monkeypatch) -> 
     thread_b = runtime.store.open_thread(
         channel="whatsapp",
         chat_id=CHAT,
-        root_principal="orderer@s.whatsapp.net",
+        root_principal=ORDERER,
         kind="dm",
         trigger_event_id="m2",
         now_ms=T0 + 1,
     )
     turn_b_id = runtime.store.open_turn(
         thread_id=thread_b,
-        principal="orderer@s.whatsapp.net",
+        principal=ORDERER,
         trigger_event_id="m2",
         now_ms=T0 + 1,
     )
@@ -812,7 +839,7 @@ async def test_reply_action_silence_withdraws_the_answer(tmp_path: Path) -> None
         assert runtime.store.list_effects() == ()
         assert runtime.transport.sent == []
     finally:
-        runtime.store.close()
+        runtime.close()
 
 
 @pytest.mark.asyncio
@@ -851,7 +878,7 @@ async def test_reply_action_react_answers_with_one_reaction(tmp_path: Path) -> N
             chat_id=CHAT,
             message_id="m1",
             text=content,
-            principal="orderer@s.whatsapp.net",
+            principal=ORDERER,
         )
 
         assert emoji == "🤙"
@@ -861,7 +888,7 @@ async def test_reply_action_react_answers_with_one_reaction(tmp_path: Path) -> N
         assert effects[0].operation_key.startswith("reaction:whatsapp:")
         assert "m1" in effects[0].operation_key, "the reaction carries its source"
     finally:
-        runtime.store.close()
+        runtime.close()
 
 
 @pytest.mark.asyncio
@@ -877,7 +904,7 @@ async def test_reply_action_react_never_acknowledges_an_observed_message(tmp_pat
         assert observed.outcome.value == "observe"
         assert observed.react is False, "an unaddressed observation must not be acknowledged"
     finally:
-        runtime.store.close()
+        runtime.close()
 
 
 @pytest.mark.asyncio
@@ -903,7 +930,7 @@ async def test_ambient_never_answers_mechanically_whatever_the_action(
         assert result.ambient_candidate is candidate
         assert result.react is react, "ambient is the judge's business, never a reflex"
     finally:
-        runtime.store.close()
+        runtime.close()
 
 
 @pytest.mark.asyncio
@@ -925,14 +952,14 @@ async def test_reply_action_react_sends_nothing_when_no_emoji_fits(tmp_path: Pat
             chat_id=CHAT,
             message_id="m1",
             text="irgendwas",
-            principal="orderer@s.whatsapp.net",
+            principal=ORDERER,
         )
 
         assert emoji is None
         assert runtime.transport.sent == []
         assert runtime.store.list_effects() == ()
     finally:
-        runtime.store.close()
+        runtime.close()
 
 
 @pytest.mark.asyncio
@@ -955,7 +982,7 @@ async def test_a_withdrawn_answer_survives_the_classic_admission(tmp_path: Path)
             "the classic pipeline would start typing and generate an answer"
         )
     finally:
-        runtime.store.close()
+        runtime.close()
 
 
 @pytest.mark.asyncio
@@ -990,7 +1017,7 @@ async def test_an_ambient_answer_closes_its_turn_after_sending(tmp_path: Path) -
         )
         assert runtime.transport.sent == ["answer"]
     finally:
-        runtime.store.close()
+        runtime.close()
 
 
 def test_the_observation_line_shows_the_reasoning_without_content(runtime) -> None:
@@ -1035,8 +1062,8 @@ def test_criterion_16_permitted_senders_answer_ambient_and_others_never_do(tmp_p
     candidate (brake passed, permission granted) and the judge decides whether it speaks.
     An unpermitted sender's message never even becomes a candidate.
     """
-    permitted = "orderer@s.whatsapp.net"
-    stranger = "stranger@s.whatsapp.net"
+    permitted = ORDERER
+    stranger = GUEST
 
     # allowed_senders: the permitted sender's unmarked message is answerable.
     runtime = _make_runtime(tmp_path / "allowed", chats=(CHAT,), ambient=(CHAT,))
@@ -1072,7 +1099,7 @@ def test_criterion_16_permitted_senders_answer_ambient_and_others_never_do(tmp_p
         )
         assert continued.outcome.value == "observe", "continuity grants no permission"
     finally:
-        runtime.store.close()
+        runtime.close()
 
     # whoCanTalk refuses the stranger's message entirely, mention or not: that is the
     # admission side, and it stays a hard gate.
@@ -1084,7 +1111,7 @@ def test_criterion_16_permitted_senders_answer_ambient_and_others_never_do(tmp_p
         )
         assert blocked.outcome.value == "deny", "an unlisted sender may not talk at all"
     finally:
-        strict.store.close()
+        strict.close()
 
     # owner_only: the owner is treated exactly like the permitted sender above.
     owner_runtime = _make_runtime(tmp_path / "owner", chats=(CHAT,), ambient=(CHAT,))
@@ -1095,11 +1122,11 @@ def test_criterion_16_permitted_senders_answer_ambient_and_others_never_do(tmp_p
             message_id="m1",
             content="nur so",
             mentioned=False,
-            sender="owner@s.whatsapp.net",
+            sender=OWNER,
         )
         assert owner.ambient_candidate is True, "the owner may be answered without a mention"
     finally:
-        owner_runtime.store.close()
+        owner_runtime.close()
 
     # mention_only keeps its DM exception: an unmarked DM is answerable, a group is not.
     dm_runtime = _make_runtime(tmp_path / "dm", chats=(CHAT,), ambient=(CHAT,))
@@ -1108,7 +1135,7 @@ def test_criterion_16_permitted_senders_answer_ambient_and_others_never_do(tmp_p
         group = _admit(dm_runtime, message_id="m1", content="nur so", mentioned=False)
         assert group.outcome.value == "observe", "an unmarked group message stays unanswered"
     finally:
-        dm_runtime.store.close()
+        dm_runtime.close()
 
 
 @pytest.mark.asyncio
@@ -1127,7 +1154,7 @@ async def test_criterion_8_a_reaction_has_its_own_lineage(runtime) -> None:
 
     submitted = await runtime.router.submit_reaction(
         SendReactionIntent(channel="whatsapp", chat_id=CHAT, message_id="m1", emoji="👍"),
-        principal="orderer@s.whatsapp.net",
+        principal=ORDERER,
     )
     assert submitted is True
 
@@ -1149,11 +1176,11 @@ async def test_group_reaction_keeps_participant_at_transport(runtime) -> None:
     assert await runtime.router.submit_reaction(
         SendReactionIntent(
             channel="whatsapp", chat_id=CHAT, message_id="group-reaction",
-            emoji="👍", participant_jid="orderer@s.whatsapp.net",
+            emoji="👍", participant_jid=ORDERER,
         ),
-        principal="orderer@s.whatsapp.net",
+        principal=ORDERER,
     )
-    assert runtime.transport.reaction_participants == ["orderer@s.whatsapp.net"]
+    assert runtime.transport.reaction_participants == [ORDERER]
 
 
 @pytest.mark.asyncio
@@ -1170,7 +1197,7 @@ async def test_an_unapproved_emoji_never_becomes_an_effect(runtime) -> None:
         channel="whatsapp", chat_id=CHAT, message_id="m1", emoji="👍"
     )
 
-    assert await runtime.router.submit_reaction(approved, principal="orderer@s.whatsapp.net") is True
+    assert await runtime.router.submit_reaction(approved, principal=ORDERER) is True
     assert runtime.transport.sent == ["👍"], "the approved emoji reaches the transport"
 
     unapproved = SendReactionIntent(
@@ -1178,7 +1205,7 @@ async def test_an_unapproved_emoji_never_becomes_an_effect(runtime) -> None:
     )
     # True = "handled": nothing was queued, and nothing may be published directly instead.
     assert await runtime.router.submit_reaction(
-        unapproved, principal="orderer@s.whatsapp.net"
+        unapproved, principal=ORDERER
     ) is True
     assert runtime.transport.sent == ["👍"], "an unapproved emoji must send nothing"
     assert len(runtime.store.list_effects()) == 1, "and must leave no effect behind"
@@ -1199,7 +1226,7 @@ async def test_a_gateway_decision_is_not_the_models_taste(runtime) -> None:
         origin=SYSTEM_ORIGIN,
     )
 
-    assert await runtime.router.submit_reaction(blocked, principal="orderer@s.whatsapp.net") is True
+    assert await runtime.router.submit_reaction(blocked, principal=ORDERER) is True
     assert runtime.transport.sent == ["🚫"]
 
 
@@ -1219,7 +1246,7 @@ async def test_new_confirmation_survives_the_manual_boundary(runtime) -> None:
             emoji="👍",
             origin=SYSTEM_ORIGIN,
         ),
-        principal="owner@s.whatsapp.net",
+        principal=OWNER,
     )
 
     assert confirmed is True
@@ -1235,7 +1262,7 @@ async def test_a_reaction_effect_stores_its_reason(runtime) -> None:
         SendReactionIntent(
             channel="whatsapp", chat_id=CHAT, message_id="m1", emoji="👍", reason="reply_ack"
         ),
-        principal="orderer@s.whatsapp.net",
+        principal=ORDERER,
     )
     effect = runtime.store.get_effect(runtime.store.list_effects()[0].effect_id)
     assert effect is not None and effect.payload is not None
@@ -1265,7 +1292,7 @@ async def test_the_ambient_brake_needs_both_time_and_messages(tmp_path: Path) ->
         assert admitted.ambient_candidate is True, "six messages are a conversation"
         assert admitted.outcome.value == "observe", "the judge still decides"
     finally:
-        runtime.store.close()
+        runtime.close()
 
 
 @pytest.mark.asyncio
@@ -1286,7 +1313,7 @@ async def test_the_ambient_brake_restarts_its_window_after_every_verdict(tmp_pat
         declined = _admit(runtime, message_id="m3", content="und noch einer", mentioned=False)
         assert declined.ambient_candidate is False, "a decline starts the window over too"
     finally:
-        runtime.store.close()
+        runtime.close()
 
 
 @pytest.mark.asyncio
@@ -1307,7 +1334,7 @@ async def test_a_declined_ambient_message_can_never_be_answered(tmp_path: Path) 
             "a granted message may still be opened by the channel"
         )
     finally:
-        runtime.store.close()
+        runtime.close()
 
 
 @pytest.mark.asyncio
@@ -1323,7 +1350,7 @@ async def test_an_addressed_message_ignores_the_ambient_brake(tmp_path: Path) ->
         assert result.ambient_candidate is False
         assert result.assignment is not None and result.assignment.turn_id, "it gets its turn"
     finally:
-        runtime.store.close()
+        runtime.close()
 
 
 @pytest.mark.asyncio
@@ -1352,7 +1379,7 @@ async def test_naming_the_bot_skips_the_ambient_brake(tmp_path: Path) -> None:
             "no turn before the verdict"
         )
     finally:
-        runtime.store.close()
+        runtime.close()
 
 
 @pytest.mark.asyncio
@@ -1376,16 +1403,16 @@ async def test_an_ambient_reaction_needs_no_turn_and_no_text(tmp_path: Path) -> 
             channel="whatsapp",
             chat_id=CHAT,
             message_id="m1",
-            principal="orderer@s.whatsapp.net",
-            participant_jid="orderer@s.whatsapp.net",
+            principal=ORDERER,
+            participant_jid=ORDERER,
         )
 
         assert sent == "👍"
         assert runtime.transport.sent == ["👍"], "the face reaches the transport"
-        assert runtime.transport.reaction_participants == ["orderer@s.whatsapp.net"]
+        assert runtime.transport.reaction_participants == [ORDERER]
         assert runtime.store.list_effects(), "and it does so as a real effect"
     finally:
-        runtime.store.close()
+        runtime.close()
 
 
 @pytest.mark.asyncio
@@ -1407,14 +1434,14 @@ async def test_an_unapproved_ambient_reaction_is_refused(tmp_path: Path) -> None
             channel="whatsapp",
             chat_id=CHAT,
             message_id="m1",
-            principal="orderer@s.whatsapp.net",
+            principal=ORDERER,
         )
 
         assert sent is None
         assert runtime.transport.sent == []
         assert runtime.store.list_effects() == ()
     finally:
-        runtime.store.close()
+        runtime.close()
 
 
 # replies to a bot message ---------------------------------------------------------------
@@ -1466,7 +1493,7 @@ async def test_a_reply_to_a_bot_message_continues_its_thread(tmp_path: Path) -> 
         )
         assert verdict.ambient_candidate is False, "a known reply is not ambient"
     finally:
-        runtime.store.close()
+        runtime.close()
 
 
 def test_the_journal_keeps_the_reply_target() -> None:
@@ -1520,7 +1547,7 @@ def test_the_routing_line_shows_a_withdrawn_answer_as_reaction(tmp_path) -> None
         _admit(runtime, message_id="m1", content="Arvid, was hältst du davon?")
     finally:
         logger.remove(sink)
-        runtime.store.close()
+        runtime.close()
 
     lines = [record for record in records if "routing_decision" in record]
     assert lines, records

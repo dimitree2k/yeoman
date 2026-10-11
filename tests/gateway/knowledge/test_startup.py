@@ -274,32 +274,43 @@ def test_close_drains_and_leaves_no_writer(tmp_path: Path):
     assert excinfo.value.code == "storage_unavailable"
 
 
-def test_runtime_policy_reads_membership_from_the_chat_registry(tmp_path: Path):
-    """The runtime adapter is the only bridge to the registry; unknown means unknown."""
-    from yeoman_gateway.storage.chat_registry import ChatRegistry
+def test_runtime_policy_reads_membership_from_projected_history(tmp_path: Path):
+    from yeoman_gateway.history.context import history_knowledge_scope
+    from yeoman_gateway.knowledge.api import open_knowledge_store
+    from yeoman_gateway.knowledge.authority import FakeSourceAuthority
 
-    registry = ChatRegistry(db_path=tmp_path / "registry.db")
-    registry.register_chat(
-        channel="whatsapp",
-        chat_id="group-a",
-        chat_type="group",
-        readable_name="synthetic",
-        metadata={"participants": [{"id": "whatsapp:4910000000002"}]},
+    from tests.gateway.history_test_helpers import (
+        ProjectedHistory,
+        prepare_history_retirement_knowledge,
     )
-    policy = RuntimeKnowledgePolicy(engine=None, chat_registry=registry)
+
+    policy = RuntimeKnowledgePolicy(engine=None)
+    service = open_knowledge_store(
+        prepare_history_retirement_knowledge(tmp_path, "runtime-policy"),
+        workspace_id="runtime-policy-tests",
+        source_authority=FakeSourceAuthority(),
+        policy_authority=policy,
+        history_mode=True,
+    )
+    history = ProjectedHistory(tmp_path / "history")
+    history.add_group(
+        chat_id="group-a", participants=["4910000000002@s.whatsapp.net"], timestamp=1_700_000_000_000
+    )
+    snapshot = history.snapshot()
     context = TrustedReadContext(
         principal_id="whatsapp:4910000000002",
         channel="whatsapp",
         chat_id="group-a",
         recipient_principals=frozenset({"whatsapp:4910000000002"}),
-        membership_revision="r1",
-        policy_revision=1,
+        membership_revision="history:1",
+        policy_revision=service.policy_revision,
         purpose="reply",
-        now_ms=1,
+        now_ms=1_700_000_001_000,
     )
-    membership = policy.membership(context)
-    assert membership is not None
-    assert membership.members == frozenset({"whatsapp:4910000000002"})
+    with history_knowledge_scope(snapshot, service):
+        membership = policy.membership(context)
+        assert membership is not None
+        assert membership.members == frozenset({"whatsapp:4910000000002"})
 
     unknown = TrustedReadContext(
         principal_id="whatsapp:4910000000002",
@@ -307,12 +318,15 @@ def test_runtime_policy_reads_membership_from_the_chat_registry(tmp_path: Path):
         chat_id="no-such-chat",
         recipient_principals=frozenset({"whatsapp:4910000000002"}),
         membership_revision=None,
-        policy_revision=1,
+        policy_revision=service.policy_revision,
         purpose="reply",
-        now_ms=1,
+        now_ms=1_700_000_001_000,
     )
-    assert policy.membership(unknown) is None
-    registry.close()
+    with history_knowledge_scope(snapshot, service):
+        assert policy.membership(unknown) is None
+    snapshot.close()
+    history.close()
+    service.close()
 
 
 def test_runtime_source_adapter_refuses_unregistered_evidence():

@@ -39,12 +39,14 @@ async def start_ready(projector):
         await projector._startup_task
 
 
-def test_history_projector_disabled_by_default_and_explicit_false(tmp_path, monkeypatch):
+def test_history_defaults_enabled_and_explicit_false_disables_projection(tmp_path, monkeypatch):
     from yeoman_gateway.app.bootstrap import build_history_projector
     monkeypatch.setenv('YEOMAN_HOME', str(tmp_path))
-    for config in (Config(), Config(history={'liveProjectionEnabled': False})):
-        channels = SimpleNamespace(raw_archive=None)
-        assert build_history_projector(config, channels) is None
+    assert Config().history.live_projection_enabled is True
+    assert Config().history.legacy_writers_disabled is True
+    assert all(Config().history.readers.model_dump().values())
+    assert build_history_projector(Config(history={'liveProjectionEnabled': False}),
+                                  SimpleNamespace(raw_archive=None)) is None
     assert not (tmp_path / 'data/history').exists()
 
 
@@ -57,11 +59,19 @@ def test_history_environment_cannot_activate_loader_or_bootstrap(tmp_path, monke
     path = tmp_path / 'settings.json'
     if payload is not None:
         path.write_text(json.dumps(payload))
-    channels = SimpleNamespace(raw_archive=None)
-    for _ in range(2):
-        assert build_history_projector(load_config(path), channels) is None
+    archive = RawArchive(tmp_path / 'raw', spool=tmp_path / 'spool', status_path=tmp_path / 'status.json')
+    channels = SimpleNamespace(raw_archive=archive)
+    existing_locks = set(tmp_path.rglob("*.lock"))
+    expected = payload is None or payload.get('history', {}).get('liveProjectionEnabled') is not False
+    config = load_config(path)
+    assert config.history.live_projection_enabled is expected
+    projector = build_history_projector(config, channels)
+    if expected:
+        assert projector is not None and projector.archive is archive
+    else:
+        assert projector is None
     assert not (tmp_path / 'data/history').exists()
-    assert list(tmp_path.rglob('*.lock')) == []
+    assert set(tmp_path.rglob('*.lock')) == existing_locks
     assert not [t for t in threading.enumerate() if t.name.startswith('history-projector')]
 
 
@@ -369,8 +379,8 @@ async def test_startup_incompatible_database_pauses_until_automatic_repair(tmp_p
         await p.stop()
 
 
-@pytest.mark.parametrize('enabled', [False, True])
-def test_real_bootstrap_keeps_existing_consumers_and_raw_instance(tmp_path, monkeypatch, enabled):
+@pytest.mark.parametrize('explicit_history', [False, True])
+def test_real_bootstrap_keeps_existing_consumers_and_raw_instance(tmp_path, monkeypatch, explicit_history):
     from yeoman_gateway.app.bootstrap import build_gateway_runtime
     from yeoman_gateway.bus.queue import MessageBus
     from yeoman_gateway.policy.engine import PolicyEngine
@@ -384,26 +394,26 @@ def test_real_bootstrap_keeps_existing_consumers_and_raw_instance(tmp_path, monk
             return 'test/provider'
 
     monkeypatch.setenv('YEOMAN_HOME', str(tmp_path))
-    config = Config.model_validate({'history': {'liveProjectionEnabled': enabled}, 'personaEvolution': {'enabled': False}, 'security': {'enabled': False}})
+    from tests.gateway.history_test_helpers import prepare_history_retirement_knowledge
+    settings = {'knowledge': {'enabled': True, 'db_path': str(prepare_history_retirement_knowledge(tmp_path)), 'capture_enabled': False}, 'personaEvolution': {'enabled': False}, 'security': {'enabled': False}}
+    if explicit_history:
+        settings['history'] = {'liveProjectionEnabled': True}
+    config = Config.model_validate(settings)
     runtime = build_gateway_runtime(config=config, provider=Provider(), policy_engine=PolicyEngine(PolicyConfig(), workspace=tmp_path), policy_path=None, workspace=tmp_path / 'workspace', bus=MessageBus())
     try:
-        if enabled:
-            assert runtime.history_projector.archive is runtime.channels.raw_archive
-            assert runtime.gateway_socket.history_control_handler.__self__ is runtime.history_projector
-        else:
-            assert runtime.history_projector is None
-            assert runtime.gateway_socket.history_control_handler is None
+        assert runtime.history_projector.archive is runtime.channels.raw_archive
+        assert runtime.gateway_socket.history_control_handler.__self__ is runtime.history_projector
         assert not (tmp_path / 'data/history').exists()
         assert not list(tmp_path.rglob('*writer.lock'))
         assert not list(tmp_path.rglob('.history-projection-owner.lock'))
-        assert runtime.channels.inbound_archive is runtime.inbound_archive
+        assert runtime.inbound_archive is None
+        assert not hasattr(runtime.channels, 'inbound_archive')
         assert runtime.speakup_log is None
         assert runtime.opportunity_scheduler is None
     finally:
-        runtime.inbound_archive.close()
-        runtime.chat_registry.close()
-        runtime.contacts.close()
-        runtime.memory.close()
+        for store in (runtime.inbound_archive, runtime.chat_registry, runtime.contacts, runtime.memory):
+            if store is not None:
+                store.close()
 
 
 @pytest.mark.asyncio
@@ -652,7 +662,8 @@ async def test_projector_lock_contention_keeps_gateway_running(tmp_path, monkeyp
             return 'test/provider'
 
     monkeypatch.setenv('YEOMAN_HOME', str(tmp_path))
-    config = Config.model_validate({'history': {'liveProjectionEnabled': True}, 'personaEvolution': {'enabled': False}, 'security': {'enabled': False}})
+    from tests.gateway.history_test_helpers import prepare_history_retirement_knowledge
+    config = Config.model_validate({'history': {'liveProjectionEnabled': True}, 'knowledge': {'enabled': True, 'db_path': str(prepare_history_retirement_knowledge(tmp_path)), 'capture_enabled': False}, 'personaEvolution': {'enabled': False}, 'security': {'enabled': False}})
     runtime = bootstrap.build_gateway_runtime(config=config, provider=Provider(), policy_engine=PolicyEngine(PolicyConfig(), workspace=tmp_path), policy_path=None, workspace=tmp_path / 'workspace', bus=MessageBus())
     p = runtime.history_projector
     root, db = runtime.channels.raw_archive.root, history_db_path(create=True)

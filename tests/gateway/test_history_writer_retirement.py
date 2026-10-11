@@ -22,7 +22,6 @@ def configure(monkeypatch, tmp_path, disabled):
 
 
 def writer(kind, path, disabled=False):
-    from yeoman_gateway.adapters.reply_archive_sqlite import SqliteReplyArchiveAdapter
     from yeoman_gateway.knowledge._contacts.service import ContactsService
     from yeoman_gateway.knowledge._contacts.store import ContactsStore
     from yeoman_gateway.knowledge._identity import IdentityEngine
@@ -31,14 +30,9 @@ def writer(kind, path, disabled=False):
     from yeoman_gateway.knowledge._memory.store import MemoryStore
     from yeoman_gateway.knowledge._store import KnowledgeStore
     from yeoman_gateway.session.manager import SessionManager
-    from yeoman_gateway.storage.chat_registry import ChatRegistry
-    from yeoman_gateway.storage.inbound_archive import InboundArchive
     factories = {
         'session': lambda: SessionManager(path.parent, sessions_dir=path.parent / 'sessions'),
         'identity': lambda: IdentityEngine(KnowledgeStore(path), authority=MagicMock(), policy=MagicMock()),
-        'reply-adapter': lambda: SqliteReplyArchiveAdapter(InboundArchive(path)),
-        'archive': lambda: InboundArchive(path, legacy_history_disabled=disabled),
-        'registry': lambda: ChatRegistry(path, legacy_history_disabled=disabled),
         'contacts-store': lambda: ContactsStore(path, legacy_history_disabled=disabled),
         'contacts-service': lambda: ContactsService(path, legacy_history_disabled=disabled),
         'memory-store': lambda: MemoryStore(path, legacy_history_disabled=disabled),
@@ -48,7 +42,7 @@ def writer(kind, path, disabled=False):
     return factories[kind]()
 
 
-KINDS = ('archive', 'registry', 'contacts-store', 'contacts-service', 'memory-store', 'auto-semantic-notes', 'shared-facts')
+KINDS = ( 'contacts-store', 'contacts-service', 'memory-store', 'auto-semantic-notes', 'shared-facts')
 
 
 @pytest.mark.parametrize('kind', KINDS)
@@ -71,15 +65,6 @@ def mutation(kind, obj):
     if kind == 'identity':
         from yeoman_gateway.knowledge.models import TrustedAdminContext
         return obj.set_preferred_name('synthetic', 'Changed', context=TrustedAdminContext('synthetic', 1, 'test', True))
-    if kind == 'reply-adapter':
-        from datetime import datetime
-
-        from yeoman_gateway.core.models import InboundEvent
-        return obj.record_inbound(InboundEvent(channel='whatsapp', chat_id='synthetic', sender_id='10001', content='Synthetic', timestamp=datetime.now(), message_id='m'))
-    if kind == 'archive':
-        return obj.record_inbound(channel='whatsapp', chat_id='synthetic', message_id='m', participant=None, sender_id='10001', text='Synthetic', timestamp=1)
-    if kind == 'registry':
-        return obj.register_chat(channel='whatsapp', chat_id='synthetic')
     if kind == 'contacts-store':
         return obj.create_contact(display_name='Synthetic')
     if kind == 'contacts-service':
@@ -91,7 +76,7 @@ def mutation(kind, obj):
     return obj.start()
 
 
-@pytest.mark.parametrize('kind', (*KINDS, 'session', 'identity', 'reply-adapter'))
+@pytest.mark.parametrize('kind', (*KINDS, 'session', 'identity'))
 @pytest.mark.parametrize('transition', ['instance', 'explicit-after-file-change'])
 def test_retired_writer_call_fails_on_existing_instance(tmp_path, monkeypatch, kind, transition):
     from yeoman_gateway.history.writer_guard import LegacyHistoryWriterDisabled
@@ -124,8 +109,6 @@ def test_retired_writer_call_fails_on_existing_instance(tmp_path, monkeypatch, k
             obj.close()
         elif kind == 'identity':
             obj._store.close()
-        elif kind == 'reply-adapter':
-            obj._archive.close()
 
 
 @pytest.mark.parametrize('missing', ['projection', 'adapter', 'knowledge', 'handover'])
@@ -151,7 +134,6 @@ def test_writer_off_requires_replacements_and_handover(tmp_path, monkeypatch, mi
     def forbidden(*args, **kwargs):
         pytest.fail('preflight reached legacy writer constructor')
     monkeypatch.setattr(bootstrap, 'SessionManager', forbidden)
-    monkeypatch.setattr(bootstrap, 'InboundArchive', forbidden)
     with pytest.raises(HistoryPaused):
         bootstrap.build_gateway_runtime(config=config, provider=MagicMock(), policy_engine=None,
                                         policy_path=None, workspace=tmp_path, bus=MessageBus())
@@ -213,19 +195,14 @@ def test_whatsapp_and_fact_bootstrap_skip_private_legacy_constructors(tmp_path, 
     from yeoman_gateway.app.bootstrap import build_shared_fact_runtime
     from yeoman_gateway.bus.queue import MessageBus
     from yeoman_gateway.channels.manager import ChannelManager
-    from yeoman_gateway.storage import chat_registry
     configure(monkeypatch, tmp_path, False)
-    def forbidden(*args, **kwargs):
-        pytest.fail('retired bootstrap constructed a private registry')
-    monkeypatch.setattr(chat_registry, 'ChatRegistry', forbidden)
     config = Config(history={'legacyWritersDisabled': True}, channels={'whatsapp': {'enabled': True}})
     channels = ChannelManager(config, MessageBus())
-    assert channels.channels['whatsapp']._chat_registry is None
     assert channels.raw_archive is not None
     assert build_shared_fact_runtime(config, store=MagicMock(), memory=MagicMock()) is None
 
 
-@pytest.mark.parametrize('retired', [False, True])
+@pytest.mark.parametrize('retired', [True])
 def test_bootstrap_writer_routes_and_operational_exceptions(tmp_path, monkeypatch, retired):
     from yeoman_gateway.app.bootstrap import build_gateway_runtime
     from yeoman_gateway.bus.queue import MessageBus
@@ -312,7 +289,7 @@ def test_memory_factory_uses_root_retirement_before_any_worker_or_file(tmp_path)
     assert set(threading.enumerate()) == threads
 
 
-@pytest.mark.parametrize('kind', (*KINDS, 'session', 'identity', 'reply-adapter'))
+@pytest.mark.parametrize('kind', (*KINDS, 'session', 'identity'))
 @pytest.mark.parametrize('retired', [False, True])
 def test_guarded_calls_do_not_read_config_after_construction(tmp_path, monkeypatch, kind, retired):
     from yeoman_gateway.history.writer_guard import (
@@ -337,54 +314,17 @@ def test_guarded_calls_do_not_read_config_after_construction(tmp_path, monkeypat
             obj.close()
         elif kind == 'identity':
             obj._store.close()
-        elif kind == 'reply-adapter':
-            obj._archive.close()
 
 
 @pytest.mark.parametrize('retired', [False, True])
-def test_archive_and_signal_guards_use_cached_flag(tmp_path, monkeypatch, retired):
-    from yeoman_gateway.adapters.reply_archive_sqlite import SqliteReplyArchiveAdapter
-    from yeoman_gateway.history.live import HistoryPaused
-    from yeoman_gateway.history.writer_guard import LegacyHistoryWriterDisabled
+def test_signal_guard_uses_cached_flag(tmp_path, monkeypatch, retired):
     from yeoman_gateway.processing.signals import SignalJournalSink
-    from yeoman_gateway.storage.inbound_archive import InboundArchive
-    configure(monkeypatch, tmp_path, False)
-    archive = InboundArchive(tmp_path / 'legacy.db')
-    adapter = SqliteReplyArchiveAdapter(archive)
-    sink = SignalJournalSink(MagicMock(), memory=MagicMock())
-    archive.legacy_history_disabled = adapter.legacy_history_disabled = sink.legacy_history_disabled = retired
+    sink = SignalJournalSink(MagicMock(), memory=MagicMock(), legacy_history_disabled=retired)
     reads = MagicMock(side_effect=AssertionError('hot path must not read config'))
     monkeypatch.setattr(Path, 'read_text', reads)
-    try:
-        for _ in range(20):
-            if retired:
-                with pytest.raises(HistoryPaused):
-                    adapter.lookup_message('whatsapp', 'synthetic', 'm')
-                with pytest.raises(LegacyHistoryWriterDisabled):
-                    mutation('archive', archive)
-            else:
-                adapter.lookup_message('whatsapp', 'synthetic', 'm')
-                mutation('archive', archive)
-            sink.index_enrichments('m', ())
-        reads.assert_not_called()
-    finally:
-        archive.close()
-
-
-@pytest.mark.parametrize('failure', ['parse', 'read'])
-def test_unreadable_config_preserves_dormant_constructor_behavior(tmp_path, monkeypatch, failure):
-    from yeoman_gateway.storage.inbound_archive import InboundArchive
-    root = configure(monkeypatch, tmp_path, False)
-    if failure == 'parse':
-        (root / 'config.json').write_text('{')
-    else:
-        monkeypatch.setattr(Path, 'read_text', MagicMock(side_effect=OSError('synthetic unreadable config')))
-    archive = InboundArchive(tmp_path / 'legacy.db')
-    try:
-        assert archive.legacy_history_disabled is False
-        mutation('archive', archive)
-    finally:
-        archive.close()
+    for _ in range(20):
+        sink.index_enrichments('m', ())
+    reads.assert_not_called()
 
 
 def test_knowledge_composition_passes_resolved_flag_to_identity(case, tmp_path, monkeypatch):  # noqa: F811 - fixture
@@ -405,35 +345,3 @@ def test_knowledge_composition_passes_resolved_flag_to_identity(case, tmp_path, 
     reads.assert_not_called()
 
 
-@pytest.mark.parametrize("retired", [False, True])
-def test_archive_middleware_skips_only_retired_whatsapp_projection(tmp_path, retired):
-    import asyncio
-    from datetime import UTC, datetime
-
-    from yeoman_gateway.adapters.reply_archive_sqlite import SqliteReplyArchiveAdapter
-    from yeoman_gateway.core.models import InboundEvent
-    from yeoman_gateway.core.pipeline import PipelineContext
-    from yeoman_gateway.pipeline.archive import ArchiveMiddleware
-    from yeoman_gateway.storage.inbound_archive import InboundArchive
-
-    archive = InboundArchive(tmp_path / "inbound.db")
-    adapter = SqliteReplyArchiveAdapter(archive, legacy_history_disabled=retired)
-    event = InboundEvent(channel="whatsapp", chat_id="synthetic-room", sender_id="10001",
-                         content="Synthetic", timestamp=datetime.now(UTC), message_id="synthetic-message")
-    progressed = []
-
-    async def next_step(ctx):
-        progressed.append(ctx.event)
-
-    try:
-        asyncio.run(ArchiveMiddleware(archive=adapter)(PipelineContext(event=event), next_step))
-        assert progressed == [event]
-        row = archive.lookup_message("whatsapp", "synthetic-room", "synthetic-message")
-        assert (row is None) is retired
-        # Non-WhatsApp projection remains enabled even when WhatsApp writers retire.
-        other = InboundEvent(channel="telegram", chat_id="synthetic-room", sender_id="10001",
-                             content="Synthetic", timestamp=datetime.now(UTC), message_id="other-message")
-        asyncio.run(ArchiveMiddleware(archive=adapter)(PipelineContext(event=other), next_step))
-        assert archive.lookup_message("telegram", "synthetic-room", "other-message") is not None
-    finally:
-        archive.close()

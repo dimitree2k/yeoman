@@ -494,7 +494,7 @@ async def test_unprocessed_edit_queues_current_revision_once_and_preserves_job_i
     assert all(r["outcome"] != "pending" for r in k._store.query("SELECT outcome FROM knowledge_history_capture"))
 
 
-def test_builder_selection_keeps_default_worker_and_selects_history(case, monkeypatch):
+def test_builder_selection_defaults_to_history_worker(case, monkeypatch):
     from yeoman_gateway.app.bootstrap import build_statement_capture
     from yeoman_gateway.knowledge import _capture_worker
     from yeoman_gateway.knowledge._history_capture import HistoryCaptureWorker
@@ -504,9 +504,9 @@ def test_builder_selection_keeps_default_worker_and_selects_history(case, monkey
     base = {"knowledge": {"captureEnabled": True}}
     path = h.path.parent / "settings.json"
     path.write_text(json.dumps(base))
-    dormant = load_config(path)
-    legacy = build_statement_capture(dormant, knowledge=k, processing=object(), projector=h.projector)
-    assert type(legacy).__name__ == "StatementCaptureWorker"
+    default = load_config(path)
+    assert isinstance(build_statement_capture(default, knowledge=k, processing=object(), projector=h.projector),
+                      HistoryCaptureWorker)
     path.write_text(json.dumps({**base, "history": {
         "liveProjectionEnabled": True, "readers": {"knowledge": True}}}))
     selected = load_config(path)

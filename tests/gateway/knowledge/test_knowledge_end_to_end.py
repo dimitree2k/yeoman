@@ -3,7 +3,7 @@
 The test drives the actual :class:`Orchestrator` pipeline with an injected fake provider
 and a recording transport, over a temporary knowledge database.  Identity and ACL are
 *not* mocked: they come from the knowledge facade, a fake-but-explicit policy authority
-and a chat registry whose membership is the only membership in play.
+and a real HistoryQueries roster projection.
 
 A successful spy send proves local routing only - no WhatsApp connection is involved.
 """
@@ -12,11 +12,13 @@ from __future__ import annotations
 
 from dataclasses import dataclass, field
 from pathlib import Path
+from types import SimpleNamespace
 from typing import Any
 
 import pytest
 from yeoman_gateway.core.models import InboundEvent, PolicyDecision
 from yeoman_gateway.core.orchestrator import Orchestrator
+from yeoman_gateway.history.queries import HistoryQueries
 from yeoman_gateway.knowledge.api import open_knowledge_store
 from yeoman_gateway.knowledge.authority import EvidenceAudience, FakeSourceAuthority
 from yeoman_gateway.knowledge.models import (
@@ -29,7 +31,8 @@ from yeoman_gateway.knowledge.models import (
     TrustedReadContext,
 )
 from yeoman_gateway.providers.base import LLMProvider, LLMResponse
-from yeoman_gateway.storage.chat_registry import ChatRegistry
+
+from tests.gateway.history_test_helpers import ProjectedHistory
 
 CHAT = "120363000000000001@g.us"
 DM = "4910000000002@s.whatsapp.net"
@@ -80,18 +83,12 @@ class TransportSpy:
 
 
 @dataclass
-class _Membership:
-    members: frozenset[str]
-    revision: str
-
-
-@dataclass
 class _Policy:
     """Minimal policy authority: owners are explicit, capture is never implicit."""
 
     owners: frozenset[str] = frozenset({OWNER})
     revision: int = 1
-    memberships: dict[str, _Membership] = field(default_factory=dict)
+    memberships: dict[str, SimpleNamespace] = field(default_factory=dict)
 
     def current_policy_revision(self) -> int:
         return self.revision
@@ -110,11 +107,13 @@ class _Policy:
             raise KnowledgeError("unauthorized", "capture is not authorized")
         return context.request_id
 
-    def membership(self, context: TrustedReadContext) -> _Membership | None:
+    def membership(self, context: TrustedReadContext) -> SimpleNamespace | None:
         return self.memberships.get(f"{context.channel}:{context.chat_id}")
 
     def set_members(self, channel: str, chat_id: str, members: set[str], *, revision: str) -> None:
-        self.memberships[f"{channel}:{chat_id}"] = _Membership(frozenset(members), revision)
+        self.memberships[f"{channel}:{chat_id}"] = SimpleNamespace(
+            members=frozenset(members), revision=revision
+        )
 
     def admin_actor(self) -> str:
         return sorted(self.owners)[0]
@@ -135,7 +134,8 @@ class EndToEnd:
         )
         self.provider = SpyProvider()
         self.transport = TransportSpy()
-        self.registry = ChatRegistry(db_path=tmp_path / "chat_registry.db")
+        self.history = ProjectedHistory(tmp_path / "history")
+        self._roster_revision = 0
         self.people: dict[str, str] = {}
         self._observations = 0
         self._sources = 0
@@ -199,14 +199,22 @@ class EndToEnd:
         return source
 
     def register_chat(self, *, chat_id: str, members: set[str]) -> None:
-        self.registry.register_chat(
-            channel="whatsapp",
+        self._roster_revision += 1
+        timestamp = 1_700_000_000_000 + self._roster_revision * 1000
+        self.history.add_group(
             chat_id=chat_id,
-            chat_type="group" if chat_id.endswith("@g.us") else "direct",
-            readable_name="synthetic",
-            metadata={"participants": [{"id": member} for member in sorted(members)]},
+            participants=[f"{member.split(':', 1)[1]}@s.whatsapp.net" for member in sorted(members)],
+            timestamp=timestamp,
         )
-        self.policy.set_members("whatsapp", chat_id, members, revision=f"rev-{len(members)}")
+        snapshot = self.history.snapshot()
+        try:
+            roster = HistoryQueries(snapshot).members(chat_id=chat_id, at_ms=timestamp)
+            assert roster.status == "known"
+            self.policy.set_members(
+                "whatsapp", chat_id, set(roster.members), revision=f"history:{snapshot.generation}"
+            )
+        finally:
+            snapshot.close()
 
     def capture(
         self,
@@ -274,7 +282,7 @@ class EndToEnd:
 
     def close(self) -> None:
         self.knowledge.close()
-        self.registry.close()
+        self.history.close()
 
 
 class _AllowAll:

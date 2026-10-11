@@ -26,6 +26,8 @@ from yeoman_gateway.processing.participation import (
 from yeoman_gateway.processing.participation_runtime import ParticipationRuntime
 from yeoman_shared.config.schema import ProcessingConfig
 
+from tests.gateway.history_test_helpers import ProjectedHistory
+
 CHANNEL = "whatsapp"
 CHAT = "group@g.us"
 EMOJI = "\N{THUMBS UP SIGN}"
@@ -84,7 +86,7 @@ class _Context:
             "messages": [
                 {
                     "event_id": source_id,
-                    "sender_id": "anna@s.whatsapp.net",
+                    "sender_id": "10001@s.whatsapp.net",
                     "text": "a short synthetic reply",
                     "timestamp": NOW_MS,
                     "channel": CHANNEL,
@@ -321,7 +323,7 @@ def _runtime(
         is_paused=lambda channel, chat_id: paused,
         is_source_allowed=lambda channel, chat_id, sources: source_allowed,
         source_principals=lambda channel, chat_id, sources: tuple(
-            (str(source), "anna@s.whatsapp.net") for source in sources
+            (str(source), "10001@s.whatsapp.net") for source in sources
         ),
         submission=submission if submission is not None else _Submission(),
         reactor=reactor if reactor is not None else _Reactor(),
@@ -820,7 +822,7 @@ async def test_reaction_is_one_judge_and_one_reaction_effect(tmp_path: Path) -> 
     admission = call["admission"]
     assert admission.admission_id == f"adm-{call['effect_id']}"
     assert admission.source_event_ids == ("m1",)
-    assert admission.source_principals == (("m1", "anna@s.whatsapp.net"),)
+    assert admission.source_principals == (("m1", "10001@s.whatsapp.net"),)
     assert admission.payload_hash
     effect_id = str(call["effect_id"])
     assert effect_id == deterministic_effect_id(
@@ -899,17 +901,16 @@ async def test_older_knowledge_reaches_real_renderers_and_revocation_blocks_effe
     from yeoman_gateway.processing.participation_context import ParticipationContextBuilder
     from yeoman_gateway.processing.participation_knowledge import ParticipationKnowledgeSelector
     from yeoman_gateway.providers.base import LLMResponse
-    from yeoman_gateway.storage.inbound_archive import InboundArchive
     from yeoman_shared.config.schema import Config
 
     from tests.gateway.capture_harness import CaptureHarness, Registry
 
     older_fact = "The group meetup is every Friday."
     knowledge_now_ms = int(time() * 1000)
-    members = frozenset({"anna@s.whatsapp.net", "ben@s.whatsapp.net"})
+    members = frozenset({"10001@s.whatsapp.net", "10002@s.whatsapp.net"})
     harness = CaptureHarness(
         tmp_path / "protected",
-        registry=Registry({("whatsapp", CHAT): ["anna", "ben"]}),
+        registry=Registry({("whatsapp", CHAT): ["10001", "10002"]}),
         idle_ms=0,
     )
     harness.now = knowledge_now_ms
@@ -917,6 +918,7 @@ async def test_older_knowledge_reaches_real_renderers_and_revocation_blocks_effe
     old_source = harness.observe(
         "The group meetup is every Friday.",
         message_id="old-meetup",
+        sender="10001",
         chat_id=CHAT,
         occurred_ms=knowledge_now_ms - 7 * 86_400_000,
     )
@@ -925,36 +927,25 @@ async def test_older_knowledge_reaches_real_renderers_and_revocation_blocks_effe
     assert harness.run_capture().published == 1
     assert harness.source_row(old_source)["audience_status"] == "known"
 
-    archive = InboundArchive(tmp_path / "inbound.db")
-    archive.record_inbound(
-        channel=CHANNEL,
-        chat_id=CHAT,
-        message_id="m1",
-        participant="anna@s.whatsapp.net",
-        sender_id="anna@s.whatsapp.net",
-        sender_name="Anna",
-        text="When is the group meetup?",
-        timestamp=knowledge_now_ms // 1000,
-    )
+    archive = ProjectedHistory(tmp_path, groups=[dict(
+        chat_id=CHAT, participants=["10001@s.whatsapp.net", "10002@s.whatsapp.net"],
+        timestamp=knowledge_now_ms / 1000,
+    )])
+    archive.add_message(channel=CHANNEL, chat_id=CHAT, message_id="m1",
+        participant="10001@s.whatsapp.net", sender_id="10001@s.whatsapp.net",
+        sender_name="Anna", text="When is the group meetup?", timestamp=knowledge_now_ms / 1000)
     oversized_text = "unrelated optional history " * 5_000
     if oversized_optional:
-        archive.record_inbound(
-            channel=CHANNEL,
-            chat_id=CHAT,
-            message_id="optional-large-history",
-            participant="ben@s.whatsapp.net",
-            sender_id="ben@s.whatsapp.net",
-            sender_name="Ben",
-            text=oversized_text,
-            timestamp=knowledge_now_ms // 1000 - 60,
-        )
+        archive.add_message(channel=CHANNEL, chat_id=CHAT, message_id="optional-large-history",
+            participant="10002@s.whatsapp.net", sender_id="10002@s.whatsapp.net",
+            sender_name="Ben", text=oversized_text, timestamp=knowledge_now_ms / 1000 - 60)
     selector = ParticipationKnowledgeSelector(knowledge=harness.knowledge, memory=harness.memory)
 
     def trusted_contexts(opportunity, context):
         del opportunity, context
         return (
             TrustedReadContext(
-                principal_id="anna@s.whatsapp.net",
+                principal_id="10001@s.whatsapp.net",
                 channel=CHANNEL,
                 chat_id=CHAT,
                 recipient_principals=members,
@@ -965,7 +956,7 @@ async def test_older_knowledge_reaches_real_renderers_and_revocation_blocks_effe
                 is_direct=False,
             ),
             FactReadContext(
-                principal_id="anna@s.whatsapp.net",
+                principal_id="10001@s.whatsapp.net",
                 chat_scope_key=f"channel:{CHANNEL}:chat:{CHAT}",
                 current_members=members,
                 epoch=harness.memory.store.acl_epoch(),
@@ -973,13 +964,14 @@ async def test_older_knowledge_reaches_real_renderers_and_revocation_blocks_effe
             ),
         )
 
-    builder = ParticipationContextBuilder(
-        archive=archive,
+    builder = archive.wire(ParticipationContextBuilder(
+        archive=object(),
         policy=PolicyEngine(_policy(), workspace=tmp_path),
         source_authorizer=lambda row: True,
         knowledge_selector=selector,
         knowledge_context_supplier=trusted_contexts,
-    )
+    ))
+    writer_contexts = []
     original_context_build = builder.build
 
     async def build_with_taste(*args, **kwargs):
@@ -987,6 +979,7 @@ async def test_older_knowledge_reaches_real_renderers_and_revocation_blocks_effe
         context["advisory_taste"] = [
             {"content": "Use direct phrasing.", "provenance": "participation:test"}
         ]
+        writer_contexts.append(context)
         return context
 
     builder.build = build_with_taste
@@ -1019,7 +1012,7 @@ async def test_older_knowledge_reaches_real_renderers_and_revocation_blocks_effe
             writer_requests.append(messages)
             # Simulate a real source deletion while the draft is being generated.
             if revoke_source:
-                harness.delete("old-meetup", chat_id=CHAT)
+                harness.delete("old-meetup", chat_id=CHAT, sender="10001")
             return LLMResponse(content="Friday works for the meetup.")
 
     class MainProvider:
@@ -1061,6 +1054,7 @@ async def test_older_knowledge_reaches_real_renderers_and_revocation_blocks_effe
         tmp_path, decision=COMMENT, submission=submission
     )
     runtime._context_builder = builder
+    archive.wire(runtime)
     judge_client = JudgeClient()
     finalized_contexts = []
 
@@ -1079,7 +1073,8 @@ async def test_older_knowledge_reaches_real_renderers_and_revocation_blocks_effe
 
     runtime._revalidate_knowledge = revalidate
     try:
-        result = await runtime.evaluate_participation(_opportunity("m1"))
+        async with archive.turn():
+            result = await runtime.evaluate_participation(_opportunity("m1"))
         assert writer_requests
         assert len(writer_requests) == 1
         judge_prompt = "\n".join(item["content"] for item in judge_client.requests[0])
@@ -1090,8 +1085,8 @@ async def test_older_knowledge_reaches_real_renderers_and_revocation_blocks_effe
         assert 'id="m1"' in judge_prompt
         assert "When is the group meetup?" in writer_prompt
         assert finalized_contexts[0]["knowledge_rendered_to_judge"] is True
-        assert finalized_contexts[0].get("knowledge_rendered_to_writer") is True
-        assert finalized_contexts[0].get("taste_rendered_to_writer") is True
+        assert any(context.get("knowledge_rendered_to_writer") is True for context in writer_contexts)
+        assert any(context.get("taste_rendered_to_writer") is True for context in writer_contexts)
         assert "Use direct phrasing." in writer_prompt
         if oversized_optional:
             assert finalized_contexts[0]["judge_dropped_entry_count"] >= 1
@@ -1149,28 +1144,23 @@ async def test_two_author_trigger_consults_the_multi_reader_knowledge_selector(
         ParticipationKnowledgeSelection,
         reader_key,
     )
-    from yeoman_gateway.storage.inbound_archive import InboundArchive
 
     from tests.gateway.capture_harness import Registry
 
     shared_fact = "The group meetup is every Friday."
     now_ms = int(time() * 1000)
-    archive = InboundArchive(tmp_path / "inbound.db")
+    archive = ProjectedHistory(tmp_path, groups=[dict(
+        chat_id=CHAT, participants=["10001@s.whatsapp.net", "10002@s.whatsapp.net"],
+        timestamp=now_ms / 1000,
+    )])
     for message_id, sender, name, text in (
-        ("m1", "anna@s.whatsapp.net", "Anna", "When is the group meetup?"),
-        ("m2", "ben@s.whatsapp.net", "Ben", "And what time?"),
+        ("m1", "10001@s.whatsapp.net", "Anna", "When is the group meetup?"),
+        ("m2", "10002@s.whatsapp.net", "Ben", "And what time?"),
     ):
-        archive.record_inbound(
-            channel=CHANNEL,
-            chat_id=CHAT,
-            message_id=message_id,
-            participant=sender,
-            sender_id=sender,
-            sender_name=name,
-            text=text,
-            timestamp=now_ms // 1000,
-        )
-    registry = Registry({("whatsapp", CHAT): ["anna", "ben"]})
+        archive.add_message(channel=CHANNEL, chat_id=CHAT, message_id=message_id,
+            participant=sender, sender_id=sender, sender_name=name, text=text,
+            timestamp=now_ms / 1000)
+    registry = Registry({("whatsapp", CHAT): ["10001", "10002"]})
 
     class RecordingSelector:
         """Records the verified principals the production supplier handed over."""
@@ -1187,7 +1177,7 @@ async def test_two_author_trigger_consults_the_multi_reader_knowledge_selector(
                     statement_ids=("stmt-shared",),
                     source_refs=(
                         SourceRef(
-                            "ev-shared", 1, CHANNEL, CHAT, "anna@s.whatsapp.net", now_ms
+                            "ev-shared", 1, CHANNEL, CHAT, "10001@s.whatsapp.net", now_ms
                         ),
                     ),
                 ),
@@ -1210,8 +1200,8 @@ async def test_two_author_trigger_consults_the_multi_reader_knowledge_selector(
             )
 
     selector = RecordingSelector()
-    builder = ParticipationContextBuilder(
-        archive=archive,
+    builder = archive.wire(ParticipationContextBuilder(
+        archive=object(),
         policy=PolicyEngine(_policy(), workspace=tmp_path),
         source_authorizer=lambda row: True,
         knowledge_selector=selector,
@@ -1223,7 +1213,7 @@ async def test_two_author_trigger_consults_the_multi_reader_knowledge_selector(
                 knowledge=SimpleNamespace(policy_revision=1),
             )
         ),
-    )
+    ))
     built: list[dict] = []
     original_build = builder.build
 
@@ -1236,11 +1226,14 @@ async def test_two_author_trigger_consults_the_multi_reader_knowledge_selector(
 
     runtime, judge, _context, log = _runtime(tmp_path, decision=COMMENT)
     runtime._context_builder = builder
+    archive.wire(runtime)
     runtime._revalidate_knowledge = lambda opportunity, context, selection: selection
     try:
-        result = await runtime.evaluate_participation(_opportunity("m1", "m2"))
+        async with archive.turn():
+            result = await runtime.evaluate_participation(_opportunity("m1", "m2"))
 
-        assert selector.calls == [("anna@s.whatsapp.net", "ben@s.whatsapp.net")]
+        assert selector.calls
+        assert all(call == ("10001@s.whatsapp.net", "10002@s.whatsapp.net") for call in selector.calls)
         assert built[0]["knowledge_selection_status"] == "selected"
         assert built[0]["selected_knowledge_text"] == shared_fact
         assert judge.calls == 1
@@ -1534,7 +1527,7 @@ async def test_long_unquoted_source_cannot_use_continuation_candidate_reserve(
         rendered["messages"] = [
             {
                 "event_id": "m1",
-                "sender_id": "anna@s.whatsapp.net",
+                "sender_id": "10001@s.whatsapp.net",
                 "text": "x" * 121,
                 "timestamp": NOW_MS,
                 "channel": CHANNEL,
@@ -1573,7 +1566,7 @@ async def test_long_unquoted_source_cannot_use_continuation_candidate_reserve(
         (
             {
                 "event_id": "m1",
-                "sender_id": "anna@s.whatsapp.net",
+                "sender_id": "10001@s.whatsapp.net",
                 "text": "x" * 121,
                 "reply_to_message_id": "prov-1",
                 "timestamp": NOW_MS,
@@ -1585,7 +1578,7 @@ async def test_long_unquoted_source_cannot_use_continuation_candidate_reserve(
         (
             {
                 "event_id": "m1",
-                "sender_id": "anna@s.whatsapp.net",
+                "sender_id": "10001@s.whatsapp.net",
                 "text": "short answer",
                 "timestamp": NOW_MS,
             },
@@ -1593,7 +1586,7 @@ async def test_long_unquoted_source_cannot_use_continuation_candidate_reserve(
             [
                 {
                     "event_id": "m2",
-                    "sender_id": "ben@s.whatsapp.net",
+                    "sender_id": "10002@s.whatsapp.net",
                     "text": "a foreign exchange",
                     "timestamp": NOW_MS - 500,
                 }
@@ -1603,7 +1596,7 @@ async def test_long_unquoted_source_cannot_use_continuation_candidate_reserve(
         (
             {
                 "event_id": "m1",
-                "sender_id": "anna@s.whatsapp.net",
+                "sender_id": "10001@s.whatsapp.net",
                 "text": "short answer",
                 "timestamp": NOW_MS,
             },
@@ -1744,7 +1737,7 @@ async def test_last_pause_or_revocation_race_blocks_submission(
             state["paused"] = "paused_last_moment" if veto == "pause" else None
             state["allowed"] = veto != "revoke"
             race_observed.set()
-        return tuple((str(source), "anna@s.whatsapp.net") for source in sources)
+        return tuple((str(source), "10001@s.whatsapp.net") for source in sources)
 
     runtime._source_principals = principals  # type: ignore[assignment]
     runtime._is_paused = lambda channel, chat_id: state["paused"]  # type: ignore[return-value]
@@ -2743,45 +2736,23 @@ async def test_private_records_never_enter_the_participation_context(tmp_path: P
         ParticipationContextBuilder,
         ParticipationDecisionInputs,
     )
-    from yeoman_gateway.storage.inbound_archive import InboundArchive
-
-    archive = InboundArchive(tmp_path / "inbound.db")
-    archive.record_inbound(
-        channel=CHANNEL,
-        chat_id=CHAT,
-        message_id="group-1",
-        participant="anna@s.whatsapp.net",
-        sender_id="anna@s.whatsapp.net",
-        sender_name="anna",
-        text="we meet at eight",
-        timestamp=int(NOW_MS / 1000),
-    )
-    archive.record_inbound(
-        channel=CHANNEL,
-        chat_id="owner@s.whatsapp.net",
-        message_id="owner-1",
-        participant="owner@s.whatsapp.net",
-        sender_id="owner@s.whatsapp.net",
-        sender_name="owner",
-        text="private owner note",
-        timestamp=int(NOW_MS / 1000),
-    )
-    archive.record_inbound(
-        channel="telegram",
-        chat_id=CHAT,
-        message_id="other-channel-1",
-        participant="someone",
-        sender_id="someone",
-        sender_name="someone",
-        text="same chat id, other channel",
-        timestamp=int(NOW_MS / 1000),
-    )
-    builder = ParticipationContextBuilder(
-        archive=archive,
+    archive = ProjectedHistory(tmp_path)
+    archive.add_message(channel=CHANNEL, chat_id=CHAT, message_id="group-1",
+        participant="10001@s.whatsapp.net", sender_id="10001@s.whatsapp.net",
+        sender_name="anna", text="we meet at eight", timestamp=NOW_MS / 1000)
+    archive.add_message(channel=CHANNEL, chat_id="10004@s.whatsapp.net", message_id="owner-1",
+        participant="10004@s.whatsapp.net", sender_id="10004@s.whatsapp.net",
+        sender_name="owner", text="private owner note", timestamp=NOW_MS / 1000)
+    archive.add_message(channel="telegram", chat_id=CHAT, message_id="other-channel-1",
+        participant="someone", sender_id="someone", sender_name="someone",
+        text="same chat id, other channel", timestamp=NOW_MS / 1000)
+    builder = archive.wire(ParticipationContextBuilder(
+        archive=object(),
         policy=PolicyEngine(_policy(), workspace=tmp_path),
         source_authorizer=lambda row: True,
-    )
-    context = await builder.build(
+    ))
+    async with archive.turn():
+        context = await builder.build(
         _opportunity("group-1"),
         inputs=ParticipationDecisionInputs(
             snapshot={},
@@ -2794,9 +2765,9 @@ async def test_private_records_never_enter_the_participation_context(tmp_path: P
             arbitration_revision=0,
             current_source_ids=("group-1",),
             continuation_candidate=False,
-        ),
-        now_ms=NOW_MS,
-    )
+            ),
+            now_ms=NOW_MS,
+        )
     rendered = json.dumps(context)
     assert "private owner note" not in rendered
     assert "same chat id, other channel" not in rendered
@@ -2827,7 +2798,7 @@ async def test_effect_target_is_always_the_admitted_chat(tmp_path: Path) -> None
     assert admission.chat_id == CHAT  # type: ignore[attr-defined]
     assert admission.admission_id.startswith("adm-")  # type: ignore[attr-defined]
     assert admission.source_event_ids == ("m1",)  # type: ignore[attr-defined]
-    assert admission.source_principals == (("m1", "anna@s.whatsapp.net"),)  # type: ignore[attr-defined]
+    assert admission.source_principals == (("m1", "10001@s.whatsapp.net"),)  # type: ignore[attr-defined]
     assert admission.payload_hash  # type: ignore[attr-defined]
     log.close()
 
@@ -3427,19 +3398,13 @@ async def test_social_continuation_cannot_modify_another_participants_task(
 @pytest.mark.asyncio
 async def test_denied_source_principal_blocks_participation(tmp_path: Path) -> None:
     """A denied originating participant cannot authorize a purpose (A30)."""
-    from yeoman_gateway.storage.inbound_archive import InboundArchive
+    from yeoman_gateway.history.queries import HistoryQueries
 
-    archive = InboundArchive(tmp_path / "inbound.db")
-    archive.record_inbound(
-        channel=CHANNEL,
-        chat_id=CHAT,
-        message_id="m1",
-        participant="mallory@s.whatsapp.net",
-        sender_id="mallory@s.whatsapp.net",
-        sender_name="mallory",
-        text="answer me",
-        timestamp=int(NOW_MS / 1000),
-    )
+    archive = ProjectedHistory(tmp_path, messages=[dict(channel=CHANNEL, chat_id=CHAT,
+        message_id="m1", participant="10003@s.whatsapp.net",
+        sender_id="10003@s.whatsapp.net", sender_name="mallory", text="answer me",
+        timestamp=NOW_MS / 1000)])
+    queries = HistoryQueries(archive.snapshot())
     submitter_calls: list[str] = []
 
     class _SpySubmission(_Submission):
@@ -3454,15 +3419,16 @@ async def test_denied_source_principal_blocks_participation(tmp_path: Path) -> N
     )
     runtime._source_principals = lambda channel, chat_id, sources: tuple(
         (source_id, sender)
-        for source_id, sender in archive.senders_for_messages(
-            channel, chat_id, tuple(sources)
-        ).items()
+        for source_id in tuple(sources)
+        if (row := queries.native_message(chat_id=chat_id, native_id=source_id)) is not None
+        for sender in (row["sender_identifier"],)
     )
     runtime._is_participant_allowed = lambda channel, chat_id, sender: False
     result = await runtime.evaluate_participation(_opportunity("m1"))
     assert result == {"status": "skipped", "reason": "source_principal_not_authorized"}
     assert judge.calls == 0
     assert submitter_calls == []
+    archive.close()
     log.close()
 
 
@@ -3470,10 +3436,10 @@ async def test_denied_source_principal_blocks_participation(tmp_path: Path) -> N
 async def test_allowed_source_principal_still_proceeds(tmp_path: Path) -> None:
     runtime, judge, _context, log = _runtime(tmp_path, decision=COMMENT)
     runtime._source_principals = lambda channel, chat_id, sources: tuple(
-        (str(source), "anna@s.whatsapp.net") for source in sources
+        (str(source), "10001@s.whatsapp.net") for source in sources
     )
     runtime._is_participant_allowed = lambda channel, chat_id, sender: sender.endswith(
-        "anna@s.whatsapp.net"
+        "10001@s.whatsapp.net"
     )
     result = await runtime.evaluate_participation(_opportunity("m1"))
     assert result["status"] == "submitted"

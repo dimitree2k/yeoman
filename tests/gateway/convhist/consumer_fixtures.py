@@ -816,7 +816,6 @@ class ParityCase(IntegratedCase):
             archive_row,
             history_text,
         )
-        from yeoman_gateway.adapters.reply_archive_sqlite import SqliteReplyArchiveAdapter
         from yeoman_gateway.agent.tools.media_history import MediaHistoryTool
         from yeoman_gateway.agent.tools.recall_conversation import RecallConversationTool
         from yeoman_gateway.media.document_cache import DocumentCache
@@ -827,9 +826,7 @@ class ParityCase(IntegratedCase):
         )
         from yeoman_gateway.session.manager import SessionManager
         from yeoman_gateway.session.operational import OperationalSessions
-        from yeoman_gateway.storage.inbound_archive import InboundArchive
         self.checked, self.differences = [], []
-        archive = InboundArchive(self.root / 'legacy-inbound.db', retention_days=None)
         legacy = SessionManager(self.root, sessions_dir=self.root / 'legacy-sessions')
         operational = OperationalSessions(self.root / 'operational.db')
         selected = SessionManager(self.root, sessions_dir=self.root / 'selected-sessions',
@@ -848,27 +845,25 @@ class ParityCase(IntegratedCase):
                 for i, (mid, text) in enumerate(pairs):
                     payload = {'media': {'kind': 'image'}} if mid == 'p3' else {}
                     await self.add(mid, chat=chat, ms=MS+i*1000, text=text, **payload)
-                    archive.record_inbound(channel='whatsapp', chat_id=chat, message_id=mid,
-                        participant=PHONE, sender_id=PHONE, sender_name='Synthetic original',
-                        text=text, timestamp=(MS+i*1000)//1000)
                     session.add_message('user', text, message_id=mid, timestamp=MS+i*1000, sender_id=PHONE)
             cache.record_media_item(channel='whatsapp', chat_id=GROUP, message_id='p3',
                 sender_id=PHONE, sender_name='Synthetic original', kind='image', mime_type='image/png',
                 file_name='synthetic.png', local_path=self.root / 'synthetic.png', size_bytes=10,
                 timestamp=(MS+2000)//1000)
             before, until = datetime.fromtimestamp((MS-1)/1000, UTC), datetime.fromtimestamp((MS+5000)/1000, UTC)
-            old = SqliteReplyArchiveAdapter(archive)
             async with history_turn(self.projector) as snapshot:
                 q = HistoryQueries(snapshot)
                 new = HistoryReplyArchiveAdapter(q)
                 def fields(rows):
                     return [{key: row[key] for key in ('message_id', 'text', 'sender_id', 'sender_name', 'timestamp')}
                             for row in rows]
-                legacy_rows = archive.lookup_messages_in_range('whatsapp', GROUP, before, until)
+                legacy_rows = [dict(message_id=mid, text=text, sender_id=PHONE,
+                    sender_name='Synthetic original', timestamp=(MS+i*1000)//1000)
+                    for i, (mid, text) in enumerate(conversations[GROUP])]
+                # Retired-store baseline is literal fixture data; History remains the actual reader.
                 assert fields(new.lookup_messages_in_range('whatsapp', GROUP, before, until)) == fields(legacy_rows)
                 self.checked.extend(('recent', 'ambient'))
-                assert [x.message_id for x in new.lookup_messages_before('whatsapp', GROUP, 'p2', limit=10)] == [
-                    x.message_id for x in old.lookup_messages_before('whatsapp', GROUP, 'p2', limit=10)]
+                assert [x.message_id for x in new.lookup_messages_before('whatsapp', GROUP, 'p2', limit=10)] == ['p1']
                 assert [r['native_message_id'] for r in q.reply_window(chat_id=GROUP, native_id='p2', before=1, after=1)] == [r['message_id'] for r in legacy_rows]
                 self.checked.append('reply_before_after')
                 for chat in (GROUP, PHONE):
@@ -921,23 +916,19 @@ class ParityCase(IntegratedCase):
                 q = HistoryQueries(snapshot)
                 new = HistoryReplyArchiveAdapter(q)
                 assert new.lookup_message('whatsapp', GROUP, 'p1').text == 'Synthetic latest edited'
-                assert old.lookup_message('whatsapp', GROUP, 'p1').text == 'Synthetic alpha'
                 self.differences.append('latest_edit')
                 assert new.lookup_message('whatsapp', GROUP, 'p2') is None
-                assert old.lookup_message('whatsapp', GROUP, 'p2') is not None
                 self.differences.append('delete_purge')
                 row = q.native_message(chat_id=GROUP, native_id='p1')
-                assert row['sender_contact_id'] != old.lookup_message('whatsapp', GROUP, 'p1').sender_id
+                assert row['sender_contact_id'] != PHONE
                 assert q.terminal(row['sender_contact_id']) == row['sender_contact_id']
                 self.differences.append('typed_terminal_identity')
                 assert q.audience(row['message_id']).members == frozenset({self.author, self.member})
                 assert self.later in q.members(chat_id=GROUP, at_ms=MS+11000).members
                 self.differences.append('evidence_audience')
                 assert '[Derived transcript]: Synthetic transcript' in history_text(q.native_message(chat_id=GROUP, native_id='p3'))
-                assert 'transcript' not in old.lookup_message('whatsapp', GROUP, 'p3').text
                 self.differences.append('derived_label')
                 assert new.lookup_message_any_chat('whatsapp', 'd1', preferred_chat_id=GROUP) is None
-                assert old.lookup_message_any_chat('whatsapp', 'd1', preferred_chat_id=GROUP) is not None
                 self.differences.append('authorized_cross_chat')
                 assert new.lookup_message('whatsapp', GROUP, 'passive') is not None
                 assert not any(r.get('message_id') == 'passive' for r in legacy.get_or_create(f'whatsapp:{GROUP}').messages)
@@ -970,7 +961,6 @@ class ParityCase(IntegratedCase):
                 self.raw, PurgeSelector('whatsapp', chat_id=GROUP, native_id='p3'), operator='synthetic', projection_owner_fd=fd))
             with self.snapshot() as snapshot:
                 assert HistoryQueries(snapshot).media(chat_id=GROUP, limit=10) == []
-                assert old.lookup_message('whatsapp', GROUP, 'p3') is not None
                 token = set_tool_context(ToolInvocationContext(channel='whatsapp', chat_id=GROUP, history_snapshot=snapshot))
                 try:
                     assert 'No cached media' in await new_media.execute()
@@ -978,7 +968,6 @@ class ParityCase(IntegratedCase):
                     reset_tool_context(token)
                 assert 'message_id=p3' in await old_media.execute()
         finally:
-            archive.close()
             operational.close()
 
 

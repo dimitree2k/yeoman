@@ -57,14 +57,17 @@ def runtime(tmp_path: Path, monkeypatch: pytest.MonkeyPatch):
             return "test/provider"
 
     monkeypatch.setenv("YEOMAN_HOME", str(tmp_path))
+    from tests.gateway.history_test_helpers import prepare_history_retirement_knowledge
+
+    knowledge_path = prepare_history_retirement_knowledge(tmp_path)
     config = Config.model_validate(
         {
             "knowledge": {
                 "enabled": True,
-                "db_path": str(tmp_path / "knowledge.db"),
+                "db_path": str(knowledge_path),
+                "capture_enabled": False,
                 "legacy_contacts_paths": [str(tmp_path / "legacy-contacts.db")],
                 "legacy_memory_paths": [str(tmp_path / "legacy-memory.db")],
-                "capture_enabled": False,
             },
             "personaEvolution": {"enabled": False},
             "processing": {"enabled": False, "participation": {"enabled": False}},
@@ -72,7 +75,7 @@ def runtime(tmp_path: Path, monkeypatch: pytest.MonkeyPatch):
         }
     )
     # Hermeticity: an unchecked field name would fall back to the real default paths.
-    assert Path(config.knowledge.db_path).expanduser() == tmp_path / "knowledge.db"
+    assert Path(config.knowledge.db_path).expanduser() == knowledge_path
 
     built = build_gateway_runtime(
         config=config,
@@ -85,10 +88,9 @@ def runtime(tmp_path: Path, monkeypatch: pytest.MonkeyPatch):
     try:
         yield built
     finally:
-        built.inbound_archive.close()
-        built.chat_registry.close()
-        built.contacts.close()
-        built.memory.close()
+        for store in (built.inbound_archive, built.chat_registry, built.contacts, built.memory):
+            if store is not None:
+                store.close()
 
 
 def _contacts_layer(runtime) -> ContactsMiddleware:
@@ -148,6 +150,34 @@ async def _resolve(layer: ContactsMiddleware, event: InboundEvent) -> PipelineCo
     return ctx
 
 
+async def _history_events(runtime, events, callback):
+    from yeoman_gateway.history.context import history_knowledge_scope, history_turn
+    from yeoman_gateway.history.project import project
+    from yeoman_shared.raw_archive.writer import RawEvent
+
+    archive = runtime.channels.raw_archive
+    projector = runtime.history_projector
+    for message_id in events:
+        archive.append_durable(RawEvent(
+            channel="whatsapp", kind="message", direction="in", received_ms=OBSERVED_AT_MS,
+            native={"type": "message", "payload": {
+                "chatJid": CHAT, "messageId": message_id, "participantJid": LID,
+                "senderId": LID, "senderPhoneJid": PHONE_JID,
+                "text": "synthetic text", "timestamp": OBSERVED_AT_MS // 1000,
+            }},
+        ))
+    project([archive.root], projector.db_path, publish_lineage_root=archive.root)
+    await projector.start()
+    if projector._startup_task is not None:
+        await projector._startup_task
+    try:
+        async with history_turn(projector) as snapshot:
+            with history_knowledge_scope(snapshot, runtime.responder.knowledge):
+                return await callback(snapshot)
+    finally:
+        await projector.stop()
+
+
 def _identifier(kind: str, value: str) -> Identifier:
     return Identifier(channel="whatsapp", kind=kind, value=value, namespace=BRIDGE_ACCOUNT)
 
@@ -155,27 +185,29 @@ def _identifier(kind: str, value: str) -> Identifier:
 @pytest.mark.asyncio
 async def test_the_live_composition_creates_a_person_for_an_unknown_sender(runtime) -> None:
     layer = _contacts_layer(runtime)
-    knowledge = runtime.responder.knowledge
+    async def check(snapshot):
+        from yeoman_gateway.history.queries import HistoryQueries
 
-    ctx = await _resolve(layer, await _bus_event(_whatsapp_event("SYN-MSG-1")))
-
-    person_id = ctx.event.raw_metadata.get("contact_id")
-    assert person_id, "a proven, unknown sender must get a person"
-    for kind, value in (("phone_jid", PHONE_JID), ("lid", LID)):
-        resolution = knowledge.resolve_identifier(_identifier(kind, value))
-        assert resolution.person_id == person_id, f"{kind} must be bound in the bridge account"
+        ctx = await _resolve(layer, await _bus_event(_whatsapp_event("SYN-MSG-1")))
+        person_id = ctx.event.raw_metadata.get("contact_id")
+        assert person_id, "a proven sender must resolve from the selected history"
+        queries = HistoryQueries(snapshot)
+        for value in (PHONE_JID, LID):
+            assert queries.resolve_identifier(value, at_ms=OBSERVED_AT_MS, time_basis="native") == person_id
+        assert ctx.event.raw_metadata.get("account_id") == BRIDGE_ACCOUNT
+    await _history_events(runtime, ("SYN-MSG-1",), check)
 
 
 @pytest.mark.asyncio
 async def test_a_known_sender_resolves_to_the_same_person_on_the_next_message(runtime) -> None:
     layer = _contacts_layer(runtime)
-
-    first = await _resolve(layer, await _bus_event(_whatsapp_event("SYN-MSG-1")))
-    second = await _resolve(layer, await _bus_event(_whatsapp_event("SYN-MSG-2")))
-
-    assert first.event.raw_metadata.get("contact_id")
-    assert second.event.raw_metadata.get("contact_id") == first.event.raw_metadata["contact_id"]
-    assert second.event.raw_metadata.get("identity_reason") == "existing_binding"
+    async def check(_snapshot):
+        first = await _resolve(layer, await _bus_event(_whatsapp_event("SYN-MSG-1")))
+        second = await _resolve(layer, await _bus_event(_whatsapp_event("SYN-MSG-2")))
+        assert first.event.raw_metadata.get("contact_id")
+        assert second.event.raw_metadata.get("contact_id") == first.event.raw_metadata["contact_id"]
+        assert second.event.raw_metadata.get("identity_reason") == "history"
+    await _history_events(runtime, ("SYN-MSG-1", "SYN-MSG-2"), check)
 
 
 @pytest.mark.asyncio

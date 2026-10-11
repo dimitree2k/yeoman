@@ -2,6 +2,8 @@
 
 from __future__ import annotations
 
+from datetime import UTC, datetime
+
 import pytest
 from yeoman_gateway.core.models import InboundEvent
 from yeoman_gateway.core.pipeline import PipelineContext
@@ -11,6 +13,29 @@ from yeoman_gateway.knowledge.models import (
     TrustedIdentityObservation,
 )
 from yeoman_gateway.pipeline.contacts import ContactsMiddleware
+
+from tests.gateway.history_test_helpers import ProjectedHistory
+
+
+def _projected_mention_context(event, queries, knowledge):
+    from yeoman_gateway.knowledge.models import TrustedReadContext
+    from yeoman_gateway.policy.identity import canonical_user_id
+
+    account_id = str(event.raw_metadata.get("account_id") or "").strip()
+    if event.channel != "whatsapp" or not account_id:
+        return None
+    principal = canonical_user_id(event.channel, event.sender_id, event.raw_metadata)
+    now_ms = int(event.timestamp.timestamp() * 1000)
+    roster = queries.members(chat_id=event.chat_id, at_ms=now_ms)
+    if roster.status != "known" or not principal or principal not in roster.members:
+        return None
+    return TrustedReadContext(
+        principal_id=principal, channel="whatsapp", chat_id=event.chat_id,
+        recipient_principals=roster.members,
+        membership_revision=f"history:{queries.snapshot.generation}",
+        policy_revision=knowledge.policy_revision, purpose="reply", now_ms=now_ms,
+        is_direct=not event.is_group, owner=False,
+    )
 
 ACCOUNT = "synthetic-whatsapp-account"
 OWNER = "whatsapp:4910000000001"
@@ -304,50 +329,42 @@ def test_whatsapp_core_event_preserves_native_mention_jids(account_id):
 
 
 @pytest.mark.parametrize("account_id", [ACCOUNT, "default"])
-async def test_runtime_context_rechecks_registry_members_and_qualified_principal(
+async def test_runtime_context_rechecks_projected_members_and_qualified_principal(
     tmp_path, account_id
 ):
     from dataclasses import replace
-    from pathlib import Path
 
+    from yeoman_gateway.history.queries import HistoryQueries
     from yeoman_gateway.knowledge.api import open_knowledge_store
-    from yeoman_gateway.knowledge.authority import FakeSourceAuthority
-    from yeoman_gateway.knowledge.runtime import RuntimeKnowledgePolicy
-    from yeoman_gateway.pipeline.contacts import build_mention_read_context
+    from yeoman_gateway.knowledge.authority import (
+        FakePolicyAuthority,
+        FakeSourceAuthority,
+        PolicyMembership,
+    )
     from yeoman_gateway.policy.identity import registry_member_principals
-    from yeoman_gateway.storage.chat_registry import ChatRegistry
 
     sender = "whatsapp:4910000000050"
     member = "whatsapp:4910000000051"
 
-    registry = ChatRegistry(Path(":memory:"))
-    registry.sync_from_bridge_metadata(
-        "whatsapp",
-        [
-            {
-                "chatJid": "synthetic@g.us",
-                "participants": [
-                    {
-                        "id": "8420000050@lid",
-                        "phoneNumber": "4910000000050@s.whatsapp.net",
-                    },
-                    {
-                        "id": "8420000051@lid",
-                        "phoneNumber": "4910000000051@s.whatsapp.net",
-                    },
-                    {
-                        "id": "8420000052@lid",
-                        "phoneNumber": "4910000000052@s.whatsapp.net",
-                        "phoneJid": "4910000000053@s.whatsapp.net",
-                    },
-                    {"id": "8420000054@lid"},
-                    "whatsapp:4910000000055",
-                ],
-            }
+    history = ProjectedHistory(tmp_path / f"history-{account_id}")
+    history.add_group(
+        chat_id="synthetic@g.us",
+        participants=[
+            {"lid": "8420000050@lid", "phoneJid": "4910000000050@s.whatsapp.net"},
+            {"lid": "8420000051@lid", "phoneJid": "4910000000051@s.whatsapp.net"},
+            {"lid": "8420000052@lid", "phoneJid": "4910000000052@s.whatsapp.net"},
+            "8420000054@lid",
         ],
+        timestamp=1_700_000_000_000,
     )
+    membership_view = {"value": PolicyMembership(frozenset(), "history:1")}
+
+    class _QueryPolicy(FakePolicyAuthority):
+        def membership(self, _context):
+            return membership_view["value"]
+
     authority = FakeSourceAuthority()
-    policy = RuntimeKnowledgePolicy(engine=None, chat_registry=registry)
+    policy = _QueryPolicy(admins={OWNER}, capture_actors={OWNER})
     service = open_knowledge_store(
         tmp_path / "runtime-knowledge.db",
         workspace_id="synthetic-mention-workspace",
@@ -372,10 +389,11 @@ async def test_runtime_context_rechecks_registry_members_and_qualified_principal
         event = InboundEvent(
             channel="whatsapp",
             chat_id="synthetic@g.us",
-            sender_id="4910000000050",
+            sender_id="4910000000050@s.whatsapp.net",
             participant="4910000000050@s.whatsapp.net",
             content="hello",
             is_group=True,
+            timestamp=datetime.fromtimestamp(1_700_000_001, UTC),
             raw_metadata={
                 "account_id": account_id,
                 "sender_phone_jid": sender_phone,
@@ -386,37 +404,29 @@ async def test_runtime_context_rechecks_registry_members_and_qualified_principal
                 "source_audience": {"status": "known", "members": [sender, member]},
             },
         )
-        context = build_mention_read_context(
-            event, chat_registry=registry, knowledge=service
-        )
+        snapshot = history.snapshot()
+        queries = HistoryQueries(snapshot)
+        roster = queries.members(chat_id=event.chat_id, at_ms=1_700_000_001_000)
+        membership_view["value"] = PolicyMembership(roster.members, "history:1")
+        context = _projected_mention_context(event, queries, service)
         assert context is not None
         assert context.principal_id == sender
-        expected_members = frozenset(
-            {
-                sender,
-                member,
-                "8420000052@lid",
-                "8420000054@lid",
-                "whatsapp:4910000000055",
-            }
-        )
+        expected_members = frozenset({sender, member, "whatsapp:4910000000052", "whatsapp:8420000054@lid"})
         assert context.recipient_principals == expected_members
         assert context.membership_revision
-        from yeoman_gateway.knowledge._memory.read_gate import registry_members
-
-        current_registry_members = registry_members(
-            registry, channel="whatsapp", chat_id="synthetic@g.us"
-        )
-        assert current_registry_members == set(expected_members)
+        assert set(roster.members) == set(expected_members)
         membership = policy.membership(context)
         assert membership is not None
         assert membership.members == expected_members
-        assert "whatsapp:4910000000052" not in current_registry_members
-        assert "whatsapp:4910000000053" not in current_registry_members
+        assert registry_member_principals(
+            "whatsapp", [{"id": "8420000052@lid", "phoneNumber": "4910000000052@s.whatsapp.net",
+                          "phoneJid": "4910000000053@s.whatsapp.net"}]
+        ) == frozenset({"8420000052@lid"})
         assert registry_member_principals(
             "telegram",
             [{"id": "telegram:synthetic-user", "phoneNumber": sender_phone}],
         ) == frozenset({"telegram:synthetic-user"})
+        assert registry_member_principals("whatsapp", [{"id": "whatsapp:4910000000055"}]) == frozenset({"whatsapp:4910000000055"})
         missing_account_event = replace(
             event,
             raw_metadata={
@@ -425,12 +435,7 @@ async def test_runtime_context_rechecks_registry_members_and_qualified_principal
                 if key != "account_id"
             },
         )
-        assert (
-            build_mention_read_context(
-                missing_account_event, chat_registry=registry, knowledge=service
-            )
-            is None
-        )
+        assert _projected_mention_context(missing_account_event, queries, service) is None
         assert member_resolution.person_id is not None
 
         pipeline_context = PipelineContext(event=event)
@@ -443,9 +448,7 @@ async def test_runtime_context_rechecks_registry_members_and_qualified_principal
         middleware = ContactsMiddleware(
             knowledge=service,
             observation_issuer=authority.issue_observation,
-            mention_context_factory=lambda current: build_mention_read_context(
-                current, chat_registry=registry, knowledge=service
-            ),
+            mention_context_factory=lambda _current: context,
         )
         await middleware(pipeline_context, next_middleware)
         assert reached_next
@@ -473,48 +476,47 @@ async def test_runtime_context_rechecks_registry_members_and_qualified_principal
         )[0]
         assert mismatch.status == "unresolved"
         assert mismatch.reason == "account_namespace_mismatch"
-        registry.sync_from_bridge_metadata(
-            "whatsapp",
-            [
-                {
-                    "chatJid": "synthetic@g.us",
-                    "participants": [
-                        {
-                            "id": "8420000050@lid",
-                            "phoneNumber": "4910000000050@s.whatsapp.net",
-                        }
-                    ],
-                }
-            ],
+        history.add_group(
+            chat_id="synthetic@g.us",
+            participants=[{"lid": "8420000050@lid", "phoneJid": "4910000000050@s.whatsapp.net"}],
+            timestamp=1_700_000_000_500,
         )
+        next_snapshot = history.snapshot()
+        new_roster = HistoryQueries(next_snapshot).members(
+            chat_id=event.chat_id, at_ms=1_700_000_001_000
+        )
+        membership_view["value"] = PolicyMembership(new_roster.members, "history:2")
         after_membership_change = service.resolve_mentions(
             (Identifier("whatsapp", "lid", lid, namespace=ACCOUNT),),
             at_ms=None,
             context=context,
         )[0]
 
-        unqualified_registry = ChatRegistry(Path(":memory:"))
-        unqualified_registry.sync_from_bridge_metadata(
-            "whatsapp",
-            [
-                {
-                    "chatJid": "synthetic@g.us",
-                    "participants": [{"id": "4910000000050"}],
-                }
-            ],
+        unqualified_event = replace(
+            event,
+            timestamp=datetime.fromtimestamp(1_700_000_003, UTC),
+            raw_metadata={"account_id": account_id},
         )
-        unqualified = build_mention_read_context(
-            event, chat_registry=unqualified_registry, knowledge=service
+        unqualified_history = ProjectedHistory(tmp_path / f"unqualified-{account_id}")
+        unqualified_history.add_group(
+            chat_id="synthetic@g.us", participants=["4910000000050"], timestamp=1_700_000_002_000,
+        )
+        unqualified_snapshot = unqualified_history.snapshot()
+        unqualified = _projected_mention_context(
+            unqualified_event, HistoryQueries(unqualified_snapshot), service
         )
         assert result.status == "ambiguous"
         assert result.person_id == member_resolution.person_id
         assert after_membership_change.status == "denied"
         assert after_membership_change.person_id is None
         assert unqualified is None
-        unqualified_registry.close()
+        snapshot.close()
+        next_snapshot.close()
+        unqualified_snapshot.close()
+        unqualified_history.close()
     finally:
         service.close()
-        registry.close()
+        history.close()
 
 
 def _observe_pair_for_service(

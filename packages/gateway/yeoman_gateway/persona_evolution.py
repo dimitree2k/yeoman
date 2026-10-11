@@ -8,7 +8,7 @@ import re
 import sqlite3
 import uuid
 from collections.abc import Callable
-from dataclasses import dataclass, field
+from dataclasses import dataclass, field, replace
 from datetime import UTC, datetime, timedelta
 from pathlib import Path
 from typing import TYPE_CHECKING, Any
@@ -21,7 +21,6 @@ if TYPE_CHECKING:  # the persona path consumes the facade's ranking results, not
     from yeoman_gateway.knowledge._memory.service import MemoryService
 from yeoman_gateway.policy.persona import resolve_persona_path
 from yeoman_gateway.policy.schema import PolicyConfig
-from yeoman_gateway.storage.inbound_archive import InboundArchive
 
 PERSONA_EVOLUTION_PROPOSAL_TTL_SECONDS = 24 * 60 * 60
 PERSONA_EVOLUTION_ALLOWED_SECTIONS = {
@@ -920,7 +919,7 @@ async def collect_persona_evolution_evidence(
     persona_file: str,
     memory: "MemoryService",
     speakup_log: SpeakupLog,
-    inbound_archive: InboundArchive,
+    inbound_archive: Any,
     window_days: int = 14,
     per_chat_limit: int = 20,
     since: datetime | None = None,
@@ -977,6 +976,7 @@ async def collect_persona_evolution_evidence(
             if knowledge is None:
                 raise HistoryPaused('secondary_knowledge_required')
             context = knowledge.owner_read_context(channel=chat.channel, chat_id=chat.chat_id)
+            context = replace(context, is_direct=not chat.chat_id.endswith("@g.us"))
             preferences = knowledge.recall(RecallQuery(limit=min(50, per_chat_limit)), context=context)
             preference_texts = list(preferences.entry_texts)
         else:
@@ -1286,7 +1286,7 @@ async def run_persona_evolution_cron(
     persona_file: str,
     memory: "MemoryService",
     speakup_log: SpeakupLog,
-    inbound_archive: InboundArchive,
+    inbound_archive: Any,
     window_days: int = 1,
     limit: int = 20,
     output_path: Path | None = None,

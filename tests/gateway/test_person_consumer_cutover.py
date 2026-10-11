@@ -14,7 +14,7 @@ from datetime import UTC, datetime
 from pathlib import Path
 
 import pytest
-from yeoman_gateway.adapters.reply_archive_sqlite import SqliteReplyArchiveAdapter
+from yeoman_gateway.adapters.reply_archive_history import HistoryReplyArchiveAdapter
 from yeoman_gateway.agent.tools.resolve_contact import (
     ResolveContactTool,
     resolve_contact_reference,
@@ -22,12 +22,13 @@ from yeoman_gateway.agent.tools.resolve_contact import (
 from yeoman_gateway.core.intents import SendOutboundIntent
 from yeoman_gateway.core.models import InboundEvent
 from yeoman_gateway.core.pipeline import PipelineContext
+from yeoman_gateway.history.queries import HistoryQueries
 from yeoman_gateway.ipc.a2a_invoke import resolve_whatsapp_recipient
 from yeoman_gateway.knowledge.models import Identifier
 from yeoman_gateway.pipeline.outbound import OutboundMiddleware
 from yeoman_gateway.pipeline.reply_context import ReplyContextMiddleware
-from yeoman_gateway.storage.chat_registry import ChatRegistry
-from yeoman_gateway.storage.inbound_archive import InboundArchive
+
+from tests.gateway.history_test_helpers import ProjectedHistory
 
 OWNER = "whatsapp:4910000000001"
 FRANK_PHONE = "4917632625469@s.whatsapp.net"
@@ -161,16 +162,6 @@ def _event(**overrides: object) -> InboundEvent:
     return InboundEvent(**defaults)
 
 
-def _registry(tmp_path: Path) -> ChatRegistry:
-    registry = ChatRegistry(db_path=tmp_path / "chat_registry.db")
-    registry.register_chat(
-        channel="whatsapp",
-        chat_id=CHAT,
-        chat_type="group",
-        readable_name="Finanzgruppe",
-        metadata={"participants": [{"id": FRANK_LID, "phoneNumber": FRANK_PHONE}]},
-    )
-    return registry
 
 
 # ── resolve_contact: the responder's delivery resolver ─────────────────────────
@@ -228,7 +219,7 @@ async def test_the_tool_reports_an_unresolved_person_instead_of_a_legacy_match(
     tool = ResolveContactTool(
         contacts=_PoisonedLegacyContacts(),
         knowledge=knowledge,
-        chat_registry=_registry(tmp_path),
+        chat_registry=None,
     )
     tool.set_context("whatsapp", CHAT)
 
@@ -301,10 +292,11 @@ async def test_a_mention_of_an_unproven_name_adds_no_candidate(knowledge) -> Non
 async def test_reply_context_speakers_come_from_proven_bindings(
     knowledge, tmp_path: Path
 ) -> None:
-    archive = InboundArchive(db_path=tmp_path / "reply_archive.db")
+    archive = ProjectedHistory(tmp_path / "reply-history")
     knowledge.issue_person(FRANK_PHONE, name="Frank Taeger")
+    archive.add_contact(identifiers=[FRANK_PHONE], name="Frank Taeger", timestamp=1)
     base = int(datetime.now(UTC).timestamp()) - 600
-    archive.record_inbound(
+    archive.add_message(
         channel="whatsapp",
         chat_id=CHAT,
         message_id="m-1",
@@ -314,7 +306,7 @@ async def test_reply_context_speakers_come_from_proven_bindings(
         timestamp=base,
         sender_name="push-name-must-not-win",
     )
-    archive.record_inbound(
+    archive.add_message(
         channel="whatsapp",
         chat_id=CHAT,
         message_id="msg-002",
@@ -325,7 +317,7 @@ async def test_reply_context_speakers_come_from_proven_bindings(
         sender_name="someone else",
     )
     middleware = ReplyContextMiddleware(
-        archive=SqliteReplyArchiveAdapter(archive),
+        archive=HistoryReplyArchiveAdapter(HistoryQueries(archive.snapshot())),
         contacts=_PoisonedLegacyContacts(),
         knowledge=knowledge,
     )
@@ -497,11 +489,14 @@ def test_the_knowledge_composition_does_not_hand_the_legacy_cache_to_consumers(
             return "test/provider"
 
     monkeypatch.setenv("YEOMAN_HOME", str(tmp_path))
+    from tests.gateway.history_test_helpers import prepare_history_retirement_knowledge
+
+    knowledge_path = prepare_history_retirement_knowledge(tmp_path)
     config = Config.model_validate(
         {
             "knowledge": {
                 "enabled": True,
-                "db_path": str(tmp_path / "knowledge.db"),
+                "db_path": str(knowledge_path),
                 "legacy_contacts_paths": [str(tmp_path / "legacy-contacts.db")],
                 "legacy_memory_paths": [str(tmp_path / "legacy-memory.db")],
                 "capture_enabled": False,
@@ -514,7 +509,7 @@ def test_the_knowledge_composition_does_not_hand_the_legacy_cache_to_consumers(
     # Hermeticity first: an unchecked field name would silently fall back to the real
     # default paths, and this test must never go near a live store.
     assert config.knowledge.enabled is True
-    assert Path(config.knowledge.db_path).expanduser() == tmp_path / "knowledge.db"
+    assert Path(config.knowledge.db_path).expanduser() == knowledge_path
     assert [Path(item).expanduser() for item in config.knowledge.legacy_contacts_paths] == [
         tmp_path / "legacy-contacts.db"
     ]
@@ -534,7 +529,7 @@ def test_the_knowledge_composition_does_not_hand_the_legacy_cache_to_consumers(
     try:
         assert runtime.responder.knowledge is not None, "the facade must be the authority"
         assert runtime.responder.contacts_service is None, "no second, unproven cache"
-        assert runtime.contacts is not None, "...but the service still owns its lifecycle"
+        assert runtime.contacts is None, "retired legacy contacts must stay unconstructed"
 
         # The pipeline layers are built from the same value: neither the reply-context nor
         # the outbound middleware receives the legacy cache in this composition.
@@ -550,10 +545,9 @@ def test_the_knowledge_composition_does_not_hand_the_legacy_cache_to_consumers(
             assert getattr(layer, "_knowledge", None) is not None
             assert getattr(layer, "_contacts", None) is None
     finally:
-        runtime.inbound_archive.close()
-        runtime.chat_registry.close()
-        runtime.contacts.close()
-        runtime.memory.close()
+        for store in (runtime.inbound_archive, runtime.chat_registry, runtime.contacts, runtime.memory):
+            if store is not None:
+                store.close()
 
 
 @pytest.mark.asyncio
@@ -574,9 +568,9 @@ async def test_an_outage_costs_the_mention_but_never_the_reply(knowledge) -> Non
 async def test_an_outage_still_renders_the_archive_name_in_reply_context(
     knowledge, tmp_path: Path
 ) -> None:
-    archive = InboundArchive(db_path=tmp_path / "outage_archive.db")
+    archive = ProjectedHistory(tmp_path / "outage-history")
     base = int(datetime.now(UTC).timestamp()) - 600
-    archive.record_inbound(
+    archive.add_message(
         channel="whatsapp",
         chat_id=CHAT,
         message_id="m-1",
@@ -586,7 +580,7 @@ async def test_an_outage_still_renders_the_archive_name_in_reply_context(
         timestamp=base,
         sender_name="archive-name",
     )
-    archive.record_inbound(
+    archive.add_message(
         channel="whatsapp",
         chat_id=CHAT,
         message_id="msg-002",
@@ -597,7 +591,7 @@ async def test_an_outage_still_renders_the_archive_name_in_reply_context(
         sender_name="someone else",
     )
     middleware = ReplyContextMiddleware(
-        archive=SqliteReplyArchiveAdapter(archive),
+        archive=HistoryReplyArchiveAdapter(HistoryQueries(archive.snapshot())),
         contacts=_PoisonedLegacyContacts(),
         knowledge=_BrokenKnowledge(),
     )

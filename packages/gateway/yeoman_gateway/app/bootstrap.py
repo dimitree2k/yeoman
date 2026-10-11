@@ -20,7 +20,6 @@ from yeoman_shared.telemetry import InMemoryTelemetry, tracing
 
 from yeoman_gateway.a2a.registry import A2AWorkerRegistry
 from yeoman_gateway.adapters.policy_engine import EnginePolicyAdapter
-from yeoman_gateway.adapters.reply_archive_sqlite import SqliteReplyArchiveAdapter
 from yeoman_gateway.adapters.responder_llm import LLMResponder
 from yeoman_gateway.adapters.typing_channel_manager import ChannelManagerTypingAdapter
 from yeoman_gateway.agent.tools.file_access import build_file_access_resolver
@@ -76,7 +75,6 @@ from yeoman_gateway.providers.factory import ProviderFactory
 from yeoman_gateway.providers.openai_compatible import resolve_openai_compatible_credentials
 from yeoman_gateway.security import NoopSecurity, SecurityEngine
 from yeoman_gateway.session.manager import SessionManager
-from yeoman_gateway.storage.inbound_archive import InboundArchive
 from yeoman_gateway.storage.private_handoff import PrivateHandoffStore
 
 if TYPE_CHECKING:
@@ -510,7 +508,7 @@ class GatewayRuntime:
     channels: ChannelManager
     cron: CronService
     heartbeat: HeartbeatService
-    inbound_archive: InboundArchive | None
+    inbound_archive: Any | None
     responder: LLMResponder
     memory: MemoryService | None
     contacts: ContactsService | None
@@ -637,12 +635,8 @@ class GatewayRuntime:
                     # cleanup (including the store fence) still runs below.
                     retention_error = exc
             await attempt_async(self.responder.aclose)
-            if self.inbound_archive is not None:
-                attempt_sync(self.inbound_archive.close)
             if self.speakup_log is not None and hasattr(self.speakup_log, "close"):
                 attempt_sync(self.speakup_log.close)
-            if hasattr(self.chat_registry, "close"):
-                attempt_sync(self.chat_registry.close)
             if self.shared_facts is not None and hasattr(self.shared_facts, "stop"):
                 attempt_sync(self.shared_facts.stop)
             if self.statement_capture is not None and hasattr(self.statement_capture, "stop"):
@@ -1546,13 +1540,22 @@ def _build_participation_runtime(
     def _source_principals(
         channel: str, chat_id: str, sources: object
     ) -> tuple[tuple[str, str], ...]:
-        if inbound_archive is None or not hasattr(inbound_archive, "senders_for_messages"):
-            return ()
-        try:
-            senders = inbound_archive.senders_for_messages(  # type: ignore[attr-defined]
-                channel, chat_id, tuple(str(item) for item in sources)  # type: ignore[arg-type]
-            )
-        except Exception:
+        if config.history.live_projection_enabled and config.history.readers.participation:
+            from yeoman_gateway.adapters.reply_archive_history import HistoryReplyArchiveAdapter
+            from yeoman_gateway.history.context import current_history_snapshot
+            from yeoman_gateway.history.queries import HistoryQueries
+
+            snapshot = current_history_snapshot()
+            if snapshot is None:
+                return ()
+            archive = HistoryReplyArchiveAdapter(HistoryQueries(snapshot))
+            senders = {}
+            for source in sources:  # type: ignore[union-attr]
+                source_id = str(source)
+                row = archive.row(channel, chat_id, source_id)
+                if row is not None and row["sender_id"]:
+                    senders[source_id] = row["sender_id"]
+        else:
             return ()
         return tuple(
             sorted(
@@ -2551,16 +2554,6 @@ def build_effect_router(
                     row = archive.row(channel, chat_id, source_id)
                     if row is not None and row['sender_id']:
                         current_senders[source_id] = str(row['sender_id'])
-        elif inbound_archive is not None and hasattr(inbound_archive, "senders_for_messages"):
-            try:
-                current_senders = {
-                    str(key): str(value)
-                    for key, value in inbound_archive.senders_for_messages(
-                        channel, chat_id, source_ids
-                    ).items()
-                }
-            except Exception:
-                current_senders = {}
         exact_sources = bool(
             source_ids
             and len(expected_senders) == len(source_ids)
@@ -2825,7 +2818,10 @@ def build_effect_router(
 def _validate_legacy_writer_retirement(config: "Config") -> None:
     """Validate the prepared replacement set and durable handover before writers exist."""
     if config.history.legacy_writers_disabled is not True:
-        return
+        raise ValueError(
+            "history.legacyWritersDisabled=false is unsupported; "
+            "set history.legacyWritersDisabled=true to use the history cutover"
+        )
     import json
     import sqlite3
 
@@ -2920,12 +2916,7 @@ def build_gateway_runtime(
     session_manager = SessionManager(workspace,
         history_selected=config.history.live_projection_enabled and config.history.readers.responder,
         legacy_history_disabled=config.history.legacy_writers_disabled)
-    # The owner wants a complete inbound record: keep every message, purge nothing.
-    inbound_archive = None if legacy_history_disabled else InboundArchive(
-        db_path=get_operational_data_path() / "inbound" / "reply_context.db",
-        retention_days=None,
-        legacy_history_disabled=legacy_history_disabled,
-    )
+    inbound_archive = None
     model_router = ModelRouter(config.models)
     media_storage = MediaStorage(
         incoming_dir=config.channels.whatsapp.media.incoming_path,
@@ -2975,12 +2966,8 @@ def build_gateway_runtime(
         except Exception as exc:
             logger.warning("security classifier disabled: {}", exc)
 
-    from yeoman_gateway.storage.chat_registry import ChatRegistry
 
-    chat_registry = None if legacy_history_disabled else ChatRegistry(
-        db_path=get_operational_data_path() / "inbound" / "chat_registry.db",
-        legacy_history_disabled=legacy_history_disabled,
-    )
+    chat_registry = None
 
     # ── knowledge storage ownership ──────────────────────────────────────────
     # With knowledge.enabled the consolidated store is the *only* writer: the memory
@@ -3346,7 +3333,6 @@ def build_gateway_runtime(
         config,
         bus,
         session_manager=session_manager,
-        inbound_archive=inbound_archive,
         model_router=model_router,
         media_storage=media_storage,
         provider_factory=provider_factory,
@@ -3467,7 +3453,7 @@ def build_gateway_runtime(
         if next_job.payload.next_job_id and response and not is_chain_failure(response):
             await _handle_chain(next_job, response, run_id)
 
-    archive_adapter = SqliteReplyArchiveAdapter(inbound_archive, legacy_history_disabled=legacy_history_disabled)
+    archive_adapter = None
     opportunity_scheduler: object | None = None
 
     def _release_participation_chat(channel: str, chat_id: str) -> None:
@@ -4468,78 +4454,6 @@ def build_gateway_runtime(
         assert consciousness_tools is not None
 
         participation_material = None
-        if participation_enabled:
-            resolve_sources = getattr(inbound_archive, "resolve_source_ids", None)
-            ensure_revisions = getattr(speakup_log, "ensure_source_revisions_sync", None)
-            read_material = getattr(speakup_log, "material_for_opportunity", None)
-            baseline_material = getattr(
-                speakup_log, "initialize_material_baseline_sync", None
-            )
-            if all(
-                callable(item)
-                for item in (
-                    resolve_sources,
-                    ensure_revisions,
-                    read_material,
-                    baseline_material,
-                )
-            ):
-                targets = {
-                    str(item).strip()
-                    for item in (
-                        *config.processing.chats,
-                        *config.processing.shadow_chats,
-                    )
-                    if str(item).strip()
-                }
-                for target in sorted(targets):
-                    channel, separator, chat_id = target.partition(":")
-                    if separator and channel and chat_id:
-                        baseline_material(
-                            channel=channel,
-                            chat_id=chat_id,
-                            source_ids=resolve_sources(channel, chat_id, None),
-                        )
-
-                def _participation_material(
-                    channel: str,
-                    chat_id: str,
-                    source_ids: tuple[str, ...] | None,
-                ) -> tuple[tuple[str, ...], int]:
-                    current = getattr(policy_adapter, "current_activation", None)
-                    snapshot = current(channel, chat_id) if callable(current) else None
-                    if snapshot is None:
-                        return (), 0
-                    lane = str(getattr(snapshot, "lane", "production"))
-                    resolved = resolve_sources(channel, chat_id, source_ids)
-                    senders = inbound_archive.senders_for_messages(
-                        channel, chat_id, tuple(resolved)
-                    )
-                    resolved = tuple(
-                        source_id
-                        for source_id in resolved
-                        if participant_is_allowed(
-                            engine=policy_engine,
-                            channel=channel,
-                            chat_id=chat_id,
-                            sender=str(senders.get(source_id) or ""),
-                        )
-                    )
-                    if resolved:
-                        ensure_revisions(
-                            channel=channel,
-                            chat_id=chat_id,
-                            source_ids=resolved,
-                        )
-                    return read_material(
-                        channel,
-                        chat_id,
-                        resolved,
-                        lane=lane,
-                    )
-
-                participation_material = _participation_material
-
         source_owner = SourceOwner(store=speakup_log)
         if participation_enabled:
             participation_runtime, opportunity_scheduler, participation_decision = (

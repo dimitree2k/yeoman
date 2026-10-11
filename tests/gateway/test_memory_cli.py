@@ -2,6 +2,7 @@ from __future__ import annotations
 
 from pathlib import Path
 
+import pytest
 from typer.testing import CliRunner
 from yeoman_gateway.cli.commands import app
 from yeoman_shared.config.loader import save_config
@@ -10,12 +11,22 @@ from yeoman_shared.config.schema import Config
 runner = CliRunner()
 
 
+@pytest.fixture(autouse=True)
+def isolated_memory_cli_config(tmp_path, monkeypatch):
+    # Retained S3 service units must not change the worker's live-default config.
+    monkeypatch.setattr("yeoman_shared.config.loader.get_config_path", lambda: tmp_path / "config.json")
+
+
+
 def test_memory_cli_commands_end_to_end(tmp_path: Path, monkeypatch) -> None:
     home = tmp_path / "home"
     home.mkdir()
     monkeypatch.setenv("HOME", str(home))
 
     cfg = Config()
+    cfg.history.legacy_writers_disabled = False
+    cfg.history.live_projection_enabled = False
+    cfg.history.readers.secondary = False
     save_config(cfg)
 
     add = runner.invoke(

@@ -31,6 +31,8 @@ from yeoman_gateway.session.manager import Session
 from yeoman_shared.config.schema import Config
 
 CHAT = "pilot@g.us"
+ORDERER = "10001@s.whatsapp.net"
+OWNER = "10002@s.whatsapp.net"
 
 
 class _Clock:
@@ -79,7 +81,7 @@ def runtime(tmp_path: Path):
     policy_path = tmp_path / "policy.json"
     policy = PolicyConfig.model_validate(
         {
-            "owners": {"whatsapp": ["owner@s.whatsapp.net"]},
+            "owners": {"whatsapp": [OWNER]},
             "channels": {
                 "whatsapp": {
                     "default": {"whoCanTalk": {"mode": "everyone"}, "whenToReply": {"mode": "all"}}
@@ -106,7 +108,13 @@ def runtime(tmp_path: Path):
     assert registry is not None and gate is not None and router is not None
     transport = _Transport()
     router.set_direct_transport(transport.send_now, transport.send_reaction_now)
+    from tests.gateway.history_test_helpers import ProjectedHistory
+
+    history = ProjectedHistory(tmp_path / "history")
+    router._gateway.set_history_scope(history, None)
+    router._test_history = history
     yield store, registry, gate, router, transport, adapter
+    history.close()
     store.close()
 
 
@@ -114,7 +122,7 @@ def _event(*, message_id: str, content: str = "hi") -> InboundEvent:
     return InboundEvent(
         channel="whatsapp",
         chat_id=CHAT,
-        sender_id="orderer@s.whatsapp.net",
+        sender_id=ORDERER,
         content=content,
         message_id=message_id,
         is_group=True,
@@ -153,6 +161,15 @@ async def test_managed_reply_dispatches_with_a_real_turn(runtime) -> None:
             trace_id="tr-m1",
             event=_event(message_id="m1"),
         )
+    )
+    source = store.get_event("m1")
+    assert source is not None and source.payload is not None
+    router._test_history.add_message(
+        chat_id=source.chat_id,
+        message_id=source.source_message_id or source.event_id,
+        text=str(source.payload.get("text") or ""),
+        sender_id=source.principal,
+        timestamp=source.occurred_ms or 1_700_000_000_000,
     )
     dispatcher = ManagedOutboundDispatcher(router=router, bus=MessageBus())
     from yeoman_gateway.bus.events import OutboundMessage
@@ -271,7 +288,7 @@ async def test_tool_effect_from_a_generation_uses_the_frozen_turn(runtime) -> No
                     content="tool answer",
                     metadata={"message_id": "m1"},
                 ),
-                principal="orderer@s.whatsapp.net",
+                principal=ORDERER,
                 capability="send_text",
                 payload=__import__(
                     "yeoman_gateway.processing.models", fromlist=["TextPayload"]
@@ -312,12 +329,12 @@ class _Sessions:
 def _dm_runtime(tmp_path: Path):
     """A managed DM: no @g.us, so the carry-over path applies."""
     config = Config.model_validate(
-        {"processing": {"enabled": True, "chats": ["whatsapp:owner@s.whatsapp.net"]}}
+        {"processing": {"enabled": True, "chats": [f"whatsapp:{OWNER}"]}}
     )
     policy_path = tmp_path / "policy.json"
     policy = PolicyConfig.model_validate(
         {
-            "owners": {"whatsapp": ["owner@s.whatsapp.net"]},
+            "owners": {"whatsapp": [OWNER]},
             "channels": {
                 "whatsapp": {
                     "default": {"whoCanTalk": {"mode": "everyone"}, "whenToReply": {"mode": "all"}}
@@ -351,7 +368,7 @@ def test_dm_carries_only_history_after_new_boundary(tmp_path: Path) -> None:
 
     config, store, registry, gate = _dm_runtime(tmp_path)
     sessions = _Sessions()
-    chat_session = sessions.get_or_create("whatsapp:owner@s.whatsapp.net")
+    chat_session = sessions.get_or_create(f"whatsapp:{OWNER}")
     chat_session.add_message("user", "earlier question about the pilot")
     chat_session.add_message("assistant", "earlier answer")
     chat_session.add_boundary()
@@ -370,8 +387,8 @@ def test_dm_carries_only_history_after_new_boundary(tmp_path: Path) -> None:
 
     event = InboundEvent(
         channel="whatsapp",
-        chat_id="owner@s.whatsapp.net",
-        sender_id="owner@s.whatsapp.net",
+        chat_id=OWNER,
+        sender_id=OWNER,
         content="next question",
         message_id="dm1",
         mentioned_bot=True,
@@ -379,11 +396,11 @@ def test_dm_carries_only_history_after_new_boundary(tmp_path: Path) -> None:
     )
     result = gate.admit(
         IngestRequest(
-            event_key="whatsapp:owner:dm1", event_id="dm1", trace_id="tr-dm1", event=event
+            event_key=f"whatsapp:{OWNER}:dm1", event_id="dm1", trace_id="tr-dm1", event=event
         )
     )
     thread_id = str(result.assignment.thread_id)
-    thread_key = f"whatsapp:owner@s.whatsapp.net:thread:{thread_id}"
+    thread_key = f"whatsapp:{OWNER}:thread:{thread_id}"
 
     import asyncio
 

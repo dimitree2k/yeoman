@@ -1,34 +1,37 @@
+from contextlib import closing
 from unittest.mock import AsyncMock
 
 import pytest
+from yeoman_gateway.adapters.reply_archive_history import HistoryReplyArchiveAdapter
 from yeoman_gateway.bus.events import OutboundMessage
-from yeoman_gateway.bus.queue import MessageBus
-from yeoman_gateway.channels.whatsapp import WhatsAppChannel
-from yeoman_gateway.storage.inbound_archive import InboundArchive
-from yeoman_shared.config.schema import WhatsAppConfig
+from yeoman_gateway.history.live import HistoryBoundary
+from yeoman_gateway.history.project import project
+from yeoman_gateway.history.queries import HistoryQueries
+from yeoman_gateway.history.reader import HistoryReader
+
+from tests.gateway.test_whatsapp_raw_archive import _FakeWs, _setup
 
 
 @pytest.mark.parametrize("confirmed", [True, False])
 async def test_only_confirmed_sent_text_becomes_reply_context(tmp_path, confirmed):
-    archive = InboundArchive(tmp_path / "archive.db")
+    channel, raw, store = _setup(tmp_path)
+    del channel._send_command
+    channel.config.bridge_token = "synthetic-token"
+    channel._ws = _FakeWs(channel, {"ok": True, "result": {"sent": {"to": "group@g.us", "messageId": "bot-1"}} if confirmed else {}})
+    channel._connected = True
+    channel._stop_typing = AsyncMock()
     try:
-        channel = WhatsAppChannel(WhatsAppConfig(), MessageBus(), inbound_archive=archive)
-        channel._connected = True
-        channel._stop_typing = AsyncMock()
-        channel._send_command_with_retry = AsyncMock(
-            return_value={"sent": {"messageId": "bot-1"}} if confirmed else {}
-        )
-        await channel.send(OutboundMessage(
-            channel="whatsapp", chat_id="group@g.us", content="On 300k that is 4%.",
-            reply_to="human-1",
-        ))
-        row = archive.lookup_message("whatsapp", "group@g.us", "bot-1")
-        if confirmed:
-            assert row is not None
-            assert row["text"] == "On 300k that is 4%."
-            assert row["sender_id"] == "assistant"
-            assert row["reply_to_message_id"] == "human-1"
-        else:
-            assert row is None
+        await channel.send(OutboundMessage(channel="whatsapp", chat_id="group@g.us", content="On 300k that is 4%.", reply_to="human-1"))
+        path = tmp_path / "history.db"
+        project([tmp_path / "raw"], path)
+        with closing(HistoryReader(path).open_snapshot(HistoryBoundary(1, ()))) as snapshot:
+            row = HistoryReplyArchiveAdapter(HistoryQueries(snapshot)).lookup_message("whatsapp", "group@g.us", "bot-1")
+            if confirmed:
+                assert row is not None
+                assert row.text == "On 300k that is 4%."
+                assert row.reply_to_message_id == "human-1"
+                assert HistoryQueries(snapshot).native_message(chat_id="group@g.us", native_id="bot-1")["direction"] == "out"
+            else:
+                assert row is None
     finally:
-        archive.close()
+        store.close()

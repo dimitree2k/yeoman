@@ -628,7 +628,7 @@ def _row_timestamp_ms(row: Mapping[str, Any]) -> int | None:
     value = row.get("timestamp")
     if isinstance(value, (int, float)) and not isinstance(value, bool):
         number = float(value)
-        # InboundArchive stores Unix seconds; test doubles often use milliseconds.
+        # Archive rows use Unix seconds; test doubles often use milliseconds.
         return int(number * 1000 if abs(number) < 100_000_000_000 else number)
     created_at = str(row.get("created_at") or "").strip()
     if not created_at:
@@ -720,7 +720,11 @@ def _render_message(row: Mapping[str, Any]) -> dict[str, object]:
     """One context message. Media summaries are reused, never invented."""
     text = str(row.get("text") or "").strip()
     media_summary = ""
-    if "[image_description]" in text:
+    if "[Derived description]:" in text:
+        text, _, description = text.partition("[Derived description]:")
+        media_summary = "[Derived description]:" + description
+        text = text.strip()
+    elif "[image_description]" in text:
         media_summary = text
         text = ""
     return {

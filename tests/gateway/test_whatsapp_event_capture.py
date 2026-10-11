@@ -58,7 +58,7 @@ def _drain_inbound(channel: WhatsAppChannel) -> None:
     asyncio.run(drain())
 
 
-def test_message_is_committed_before_ack_archive_or_routing(tmp_path: Path) -> None:
+def test_message_is_committed_before_ack_or_routing(tmp_path: Path) -> None:
     store = ProcessingStore(tmp_path / "processing.db")
     channel = _channel(store)
     order: list[str] = []
@@ -71,7 +71,6 @@ def test_message_is_committed_before_ack_archive_or_routing(tmp_path: Path) -> N
         return {"acknowledged": True}
 
     channel._send_command = ack  # type: ignore[method-assign]
-    channel._archive_inbound_event = lambda event: order.append("archive")  # type: ignore[method-assign]
 
     async def publish(event):
         order.append("route")
@@ -95,7 +94,7 @@ def test_message_is_committed_before_ack_archive_or_routing(tmp_path: Path) -> N
     )
     _drain_inbound(channel)
 
-    assert order == ["ack", "archive", "route"]
+    assert order == ["ack", "route"]  # Legacy DB projection retired; durable commit assertions stay.
     assert store.count_events() == 1
     store.close()
 
@@ -349,7 +348,6 @@ def test_replay_with_a_shifted_source_timestamp_is_idempotent(tmp_path: Path) ->
         return {}
 
     channel._send_command = ack  # type: ignore[method-assign]
-    channel._archive_inbound_event = lambda event: downstream.append("archive")  # type: ignore[method-assign]
     channel._publish_event = lambda event: downstream.append("route")  # type: ignore[method-assign]
     store.append_event = fail_append  # type: ignore[method-assign]
 
@@ -383,7 +381,6 @@ def test_ack_failure_keeps_canonical_row_but_invokes_no_downstream(tmp_path: Pat
         raise RuntimeError("ack failed")
 
     channel._send_command = fail_ack  # type: ignore[method-assign]
-    channel._archive_inbound_event = lambda event: downstream.append("archive")  # type: ignore[method-assign]
     channel._publish_event = lambda event: downstream.append("route")  # type: ignore[method-assign]
 
     asyncio.run(

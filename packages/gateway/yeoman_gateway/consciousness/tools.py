@@ -20,7 +20,6 @@ from yeoman_gateway.consciousness.log import SpeakupLog, deterministic_effect_id
 from yeoman_gateway.history.export import secondary_consumer
 from yeoman_gateway.policy.engine import PolicyEngine
 from yeoman_gateway.policy.persona import load_persona_text
-from yeoman_gateway.storage.inbound_archive import InboundArchive
 
 DEFAULT_HELPFUL_ACTIONS = {
     "answer_open_question",
@@ -162,7 +161,7 @@ class ConsciousnessTools:
         policy_engine: PolicyEngine,
         bus: MessageBus,
         log: SpeakupLog,
-        inbound_archive: InboundArchive,
+        inbound_archive: Any,
         memory: object | None,
         security: object,
         approval_store: SpeakupApprovalStore | None = None,

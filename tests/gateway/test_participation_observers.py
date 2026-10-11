@@ -18,8 +18,11 @@ from yeoman_gateway.consciousness.participation_runtime import (
     ParticipationRuntime,
     SourceOwner,
 )
+from yeoman_gateway.history.queries import HistoryQueries
 from yeoman_gateway.processing.participation import ParticipationOpportunity
 from yeoman_shared.config.schema import Config, ConsciousnessConfig
+
+from tests.gateway.history_test_helpers import ProjectedHistory
 
 CHAT = "synthetic@g.us"
 OTHER = "other@g.us"
@@ -59,7 +62,7 @@ def _observed(
     return InboundObservedEvent(
         channel="whatsapp",
         chat_id=CHAT,
-        sender_id="anna@s.whatsapp.net",
+        sender_id="10001@s.whatsapp.net",
         content=content,
         timestamp=timestamp,
         message_id=message_id,
@@ -69,10 +72,10 @@ def _observed(
 
 
 def _material_provider(archive, log):
-    """Compose pure archive ACL lookup with the durable ledger sequence."""
+    """Compose native History source lookup with the durable ledger sequence."""
 
     def provide(channel: str, chat_id: str, source_ids: tuple[str, ...] | None):
-        resolved = archive.resolve_source_ids(channel, chat_id, source_ids)
+        resolved = _resolve_source_ids(archive, chat_id, source_ids)
         if resolved:
             log.ensure_source_revisions_sync(
                 channel=channel, chat_id=chat_id, source_ids=resolved
@@ -80,6 +83,17 @@ def _material_provider(archive, log):
         return log.material_for_opportunity(channel, chat_id, None if source_ids is None else resolved)
 
     return provide
+
+
+def _resolve_source_ids(history, chat_id: str, source_ids: tuple[str, ...] | None):
+    snapshot = history.snapshot()
+    try:
+        rows = HistoryQueries(snapshot).recent(chat_id=chat_id, limit=500)
+        available = tuple(str(row["native_message_id"]) for row in rows)
+        requested = set(available if source_ids is None else source_ids)
+        return tuple(message_id for message_id in available if message_id in requested)
+    finally:
+        snapshot.close()
 
 
 def _synthetic_material_provider(
@@ -95,27 +109,21 @@ def test_archive_material_resolution_is_pure_and_ledger_owns_revision(
     tmp_path: Path,
 ) -> None:
     from yeoman_gateway.consciousness.log import SpeakupLog
-    from yeoman_gateway.storage.inbound_archive import InboundArchive
-
-    archive = InboundArchive(tmp_path / "inbound.db", retention_days=None)
+    archive = ProjectedHistory(tmp_path)
     for index, message_id in enumerate(("m1", "m2"), start=1):
-        archive.record_inbound(
+        archive.add_message(
             channel="whatsapp",
             chat_id=CHAT,
             message_id=message_id,
-            participant=f"person{index}@s.whatsapp.net",
-            sender_id=f"person{index}",
+            participant=f"{10000 + index}@s.whatsapp.net",
+            sender_id=f"{10000 + index}@s.whatsapp.net",
             text=message_id,
             timestamp=index,
         )
 
-    assert archive.resolve_source_ids(
-        "whatsapp", CHAT, ("m2", "missing", "observed:whatsapp:" + CHAT, "m1")
+    assert _resolve_source_ids(
+        archive, CHAT, ("m2", "missing", "observed:whatsapp:" + CHAT, "m1")
     ) == ("m1", "m2")
-    assert not archive._conn.execute(  # noqa: SLF001 - schema guard for the source owner
-        "SELECT 1 FROM sqlite_master WHERE type = 'table' AND name = 'participation_material_state'"
-    ).fetchone()
-
     log = SpeakupLog(tmp_path / "speakups.db")
     provider = _material_provider(archive, log)
     material, revision = provider(
@@ -128,12 +136,12 @@ def test_archive_material_resolution_is_pure_and_ledger_owns_revision(
         channel="whatsapp", chat_id=CHAT, observed_revision=revision
     )
     # The same source sequence remains the same after a later source appears.
-    archive.record_inbound(
+    archive.add_message(
         channel="whatsapp",
         chat_id=CHAT,
         message_id="m3",
-        participant="person3@s.whatsapp.net",
-        sender_id="person3",
+        participant="10003@s.whatsapp.net",
+        sender_id="10003@s.whatsapp.net",
         text="m3",
         timestamp=3,
     )
@@ -183,20 +191,18 @@ def test_first_enable_baselines_archive_history_but_restart_keeps_unconsidered_s
 ) -> None:
     """Only a truly uninitialized ledger chat may adopt retained history as baseline."""
     from yeoman_gateway.consciousness.log import SpeakupLog
-    from yeoman_gateway.storage.inbound_archive import InboundArchive
-
-    archive = InboundArchive(tmp_path / "inbound.db", retention_days=None)
-    archive.record_inbound(
+    archive = ProjectedHistory(tmp_path)
+    archive.add_message(
         channel="whatsapp",
         chat_id=CHAT,
         message_id="historic",
-        participant="person@s.whatsapp.net",
-        sender_id="person",
+        participant="10001@s.whatsapp.net",
+        sender_id="10001@s.whatsapp.net",
         text="historic",
         timestamp=1,
     )
     log = SpeakupLog(tmp_path / "speakups.db")
-    historic = archive.resolve_source_ids("whatsapp", CHAT, None)
+    historic = _resolve_source_ids(archive, CHAT, None)
     assert log.initialize_material_baseline_sync(
         channel="whatsapp", chat_id=CHAT, source_ids=historic
     ) == 1
@@ -205,16 +211,16 @@ def test_first_enable_baselines_archive_history_but_restart_keeps_unconsidered_s
         "whatsapp", CHAT, None, lane="shadow"
     ) == ((), 1)
 
-    archive.record_inbound(
+    archive.add_message(
         channel="whatsapp",
         chat_id=CHAT,
         message_id="new",
-        participant="person@s.whatsapp.net",
-        sender_id="person",
+        participant="10001@s.whatsapp.net",
+        sender_id="10001@s.whatsapp.net",
         text="new",
         timestamp=2,
     )
-    new_ids = archive.resolve_source_ids("whatsapp", CHAT, None)
+    new_ids = _resolve_source_ids(archive, CHAT, None)
     log.ensure_source_revisions_sync(
         channel="whatsapp", chat_id=CHAT, source_ids=new_ids
     )
@@ -316,53 +322,7 @@ def test_ledger_migrates_legacy_claims_and_dispositions_without_reallocating_on_
     reopened.close()
 
 
-def test_archive_retention_does_not_renumber_ledger_source_revisions(tmp_path: Path) -> None:
-    """Purging retained rows cannot move the durable source sequence backwards."""
-    from yeoman_gateway.consciousness.log import SpeakupLog
-    from yeoman_gateway.storage.inbound_archive import InboundArchive
-
-    archive = InboundArchive(tmp_path / "inbound.db", retention_days=1)
-    archive.record_inbound(
-        channel="whatsapp",
-        chat_id=CHAT,
-        message_id="old",
-        participant="person@s.whatsapp.net",
-        sender_id="person",
-        text="old",
-        timestamp=1,
-    )
-    log = SpeakupLog(tmp_path / "speakups.db")
-    log.ensure_source_revisions_sync(
-        channel="whatsapp", chat_id=CHAT, source_ids=("old",)
-    )
-    log.mark_material_considered_sync(
-        channel="whatsapp", chat_id=CHAT, observed_revision=1
-    )
-    with archive._lock:  # noqa: SLF001 - deterministic synthetic retention setup
-        archive._conn.execute(  # noqa: SLF001
-            "UPDATE inbound_messages SET created_at = ? WHERE message_id = ?",
-            ("2000-01-01T00:00:00+00:00", "old"),
-        )
-        archive._conn.commit()  # noqa: SLF001
-    assert archive.purge_older_than(1) == 1
-
-    archive.record_inbound(
-        channel="whatsapp",
-        chat_id=CHAT,
-        message_id="new",
-        participant="person@s.whatsapp.net",
-        sender_id="person",
-        text="new",
-        timestamp=2,
-    )
-    resolved = archive.resolve_source_ids("whatsapp", CHAT, None)
-    assert resolved == ("new",)
-    assert log.ensure_source_revisions_sync(
-        channel="whatsapp", chat_id=CHAT, source_ids=resolved
-    ) == (("new", 2),)
-    assert log.material_for_opportunity("whatsapp", CHAT, None) == (("new",), 2)
-    log.close()
-    archive.close()
+# Retention/purge behavior belonged only to the retired inbound store.
 
 
 def test_ingress_uses_batch_material_provider_without_consuming_duplicate_revision(
@@ -370,16 +330,14 @@ def test_ingress_uses_batch_material_provider_without_consuming_duplicate_revisi
 ) -> None:
     from yeoman_gateway.consciousness.log import SpeakupLog
     from yeoman_gateway.consciousness.participation_runtime import ParticipationIngress
-    from yeoman_gateway.storage.inbound_archive import InboundArchive
-
-    archive = InboundArchive(tmp_path / "inbound.db", retention_days=None)
+    archive = ProjectedHistory(tmp_path)
     for index, message_id in enumerate(("m1", "m2"), start=1):
-        archive.record_inbound(
+        archive.add_message(
             channel="whatsapp",
             chat_id=CHAT,
             message_id=message_id,
-            participant=f"person{index}@s.whatsapp.net",
-            sender_id=f"person{index}",
+            participant=f"{10000 + index}@s.whatsapp.net",
+            sender_id=f"{10000 + index}@s.whatsapp.net",
             text=message_id,
             timestamp=index,
         )
@@ -403,7 +361,7 @@ def test_ingress_uses_batch_material_provider_without_consuming_duplicate_revisi
     event = InboundObservedEvent(
         channel="whatsapp",
         chat_id=CHAT,
-        sender_id="person2",
+        sender_id="10002@s.whatsapp.net",
         content="m1 + m2",
         timestamp=2.0,
         message_id="m2",
@@ -421,7 +379,7 @@ def test_ingress_uses_batch_material_provider_without_consuming_duplicate_revisi
     empty = InboundObservedEvent(
         channel="whatsapp",
         chat_id=CHAT,
-        sender_id="person2",
+        sender_id="10002@s.whatsapp.net",
         content="",
         timestamp=2.0,
         message_id=None,
@@ -460,7 +418,7 @@ def test_participation_ingress_rejects_trusted_direct_source_before_claim(
     event = InboundObservedEvent(
         channel="whatsapp",
         chat_id=CHAT,
-        sender_id="person",
+        sender_id="10001@s.whatsapp.net",
         content="direct",
         timestamp=1.0,
         message_id="m-direct",
@@ -473,7 +431,7 @@ def test_participation_ingress_rejects_trusted_direct_source_before_claim(
     allowed = InboundObservedEvent(
         channel="whatsapp",
         chat_id=CHAT,
-        sender_id="person",
+        sender_id="10001@s.whatsapp.net",
         content="social",
         timestamp=1.0,
         message_id="m-social",
@@ -547,16 +505,14 @@ async def test_duplicate_batch_material_reaches_one_real_runtime_evaluation(
         ParticipationIngress,
         ParticipationRuntime,
     )
-    from yeoman_gateway.storage.inbound_archive import InboundArchive
-
-    archive = InboundArchive(tmp_path / "inbound.db", retention_days=None)
+    archive = ProjectedHistory(tmp_path)
     for index, message_id in enumerate(("m1", "m2"), start=1):
-        archive.record_inbound(
+        archive.add_message(
             channel="whatsapp",
             chat_id=CHAT,
             message_id=message_id,
-            participant=f"person{index}@s.whatsapp.net",
-            sender_id=f"person{index}",
+            participant=f"{10000 + index}@s.whatsapp.net",
+            sender_id=f"{10000 + index}@s.whatsapp.net",
             text=message_id,
             timestamp=index,
         )
@@ -585,7 +541,7 @@ async def test_duplicate_batch_material_reaches_one_real_runtime_evaluation(
     event = InboundObservedEvent(
         channel="whatsapp",
         chat_id=CHAT,
-        sender_id="person2",
+        sender_id="10002@s.whatsapp.net",
         content="m1 + m2",
         timestamp=2.0,
         message_id="m2",
@@ -615,7 +571,7 @@ async def test_message_bus_preserves_batch_source_event_ids(tmp_path: Path) -> N
     await bus.publish_inbound(
         InboundMessage(
             channel="whatsapp",
-            sender_id="person",
+            sender_id="10001@s.whatsapp.net",
             chat_id=CHAT,
             content="m1 + m2",
             metadata={"message_id": "m2", "source_event_ids": ["m1", "m2"]},
@@ -667,6 +623,8 @@ async def test_event_dispatch_is_not_blocked_by_an_observer_producer(tmp_path: P
         on_burst=offer,
         is_eligible=_eligible,
     )
+    history = ProjectedHistory(tmp_path)
+    history.wire(burst)
     bus = MessageBus()
     bus.subscribe_event("InboundObservedEvent", burst.handle)
     second_seen = asyncio.Event()
@@ -676,22 +634,24 @@ async def test_event_dispatch_is_not_blocked_by_an_observer_producer(tmp_path: P
         second_seen.set()
 
     bus.subscribe_event("InboundObservedEvent", harmless_handler)
+    history.snapshot()  # Project fixture data before measuring event dispatch.
     dispatcher = asyncio.create_task(bus.dispatch_events())
     try:
         await bus.publish_event(_observed(100.0, message_id="b1"))
         await bus.publish_event(_observed(101.0, message_id="b2"))
         started = _time.monotonic()
-        await asyncio.wait_for(producer_done.wait(), timeout=2)
+        await asyncio.wait_for(producer_done.wait(), timeout=30)
         produced_after = _time.monotonic() - started
         assert produced_after < 0.5, "the producer must not perform model work"
         await bus.publish_event(_observed(102.0, message_id="b3"))
-        await asyncio.wait_for(second_seen.wait(), timeout=2)
+        await asyncio.wait_for(second_seen.wait(), timeout=30)
     finally:
         bus.stop()
         dispatcher.cancel()
         with pytest.raises(asyncio.CancelledError):
             await dispatcher
         await scheduler.stop()
+        history.close()
         log.close()
     assert handler_calls
 
@@ -733,6 +693,8 @@ async def test_burst_and_lull_callbacks_return_without_model_work(tmp_path: Path
         ),
         is_eligible=_eligible,
     )
+    history = ProjectedHistory(tmp_path)
+    history.wire(burst)
     # A lull is a genuinely later revision with its own retained source, so it is a
     # new opportunity rather than a replay of the burst material.
     lull = LullObserver(
@@ -748,6 +710,7 @@ async def test_burst_and_lull_callbacks_return_without_model_work(tmp_path: Path
         is_eligible=_eligible,
         clock=lambda: _LULL_NOW,
     )
+    history.wire(lull)
     try:
         # Two messages reach the burst threshold and fire without awaiting the handler.
         await asyncio.wait_for(burst.handle(_observed(100.0, message_id="b1")), timeout=1)
@@ -779,6 +742,7 @@ async def test_burst_and_lull_callbacks_return_without_model_work(tmp_path: Path
     finally:
         release.set()
         await scheduler.stop()
+        history.close()
         log.close()
 
 

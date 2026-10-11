@@ -30,6 +30,16 @@ from yeoman_gateway.processing.store import ProcessingStore
 from yeoman_shared.config.schema import Config, WhatsAppConfig
 from yeoman_shared.utils.helpers import get_operational_store_path
 
+from tests.gateway.history_test_helpers import prepare_history_retirement_knowledge
+
+
+def _history_knowledge_config(tmp_path: Path, name: str) -> dict[str, object]:
+    return {
+        "enabled": True,
+        "db_path": str(prepare_history_retirement_knowledge(tmp_path, name)),
+        "capture_enabled": False,
+    }
+
 
 def test_participation_knowledge_context_uses_verified_single_source_author() -> None:
     opportunity = SimpleNamespace(
@@ -192,6 +202,7 @@ def test_legacy_consciousness_flag_does_not_build_a_social_runtime(
     monkeypatch.setenv("YEOMAN_HOME", str(tmp_path))
     config = Config.model_validate(
         {
+            "knowledge": _history_knowledge_config(tmp_path, "legacy-consciousness-knowledge"),
             "consciousness": {"enabled": True},
             "personaEvolution": {"enabled": False},
             "processing": {"enabled": False, "participation": {"enabled": False}},
@@ -211,10 +222,9 @@ def test_legacy_consciousness_flag_does_not_build_a_social_runtime(
         assert runtime.speakup_log is None
         assert not hasattr(runtime, "consciousness")
     finally:
-        runtime.inbound_archive.close()
-        runtime.chat_registry.close()
-        runtime.contacts.close()
-        runtime.memory.close()
+        for store in (runtime.inbound_archive, runtime.chat_registry, runtime.contacts, runtime.memory):
+            if store is not None:
+                store.close()
 
 
 @pytest.mark.asyncio
@@ -224,6 +234,7 @@ async def test_persona_evolution_lazily_reads_historical_speakup_log(
     """Historical social evidence stays readable after the old generator is removed."""
 
     from yeoman_gateway.cron.types import CronJob, CronPayload
+    from yeoman_gateway.history.project import project
 
     captured_logs: list[object] = []
 
@@ -248,6 +259,7 @@ async def test_persona_evolution_lazily_reads_historical_speakup_log(
     monkeypatch.setenv("YEOMAN_HOME", str(tmp_path))
     config = Config.model_validate(
         {
+            "knowledge": _history_knowledge_config(tmp_path, "persona-knowledge"),
             "consciousness": {"enabled": False},
             "personaEvolution": {"enabled": True},
             "processing": {"enabled": False, "participation": {"enabled": False}},
@@ -263,6 +275,11 @@ async def test_persona_evolution_lazily_reads_historical_speakup_log(
         workspace=tmp_path / "workspace",
         bus=MessageBus(),
     )
+    raw_root = runtime.channels.raw_archive.root
+    project([raw_root], runtime.history_projector.db_path, publish_lineage_root=raw_root)
+    await runtime.history_projector.start()
+    if runtime.history_projector._startup_task is not None:
+        await runtime.history_projector._startup_task
     try:
         assert runtime.speakup_log is None
         assert not speakup_path.exists()
@@ -283,10 +300,10 @@ async def test_persona_evolution_lazily_reads_historical_speakup_log(
         with pytest.raises(sqlite3.ProgrammingError, match="closed database"):
             await captured_logs[0].history("whatsapp", "group@g.us")
     finally:
-        runtime.inbound_archive.close()
-        runtime.chat_registry.close()
-        runtime.contacts.close()
-        runtime.memory.close()
+        await runtime.history_projector.stop()
+        for store in (runtime.inbound_archive, runtime.chat_registry, runtime.contacts, runtime.memory):
+            if store is not None:
+                store.close()
 
 
 @pytest.mark.asyncio
@@ -426,6 +443,7 @@ def test_processing_only_pending_data_enables_recovery_without_creating_speakup_
 
     config = Config.model_validate(
         {
+            "knowledge": _history_knowledge_config(tmp_path, "recovery-knowledge"),
             "processing": {
                 "enabled": False,
                 "db_path": str(processing_path),
@@ -459,10 +477,9 @@ def test_processing_only_pending_data_enables_recovery_without_creating_speakup_
         assert not speakup_path.exists()
     finally:
         runtime.processing.close()
-        runtime.inbound_archive.close()
-        runtime.chat_registry.close()
-        runtime.contacts.close()
-        runtime.memory.close()
+        for store in (runtime.inbound_archive, runtime.chat_registry, runtime.contacts, runtime.memory):
+            if store is not None:
+                store.close()
 
 
 def test_pending_recovery_probe_fails_closed_on_corrupt_existing_ledger(
@@ -542,6 +559,7 @@ async def test_receipts_reconcile_with_learning_and_consciousness_disabled(
     speakup_path = get_operational_store_path("speakups", data_dir=tmp_path / "data")
     config = Config.model_validate(
         {
+            "knowledge": _history_knowledge_config(tmp_path, "receipts-knowledge"),
             "processing": {
                 "enabled": False,
                 "db_path": str(processing_path),
@@ -650,6 +668,9 @@ async def test_receipts_reconcile_with_learning_and_consciousness_disabled(
 
     async def _run_once(expected_state: str) -> None:
         monkeypatch.setenv("YEOMAN_HOME", str(tmp_path))
+        config.knowledge.db_path = str(
+            prepare_history_retirement_knowledge(tmp_path, f"recovery-{expected_state}-knowledge")
+        )
         runtime = build_gateway_runtime(
             config=config,
             provider=_NeverProvider(),  # type: ignore[arg-type]
@@ -738,6 +759,9 @@ async def test_receipts_reconcile_with_learning_and_consciousness_disabled(
     log_only_log.close()
     log_only_config = config.model_copy(deep=True)
     log_only_config.processing.db_path = str(log_only_processing)
+    log_only_config.knowledge.db_path = str(
+        prepare_history_retirement_knowledge(tmp_path, "log-only-knowledge")
+    )
     monkeypatch.setenv("YEOMAN_HOME", str(log_only_home))
     assert _has_pending_participation_recovery(
         speakup_path=log_only_speakups,
@@ -776,6 +800,9 @@ async def test_receipts_reconcile_with_learning_and_consciousness_disabled(
     empty_speakups = get_operational_store_path("speakups", data_dir=empty_home / "data")
     empty_config = config.model_copy(deep=True)
     empty_config.processing.db_path = str(empty_processing)
+    empty_config.knowledge.db_path = str(
+        prepare_history_retirement_knowledge(tmp_path, "empty-knowledge")
+    )
     monkeypatch.setenv("YEOMAN_HOME", str(empty_home))
     assert not _has_pending_participation_recovery(
         speakup_path=empty_speakups, processing_path=empty_processing
@@ -936,7 +963,9 @@ def test_restart_activation_transition_new_offers_use_new_epoch(
         ActivationEpochTracker,
         SourceOwner,
     )
-    from yeoman_gateway.storage.inbound_archive import InboundArchive
+    from yeoman_gateway.history.export import SecondaryArchive
+
+    from tests.gateway.history_test_helpers import ProjectedHistory
 
     class RouteClient:
         def __init__(self, **_: object) -> None:
@@ -1002,7 +1031,7 @@ def test_restart_activation_transition_new_offers_use_new_epoch(
         workspace=tmp_path,
     )
     log = SpeakupLog(db_path)
-    archive = InboundArchive(tmp_path / "inbound.db")
+    archive = ProjectedHistory(tmp_path / "participation-history")
     processing_store = ProcessingStore(tmp_path / "processing.db")
     tracker = ActivationEpochTracker(store=log)
     adapter = EnginePolicyAdapter(
@@ -1026,7 +1055,7 @@ def test_restart_activation_transition_new_offers_use_new_epoch(
             source_owner=SourceOwner(store=log),
             log=log,
             policy_engine=engine,
-            inbound_archive=archive,
+            inbound_archive=SecondaryArchive(None, config.history),
             processing_store=processing_store,
             responder=UnprovenReactionResponder(),
             policy_adapter=adapter,
@@ -1115,7 +1144,7 @@ async def test_whatsapp_debounce_preserves_all_participation_source_ids(
         return InboundEvent(
             message_id=message_id,
             chat_jid="group@g.us",
-            participant_jid="person@s.whatsapp.net",
+            participant_jid="10001@s.whatsapp.net",
             sender_id="person",
             sender_phone_jid=None,
             is_group=True,
@@ -1166,10 +1195,12 @@ async def test_bootstrap_reaction_reaches_transport_with_reserved_effect_id(
         deterministic_effect_id,
     )
     from yeoman_gateway.consciousness.participation_runtime import SourceOwner
+    from yeoman_gateway.history.export import SecondaryArchive
     from yeoman_gateway.processing.dispatch import ServiceEffectProducer
     from yeoman_gateway.processing.models import ReactionPayload
     from yeoman_gateway.processing.participation import ParticipationOpportunity
-    from yeoman_gateway.storage.inbound_archive import InboundArchive
+
+    from tests.gateway.history_test_helpers import ProjectedHistory
 
     class RouteClient:
         route_key = "participation.judge"
@@ -1211,7 +1242,7 @@ async def test_bootstrap_reaction_reaches_transport_with_reserved_effect_id(
     monkeypatch.setenv("YEOMAN_HOME", str(tmp_path))
     monkeypatch.setenv("OPENROUTER_API_KEY", "test-key")
     chat_id = "group@g.us"
-    sender = "person@s.whatsapp.net"
+    sender = "10001@s.whatsapp.net"
     config = Config.model_validate(
         {
             "models": {
@@ -1268,7 +1299,7 @@ async def test_bootstrap_reaction_reaches_transport_with_reserved_effect_id(
     from yeoman_gateway.consciousness.participation_runtime import ActivationEpochTracker
 
     log = SpeakupLog(tmp_path / "speakups.db")
-    archive = InboundArchive(tmp_path / "inbound.db")
+    archive = ProjectedHistory(tmp_path / "participation-history")
     store = ProcessingStore(tmp_path / "processing.db")
     adapter = EnginePolicyAdapter(
         engine=engine,
@@ -1285,7 +1316,7 @@ async def test_bootstrap_reaction_reaches_transport_with_reserved_effect_id(
         store,
         bus,
         participation_ledger=log,
-        inbound_archive=archive,
+        inbound_archive=SecondaryArchive(None, config.history),
     )
     assert router is not None
     reaction_calls: list[object] = []
@@ -1312,7 +1343,7 @@ async def test_bootstrap_reaction_reaches_transport_with_reserved_effect_id(
     )
     assert responder is not None
     now = datetime.now(UTC)
-    archive.record_inbound(
+    archive.add_message(
         channel="whatsapp",
         chat_id=chat_id,
         message_id="source-1",
@@ -1332,12 +1363,13 @@ async def test_bootstrap_reaction_reaches_transport_with_reserved_effect_id(
         source_owner=SourceOwner(store=log),
         log=log,
         policy_engine=engine,
-        inbound_archive=archive,
+        inbound_archive=SecondaryArchive(None, config.history),
         processing_store=store,
         responder=responder,
         policy_adapter=adapter,
     )
     decision_runtime, _reconciler = decision
+    archive.wire(decision_runtime)
     assert decision_runtime._submission is None  # noqa: SLF001
     assert not decision_runtime._writer_available  # noqa: SLF001
     opportunity = ParticipationOpportunity(
@@ -1352,7 +1384,8 @@ async def test_bootstrap_reaction_reaches_transport_with_reserved_effect_id(
     )
 
     try:
-        result = await decision_runtime.evaluate_participation(opportunity)
+        async with archive.turn():
+            result = await decision_runtime.evaluate_participation(opportunity)
 
         effect_id = deterministic_effect_id(
             channel="whatsapp",
@@ -1534,13 +1567,15 @@ async def test_participation_approval_rechecks_pause_and_submits_once(
     from yeoman_gateway.core.models import InboundEvent as CoreInboundEvent
     from yeoman_gateway.core.models import PolicyDecision
     from yeoman_gateway.core.pipeline import PipelineContext
+    from yeoman_gateway.history.export import SecondaryArchive
     from yeoman_gateway.media.router import ModelRouter
     from yeoman_gateway.pipeline.speakup_approval import SpeakupApprovalMiddleware
     from yeoman_gateway.processing.dispatch import ServiceEffectProducer
     from yeoman_gateway.processing.participation import ParticipationOpportunity
     from yeoman_gateway.providers.base import LLMResponse
     from yeoman_gateway.security import NoopSecurity
-    from yeoman_gateway.storage.inbound_archive import InboundArchive
+
+    from tests.gateway.history_test_helpers import ProjectedHistory
 
     class RouteClient:
         route_key = "participation.judge"
@@ -1586,7 +1621,7 @@ async def test_participation_approval_rechecks_pause_and_submits_once(
     monkeypatch.setenv("YEOMAN_HOME", str(tmp_path))
     monkeypatch.setenv("OPENROUTER_API_KEY", "test-key")
     chat_id = "group@g.us"
-    sender = "person@s.whatsapp.net"
+    sender = "10001@s.whatsapp.net"
     owner = "owner@s.whatsapp.net"
     config = Config.model_validate(
         {
@@ -1649,7 +1684,7 @@ async def test_participation_approval_rechecks_pause_and_submits_once(
         workspace=tmp_path,
     )
     log = SpeakupLog(tmp_path / "speakups.db")
-    archive = InboundArchive(tmp_path / "inbound.db")
+    archive = ProjectedHistory(tmp_path / "participation-history")
     store = ProcessingStore(tmp_path / "processing.db")
     approval_store = SpeakupApprovalStore(tmp_path / "legacy-approvals.json")
     adapter = EnginePolicyAdapter(
@@ -1667,7 +1702,7 @@ async def test_participation_approval_rechecks_pause_and_submits_once(
         store,
         bus,
         participation_ledger=log,
-        inbound_archive=archive,
+        inbound_archive=SecondaryArchive(None, config.history),
     )
     assert router is not None
     target_calls: list[object] = []
@@ -1705,19 +1740,20 @@ async def test_participation_approval_rechecks_pause_and_submits_once(
         policy_engine=engine,
         bus=bus,
         log=log,
-        inbound_archive=archive,
+        inbound_archive=SecondaryArchive(None, config.history),
         memory=None,
         security=NoopSecurity(),
         approval_store=approval_store,
         service_effects=effects,
         activation_provider=adapter.current_activation,
     )
+    archive.wire(tools)
     runtime, _scheduler, decision = _build_participation_runtime(
         config=config,
         source_owner=SourceOwner(store=log),
         log=log,
         policy_engine=engine,
-        inbound_archive=archive,
+        inbound_archive=SecondaryArchive(None, config.history),
         processing_store=store,
         responder=responder,
         policy_adapter=adapter,
@@ -1725,6 +1761,7 @@ async def test_participation_approval_rechecks_pause_and_submits_once(
     )
     del runtime, _scheduler
     decision_runtime, _reconciler = decision
+    archive.wire(decision_runtime)
     middleware = SpeakupApprovalMiddleware(
         approval_store=approval_store,
         bus=bus,
@@ -1736,7 +1773,7 @@ async def test_participation_approval_rechecks_pause_and_submits_once(
     async def stage(index: int) -> tuple[ParticipationOpportunity, str]:
         timestamp = datetime.now(UTC)
         source_id = f"source-{index}"
-        archive.record_inbound(
+        archive.add_message(
             channel="whatsapp",
             chat_id=chat_id,
             message_id=source_id,
@@ -1761,7 +1798,8 @@ async def test_participation_approval_rechecks_pause_and_submits_once(
             activation_epoch=activation.activation_epoch,
             created_at_ms=int(timestamp.timestamp() * 1000),
         )
-        result = await decision_runtime.evaluate_participation(opportunity)
+        async with archive.turn():
+            result = await decision_runtime.evaluate_participation(opportunity)
         assert result["status"] == "awaiting_approval", result
         preview = await bus.consume_outbound()
         code = preview.content.split("Approve: ", 1)[1].splitlines()[0].strip()
@@ -1795,16 +1833,18 @@ async def test_participation_approval_rechecks_pause_and_submits_once(
 
     try:
         first, first_code = await stage(1)
-        await middleware(
-            owner_context(first_code, identity="intruder@s.whatsapp.net"),
-            unused_next,
-        )
+        async with archive.turn():
+            await middleware(
+                owner_context(first_code, identity="intruder@s.whatsapp.net"),
+                unused_next,
+            )
         assert await log.approval_claim(first.opportunity_id) is None
         assert target_calls == []
         adapter._set_chat_pause(  # noqa: SLF001
             channel="whatsapp", chat_id=chat_id, until_ms=2**63 - 1
         )
-        await middleware(owner_context(first_code), unused_next)
+        async with archive.turn():
+            await middleware(owner_context(first_code), unused_next)
         assert target_calls == []
         first_effect_id = deterministic_effect_id(
             channel="whatsapp",
@@ -1818,8 +1858,10 @@ async def test_participation_approval_rechecks_pause_and_submits_once(
 
         adapter._clear_chat_pause(channel="whatsapp", chat_id=chat_id)  # noqa: SLF001
         second, second_code = await stage(2)
-        await middleware(owner_context(second_code), unused_next)
-        await middleware(owner_context(second_code), unused_next)
+        async with archive.turn():
+            await middleware(owner_context(second_code), unused_next)
+        async with archive.turn():
+            await middleware(owner_context(second_code), unused_next)
 
         assert len(target_calls) == 1
         second_effect_id = deterministic_effect_id(
@@ -1918,6 +1960,8 @@ async def test_participation_burst_observer_runs_without_legacy_consciousness(
 ) -> None:
     from yeoman_gateway.consciousness.burst import BurstObserver
 
+    from tests.gateway.history_test_helpers import ProjectedHistory
+
     calls: list[tuple[str, str]] = []
     config = Config.model_validate(
         {
@@ -1942,12 +1986,16 @@ async def test_participation_burst_observer_runs_without_legacy_consciousness(
         on_burst=lambda channel, chat_id: calls.append((channel, chat_id)),
         is_eligible=lambda channel, chat_id: True,
     )
+    archive = ProjectedHistory(tmp_path / "burst-history")
+    archive.wire(observer)
     for timestamp, message_id in ((1.0, "m1"), (2.0, "m2")):
+        archive.add_message(chat_id="group@g.us", message_id=message_id, text=message_id,
+                            timestamp=timestamp, sender_id="10001@s.whatsapp.net")
         await observer.handle(
             InboundObservedEvent(
                 channel="whatsapp",
                 chat_id="group@g.us",
-                sender_id="person",
+                sender_id="10001@s.whatsapp.net",
                 content=message_id,
                 timestamp=timestamp,
                 message_id=message_id,
@@ -1956,6 +2004,8 @@ async def test_participation_burst_observer_runs_without_legacy_consciousness(
             )
         )
     assert calls == [("whatsapp", "group@g.us")]
+
+    archive.close()
 
 
 @pytest.mark.asyncio
@@ -1966,6 +2016,7 @@ async def test_real_effect_transport_denies_participation_after_pause(
     from yeoman_gateway.adapters.policy_engine import EnginePolicyAdapter
     from yeoman_gateway.consciousness.log import SpeakupLog
     from yeoman_gateway.consciousness.participation_runtime import ActivationEpochTracker
+    from yeoman_gateway.history.export import SecondaryArchive
     from yeoman_gateway.processing.models import (
         EffectEnvelope,
         EffectTarget,
@@ -1973,11 +2024,12 @@ async def test_real_effect_transport_denies_participation_after_pause(
         payload_hash,
     )
     from yeoman_gateway.processing.participation_runtime import ParticipationAdmission
-    from yeoman_gateway.storage.inbound_archive import InboundArchive
+
+    from tests.gateway.history_test_helpers import ProjectedHistory
 
     monkeypatch.setenv("YEOMAN_HOME", str(tmp_path))
     chat_id = "group@g.us"
-    sender = "person@s.whatsapp.net"
+    sender = "10001@s.whatsapp.net"
     config = Config.model_validate(
         {
             "consciousness": {"defaultDailyCap": 1},
@@ -2021,7 +2073,7 @@ async def test_real_effect_transport_denies_participation_after_pause(
         workspace=tmp_path,
     )
     log = SpeakupLog(tmp_path / "speakups.db")
-    archive = InboundArchive(tmp_path / "inbound.db")
+    archive = ProjectedHistory(tmp_path / "participation-history")
     store = ProcessingStore(tmp_path / "processing.db")
     tracker = ActivationEpochTracker(store=log)
     adapter = EnginePolicyAdapter(
@@ -2032,7 +2084,7 @@ async def test_real_effect_transport_denies_participation_after_pause(
         processing_config=config.processing,
         activation_tracker=tracker,
     )
-    archive.record_inbound(
+    archive.add_message(
         channel="whatsapp",
         chat_id=chat_id,
         message_id="source-1",
@@ -2042,130 +2094,131 @@ async def test_real_effect_transport_denies_participation_after_pause(
         text="What do you think?",
         timestamp=1,
     )
-    try:
-        activation = adapter.current_activation("whatsapp", chat_id)
-        assert activation is not None and activation.live
-        source_rows = log.ensure_source_revisions_sync(
-            channel="whatsapp", chat_id=chat_id, source_ids=("source-1",)
-        )
-        observed_revision = source_rows[0][1]
-        log.mark_material_considered_sync(
-            channel="whatsapp",
-            chat_id=chat_id,
-            observed_revision=observed_revision,
-            lane="production",
-        )
-        payload = TextPayload(text="A bound answer")
-        effect_id = "participation-effect-1"
-        admission = ParticipationAdmission(
-            opportunity_id="opportunity-1",
-            channel="whatsapp",
-            chat_id=chat_id,
-            activation_epoch=activation.activation_epoch,
-            lane="production",
-            observed_revision=observed_revision,
-            action="comment",
-            intent="initiate",
-            admission_id="admission-1",
-            source_event_ids=("source-1",),
-            source_principals=(("source-1", sender),),
-            policy_version=activation.policy_version,
-            policy_hash=adapter.policy_snapshot().policy_hash,
-            arbitration_revision=store.arbitration_revision("whatsapp", chat_id),
-            contribution_type="observation",
-            payload_hash=payload_hash(payload),
-        )
-        assert log.reserve_delivery_sync(
-            proposal_id=admission.opportunity_id,
-            effect_id=effect_id,
-            channel="whatsapp",
-            chat_id=chat_id,
-            now_ms=1,
-            limits=(("comment", 1, 60_000),),
-            observed_revision=observed_revision,
-            activation_epoch=activation.activation_epoch,
-        )
-        router = build_effect_router(
-            config,
-            adapter,
-            store,
-            MessageBus(),
-            participation_ledger=log,
-            inbound_archive=archive,
-        )
-        assert router is not None
-        sent: list[object] = []
+    async with archive.turn():
+        try:
+            activation = adapter.current_activation("whatsapp", chat_id)
+            assert activation is not None and activation.live
+            source_rows = log.ensure_source_revisions_sync(
+                channel="whatsapp", chat_id=chat_id, source_ids=("source-1",)
+            )
+            observed_revision = source_rows[0][1]
+            log.mark_material_considered_sync(
+                channel="whatsapp",
+                chat_id=chat_id,
+                observed_revision=observed_revision,
+                lane="production",
+            )
+            payload = TextPayload(text="A bound answer")
+            effect_id = "participation-effect-1"
+            admission = ParticipationAdmission(
+                opportunity_id="opportunity-1",
+                channel="whatsapp",
+                chat_id=chat_id,
+                activation_epoch=activation.activation_epoch,
+                lane="production",
+                observed_revision=observed_revision,
+                action="comment",
+                intent="initiate",
+                admission_id="admission-1",
+                source_event_ids=("source-1",),
+                source_principals=(("source-1", sender),),
+                policy_version=activation.policy_version,
+                policy_hash=adapter.policy_snapshot().policy_hash,
+                arbitration_revision=store.arbitration_revision("whatsapp", chat_id),
+                contribution_type="observation",
+                payload_hash=payload_hash(payload),
+            )
+            assert log.reserve_delivery_sync(
+                proposal_id=admission.opportunity_id,
+                effect_id=effect_id,
+                channel="whatsapp",
+                chat_id=chat_id,
+                now_ms=1,
+                limits=(("comment", 1, 60_000),),
+                observed_revision=observed_revision,
+                activation_epoch=activation.activation_epoch,
+            )
+            router = build_effect_router(
+                config,
+                adapter,
+                store,
+                MessageBus(),
+                participation_ledger=log,
+                inbound_archive=SecondaryArchive(None, config.history),
+            )
+            assert router is not None
+            sent: list[object] = []
 
-        async def transport(message: object) -> None:
-            sent.append(message)
+            async def transport(message: object) -> None:
+                sent.append(message)
 
-        router.set_direct_transport(transport, transport)
-        envelope = EffectEnvelope(
-            effect_id=effect_id,
-            operation_key="participation:opportunity-1",
-            payload=payload,
-            target=EffectTarget(channel="whatsapp", chat_id=chat_id),
-            principal="service:speakup",
-            capability="send_text",
-            origin="participation",
-            admission_id=admission.admission_id,
-            created_ms=1,
-        )
-        router._gateway.submit_participation(envelope, admission)  # noqa: SLF001
-        await log.record_send_attempt(
-            admission.opportunity_id, effect_id=effect_id, now_ms=2
-        )
-        before_pause = router._gateway._authorizer.check(envelope, None)  # noqa: SLF001
-        assert before_pause.outcome == "allow", before_pause.reason
+            router.set_direct_transport(transport, transport)
+            envelope = EffectEnvelope(
+                effect_id=effect_id,
+                operation_key="participation:opportunity-1",
+                payload=payload,
+                target=EffectTarget(channel="whatsapp", chat_id=chat_id),
+                principal="service:speakup",
+                capability="send_text",
+                origin="participation",
+                admission_id=admission.admission_id,
+                created_ms=1,
+            )
+            router._gateway.submit_participation(envelope, admission)  # noqa: SLF001
+            await log.record_send_attempt(
+                admission.opportunity_id, effect_id=effect_id, now_ms=2
+            )
+            before_pause = router._gateway._authorizer.check(envelope, None)  # noqa: SLF001
+            assert before_pause.outcome == "allow", before_pause.reason
 
-        adapter._set_chat_pause(  # noqa: SLF001
-            channel="whatsapp", chat_id=chat_id, until_ms=2**63 - 1
-        )
-        receipt = await router._gateway.execute_ready(effect_id)  # noqa: SLF001
-        assert receipt.state == "blocked"
-        assert sent == []
+            adapter._set_chat_pause(  # noqa: SLF001
+                channel="whatsapp", chat_id=chat_id, until_ms=2**63 - 1
+            )
+            receipt = await router._gateway.execute_ready(effect_id)  # noqa: SLF001
+            assert receipt.state == "blocked"
+            assert sent == []
 
-        adapter._clear_chat_pause(channel="whatsapp", chat_id=chat_id)  # noqa: SLF001
-        refreshed = adapter.current_activation("whatsapp", chat_id)
-        assert refreshed is not None
-        fresh_effect_id = "participation-effect-2"
-        fresh_admission = replace(
-            admission,
-            opportunity_id="opportunity-2",
-            admission_id="admission-2",
-            activation_epoch=refreshed.activation_epoch,
-            policy_version=refreshed.policy_version,
-            policy_hash=adapter.policy_snapshot().policy_hash,
-            arbitration_revision=store.arbitration_revision("whatsapp", chat_id),
-        )
-        assert log.reserve_delivery_sync(
-            proposal_id=fresh_admission.opportunity_id,
-            effect_id=fresh_effect_id,
-            channel="whatsapp",
-            chat_id=chat_id,
-            now_ms=3,
-            limits=(("comment", 2, 60_000),),
-            observed_revision=observed_revision,
-            activation_epoch=refreshed.activation_epoch,
-        )
-        fresh_envelope = replace(
-            envelope,
-            effect_id=fresh_effect_id,
-            operation_key="participation:opportunity-2",
-            admission_id=fresh_admission.admission_id,
-        )
-        router._gateway.submit_participation(fresh_envelope, fresh_admission)  # noqa: SLF001
-        await log.record_send_attempt(
-            fresh_admission.opportunity_id, effect_id=fresh_effect_id, now_ms=4
-        )
-        assert router._gateway._authorizer.check(fresh_envelope, None).outcome == "allow"  # noqa: SLF001
-        store.note_direct_admission(
-            "whatsapp", chat_id, "direct-source", "direct-turn", now_ms=5
-        )
-        stale = router._gateway._authorizer.check(fresh_envelope, None)  # noqa: SLF001
-        assert stale.outcome == "deny"
-        assert stale.reason == "participation_denied:source_not_authorized"
-    finally:
-        store.close()
-        archive.close()
-        log.close()
+            adapter._clear_chat_pause(channel="whatsapp", chat_id=chat_id)  # noqa: SLF001
+            refreshed = adapter.current_activation("whatsapp", chat_id)
+            assert refreshed is not None
+            fresh_effect_id = "participation-effect-2"
+            fresh_admission = replace(
+                admission,
+                opportunity_id="opportunity-2",
+                admission_id="admission-2",
+                activation_epoch=refreshed.activation_epoch,
+                policy_version=refreshed.policy_version,
+                policy_hash=adapter.policy_snapshot().policy_hash,
+                arbitration_revision=store.arbitration_revision("whatsapp", chat_id),
+            )
+            assert log.reserve_delivery_sync(
+                proposal_id=fresh_admission.opportunity_id,
+                effect_id=fresh_effect_id,
+                channel="whatsapp",
+                chat_id=chat_id,
+                now_ms=3,
+                limits=(("comment", 2, 60_000),),
+                observed_revision=observed_revision,
+                activation_epoch=refreshed.activation_epoch,
+            )
+            fresh_envelope = replace(
+                envelope,
+                effect_id=fresh_effect_id,
+                operation_key="participation:opportunity-2",
+                admission_id=fresh_admission.admission_id,
+            )
+            router._gateway.submit_participation(fresh_envelope, fresh_admission)  # noqa: SLF001
+            await log.record_send_attempt(
+                fresh_admission.opportunity_id, effect_id=fresh_effect_id, now_ms=4
+            )
+            assert router._gateway._authorizer.check(fresh_envelope, None).outcome == "allow"  # noqa: SLF001
+            store.note_direct_admission(
+                "whatsapp", chat_id, "direct-source", "direct-turn", now_ms=5
+            )
+            stale = router._gateway._authorizer.check(fresh_envelope, None)  # noqa: SLF001
+            assert stale.outcome == "deny"
+            assert stale.reason == "participation_denied:source_not_authorized"
+        finally:
+            store.close()
+            archive.close()
+            log.close()

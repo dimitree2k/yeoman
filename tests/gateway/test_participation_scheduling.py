@@ -1055,7 +1055,6 @@ async def test_available_actions_shrink_with_budgets_but_never_lose_silence(
     from yeoman_gateway.consciousness.tools import ConsciousnessTools
     from yeoman_gateway.policy.engine import PolicyEngine
     from yeoman_gateway.policy.schema import PolicyConfig
-    from yeoman_gateway.storage.inbound_archive import InboundArchive
     from yeoman_shared.config.schema import Config, ConsciousnessConfig
 
     from tests.gateway.test_participation_delivery import (
@@ -1088,7 +1087,7 @@ async def test_available_actions_shrink_with_budgets_but_never_lose_silence(
         policy_engine=PolicyEngine(policy, workspace=tmp_path),
         bus=MessageBus(),
         log=log,
-        inbound_archive=InboundArchive(tmp_path / "inbound.db"),
+        inbound_archive=object(),
         memory=_FakeMemory(),
         security=_AllowSecurity(),
         approval_store=SpeakupApprovalStore(tmp_path / "approvals.json"),

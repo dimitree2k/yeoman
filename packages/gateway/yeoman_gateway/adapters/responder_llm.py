@@ -82,8 +82,6 @@ if TYPE_CHECKING:
     from yeoman_gateway.media.lazy_resolver import LazyMediaResolver
     from yeoman_gateway.media.router import ModelRouter
     from yeoman_gateway.media.tts import TTSSynthesizer
-    from yeoman_gateway.storage.chat_registry import ChatRegistry
-    from yeoman_gateway.storage.inbound_archive import InboundArchive
     from yeoman_gateway.storage.private_handoff import PrivateHandoffStore
 
 
@@ -650,7 +648,7 @@ class LLMResponder(ResponderPort):
         exec_config: "ExecToolConfig | None" = None,
         cron_service: "CronService | None" = None,
         contacts_service: "ContactsService | None" = None,
-        chat_registry: "ChatRegistry | None" = None,
+        chat_registry: "Any | None" = None,
         caldav_service: "CalDAVService | None" = None,
         restrict_to_workspace: bool = False,
         session_manager: SessionManager | None = None,
@@ -670,7 +668,7 @@ class LLMResponder(ResponderPort):
         whatsapp_tts_outgoing_dir: Path | None = None,
         whatsapp_tts_max_raw_bytes: int = 160 * 1024,
         recording_notifier: "Callable[[str, str], Awaitable[None]] | None" = None,
-        inbound_archive: "InboundArchive | None" = None,
+        inbound_archive: "Any | None" = None,
         private_handoff_store: "PrivateHandoffStore | None" = None,
         a2a_registry: "A2AWorkerRegistry | None" = None,
         a2a_delivery: object | None = None,

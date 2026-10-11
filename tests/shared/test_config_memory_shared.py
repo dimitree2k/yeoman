@@ -11,6 +11,7 @@ from yeoman_shared.config.schema import Config
 
 def _config(tmp_path: Path) -> Config:
     config = Config()
+    config.history.legacy_writers_disabled = False  # Retained S3 service unit, not gateway startup.
     config.memory.db_path = str(tmp_path / "memory.db")
     config.memory.capture.enabled = False
     config.memory.embedding.enabled = False

@@ -308,7 +308,16 @@ async def test_secondary_persona_and_policy_metadata_reopen_in_owned_scope(tmp_p
             assert queries.snapshot is current_history_snapshot()
             yield
         def owner_read_context(self, **kwargs):
-            return object()
+            return TrustedReadContext(
+                principal_id=AUTHOR,
+                channel=kwargs["channel"],
+                chat_id=kwargs["chat_id"],
+                recipient_principals=frozenset({AUTHOR}),
+                membership_revision="synthetic-membership-v1",
+                policy_revision=1,
+                purpose="proactive",
+                now_ms=1_800_000_000_000,
+            )
         def recall(self, *args, **kwargs):
             generations.append(current_history_snapshot().generation)
             return SimpleNamespace(entry_texts=(f'Synthetic preference {p.generation}',))

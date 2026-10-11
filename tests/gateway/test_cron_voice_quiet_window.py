@@ -9,11 +9,33 @@ import pytest
 from yeoman_gateway.cron.service import CronJobDeferredError, CronService
 from yeoman_gateway.cron.types import CronPayload, CronSchedule
 from yeoman_gateway.cron.voice import evaluate_voice_quiet_gate
-from yeoman_gateway.storage.inbound_archive import InboundArchive
+
+from tests.gateway.history_test_helpers import ProjectedHistory
 
 
-def _archive(tmp_path: Path) -> InboundArchive:
-    return InboundArchive(tmp_path / "reply_context.db")
+def _archive(tmp_path: Path) -> ProjectedHistory:
+    return ProjectedHistory(tmp_path / "history")
+
+
+async def _evaluate(
+    history: ProjectedHistory,
+    *,
+    payload: CronPayload,
+    channel: str,
+    chat_id: str,
+    now: datetime,
+):
+    from yeoman_gateway.adapters.reply_archive_history import HistoryReplyArchiveAdapter
+    from yeoman_gateway.history.queries import HistoryQueries
+
+    async with history.turn() as snapshot:
+        return evaluate_voice_quiet_gate(
+            payload=payload,
+            inbound_archive=HistoryReplyArchiveAdapter(HistoryQueries(snapshot)),
+            channel=channel,
+            chat_id=chat_id,
+            now=now,
+        )
 
 
 def _voice_payload(**overrides: object) -> CronPayload:
@@ -29,22 +51,22 @@ def _voice_payload(**overrides: object) -> CronPayload:
     return payload
 
 
-def test_quiet_gate_allows_voice_when_chat_has_been_silent(tmp_path: Path) -> None:
+@pytest.mark.asyncio
+async def test_quiet_gate_allows_voice_when_chat_has_been_silent(tmp_path: Path) -> None:
     now = datetime(2026, 5, 8, 8, 30, tzinfo=UTC)
     archive = _archive(tmp_path)
-    archive.record_inbound(
-        channel="whatsapp",
+    archive.add_message(
         chat_id="group@g.us",
         message_id="old",
-        participant="user",
-        sender_id="user",
+        participant="4691000000001@s.whatsapp.net",
+        sender_id="4691000000001@s.whatsapp.net",
         text="old topic",
-        timestamp=int((now - timedelta(hours=3)).timestamp()),
+        timestamp=(now - timedelta(hours=3)).timestamp(),
     )
 
-    decision = evaluate_voice_quiet_gate(
+    decision = await _evaluate(
+        archive,
         payload=_voice_payload(),
-        inbound_archive=archive,
         channel="whatsapp",
         chat_id="group@g.us",
         now=now,
@@ -54,22 +76,22 @@ def test_quiet_gate_allows_voice_when_chat_has_been_silent(tmp_path: Path) -> No
     assert decision.retry_at_ms is None
 
 
-def test_quiet_gate_defers_voice_when_chat_is_active_inside_window(tmp_path: Path) -> None:
+@pytest.mark.asyncio
+async def test_quiet_gate_defers_voice_when_chat_is_active_inside_window(tmp_path: Path) -> None:
     now = datetime(2026, 5, 8, 8, 30, tzinfo=UTC)
     archive = _archive(tmp_path)
-    archive.record_inbound(
-        channel="whatsapp",
+    archive.add_message(
         chat_id="group@g.us",
         message_id="recent",
-        participant="user",
-        sender_id="user",
+        participant="4691000000001@s.whatsapp.net",
+        sender_id="4691000000001@s.whatsapp.net",
         text="active topic",
-        timestamp=int((now - timedelta(minutes=10)).timestamp()),
+        timestamp=(now - timedelta(minutes=10)).timestamp(),
     )
 
-    decision = evaluate_voice_quiet_gate(
+    decision = await _evaluate(
+        archive,
         payload=_voice_payload(),
-        inbound_archive=archive,
         channel="whatsapp",
         chat_id="group@g.us",
         now=now,
@@ -81,24 +103,24 @@ def test_quiet_gate_defers_voice_when_chat_is_active_inside_window(tmp_path: Pat
     assert decision.retry_at_ms == int((now + timedelta(minutes=30)).timestamp() * 1000)
 
 
-def test_quiet_gate_skips_voice_after_window_end_when_chat_is_still_active(
+@pytest.mark.asyncio
+async def test_quiet_gate_skips_voice_after_window_end_when_chat_is_still_active(
     tmp_path: Path,
 ) -> None:
     now = datetime(2026, 5, 8, 11, 45, tzinfo=UTC)
     archive = _archive(tmp_path)
-    archive.record_inbound(
-        channel="whatsapp",
+    archive.add_message(
         chat_id="group@g.us",
         message_id="recent",
-        participant="user",
-        sender_id="user",
+        participant="4691000000001@s.whatsapp.net",
+        sender_id="4691000000001@s.whatsapp.net",
         text="still active",
-        timestamp=int((now - timedelta(minutes=5)).timestamp()),
+        timestamp=(now - timedelta(minutes=5)).timestamp(),
     )
 
-    decision = evaluate_voice_quiet_gate(
+    decision = await _evaluate(
+        archive,
         payload=_voice_payload(),
-        inbound_archive=archive,
         channel="whatsapp",
         chat_id="group@g.us",
         now=now,

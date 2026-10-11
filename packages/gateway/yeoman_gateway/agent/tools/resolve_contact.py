@@ -22,7 +22,7 @@ from yeoman_gateway.history.live import HistoryPaused
 if TYPE_CHECKING:
     from yeoman_gateway.knowledge._contacts.models import Contact
     from yeoman_gateway.knowledge._contacts.service import ContactsService
-    from yeoman_gateway.storage.chat_registry import ChatRegistry
+
 
 _MENTION_TOKEN_RE = re.compile(
     r"(?<![\w@\x80-\U0010ffff])"
@@ -69,7 +69,7 @@ def _mention_candidates(text: str) -> list[str]:
 
 
 def _participant_phone_map(
-    chat_registry: "ChatRegistry | None",
+    chat_registry: "Any | None",
     *,
     channel: str,
     chat_id: str,
@@ -100,7 +100,7 @@ def _participant_phone_map(
 
 
 def chat_participant_identifiers(
-    chat_registry: "ChatRegistry | None",
+    chat_registry: "Any | None",
     *,
     channel: str,
     chat_id: str,
@@ -173,7 +173,7 @@ def resolve_contact_reference(
     reference: str,
     channel: str,
     chat_id: str,
-    chat_registry: "ChatRegistry | None" = None,
+    chat_registry: "Any | None" = None,
     contacts: "ContactsService | None" = None,
     knowledge: object | None = None,
 ) -> ContactResolution | None:
@@ -235,13 +235,20 @@ def _resolve_through_knowledge(
     participant_map: dict[str, str],
     participant_ids: set[str],
 ) -> ContactResolution | None:
-    """Resolve a reference through the public knowledge facade only."""
+    """Resolve proven targets through the selected chat scope or Knowledge facade."""
+    from yeoman_gateway.knowledge._history_identity import current_history_scope
+    scope = current_history_scope()
     mention_candidates = _mention_candidates(ref)
     if mention_candidates:
         # A mention is an identifier, not a name: only a proven binding on this channel
         # names a person, and only with an address that person actually has.
         for candidate in mention_candidates:
             mapped = participant_map.get(candidate, candidate)
+            if scope is not None and channel == "whatsapp":
+                import time
+                mapped = scope.queries.mention(
+                    candidate, chat_id=chat_id, at_ms=int(time.time() * 1000)
+                ) or candidate
             for value in dict.fromkeys((mapped, candidate)):
                 proven = _proven_mention_target(knowledge, channel=channel, value=value)
                 if proven is None:
@@ -258,17 +265,23 @@ def _resolve_through_knowledge(
                     )
         return None
 
+    if scope is not None and channel == "whatsapp":
+        import time
+        found = scope.queries.resolve_person(ref, (chat_id,), int(time.time() * 1000))
+        people = [(found.person_id, (scope.queries.contact(found.person_id) or {}).get("display_name"))] if found.person_id else []
+    else:
+        people = [(person.person_id, person.display_name) for person in knowledge.search_people_with_policy(
+            ref, channel=channel, chat_id=chat_id
+        )]
     candidates: list[ContactResolution] = []
-    for person in knowledge.search_people_with_policy(
-        ref, channel=channel, chat_id=chat_id
-    ):
-        labels = [knowledge.person_display_name(person.person_id) or ""]
-        labels.extend(knowledge.alias_names(person.person_id))
+    for person_id, display_name in people:
+        labels = [knowledge.person_display_name(person_id) or ""]
+        labels.extend(knowledge.alias_names(person_id))
         if not _reference_matches_labels(ref, [label for label in labels if label]):
             continue
         identifiers = [
             item.value
-            for item in knowledge.person_identifiers(person.person_id)
+            for item in knowledge.person_identifiers(person_id)
             if item.channel == channel
         ]
         if participant_ids:
@@ -278,7 +291,7 @@ def _resolve_through_knowledge(
             continue
         candidates.append(
             ContactResolution(
-                display_name=person.display_name or chosen,
+                display_name=display_name or chosen,
                 jid=chosen,
             )
         )
@@ -404,7 +417,7 @@ class ResolveContactTool(Tool):
         *,
         contacts: "ContactsService | None" = None,
         knowledge: object | None = None,
-        chat_registry: "ChatRegistry | None" = None,
+        chat_registry: "Any | None" = None,
     ) -> None:
         self._contacts = contacts
         self._knowledge = knowledge

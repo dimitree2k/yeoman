@@ -102,21 +102,25 @@ async def test_delayed_approval_reopens_scope_and_revalidates_source_revisions()
 async def test_native_approval_proof_survives_real_staging(tmp_path, with_knowledge):
     from test_participation_knowledge_approval import (
         CHAT,
+        NOW,
         _build_tools,
         _stage,
         _statement_selection,
         _stored_snapshot,
     )
-    from yeoman_gateway.history.context import history_turn
+    from yeoman_gateway.history.context import current_history_snapshot, history_turn
+    from yeoman_gateway.history.queries import HistoryQueries
     from yeoman_gateway.processing.participation_knowledge import selection_to_mapping
     from yeoman_gateway.processing.participation_runtime import _knowledge_evidence_for_admission
-    p = Projector()
-    p.add('m1', chat=CHAT)
     admission = SimpleNamespace(channel='whatsapp', chat_id=CHAT, source_event_ids=('m1',), knowledge_evidence=None)
     context = {'_knowledge_evidence': selection_to_mapping(_statement_selection())} if with_knowledge else {}
     tools, log, archive, effects = _build_tools(tmp_path)
+    archive.add_message(chat_id=CHAT, message_id="m1", sender_id="10001@s.whatsapp.net",
+                        text="synthetic source", timestamp=NOW // 1000)
     try:
-        async with history_turn(p):
+        async with history_turn(archive):
+            row = HistoryQueries(current_history_snapshot()).native_message(chat_id=CHAT, native_id="m1")
+            admission.source_event_ids = (row["message_id"],)
             evidence = _knowledge_evidence_for_admission(admission, context)
             result = await _stage(tools, knowledge_evidence=evidence)
             assert result['status'] == 'awaiting_approval', result
@@ -126,7 +130,6 @@ async def test_native_approval_proof_survives_real_staging(tmp_path, with_knowle
     finally:
         archive.close()
         log.close()
-        p.close()
 
 
 async def test_non_dict_history_evidence_with_stale_proof_is_refused():

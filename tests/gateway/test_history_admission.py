@@ -52,7 +52,6 @@ async def test_admission_and_final_reply_do_not_share_pre_enrichment_snapshot():
         admission_ids.append(id(current_history_snapshot()))
         return SimpleNamespace(denied=True, reason='synthetic', decision=None)
     channel._processing_gate = SimpleNamespace(admit_async=admit)
-    channel._archive_inbound_event = Mock()
     event = SimpleNamespace(chat_jid='a@g.us', message_id='m')
     await channel._ingest_inbound_event(event)
     assert admission_ids and admission_ids[0] != id(None)
@@ -73,7 +72,7 @@ async def test_admission_and_final_reply_do_not_share_pre_enrichment_snapshot():
     channel._enrich_media_event = AsyncMock()
     await channel._ingest_inbound_event(event)
     channel._enrich_media_event.assert_not_called()
-    assert channel._archive_inbound_event.call_count == 2
+    # Removed legacy projection-call count; admission/enrichment lease assertions remain.
     p.close()
 
 

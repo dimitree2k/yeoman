@@ -1070,7 +1070,7 @@ class EnginePolicyAdapter(PolicyPort):
         return bool(self._owner_policy_for_context(ctx))
 
     def _get_group_name(self, chat_id: str) -> str | None:
-        """Get group name from chat_registry or bridge."""
+        """Get group name from History or bridge."""
         history = getattr(self, '_history_config', None)
         if history is not None and (history.live_projection_enabled and history.readers.secondary or history.legacy_writers_disabled):
             from yeoman_gateway.history.context import current_history_snapshot
@@ -1080,22 +1080,6 @@ class EnginePolicyAdapter(PolicyPort):
             if snapshot is None or not (history.live_projection_enabled and history.readers.secondary):
                 raise HistoryPaused('secondary_history_scope_required')
             return next((row['subject'] for row in HistoryQueries(snapshot).chats() if row['chat_id'] == chat_id), None)
-        # Try chat_registry first
-        try:
-            from yeoman_gateway.storage.chat_registry import ChatRegistry
-
-            registry = ChatRegistry()
-            try:
-                chat_info = registry.get_chat("whatsapp", chat_id)
-                if chat_info:
-                    name = chat_info.get("readable_name")
-                    if name:
-                        return name
-            finally:
-                registry.close()
-        except Exception:
-            pass
-
         # Try bridge lookup
         try:
             names = self._list_group_subjects_from_bridge([chat_id])

@@ -1,10 +1,12 @@
 """History activation is controlled by file/initializer data only."""
 import json
 import os
+from types import SimpleNamespace
 
 import pytest
 from yeoman_shared.config.loader import load_config
 from yeoman_shared.config.schema import Config
+from yeoman_shared.raw_archive.writer import RawArchive
 
 ENV_KEYS = ['YEOMAN_HISTORY__LIVE_PROJECTION_ENABLED', 'YEOMAN_HISTORY__liveProjectionEnabled', 'yeoman_history__LIVE_PROJECTION_ENABLED', 'YEOMAN_HISTORY']
 
@@ -17,8 +19,11 @@ def test_history_environment_cannot_activate_loader_or_bootstrap(tmp_path, monke
     path = tmp_path / 'settings.json'
     if payload is not None:
         path.write_text(json.dumps(payload))
-    for config in (Config(), Config.model_validate({}), load_config(path), load_config(path)):
-        assert config.history.live_projection_enabled is False
+    assert Config().history.live_projection_enabled
+    assert Config.model_validate({}).history.live_projection_enabled
+    expected = payload is None or payload.get('history', {}).get('liveProjectionEnabled') is not False
+    assert load_config(path).history.live_projection_enabled is expected
+    assert load_config(path).history.live_projection_enabled is expected
     assert os.environ[key].endswith('true}') or os.environ[key] == 'true'
 
 
@@ -56,7 +61,7 @@ def test_history_env_filter_preserves_other_config_sources(tmp_path, monkeypatch
       for family in ("PARTICIPATION", "WHATSAPP", "RESPONDER", "TOOLS", "SECONDARY", "KNOWLEDGE")],
 ])
 @pytest.mark.parametrize("dotenv", [False, True])
-def test_history_selectors_off_and_environment_cannot_activate(tmp_path, monkeypatch, key, dotenv):
+def test_history_defaults_on_and_environment_cannot_override(tmp_path, monkeypatch, key, dotenv):
     from yeoman_gateway.app.bootstrap import build_history_projector
 
     monkeypatch.setenv("YEOMAN_HOME", str(tmp_path))
@@ -66,12 +71,18 @@ def test_history_selectors_off_and_environment_cannot_activate(tmp_path, monkeyp
         envfile.write_text(f"{key}={value}\n")
     else:
         monkeypatch.setenv(key, value)
+    archive = RawArchive(tmp_path / "raw", spool=tmp_path / "spool",
+                         status_path=tmp_path / "raw-status.json")
     for data in ({}, {"history": {"liveProjectionEnabled": False}}):
         config = Config(_env_file=envfile if dotenv else None, **data)
-        assert not config.history.live_projection_enabled
-        assert not config.history.legacy_writers_disabled
-        assert not any(config.history.readers.model_dump().values())
-        assert build_history_projector(config, object()) is None
+        assert config.history.live_projection_enabled is (not bool(data))
+        assert config.history.legacy_writers_disabled
+        assert all(config.history.readers.model_dump().values())
+        projector = build_history_projector(config, SimpleNamespace(raw_archive=archive))
+        if config.history.live_projection_enabled:
+            assert projector is not None and projector.archive is archive
+        else:
+            assert projector is None
     for enabled in (False, True):
         data = {"history": {"liveProjectionEnabled": enabled, "readers": {"tools": True, "whatsapp": True},
                             "legacyWritersDisabled": False}}
@@ -80,10 +91,13 @@ def test_history_selectors_off_and_environment_cannot_activate(tmp_path, monkeyp
         for config in (Config(_env_file=envfile if dotenv else None, **data), load_config(path)):
             selected = {family for family, value in config.history.readers.model_dump().items()
                         if config.history.live_projection_enabled and value}
-            assert selected == ({"tools", "whatsapp"} if enabled else set())
+            assert selected == (set(config.history.readers.model_dump()) if enabled else set())
             assert not config.history.legacy_writers_disabled
-            if not enabled:
-                assert build_history_projector(config, object()) is None
+            projector = build_history_projector(config, SimpleNamespace(raw_archive=archive))
+            if enabled:
+                assert projector is not None and projector.archive is archive
+            else:
+                assert projector is None
     assert Config(history={"legacyWritersDisabled": True}).history.legacy_writers_disabled
     assert not (tmp_path / "data" / "operational" / "history").exists()
 

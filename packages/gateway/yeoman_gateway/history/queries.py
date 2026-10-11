@@ -196,10 +196,10 @@ class HistoryQueries:
     def chats(self) -> list[Row]:
         return self._rows("""
             SELECT 'whatsapp' AS channel, chat_id,
-              (SELECT json_extract(payload_json,'$.subject') FROM message_events e
+              (SELECT COALESCE(json_extract(payload_json,'$.value'), json_extract(payload_json,'$.subject')) FROM message_events e
                WHERE e.channel='whatsapp' AND e.chat_id=c.chat_id AND kind='group_subject'
                ORDER BY occurred_ms DESC,event_id DESC LIMIT 1) AS subject,
-              (SELECT json_extract(payload_json,'$.description') FROM message_events e
+              (SELECT COALESCE(json_extract(payload_json,'$.value'), json_extract(payload_json,'$.description')) FROM message_events e
                WHERE e.channel='whatsapp' AND e.chat_id=c.chat_id AND kind='group_description'
                ORDER BY occurred_ms DESC,event_id DESC LIMIT 1) AS description
             FROM (SELECT chat_id FROM messages WHERE channel='whatsapp'

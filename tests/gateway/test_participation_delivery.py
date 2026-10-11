@@ -1888,9 +1888,11 @@ def _build_tools(tmp_path: Path, *, security: object | None = None, policy: obje
     from yeoman_gateway.bus.queue import MessageBus
     from yeoman_gateway.consciousness.approval import SpeakupApprovalStore
     from yeoman_gateway.consciousness.tools import ConsciousnessTools
+    from yeoman_gateway.history.export import SecondaryArchive
     from yeoman_gateway.policy.engine import PolicyEngine
-    from yeoman_gateway.storage.inbound_archive import InboundArchive
     from yeoman_shared.config.schema import Config, ConsciousnessConfig
+
+    from tests.gateway.history_test_helpers import ProjectedHistory
 
     config = Config(
         consciousness=ConsciousnessConfig.model_validate(
@@ -1904,6 +1906,7 @@ def _build_tools(tmp_path: Path, *, security: object | None = None, policy: obje
         )
     )
     log = SpeakupLog(tmp_path / "speakups.db")
+    archive = ProjectedHistory(tmp_path)
     store = SpeakupApprovalStore(
         tmp_path / "approvals.json", now=lambda: _FIXED_NOW.timestamp()
     )
@@ -1912,12 +1915,13 @@ def _build_tools(tmp_path: Path, *, security: object | None = None, policy: obje
         policy_engine=PolicyEngine(policy or _group_policy(), workspace=tmp_path),
         bus=MessageBus(),
         log=log,
-        inbound_archive=InboundArchive(tmp_path / "inbound.db"),
+        inbound_archive=SecondaryArchive(archive, config.history),
         memory=_FakeMemory(),
         security=security or _AllowSecurity(),
         approval_store=store,
         now=lambda: _FIXED_NOW,
     )
+    archive.wire(tools)
     tools.begin_run(trigger="cron")
     return tools, store, log
 

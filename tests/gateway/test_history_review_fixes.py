@@ -132,30 +132,3 @@ async def test_observer_scopes_only_eligible_inbound(tmp_path, kind, case):
         assert p.live_snapshot_count == 0
     finally:
         p.close()
-
-
-@pytest.mark.parametrize('kind', ['burst', 'lull'])
-async def test_dormant_observer_keeps_eligibility_order(tmp_path, kind):
-    from yeoman_gateway.bus.events import InboundObservedEvent
-    from yeoman_gateway.consciousness.burst import BurstObserver
-    from yeoman_gateway.consciousness.lull import LullObserver
-    from yeoman_shared.config.schema import Config
-
-    config = Config()
-    config.consciousness.enabled = True
-    config.consciousness.burst_enabled = True
-    config.consciousness.lull_enabled = True
-    calls = []
-    def eligible(channel, chat_id):
-        calls.append('eligible')
-        return False
-    cls = BurstObserver if kind == 'burst' else LullObserver
-    observer = cls(config=config, state_path=tmp_path / f'{kind}.json', is_eligible=eligible,
-                   **{f'on_{kind}': AsyncMock()})
-    def direct(event):
-        assert current_history_snapshot() is None
-        calls.append('direct')
-        return False
-    observer._is_direct_bot_interaction = direct
-    await observer.handle(InboundObservedEvent(channel='whatsapp', chat_id='a@g.us', sender_id='synthetic', content='synthetic', timestamp=1700000000))
-    assert calls == (['direct', 'eligible'] if kind == 'burst' else ['direct'])

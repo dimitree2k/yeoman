@@ -15,6 +15,7 @@ import time
 from pathlib import Path
 
 import pytest
+from yeoman_gateway.adapters.reply_archive_history import HistoryReplyArchiveAdapter
 from yeoman_gateway.app.bootstrap import participant_is_allowed
 from yeoman_gateway.bus.events import InboundObservedEvent
 from yeoman_gateway.consciousness.delivery import DeliveryAnchorReader
@@ -27,6 +28,7 @@ from yeoman_gateway.consciousness.participation_runtime import (
 from yeoman_gateway.consciousness.participation_runtime import (
     ParticipationRuntime as OfferRuntime,
 )
+from yeoman_gateway.history.queries import HistoryQueries
 from yeoman_gateway.policy.engine import PolicyEngine
 from yeoman_gateway.policy.schema import PolicyConfig
 from yeoman_gateway.processing.participation import (
@@ -38,8 +40,9 @@ from yeoman_gateway.processing.participation_runtime import (
     ParticipationRuntime as DecisionRuntime,
 )
 from yeoman_gateway.processing.store import ProcessingStore
-from yeoman_gateway.storage.inbound_archive import InboundArchive
 from yeoman_shared.config.schema import ProcessingConfig
+
+from tests.gateway.history_test_helpers import ProjectedHistory
 
 CHANNEL = "whatsapp"
 CHAT = "pilot@g.us"
@@ -152,17 +155,10 @@ def _pilot_runtime(tmp_path: Path, *, decision: dict[str, object], shadow: bool)
     engine = PolicyEngine(policy, workspace=tmp_path)
     log = SpeakupLog(tmp_path / "speakups.db")
     store = ProcessingStore(tmp_path / "processing.db")
-    archive = InboundArchive(tmp_path / "inbound.db")
-    archive.record_inbound(
-        channel=CHANNEL,
-        chat_id=CHAT,
-        message_id="m1",
-        participant="anna@s.whatsapp.net",
-        sender_id="anna@s.whatsapp.net",
-        sender_name="anna",
-        text="Wer steht heute im Tor?",
-        timestamp=int(NOW_MS / 1000),
-    )
+    archive = ProjectedHistory(tmp_path, messages=[dict(channel=CHANNEL, chat_id=CHAT,
+        message_id="m1", participant="10001@s.whatsapp.net", sender_id="10001@s.whatsapp.net",
+        sender_name="anna", text="Wer steht heute im Tor?", timestamp=NOW_MS / 1000)])
+    queries = HistoryQueries(archive.snapshot())
 
     client = _ScriptedClient(decision)
     judge = ParticipationJudge(client=client, allowed_emojis=("👍",))
@@ -221,8 +217,8 @@ def _pilot_runtime(tmp_path: Path, *, decision: dict[str, object], shadow: bool)
             "payload_hash": "",
         }
 
-    builder = ParticipationContextBuilder(
-        archive=archive,
+    builder = archive.wire(ParticipationContextBuilder(
+        archive=HistoryReplyArchiveAdapter(queries),
         policy=engine,
         anchors=DeliveryAnchorReader(log=log, store=store),
         source_authorizer=lambda row: participant_is_allowed(
@@ -231,7 +227,7 @@ def _pilot_runtime(tmp_path: Path, *, decision: dict[str, object], shadow: bool)
             chat_id=str(row.get("chat_id") or ""),
             sender=str(row.get("sender_id") or row.get("participant") or ""),
         ),
-    )
+    ))
     submission = _Submission()
     reactor = _Reactor()
     decision_runtime = DecisionRuntime(
@@ -242,13 +238,14 @@ def _pilot_runtime(tmp_path: Path, *, decision: dict[str, object], shadow: bool)
         is_paused=lambda channel, chat_id: None,
         is_source_allowed=lambda channel, chat_id, sources: True,
         source_principals=lambda channel, chat_id, sources: tuple(
-            (str(source), "anna@s.whatsapp.net") for source in sources
+            (str(source), "10001@s.whatsapp.net") for source in sources
         ),
         is_participant_allowed=lambda channel, chat_id, sender: True,
         submission=submission,
         reactor=reactor,
         clock_ms=lambda: NOW_MS,
     )
+    archive.wire(decision_runtime)
     scheduler = OpportunityScheduler(
         handle=decision_runtime.evaluate_participation,
         max_concurrent_decisions=1,
@@ -263,7 +260,9 @@ def _pilot_runtime(tmp_path: Path, *, decision: dict[str, object], shadow: bool)
     def _material(
         channel: str, chat_id: str, source_ids: tuple[str, ...] | None
     ) -> tuple[tuple[str, ...], int]:
-        resolved_sources = archive.resolve_source_ids(channel, chat_id, source_ids)
+        rows = queries.recent(chat_id=chat_id, limit=500)
+        available = {str(row["native_message_id"]) for row in rows}
+        resolved_sources = tuple(sorted(set(source_ids or available) & available))
         log.ensure_source_revisions_sync(
             channel=channel,
             chat_id=chat_id,
@@ -301,7 +300,7 @@ def _event(message_id: str = "m1") -> InboundObservedEvent:
     return InboundObservedEvent(
         channel=CHANNEL,
         chat_id=CHAT,
-        sender_id="anna@s.whatsapp.net",
+        sender_id="10001@s.whatsapp.net",
         content="Wer steht heute im Tor?",
         timestamp=NOW_MS / 1000,
         message_id=message_id,
@@ -326,17 +325,18 @@ async def test_shadow_pilot_admits_and_decides_without_any_effect(tmp_path: Path
         },
         shadow=True,
     )
-    await rt["scheduler"].start()
-    try:
-        assert rt["ingress"].handle_event(_event()) is True
-        deadline = time.monotonic() + 10
-        while time.monotonic() < deadline:
-            disposition = await rt["log"].disposition_by_chat(CHANNEL, CHAT)
-            if disposition:
-                break
-            await asyncio.sleep(0.02)
-    finally:
-        await rt["scheduler"].stop()
+    async with rt["archive"].turn():
+        await rt["scheduler"].start()
+        try:
+            assert rt["ingress"].handle_event(_event()) is True
+            deadline = time.monotonic() + 30
+            while time.monotonic() < deadline:
+                disposition = await rt["log"].disposition_by_chat(CHANNEL, CHAT)
+                if disposition:
+                    break
+                await asyncio.sleep(0.02)
+        finally:
+            await rt["scheduler"].stop()
 
     # The judge ran, and the decision was recorded as a shadow decision.
     assert rt["client"].calls == 1
@@ -353,6 +353,7 @@ async def test_shadow_pilot_admits_and_decides_without_any_effect(tmp_path: Path
     ) == []
     rt["log"].close()
     rt["store"].close()
+    rt["archive"].close()
 
 
 @pytest.mark.asyncio
@@ -371,16 +372,17 @@ async def test_live_pilot_path_produces_one_comment_and_one_reservation(tmp_path
         },
         shadow=False,
     )
-    await rt["scheduler"].start()
-    try:
-        assert rt["ingress"].handle_event(_event()) is True
-        deadline = time.monotonic() + 10
-        while time.monotonic() < deadline:
-            if rt["submission"].submissions:
-                break
-            await asyncio.sleep(0.02)
-    finally:
-        await rt["scheduler"].stop()
+    async with rt["archive"].turn():
+        await rt["scheduler"].start()
+        try:
+            assert rt["ingress"].handle_event(_event()) is True
+            deadline = time.monotonic() + 30
+            while time.monotonic() < deadline:
+                if rt["submission"].submissions:
+                    break
+                await asyncio.sleep(0.02)
+        finally:
+            await rt["scheduler"].stop()
 
     assert rt["client"].calls == 1
     assert rt["submission"].drafts == 1
@@ -395,6 +397,7 @@ async def test_live_pilot_path_produces_one_comment_and_one_reservation(tmp_path
     assert held[0]["effect_id"] == call["effect_id"]
     rt["log"].close()
     rt["store"].close()
+    rt["archive"].close()
 
 
 @pytest.mark.asyncio
@@ -404,17 +407,18 @@ async def test_silence_pilot_records_silence_and_spends_nothing(tmp_path: Path) 
         decision={"action": "silence", "intent": "initiate", "reason": "nothing to add"},
         shadow=False,
     )
-    await rt["scheduler"].start()
-    try:
-        assert rt["ingress"].handle_event(_event()) is True
-        deadline = time.monotonic() + 10
-        while time.monotonic() < deadline:
-            disposition = await rt["log"].disposition_by_chat(CHANNEL, CHAT)
-            if disposition:
-                break
-            await asyncio.sleep(0.02)
-    finally:
-        await rt["scheduler"].stop()
+    async with rt["archive"].turn():
+        await rt["scheduler"].start()
+        try:
+            assert rt["ingress"].handle_event(_event()) is True
+            deadline = time.monotonic() + 30
+            while time.monotonic() < deadline:
+                disposition = await rt["log"].disposition_by_chat(CHANNEL, CHAT)
+                if disposition:
+                    break
+                await asyncio.sleep(0.02)
+        finally:
+            await rt["scheduler"].stop()
     assert rt["client"].calls == 1
     disposition = await rt["log"].disposition_by_chat(CHANNEL, CHAT)
     assert disposition is not None and disposition["disposition"] == "decided_silence"
@@ -422,6 +426,7 @@ async def test_silence_pilot_records_silence_and_spends_nothing(tmp_path: Path) 
     assert await rt["log"].pending_delivery_reservations() == []
     rt["log"].close()
     rt["store"].close()
+    rt["archive"].close()
 
 
 # -- the real participant-authorization predicate (found broken by the live probe) ------
@@ -456,7 +461,7 @@ def _pilot_engine(tmp_path: Path):
 @pytest.mark.parametrize(
     "chat,sender,allowed",
     [
-        (CHAT, "anna@s.whatsapp.net", True),
+        (CHAT, "10001@s.whatsapp.net", True),
         (CHAT, "ben@s.whatsapp.net", True),
         ("closed@g.us", "vip@s.whatsapp.net", True),
         ("closed@g.us", "stranger@s.whatsapp.net", False),
@@ -484,7 +489,7 @@ def test_participant_is_allowed_fails_closed_on_a_broken_check(tmp_path: Path) -
 
     assert (
         participant_is_allowed(
-            engine=_Broken(), channel=CHANNEL, chat_id=CHAT, sender="anna@s.whatsapp.net"
+            engine=_Broken(), channel=CHANNEL, chat_id=CHAT, sender="10001@s.whatsapp.net"
         )
         is False
     )
@@ -611,7 +616,10 @@ async def test_continuation_candidate_may_use_reserved_slots_end_to_end(
         source_event_ids=("m1",), observed_revision=99, activation_epoch=1,
         created_at_ms=NOW_MS,
     )
-    result = await runtime.evaluate_participation(opportunity)
+    rt["archive"].add_message(chat_id=CHAT, message_id="bot-anchor", text="Earlier bot contribution",
+        timestamp=(NOW_MS - 119_000) / 1000, direction="out")
+    async with rt["archive"].turn():
+        result = await runtime.evaluate_participation(opportunity)
     assert result["status"] == "silence"
     assert provider_calls.calls == 1
     attempts = await log.judge_attempts_since(

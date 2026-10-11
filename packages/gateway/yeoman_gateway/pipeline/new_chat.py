@@ -206,22 +206,8 @@ class NewChatNotifyMiddleware:
             from yeoman_gateway.history.live import HistoryPaused
             raise HistoryPaused('secondary_reader_unselected')
         else:
-            # Fetch group info.
             group_name = None
             group_desc = None
-            try:
-                from yeoman_gateway.storage.chat_registry import ChatRegistry
-
-                registry = ChatRegistry()
-                try:
-                    chat_info = registry.get_chat(event.channel, event.chat_id)
-                    if chat_info:
-                        group_name = chat_info.get("readable_name")
-                        group_desc = chat_info.get("description")
-                finally:
-                    registry.close()
-            except Exception:
-                pass
 
         if not group_name and not (history is not None and history.live_projection_enabled and history.readers.secondary):
             group_name = event.raw_metadata.get("group_name") or event.raw_metadata.get("subject")

@@ -725,8 +725,10 @@ def _build_tools(tmp_path: Path):
     from yeoman_gateway.bus.queue import MessageBus
     from yeoman_gateway.consciousness.approval import SpeakupApprovalStore
     from yeoman_gateway.consciousness.tools import ConsciousnessTools
-    from yeoman_gateway.storage.inbound_archive import InboundArchive
+    from yeoman_gateway.history.export import SecondaryArchive
     from yeoman_shared.config.schema import Config, ConsciousnessConfig
+
+    from tests.gateway.history_test_helpers import ProjectedHistory
 
     config = Config(
         consciousness=ConsciousnessConfig.model_validate(
@@ -740,14 +742,14 @@ def _build_tools(tmp_path: Path):
         )
     )
     log = SpeakupLog(tmp_path / "speakups.db")
-    archive = InboundArchive(tmp_path / "inbound.db")
+    archive = ProjectedHistory(tmp_path)
     effects = _RecordingEffects()
     tools = ConsciousnessTools(
         config=config,
         policy_engine=PolicyEngine(_policy(), workspace=tmp_path),
         bus=MessageBus(),
         log=log,
-        inbound_archive=archive,
+        inbound_archive=SecondaryArchive(archive, config.history),
         memory=None,
         security=_AllowSecurity(),
         approval_store=SpeakupApprovalStore(
@@ -756,6 +758,7 @@ def _build_tools(tmp_path: Path):
         service_effects=effects,
         now=lambda: FIXED_NOW,
     )
+    archive.wire(tools)
     tools.begin_run(trigger="cron")
     return tools, log, archive, effects
 
@@ -843,7 +846,6 @@ async def test_staging_persists_the_evidence_and_reconstructs_it_after_a_restart
 
     await _claim(log, snapshot)
     log.close()
-    archive.close()
 
     restarted, restarted_log, restarted_archive, _ = _build_tools(tmp_path)
     submission = _Submission()
@@ -852,7 +854,6 @@ async def test_staging_persists_the_evidence_and_reconstructs_it_after_a_restart
         outcome = await restarted.submit_proposal("opp-1")
     finally:
         restarted_log.close()
-        restarted_archive.close()
 
     assert outcome["status"] == "submitted"
     assert len(submission.calls) == 1
@@ -876,7 +877,6 @@ async def test_staging_a_legacy_recent_only_proposal_still_works(tmp_path: Path)
 
     await _claim(log, snapshot)
     log.close()
-    archive.close()
 
     restarted, restarted_log, restarted_archive, _ = _build_tools(tmp_path)
     submission = _Submission()
@@ -885,7 +885,6 @@ async def test_staging_a_legacy_recent_only_proposal_still_works(tmp_path: Path)
         outcome = await restarted.submit_proposal("opp-1")
     finally:
         restarted_log.close()
-        restarted_archive.close()
 
     assert outcome["status"] == "submitted"
     assert len(submission.calls) == 1
@@ -977,7 +976,6 @@ async def test_changed_draft_target_or_revision_cannot_retain_the_approval(
         assert stored["knowledge_evidence"] == evidence
     finally:
         log.close()
-        archive.close()
 
 
 # -- D. durable revalidation at both boundaries (step 4) ------------------------------
@@ -1476,7 +1474,6 @@ async def test_approval_commit_refuses_a_revoked_statement(tmp_path: Path) -> No
         assert stored["knowledge_evidence"] == evidence
     finally:
         log.close()
-        archive.close()
         harness.close()
 
 
@@ -1538,7 +1535,6 @@ async def test_a_refused_stale_approval_is_not_regenerated(tmp_path: Path) -> No
         assert stored["payload_hash"] == payload_hash(TextPayload(text="the prepared draft"))
     finally:
         log.close()
-        archive.close()
         harness.close()
 
 
@@ -1556,7 +1552,6 @@ async def test_persisted_evidence_revalidates_after_a_full_restart(tmp_path: Pat
         await _claim(log, snapshot)
     finally:
         log.close()
-        archive.close()
         harness.close()
 
     restarted = CaptureHarness(tmp_path)
@@ -1586,7 +1581,6 @@ async def test_persisted_evidence_revalidates_after_a_full_restart(tmp_path: Pat
         assert admission.knowledge_evidence == evidence
     finally:
         restarted_log.close()
-        restarted_archive.close()
         restarted.close()
 
 
@@ -1756,6 +1750,7 @@ def _dispatch_router(
             payload_hash=envelope.payload_hash,
             channel=CHANNEL,
             chat_id=GROUP,
+            source_principals=(("m1", "10001@s.whatsapp.net"),),
             arbitration_revision=0,
             knowledge_evidence=evidence,
         ),
@@ -1770,7 +1765,12 @@ def _effect_evidence(store: ProcessingStore, effect_id: str) -> list[str]:
 
 
 def test_pre_dispatch_blocks_transport_when_the_validator_refuses(tmp_path: Path) -> None:
+    from tests.gateway.history_test_helpers import ProjectedHistory
+
     store = ProcessingStore(tmp_path / "processing.db")
+    history = ProjectedHistory(tmp_path, messages=[dict(channel=CHANNEL, chat_id=GROUP,
+        message_id="m1", sender_id="10001@s.whatsapp.net", text="source",
+        timestamp=int(time.time()))])
     try:
         asked: list[str] = []
 
@@ -1783,7 +1783,11 @@ def test_pre_dispatch_blocks_transport_when_the_validator_refuses(tmp_path: Path
         )
         assert store.count_effects() == 1
 
-        receipt = asyncio.run(router._gateway.execute_ready(envelope.effect_id))
+        async def execute():
+            async with history.turn():
+                return await router._gateway.execute_ready(envelope.effect_id)
+
+        receipt = asyncio.run(execute())
 
         assert receipt.state == "failed"
         assert asked == ["adm-1"]
@@ -1795,6 +1799,7 @@ def test_pre_dispatch_blocks_transport_when_the_validator_refuses(tmp_path: Path
             for detail in _effect_evidence(store, envelope.effect_id)
         )
     finally:
+        history.close()
         store.close()
 
 
@@ -1802,6 +1807,11 @@ def test_invalidated_evidence_between_approval_and_dispatch_blocks_transport(
     tmp_path: Path,
 ) -> None:
     """Evidence true at approval time, revoked before transport: the send is blocked."""
+    from tests.gateway.history_test_helpers import ProjectedHistory
+
+    history = ProjectedHistory(tmp_path, messages=[dict(channel=CHANNEL, chat_id=GROUP,
+        message_id="m1", sender_id="10001@s.whatsapp.net", text="source",
+        timestamp=int(time.time()))])
     harness = CaptureHarness(tmp_path)
     try:
         _capture_shared_statement(harness)
@@ -1819,7 +1829,11 @@ def test_invalidated_evidence_between_approval_and_dispatch_blocks_transport(
         assert any(row["status"] == "revoked" for row in harness.statements())
         assert validator(admission) == (False, "knowledge_changed")
 
-        receipt = asyncio.run(router._gateway.execute_ready(envelope.effect_id))
+        async def execute():
+            async with history.turn():
+                return await router._gateway.execute_ready(envelope.effect_id)
+
+        receipt = asyncio.run(execute())
 
         assert receipt.state == "failed"
         assert transport == []
@@ -1829,6 +1843,7 @@ def test_invalidated_evidence_between_approval_and_dispatch_blocks_transport(
             for detail in _effect_evidence(harness.store, envelope.effect_id)
         )
     finally:
+        history.close()
         harness.close()
 
 

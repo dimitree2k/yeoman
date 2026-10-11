@@ -13,11 +13,13 @@ from yeoman_gateway.consciousness.log import SpeakupLog
 from yeoman_gateway.consciousness.tools import ConsciousnessTools
 from yeoman_gateway.core.models import InboundEvent, PolicyDecision
 from yeoman_gateway.core.pipeline import PipelineContext
+from yeoman_gateway.history.export import SecondaryArchive
 from yeoman_gateway.pipeline.speakup_approval import SpeakupApprovalMiddleware
 from yeoman_gateway.policy.engine import PolicyEngine
 from yeoman_gateway.policy.schema import PolicyConfig
-from yeoman_gateway.storage.inbound_archive import InboundArchive
 from yeoman_shared.config.schema import Config, ConsciousnessConfig
+
+from tests.gateway.history_test_helpers import ProjectedHistory
 
 
 class _FakeSecurity:
@@ -46,7 +48,7 @@ def _config(**overrides: object) -> Config:
         "maxSpeakupLengthChars": 200,
     }
     payload.update(overrides)
-    return Config(consciousness=ConsciousnessConfig.model_validate(payload))
+    return Config(history={"readers": {"secondary": True}}, consciousness=ConsciousnessConfig.model_validate(payload))
 
 
 def _policy(*, opt_in_group: bool, preview: str | None = None) -> PolicyConfig:
@@ -93,17 +95,20 @@ def _tools(
         now=lambda: fixed_now.timestamp(),
     )
     log = SpeakupLog(tmp_path / "speakups.db")
+    effective_config = config or _config()
     tools = ConsciousnessTools(
-        config=config or _config(),
+        config=effective_config,
         policy_engine=PolicyEngine(_policy(opt_in_group=opt_in_group, preview=preview), workspace=tmp_path),
         bus=MessageBus(),
         log=log,
-        inbound_archive=InboundArchive(tmp_path / "inbound.db"),
+        inbound_archive=SecondaryArchive(object(), effective_config.history),
         memory=_FakeMemory(),
         security=_FakeSecurity(),
         approval_store=approval_store,
         now=lambda: fixed_now,
     )
+    history = ProjectedHistory(tmp_path / "history")
+    history.wire(tools)
     tools.begin_run(trigger="cron")
     return tools, approval_store, log
 
@@ -208,7 +213,7 @@ async def test_service_preview_does_not_count_as_target_send(tmp_path: Path) -> 
 @pytest.mark.asyncio
 async def test_chat_window_uses_most_recent_messages(tmp_path: Path) -> None:
     tools, _, _ = _tools(tmp_path, opt_in_group=True)
-    archive = tools.inbound_archive
+    history = tools._history_projector
     base = datetime(2026, 4, 25, 12, 0, tzinfo=UTC)
     for index, (timestamp, text) in enumerate(
         [
@@ -220,12 +225,11 @@ async def test_chat_window_uses_most_recent_messages(tmp_path: Path) -> None:
             (int((base - timedelta(minutes=1)).timestamp()), "recent-3"),
         ]
     ):
-        archive.record_inbound(
-            channel="whatsapp",
+        history.add_message(
             chat_id="group@g.us",
             message_id=f"msg-{index}",
-            participant="user@s.whatsapp.net",
-            sender_id="user@s.whatsapp.net",
+            participant="4691000000001@s.whatsapp.net",
+            sender_id="4691000000001@s.whatsapp.net",
             text=text,
             timestamp=timestamp,
         )
@@ -565,12 +569,11 @@ async def test_stale_speakup_code_halts_after_expired_approval_was_purged(
 @pytest.mark.asyncio
 async def test_approve_carries_reply_to_message_id_into_outbound(tmp_path: Path) -> None:
     tools, store, log = _tools(tmp_path, opt_in_group=True)
-    tools.inbound_archive.record_inbound(
-        channel="whatsapp",
+    tools._history_projector.add_message(
         chat_id="group@g.us",
         message_id="msg-anchor",
-        participant="part-1",
-        sender_id="sender-1",
+        participant="4691000000001@s.whatsapp.net",
+        sender_id="4691000000001@s.whatsapp.net",
         text="anchor in group",
         timestamp=int(datetime(2026, 4, 25, 11, 50, tzinfo=UTC).timestamp()),
         sender_name="Robin",

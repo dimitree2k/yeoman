@@ -9,6 +9,7 @@ from typing import Any
 from unittest.mock import patch
 
 import pytest
+from test_memory_cli import isolated_memory_cli_config  # noqa: F401 - shared autouse fixture
 from typer.testing import CliRunner
 from yeoman_gateway.adapters.responder_llm import LLMResponder
 from yeoman_gateway.bus.queue import MessageBus
@@ -642,6 +643,9 @@ def test_memory_trace_reports_query_origin_and_disclosure(tmp_path: Path, monkey
     monkeypatch.setenv("HOME", str(home))
     cfg = Config()
     cfg.memory.embedding.enabled = False
+    cfg.history.legacy_writers_disabled = False  # Retained S3 service unit; no gateway startup.
+    cfg.history.live_projection_enabled = False
+    cfg.history.readers.secondary = False
     save_config(cfg)
 
     add = runner.invoke(
@@ -758,6 +762,9 @@ def test_memory_cli_add_search_and_tag_disclosure_metadata(
     monkeypatch.setenv("HOME", str(home))
 
     cfg = Config()
+    cfg.history.legacy_writers_disabled = False  # Retained S3 service unit; no gateway startup.
+    cfg.history.live_projection_enabled = False
+    cfg.history.readers.secondary = False
     save_config(cfg)
 
     add = runner.invoke(

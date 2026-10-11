@@ -23,7 +23,7 @@ CONTRIBUTION_TYPES: tuple[str, ...] = (
 
 
 class ScenarioArchive:
-    """InboundArchive stand-in over synthetic messages."""
+    """Reply archive stand-in over synthetic messages."""
 
     def __init__(self, scenario: Scenario) -> None:
         self._rows: list[dict[str, Any]] = [

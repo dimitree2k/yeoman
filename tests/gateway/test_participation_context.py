@@ -25,7 +25,8 @@ from yeoman_gateway.processing.participation_context import (
     _knowledge_query,
 )
 from yeoman_gateway.processing.store import ProcessingStore
-from yeoman_gateway.storage.inbound_archive import InboundArchive
+
+from tests.gateway.history_test_helpers import ProjectedHistory
 
 CHANNEL = "whatsapp"
 CHAT = "group@g.us"
@@ -54,12 +55,12 @@ def _policy(*, participation: dict | None = None):
     )
 
 
-def _archive(tmp_path: Path) -> InboundArchive:
-    return InboundArchive(tmp_path / "inbound.db")
+def _archive(tmp_path: Path) -> ProjectedHistory:
+    return ProjectedHistory(tmp_path)
 
 
 def _record(
-    archive: InboundArchive,
+    archive: ProjectedHistory,
     *,
     message_id: str,
     text: str,
@@ -69,15 +70,19 @@ def _record(
     channel: str = CHANNEL,
     reply_to_message_id: str | None = None,
 ) -> None:
-    archive.record_inbound(
-        channel=channel,
-        chat_id=chat_id,
-        message_id=message_id,
-        participant=f"{sender}@s.whatsapp.net",
-        sender_id=f"{sender}@s.whatsapp.net",
-        sender_name=sender,
-        text=text,
-        timestamp=int((NOW - timedelta(minutes=minutes_ago)).timestamp()),
+    sender_ids = {
+        "anna": "10001",
+        "ben": "10002",
+        "cara": "10003",
+        "allowed": "10004",
+        "blocked": "10005",
+    }
+    sender_id = f"{sender_ids.get(sender, sender)}@s.whatsapp.net"
+    archive.add_message(
+        channel=channel, chat_id=chat_id, message_id=message_id,
+        participant=sender_id, sender_id=sender_id,
+        sender_name=sender, text=text,
+        timestamp=(NOW - timedelta(minutes=minutes_ago)).timestamp(),
         reply_to_message_id=reply_to_message_id,
     )
 
@@ -97,13 +102,22 @@ def _opportunity(*sources: str, revision: int = 5) -> ParticipationOpportunity:
 
 async def _builder(tmp_path: Path, *, anchors=None, taste=None):
     engine = PolicyEngine(_policy(), workspace=tmp_path)
-    return ParticipationContextBuilder(
-        archive=_archive(tmp_path),
+    history = _archive(tmp_path)
+    builder = ParticipationContextBuilder(
+        archive=object(),
         policy=engine,
         anchors=anchors,
         taste=taste,
         source_authorizer=lambda row: True,
     )
+    return history.wire(builder)
+
+
+def _context_builder(history: ProjectedHistory, tmp_path: Path, *, source_authorizer=None):
+    return history.wire(ParticipationContextBuilder(
+        archive=object(), policy=PolicyEngine(_policy(), workspace=tmp_path),
+        source_authorizer=source_authorizer,
+    ))
 
 
 def _inputs(
@@ -148,18 +162,20 @@ async def _build_context(
     now_ms: int = NOW_MS,
     current_source_ids: tuple[str, ...] | None = None,
 ) -> dict[str, object]:
-    return await builder.build(
-        opportunity,
-        inputs=_inputs(
-            bounds=bounds,
-            current_source_ids=(
-                tuple(opportunity.source_event_ids)
-                if current_source_ids is None
-                else current_source_ids
+    history = builder._history_projector
+    async with history.turn():
+        return await builder.build(
+            opportunity,
+            inputs=_inputs(
+                bounds=bounds,
+                current_source_ids=(
+                    tuple(opportunity.source_event_ids)
+                    if current_source_ids is None
+                    else current_source_ids
+                ),
             ),
-        ),
-        now_ms=now_ms,
-    )
+            now_ms=now_ms,
+        )
 
 
 @pytest.mark.asyncio
@@ -168,13 +184,11 @@ async def test_newest_required_source_is_default_reaction_target(tmp_path: Path)
     from yeoman_gateway.processing.participation import ParticipationJudge
 
     builder = await _builder(tmp_path)
-    archive = builder._archive
+    archive = builder._history_projector
     _record(archive, message_id="old", text="old", minutes_ago=3)
     _record(archive, message_id="middle", text="middle", minutes_ago=2)
     _record(archive, message_id="new", text="new", minutes_ago=1)
-    context = await builder.build(
-        _opportunity("new"), inputs=_inputs(current_source_ids=("new",)), now_ms=NOW_MS
-    )
+    context = await _build_context(builder, _opportunity("new"), current_source_ids=("new",))
 
     class _Client:
         route_key = "test.participation"
@@ -202,7 +216,7 @@ async def test_newest_required_source_is_default_reaction_target(tmp_path: Path)
 @pytest.mark.asyncio
 async def test_related_emoji_five_minutes_after_a_joke_is_in_context(tmp_path: Path) -> None:
     builder = await _builder(tmp_path)
-    archive = builder._archive
+    archive = builder._history_projector
     _record(archive, message_id="joke", text="that goalkeeper joke again", minutes_ago=6)
     _record(archive, message_id="emoji", text="\N{THUMBS UP SIGN}", minutes_ago=5)
     context = await _build_context(builder, _opportunity("joke", "emoji"))
@@ -214,7 +228,7 @@ async def test_related_emoji_five_minutes_after_a_joke_is_in_context(tmp_path: P
 @pytest.mark.asyncio
 async def test_intervening_participants_are_retained(tmp_path: Path) -> None:
     builder = await _builder(tmp_path)
-    archive = builder._archive
+    archive = builder._history_projector
     _record(archive, message_id="m1", text="who plays in goal?", minutes_ago=4, sender="anna")
     _record(archive, message_id="m2", text="not me", minutes_ago=3, sender="ben")
     _record(archive, message_id="m3", text="I could", minutes_ago=2, sender="cara")
@@ -226,7 +240,7 @@ async def test_intervening_participants_are_retained(tmp_path: Path) -> None:
 @pytest.mark.asyncio
 async def test_exact_reply_reference_reaches_participation_context(tmp_path: Path) -> None:
     builder = await _builder(tmp_path)
-    archive = builder._archive
+    archive = builder._history_projector
     _record(
         archive,
         message_id="reply",
@@ -243,7 +257,7 @@ async def test_exact_reply_reference_reaches_participation_context(tmp_path: Pat
 @pytest.mark.asyncio
 async def test_twenty_minute_callback_is_inside_the_horizon(tmp_path: Path) -> None:
     builder = await _builder(tmp_path)
-    archive = builder._archive
+    archive = builder._history_projector
     _record(archive, message_id="old", text="the answer is 42", minutes_ago=20)
     context = await _build_context(builder, _opportunity("old"))
     assert [row["event_id"] for row in context["messages"]] == ["old"]  # type: ignore[index]
@@ -252,7 +266,7 @@ async def test_twenty_minute_callback_is_inside_the_horizon(tmp_path: Path) -> N
 @pytest.mark.asyncio
 async def test_outside_the_window_is_not_included(tmp_path: Path) -> None:
     builder = await _builder(tmp_path)
-    archive = builder._archive
+    archive = builder._history_projector
     _record(archive, message_id="ancient", text="before the horizon", minutes_ago=600)
     context = await _build_context(builder, _opportunity())
     assert context["messages"] == []
@@ -263,7 +277,7 @@ async def test_outside_the_window_is_not_included(tmp_path: Path) -> None:
 @pytest.mark.asyncio
 async def test_required_sources_survive_truncation(tmp_path: Path) -> None:
     builder = await _builder(tmp_path)
-    archive = builder._archive
+    archive = builder._history_projector
     _record(archive, message_id="trigger", text="the exact source", minutes_ago=1)
     for index in range(30):
         _record(
@@ -286,7 +300,7 @@ async def test_required_sources_survive_truncation(tmp_path: Path) -> None:
 @pytest.mark.asyncio
 async def test_context_truncation_keeps_newest_optional_messages(tmp_path: Path) -> None:
     builder = await _builder(tmp_path)
-    archive = builder._archive
+    archive = builder._history_projector
     _record(archive, message_id="required", text="required", minutes_ago=1)
     for index in range(50):
         _record(
@@ -312,7 +326,7 @@ async def test_required_sources_over_bound_fail_closed(
     tmp_path: Path,
 ) -> None:
     builder = await _builder(tmp_path)
-    archive = builder._archive
+    archive = builder._history_projector
     for index in range(6):
         _record(
             archive,
@@ -332,7 +346,7 @@ async def test_required_sources_over_bound_fail_closed(
 @pytest.mark.asyncio
 async def test_required_source_is_exactly_looked_up_beyond_history_slice(tmp_path: Path) -> None:
     builder = await _builder(tmp_path)
-    archive = builder._archive
+    archive = builder._history_projector
     _record(archive, message_id="required", text="the trigger", minutes_ago=100)
     for index in range(50):
         _record(
@@ -363,16 +377,12 @@ async def test_required_source_failures_are_rejected_before_judge(
     tmp_path: Path, setup: str, reason: str
 ) -> None:
     builder = await _builder(tmp_path)
-    archive = builder._archive
+    archive = builder._history_projector
     if setup == "expired":
         _record(archive, message_id="source", text="old", minutes_ago=600)
     elif setup == "unauthorized":
         _record(archive, message_id="source", text="blocked", minutes_ago=1)
-        builder = ParticipationContextBuilder(
-            archive=archive,
-            policy=PolicyEngine(_policy(), workspace=tmp_path),
-            source_authorizer=lambda row: False,
-        )
+        builder = _context_builder(archive, tmp_path, source_authorizer=lambda row: False)
     with pytest.raises(ParticipationDecisionError) as error:
         await _build_context(builder, _opportunity("source"))
     assert error.value.reason == reason
@@ -383,13 +393,9 @@ async def test_optional_history_is_filtered_per_sender_before_rendering(tmp_path
     archive = _archive(tmp_path)
     _record(archive, message_id="required", text="keep", minutes_ago=2, sender="allowed")
     _record(archive, message_id="optional", text="do not leak", minutes_ago=1, sender="blocked")
-    builder = ParticipationContextBuilder(
-        archive=archive,
-        policy=PolicyEngine(_policy(), workspace=tmp_path),
-        source_authorizer=lambda row: str(row.get("sender_id") or "").startswith(
-            "allowed@"
-        ),
-    )
+    builder = _context_builder(archive, tmp_path, source_authorizer=lambda row: str(row.get("sender_id") or "").startswith(
+            "10004@"
+        ))
     context = await _build_context(builder, _opportunity("required"))
     ids = [row["event_id"] for row in context["messages"]]  # type: ignore[index]
     assert ids == ["required"]
@@ -403,30 +409,26 @@ async def test_source_acl_requires_per_row_evidence_for_required_and_optional(
     archive = _archive(tmp_path)
     _record(archive, message_id="required", text="required", minutes_ago=2)
     _record(archive, message_id="optional", text="optional", minutes_ago=1)
-    builder = ParticipationContextBuilder(
-        archive=archive,
-        policy=PolicyEngine(_policy(), workspace=tmp_path),
-    )
+    builder = _context_builder(archive, tmp_path)
 
     with pytest.raises(ParticipationDecisionError) as error:
-        await builder.build(
-            _opportunity("required"),
-            inputs=_inputs(current_source_ids=("required",)),
-            now_ms=NOW_MS,
-        )
+        async with archive.turn():
+            await builder.build(
+                _opportunity("required"),
+                inputs=_inputs(current_source_ids=("required",)),
+                now_ms=NOW_MS,
+            )
     assert error.value.reason == "source_not_authorized"
 
-    context = await builder.build(
-        _opportunity("required"),
-        inputs=_inputs(
-            current_source_ids=("required",),
-            snapshot={
-                "guidance": "Join only for football.",
-                "source_authorized": {"required": True},
-            },
-        ),
-        now_ms=NOW_MS,
-    )
+    async with archive.turn():
+        context = await builder.build(
+            _opportunity("required"),
+            inputs=_inputs(
+                current_source_ids=("required",),
+                snapshot={"guidance": "Join only for football.", "source_authorized": {"required": True}},
+            ),
+            now_ms=NOW_MS,
+        )
     assert [row["event_id"] for row in context["messages"]] == ["required"]  # type: ignore[index]
 
 
@@ -448,7 +450,7 @@ def test_decision_inputs_reject_non_ledger_reservation_shapes(
 async def test_other_chat_and_other_channel_never_leak(tmp_path: Path) -> None:
     """Hard exact-channel/chat ACL, not a prompt instruction (A39)."""
     builder = await _builder(tmp_path)
-    archive = builder._archive
+    archive = builder._history_projector
     _record(archive, message_id="mine", text="same chat", minutes_ago=1)
     _record(archive, message_id="theirs", text="other chat", minutes_ago=1, chat_id=OTHER_CHAT)
     _record(
@@ -583,11 +585,12 @@ async def test_delivered_anchor_is_included_and_nothing_else_is(tmp_path: Path) 
         evidence_ref="receipt-1",
         now_ms=NOW_MS,
     )
-    builder = ParticipationContextBuilder(
-        archive=_archive(tmp_path),
+    history = _archive(tmp_path)
+    builder = history.wire(ParticipationContextBuilder(
+        archive=object(),
         policy=PolicyEngine(_policy(), workspace=tmp_path),
         anchors=DeliveryAnchorReader(log=log, store=store),
-    )
+    ))
     context = await _build_context(builder, _opportunity())
     assert context["anchors"] == []
     assert not any(
@@ -595,6 +598,11 @@ async def test_delivered_anchor_is_included_and_nothing_else_is(tmp_path: Path) 
         for row in context["messages"]  # type: ignore[index]
     )
 
+    history.add_message(
+        channel=CHANNEL, chat_id=CHAT, message_id="prov-1",
+        sender_id="10000@s.whatsapp.net", sender_name="Arvid",
+        text="Arvid: I can play in goal.", timestamp=NOW_MS / 1000, direction="out",
+    )
     await log.project_recipient_delivery(
         "p1",
         effect_id=effect_id,
@@ -627,9 +635,10 @@ async def test_context_carries_trusted_inputs_not_a_verdict(tmp_path: Path) -> N
 @pytest.mark.asyncio
 async def test_context_renders_trusted_intents_and_remaining_budgets(tmp_path: Path) -> None:
     builder = await _builder(tmp_path)
-    context = await builder.build(
-        _opportunity(),
-        inputs=ParticipationDecisionInputs(
+    async with builder._history_projector.turn():
+        context = await builder.build(
+            _opportunity(),
+            inputs=ParticipationDecisionInputs(
             snapshot={
                 "guidance": "Join only for football.",
                 "allowed_contribution_types": ("observation",),
@@ -643,9 +652,9 @@ async def test_context_renders_trusted_intents_and_remaining_budgets(tmp_path: P
             arbitration_revision=4,
             current_source_ids=("required",),
             continuation_candidate=True,
-        ),
-        now_ms=NOW_MS,
-    )
+            ),
+            now_ms=NOW_MS,
+        )
     assert context["allowed_actions"] == ["silence", "comment"]
     assert context["allowed_intents"] == ["continue"]
     assert context["remaining_budgets"] == {"comments_per_window": 2}
@@ -693,13 +702,13 @@ async def test_context_attaches_only_rendered_selection_with_bounded_source_quer
                 fact_context=reader.fact_context,
             )
 
-    builder = ParticipationContextBuilder(
-        archive=archive,
+    builder = archive.wire(ParticipationContextBuilder(
+        archive=object(),
         policy=PolicyEngine(_policy(), workspace=tmp_path),
         source_authorizer=lambda row: True,
         knowledge_selector=_Selector(),
         knowledge_context_supplier=lambda opportunity, context: ("trusted-read", "trusted-facts"),
-    )
+    ))
     context = await _build_context(builder, _opportunity("trigger"))
 
     assert captured["query"] == "Riverside venue plans"
@@ -716,7 +725,7 @@ async def test_context_attaches_only_rendered_selection_with_bounded_source_quer
 @pytest.mark.asyncio
 async def test_media_and_forward_summaries_are_preserved(tmp_path: Path) -> None:
     builder = await _builder(tmp_path)
-    archive = builder._archive
+    archive = builder._history_projector
     _record(
         archive,
         message_id="img",
@@ -816,3 +825,16 @@ def test_knowledge_query_does_not_mutate_message_bodies() -> None:
     before = [dict(row) for row in rows]
     _knowledge_query({"messages": rows}, ("long",))
     assert rows == before
+
+
+@pytest.mark.asyncio
+async def test_history_media_summary_keeps_authored_caption(tmp_path: Path) -> None:
+    builder = await _builder(tmp_path)
+    archive = builder._history_projector
+    archive.add_message(chat_id=CHAT, message_id="caption", text="My formation",
+        timestamp=(NOW - timedelta(minutes=1)).timestamp(), sender_id="10001@s.whatsapp.net",
+        media={"kind": "image", "description": {"text": "A whiteboard"}})
+    context = await _build_context(builder, _opportunity("caption"))
+    row = context["messages"][0]
+    assert row["text"] == "My formation"
+    assert row["media_summary"] == "[Derived description]: A whiteboard"
