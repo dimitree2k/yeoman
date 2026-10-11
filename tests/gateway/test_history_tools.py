@@ -43,6 +43,182 @@ async def test_concurrent_tool_turns_keep_snapshot_and_chat_separate():
     p.close()
 
 
+def _person_lookup_projector():
+    import json
+
+    from yeoman_gateway.history.schema import FTS_ROWS
+
+    p = Projector()
+    owner_phone = '491000000001@s.whatsapp.net'
+    person_phone = '491000000002@s.whatsapp.net'
+    p.db.execute("INSERT INTO contacts VALUES ('owner','person','owner','Owner','confirmed',NULL,'[]')")
+    p.db.execute("INSERT INTO contacts VALUES ('alex','person',NULL,'Alexandra','confirmed',NULL,'[]')")
+    p.db.execute("INSERT INTO contacts VALUES ('alex-alias','person',NULL,'Alex','confirmed','alex','[]')")
+    for contact, phone in (('owner', owner_phone), ('alex', person_phone)):
+        p.db.execute("INSERT INTO identifier_history(contact_id,channel,kind,value,strength,evidence,source_refs)"
+                      " VALUES (?,'whatsapp','pn_jid',?,'strong','owner_attested','[]')", (contact, phone))
+    p.db.execute("INSERT INTO identifier_history(contact_id,channel,kind,value,strength,evidence,source_refs)"
+                  " VALUES ('alex-alias','whatsapp','push_name','Lex','weak','observed','[]')")
+    p.db.execute("INSERT INTO message_events(event_id,kind,channel,chat_id,occurred_ms,time_certainty,"
+                  "payload_json,provenance,actor_basis,source_refs) VALUES "
+                  "('members','member_snapshot','whatsapp','family@g.us',1700000000000,'native',?,'native','unknown','[]')",
+                  # Alex has left; historical authored messages remain resolvable because
+                  # the owner is still a proven current member of this authorized chat.
+                  (json.dumps({'complete': True, 'participants': [[owner_phone]]}),))
+    p.add('quoted', chat='family@g.us', text="Alex' Aktien wurden erwähnt.")
+    p.db.execute("UPDATE messages SET sender_contact_id='owner',sender_basis='native_identifier',sender_identifier=? WHERE message_id='quoted'", (owner_phone,))
+    p.add('authored', chat='family@g.us', text='synthetic author note')
+    p.db.execute("UPDATE messages SET sender_contact_id='alex',sender_basis='native_identifier',sender_identifier=? WHERE message_id='authored'", (person_phone,))
+    p.db.execute('DELETE FROM messages_fts')
+    p.db.execute('INSERT INTO messages_fts(message_id,chat_id,text) ' + FTS_ROWS)
+    p.db.commit()
+    return p, owner_phone
+
+
+async def test_recall_person_scope_requires_owner_dm_and_current_membership():
+    import time
+
+    from yeoman_gateway.history.context import history_turn
+
+    p, owner_phone = _person_lookup_projector()
+    tool = RecallConversationTool(None, group_resolver=lambda ref: (
+        {'family': 'family@g.us', 'other': 'other@g.us'}.get(ref), None))
+    async with history_turn(p) as snapshot:
+        from yeoman_gateway.history.queries import HistoryQueries
+        assert HistoryQueries(snapshot).resolve_person(
+            'Lex', ('family@g.us',), time.time_ns() // 1_000_000) == 'alex'
+        token = set_tool_context(ToolInvocationContext(
+            channel='whatsapp', chat_id=owner_phone, canonical_user_id='whatsapp:491000000001',
+            is_owner=True, history_snapshot=snapshot))
+        try:
+            result = await tool.execute(query='ignored', person='Alex', group='family')
+            assert 'Alex\' Aktien' in result
+            assert 'synthetic author note' in result
+            assert 'quoted' not in result and 'authored' not in result
+            assert await tool.execute(query='ignored', group='other') == (
+                'That group is not in your current WhatsApp memberships.')
+        finally:
+            reset_tool_context(token)
+    async with history_turn(p) as snapshot:
+        token = set_tool_context(ToolInvocationContext(
+            channel='whatsapp', chat_id=owner_phone, canonical_user_id='whatsapp:491000000001',
+            is_owner=False, history_snapshot=snapshot))
+        try:
+            assert 'only in the owner' in await tool.execute(query='ignored', person='Alex')
+        finally:
+            reset_tool_context(token)
+    async with history_turn(p) as snapshot:
+        token = set_tool_context(ToolInvocationContext(
+            channel='whatsapp', chat_id='family@g.us', canonical_user_id='whatsapp:491000000001',
+            is_owner=True, history_snapshot=snapshot))
+        try:
+            assert 'only in the owner' in await tool.execute(query='ignored', person='Alex')
+        finally:
+            reset_tool_context(token)
+    p.close()
+
+
+async def test_recall_person_alias_ambiguity_and_non_whatsapp_refusal_do_not_use_legacy():
+    from yeoman_gateway.history.context import history_turn
+
+    p, owner_phone = _person_lookup_projector()
+    person_phone = '491000000003@s.whatsapp.net'
+    p.db.execute("INSERT INTO contacts VALUES ('other-person','person',NULL,'Alex','confirmed',NULL,'[]')")
+    p.db.execute("INSERT INTO identifier_history(contact_id,channel,kind,value,strength,evidence,source_refs)"
+                 " VALUES ('other-person','whatsapp','pn_jid',?,'strong','owner_attested','[]')", (person_phone,))
+    p.db.execute("UPDATE message_events SET payload_json=? WHERE event_id='members'", (
+        __import__('json').dumps({'complete': True, 'participants': [
+            ['491000000001@s.whatsapp.net'], ['491000000002@s.whatsapp.net'], [person_phone]]}),))
+    p.db.commit()
+    tool = RecallConversationTool(SimpleNamespace(get_or_create=Mock(side_effect=AssertionError('legacy'))))
+    async with history_turn(p) as snapshot:
+        token = set_tool_context(ToolInvocationContext(
+            channel='whatsapp', chat_id=owner_phone, canonical_user_id='whatsapp:491000000001',
+            is_owner=True, history_snapshot=snapshot))
+        try:
+            assert await tool.execute(query='topic', person='Alex') == (
+                "No unique current person named 'Alex' was found in those chats.")
+        finally:
+            reset_tool_context(token)
+    token = set_tool_context(ToolInvocationContext(
+        channel='telegram', chat_id='telegram:synthetic', request_text='topic'))
+    try:
+        assert 'only in the owner' in await tool.execute(query='topic', person='Alex')
+    finally:
+        reset_tool_context(token)
+    token = set_tool_context(ToolInvocationContext(
+        channel='whatsapp', chat_id=owner_phone, canonical_user_id='whatsapp:491000000001',
+        is_owner=True))
+    try:
+        assert 'unavailable in this context' in await tool.execute(query='topic', person='Alex')
+    finally:
+        reset_tool_context(token)
+    p.close()
+
+
+async def test_history_person_search_keeps_older_indexed_match_past_unrelated_rows():
+    import time
+
+    from yeoman_gateway.history.context import history_turn
+    from yeoman_gateway.history.queries import HistoryQueries
+
+    p, _ = _person_lookup_projector()
+    unrelated = [
+        (f'unrelated-{index:05d}', 'whatsapp', 'family@g.us', f'unrelated-native-{index}',
+         'owner', None, 'unknown', 'in', 1700000000000, 'native', 'unrelated archive entry',
+         None, None, None, 'native', '[]')
+        for index in range(5001)
+    ]
+    p.db.executemany('INSERT INTO messages VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)', unrelated)
+    p.db.execute("INSERT INTO messages VALUES ('zz-old','whatsapp','family@g.us','zz-old','owner',NULL,"
+                 "'unknown','in',1690000000000,'native',\"Alex's old holdings record\",NULL,NULL,NULL,'native','[]')")
+    p.db.execute('DELETE FROM messages_fts')
+    p.db.execute('INSERT INTO messages_fts(message_id,chat_id,text) ' + __import__(
+        'yeoman_gateway.history.schema', fromlist=['FTS_ROWS']).FTS_ROWS)
+    p.db.commit()
+    async with history_turn(p) as snapshot:
+        queries = HistoryQueries(snapshot)
+        now_ms = time.time_ns() // 1_000_000
+        person = queries.resolve_person('Alex', ('family@g.us',), now_ms)
+        assert person == 'alex'
+        rows = queries.search_person(chat_ids=('family@g.us',), contact_id=person,
+                                     at_ms=now_ms, limit=10, query='holdings')
+        assert 'zz-old' in {row['message_id'] for row in rows}
+    p.close()
+
+
+async def test_person_recall_excludes_weakly_attributed_authorship():
+    import time
+
+    from yeoman_gateway.history.context import history_turn
+    from yeoman_gateway.history.queries import HistoryQueries
+
+    p, owner_phone = _person_lookup_projector()
+    p.add('weak-author', chat='family@g.us', text='impostor payload')
+    p.db.execute("UPDATE messages SET sender_contact_id='alex',sender_basis='push_name' WHERE message_id='weak-author'")
+    p.add('weak-mention', chat='family@g.us', text='Alex appears in this unattributed message')
+    p.db.execute("UPDATE messages SET sender_contact_id='alex',sender_basis='push_name' WHERE message_id='weak-mention'")
+    p.db.commit()
+    tool = RecallConversationTool(None)
+    async with history_turn(p) as snapshot:
+        token = set_tool_context(ToolInvocationContext(
+            channel='whatsapp', chat_id=owner_phone, canonical_user_id='whatsapp:491000000001',
+            is_owner=True, history_snapshot=snapshot))
+        try:
+            result = await tool.execute(query='topic', person='Alex')
+            assert 'synthetic author note' in result
+            assert 'impostor payload' not in result
+            assert any('sender=Alexandra' in line and 'synthetic author note' in line for line in result.splitlines())
+            assert any('sender=unverified' in line and 'unattributed message' in line for line in result.splitlines())
+            snapshot.connection.execute("UPDATE messages SET sender_basis='push_name' WHERE message_id='authored'")
+            assert HistoryQueries(snapshot).resolve_person(
+                'Alex', ('family@g.us',), time.time_ns() // 1_000_000
+            ) is None
+        finally:
+            reset_tool_context(token)
+    p.close()
+
+
 class ScopedKnowledge:
     def __init__(self, p):
         self.p = p

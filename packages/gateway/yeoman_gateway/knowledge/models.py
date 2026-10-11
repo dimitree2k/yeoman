@@ -835,6 +835,8 @@ class TrustedReadContext:
     now_ms: int
     is_direct: bool = False
     owner: bool = False
+    owner_lookup_person_ids: tuple[str, ...] = ()
+    owner_lookup_chat_ids: tuple[str, ...] = ()
 
     def __post_init__(self) -> None:
         object.__setattr__(
@@ -860,6 +862,12 @@ class TrustedReadContext:
                 "membership_revision",
                 self.membership_revision,
             )
+        for name in ("owner_lookup_person_ids", "owner_lookup_chat_ids"):
+            values = tuple(_require_id(item, name.removeprefix("owner_lookup_").removesuffix("_ids"))
+                           for item in getattr(self, name))
+            if len(set(values)) != len(values):
+                raise ValidationError(f"duplicate values in {name}")
+            object.__setattr__(self, name, values)
 
     @property
     def membership_known(self) -> bool:
@@ -867,6 +875,13 @@ class TrustedReadContext:
 
     def scope_key(self) -> str:
         return f"channel:{self.channel}:chat:{self.chat_id}"
+
+    @property
+    def owner_lookup_enabled(self) -> bool:
+        return bool(
+            self.owner and self.is_direct and self.purpose == "reply"
+            and (self.owner_lookup_person_ids or self.owner_lookup_chat_ids)
+        )
 
 
 @dataclass(frozen=True, slots=True)

@@ -255,25 +255,49 @@ class RetrievalEngine:
         visibility, visibility_params = statement_visibility_clause(view, at_ms=at_ms)
         clauses = [
             "s.workspace_id = ?",
-            "s.scope_key = ?",
             f"({visibility})",
             "(s.valid_until_ms IS NULL OR s.valid_until_ms > ?)",
             "(s.valid_from_ms <= ?)",
         ]
         params: list[Any] = [
             self.workspace_id,
-            context.scope_key(),
             *visibility_params,
             at_ms,
             at_ms,
         ]
+        owner_lookup = context.owner_lookup_enabled and not group_wide
+        if owner_lookup:
+            target_clauses: list[str] = []
+            target_params: list[Any] = []
+            if context.owner_lookup_person_ids:
+                person_clause, person_params = self._person_filter_clause(
+                    context.owner_lookup_person_ids, ()
+                )
+                if person_clause:
+                    target_clauses.append(person_clause)
+                    target_params.extend(person_params)
+            if context.owner_lookup_chat_ids:
+                target_clauses.append(
+                    "s.source_channel = 'whatsapp' AND s.source_chat_id IN ("
+                    + ",".join("?" for _ in context.owner_lookup_chat_ids) + ")"
+                )
+                target_params.extend(context.owner_lookup_chat_ids)
+            # The current chat stays available; explicit targets are a narrow extra scope.
+            clauses.append(
+                "(s.scope_key = ? OR (" + " AND ".join(target_clauses) + "))"
+            )
+            params.extend((context.scope_key(), *target_params))
+        else:
+            clauses.append("s.scope_key = ?")
+            params.append(context.scope_key())
         # Group-wide reads cannot inherit the triggering author's author-only right.
         if group_wide:
             clauses.append("s.visibility_scope <> 'author_only'")
         else:
             clauses.append(
                 "((s.visibility_scope = 'author_only' AND s.author_principal = ?)"
-                " OR (s.visibility_scope <> 'author_only'))"
+                + (" OR s.visibility_scope = 'author_only'" if owner_lookup else "")
+                + " OR (s.visibility_scope <> 'author_only'))"
             )
             params.append(context.principal_id)
         # Every verified recipient must be named in the audience.  actor_only resolves
@@ -292,7 +316,9 @@ class RetrievalEngine:
         elif recipients:
             clauses.append(
                 "((s.visibility_scope <> 'author_only' AND " + audience_match + ")"
-                " OR (s.visibility_scope = 'author_only' AND s.author_principal = ?))"
+                " OR (s.visibility_scope = 'author_only' AND s.author_principal = ?)"
+                + (" OR (s.visibility_scope = 'author_only' AND 1=1)" if owner_lookup else "")
+                + ")"
             )
             params.extend(recipients)
             params.append(len(recipients))
@@ -403,8 +429,31 @@ class RetrievalEngine:
         from yeoman_gateway.knowledge._history_identity import current_history_scope
         scope = current_history_scope(self._store)
         if scope is None:
-            return True
+            return not context.owner_lookup_enabled
         sources = self._statements.sources_of(statement_id)
+        if context.owner_lookup_enabled:
+            def permits_owner_lookup(source: SourceRef, status: str) -> bool:
+                if status != "active" or source.channel != "whatsapp" or not scope.sources.verify_source(source):
+                    return False
+                if source.chat_id == context.chat_id:
+                    return all(scope.sources.permits_principal(
+                        source, principal, now_ms=context.now_ms
+                    ) for principal in decision.recipients)
+                # Cross-chat rights require both source-time audience and current roster proof.
+                audience = scope.sources.evidence_audience(source, basis="")
+                current = scope.queries.members(chat_id=source.chat_id, at_ms=context.now_ms)
+                return bool(
+                    scope.sources.permits_principal(
+                        source, context.principal_id, now_ms=context.now_ms
+                    )
+                    and audience is not None and audience.status == "known"
+                    and context.principal_id in audience.members
+                    and current.status == "known" and context.principal_id in current.members
+                )
+
+            return bool(sources) and all(
+                permits_owner_lookup(source, status) for source, status in sources
+            )
         return bool(sources) and all(
             status == 'active' and scope.sources.verify_source(source)
             and (source.channel != 'whatsapp' or all(scope.sources.permits_principal(source, principal, now_ms=context.now_ms)

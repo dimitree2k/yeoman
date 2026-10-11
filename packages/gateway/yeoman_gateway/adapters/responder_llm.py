@@ -78,7 +78,7 @@ if TYPE_CHECKING:
     from yeoman_gateway.cron.service import CronService
     from yeoman_gateway.knowledge._contacts.service import ContactsService
     from yeoman_gateway.knowledge._memory.service import MemoryService
-    from yeoman_gateway.knowledge.models import SourceRef
+    from yeoman_gateway.knowledge.models import SourceRef, TrustedReadContext
     from yeoman_gateway.media.lazy_resolver import LazyMediaResolver
     from yeoman_gateway.media.router import ModelRouter
     from yeoman_gateway.media.tts import TTSSynthesizer
@@ -900,7 +900,9 @@ class LLMResponder(ResponderPort):
         # Recall conversation — search session history on demand
         from yeoman_gateway.agent.tools.recall_conversation import RecallConversationTool
 
-        self._recall_tool = RecallConversationTool(session_manager=self.sessions)
+        self._recall_tool = RecallConversationTool(
+            session_manager=self.sessions, group_resolver=self._resolve_group_reference
+        )
         self.tools.register(self._recall_tool)
 
         if self._lazy_media_resolver is not None:
@@ -1022,7 +1024,7 @@ class LLMResponder(ResponderPort):
 
         recall_tool = self.tools.get("recall_conversation")
         if isinstance(recall_tool, RecallConversationTool):
-            recall_tool.set_context(channel, chat_id)
+            recall_tool.set_context(channel, chat_id, is_owner=is_owner)
 
         from yeoman_gateway.agent.tools.media_history import MediaHistoryTool
 
@@ -2883,10 +2885,11 @@ class LLMResponder(ResponderPort):
 
         if getattr(self, '_history_selected', False) and channel == 'whatsapp':
             shared = self._shared_fact_context(query=content, channel=channel, chat_id=chat_id, is_owner=is_owner)
-            context = self._knowledge_read_context(channel=channel, chat_id=chat_id,
-                principal=canonical_id, is_owner=is_owner)
-            from yeoman_gateway.knowledge.models import RecallQuery
-            statements = cast(Any, self.knowledge).recall(RecallQuery(text=content, limit=5), context=context, require_match=True).text if self.knowledge is not None and context is not None else ''
+            statements = self._knowledge_statement_context(
+                query=content, channel=channel, chat_id=chat_id,
+                principal=canonical_id, is_owner=is_owner,
+                purpose="proactive" if metadata.get("participation_draft") else "reply",
+            )
             retrieved_memory_text = '\n'.join(value for value in (shared, statements) if value)
 
         talkative_reply = await self._maybe_talkative_cooldown_reply(
@@ -3149,7 +3152,7 @@ class LLMResponder(ResponderPort):
         principal: str,
         is_owner: bool,
         purpose: str = "reply",
-    ):
+    ) -> TrustedReadContext | None:
         """Build a trusted read context from the *current* registry membership.
 
         Returns ``None`` when membership is not proven, which callers must treat as
@@ -3167,7 +3170,8 @@ class LLMResponder(ResponderPort):
             if proven:
                 members = frozenset(str(item) for item in proven)
         if members is None and is_direct:
-            members = frozenset({principal, str(chat_id)})
+            members = (frozenset({principal}) if getattr(self, "_history_selected", False)
+                       and channel == "whatsapp" and is_owner else frozenset({principal, str(chat_id)}))
         return TrustedReadContext(
             principal_id=str(principal),
             channel=str(channel),
@@ -3180,6 +3184,60 @@ class LLMResponder(ResponderPort):
             is_direct=is_direct,
             owner=bool(is_owner),
         )
+
+    def _knowledge_statement_context(
+        self, *, query: str, channel: str, chat_id: str, principal: str,
+        is_owner: bool, purpose: str = "reply",
+    ) -> str:
+        from dataclasses import replace
+
+        from yeoman_gateway.history.context import current_history_snapshot
+        from yeoman_gateway.history.queries import HistoryQueries
+        from yeoman_gateway.knowledge._history_sources import principal_identifier
+        from yeoman_gateway.knowledge.models import RecallQuery
+
+        context = self._knowledge_read_context(
+            channel=channel, chat_id=chat_id, principal=principal,
+            is_owner=is_owner, purpose=purpose,
+        )
+        if context is None:
+            return ""
+        person_ids: tuple[str, ...] = ()
+        chat_ids: tuple[str, ...] = ()
+        explicit_request = "?" in query or bool(re.match(
+            r"\s*(?:was|wer|wie|wo|wann|welche\w*|what|who|how|where|when|"
+            r"erzähl|erzähle|sag|zeige|tell|show|recall|remember)\b", query, re.IGNORECASE,
+        ))
+        snapshot = current_history_snapshot()
+        if (is_owner and purpose == "reply" and channel == "whatsapp"
+                and principal_identifier(principal) == chat_id and explicit_request
+                and snapshot is not None):
+            queries = HistoryQueries(snapshot)
+            member_chats = queries.owner_member_chat_ids(principal, context.now_ms)
+            named_chats = tuple(dict.fromkeys(
+                str(row["chat_id"]) for row in queries.chats()
+                if any(name and re.search(r"(?<!\w)" + re.escape(str(name)) + r"(?!\w)",
+                                          query, re.IGNORECASE)
+                       for name in (row.get("subject"), row["chat_id"]))
+            ))
+            if named_chats and not set(named_chats) <= set(member_chats):
+                return ""
+            chat_ids = named_chats
+            # Exact names and current aliases resolve to identities; a whole question is not a person filter.
+            person_ids = tuple(dict.fromkeys(
+                person for _, person in queries.resolve_people_in_text(
+                    query, chat_ids=chat_ids or member_chats, at_ms=context.now_ms
+                )
+            ))
+            if person_ids or chat_ids:
+                context = replace(context, owner_lookup_person_ids=person_ids,
+                                  owner_lookup_chat_ids=chat_ids)
+        lookup = bool(person_ids or chat_ids)
+        result = cast(Any, self.knowledge).recall(
+            RecallQuery(text=query, person_ids=person_ids, limit=20 if lookup else 5),
+            context=context, require_match=not lookup,
+        )
+        return str(result.text)
 
     def _knowledge_policy_revision(self) -> int:
         revision = getattr(self.knowledge, "policy_revision", None)

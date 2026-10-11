@@ -2,7 +2,7 @@
 
 from __future__ import annotations
 
-from typing import TYPE_CHECKING, Any
+from typing import TYPE_CHECKING, Any, Callable
 
 from yeoman_gateway.agent.tools.base import Tool
 
@@ -13,14 +13,28 @@ if TYPE_CHECKING:
 class RecallConversationTool(Tool):
     """Search conversation history for messages matching a query."""
 
-    def __init__(self, session_manager: "SessionManager") -> None:
+    def __init__(self, session_manager: "SessionManager",
+                 group_resolver: Callable[[str], tuple[str | None, str | None]] | None = None) -> None:
         self._session_manager = session_manager
+        self._group_resolver = group_resolver
         self._channel = ""
         self._chat_id = ""
+        self._is_owner = False
 
-    def set_context(self, channel: str, chat_id: str) -> None:
+    def set_context(self, channel: str, chat_id: str, *, is_owner: bool = False) -> None:
         self._channel = channel
         self._chat_id = chat_id
+        self._is_owner = is_owner
+
+    @property
+    def _is_owner(self) -> bool:
+        from yeoman_gateway.processing.tool_context import current_tool_context
+        context = current_tool_context()
+        return context.is_owner if context is not None else self._default_is_owner
+
+    @_is_owner.setter
+    def _is_owner(self, value: bool) -> None:
+        self._default_is_owner = value
 
     @property
     def _channel(self) -> str:
@@ -50,7 +64,11 @@ class RecallConversationTool(Tool):
             "Search earlier conversation history for messages matching a query. "
             "Use when the user references something from a previous part of the "
             "conversation that is not in your visible context. "
-            "Searches across session boundaries (including before /new)."
+            "Searches across session boundaries (including before /new). "
+            "For an explicit owner question in the owner's WhatsApp DM, use person "
+            "for questions such as 'what did Alex say?' or 'what does Alex hold?', "
+            "or group/chat for a named group. These parameters search only chats "
+            "whose current membership includes the owner and are refused elsewhere."
         )
 
     @property
@@ -69,6 +87,18 @@ class RecallConversationTool(Tool):
                     "minimum": 1,
                     "maximum": 50,
                 },
+                "group": {
+                    "type": "string",
+                    "description": "Optional group name to search from the owner’s direct chat.",
+                },
+                "chat": {
+                    "type": "string",
+                    "description": "Alias for group: an optional group name to search from the owner’s direct chat.",
+                },
+                "person": {
+                    "type": "string",
+                    "description": "Optional exact person name; available only in the owner’s direct chat.",
+                },
             },
             "required": ["query"],
         }
@@ -84,15 +114,69 @@ class RecallConversationTool(Tool):
         max_messages = int(kwargs.get("max_messages") or 30)
         max_messages = max(1, min(50, max_messages))
 
-        from yeoman_gateway.processing.tool_context import tool_history_snapshot
+        from yeoman_gateway.processing.tool_context import (
+            current_tool_context,
+            tool_history_snapshot,
+        )
+        context = current_tool_context()
+        person = str(kwargs.get('person') or '').strip()
+        group = str(kwargs.get('group') or '').strip()
+        chat = str(kwargs.get('chat') or '').strip()
+        if group and chat:
+            return "Error: supply either 'group' or 'chat', not both."
+        target_ref = group or chat
+        if person or target_ref:
+            from yeoman_gateway.knowledge._history_sources import principal_identifier
+            principal = context.canonical_user_id if context is not None else ''
+            owner_dm = (self._is_owner and principal_identifier(principal) == self._chat_id
+                        and self._channel == 'whatsapp')
+            if not owner_dm:
+                return "Person and cross-chat history lookup is available only in the owner's direct chat."
+            if context is None or context.history_snapshot is None or self._channel != 'whatsapp':
+                return "Owner history lookup is unavailable in this context."
         snapshot = tool_history_snapshot(selected=getattr(self, '_history_selected', False))
         if snapshot is not None and self._channel == 'whatsapp':
             from yeoman_gateway.adapters.reply_archive_history import history_text
             from yeoman_gateway.history.queries import HistoryQueries
-            rows = HistoryQueries(snapshot).search(chat_ids=(self._chat_id,), query=query, limit=max_messages)
+            queries = HistoryQueries(snapshot)
+            if person or target_ref:
+                principal = context.canonical_user_id if context is not None else ''
+                now_ms = __import__('time').time_ns() // 1_000_000
+                member_chats = queries.owner_member_chat_ids(principal, now_ms)
+                if target_ref:
+                    if self._group_resolver is None:
+                        return "Error: group lookup is unavailable."
+                    target, error = self._group_resolver(target_ref)
+                    if error or not target:
+                        return str(error or "Error: group not found.")
+                    if target not in member_chats:
+                        return "That group is not in your current WhatsApp memberships."
+                    chat_ids = (target,)
+                else:
+                    chat_ids = member_chats
+                if person:
+                    contact_id = queries.resolve_person(person, chat_ids, now_ms)
+                    if contact_id is None:
+                        return f"No unique current person named '{person}' was found in those chats."
+                    rows = queries.search_person(chat_ids=chat_ids, contact_id=contact_id,
+                                                at_ms=now_ms, limit=max_messages, query=query)
+                else:
+                    rows = queries.search(chat_ids=chat_ids, query=query, limit=max_messages)
+            else:
+                rows = queries.search(chat_ids=(self._chat_id,), query=query, limit=max_messages)
             if not rows:
                 return f"No matching messages found for '{query}'."
-            lines = [f"[{row['sent_ms']}] [{'assistant' if row['direction'] == 'out' else 'user'}]: {history_text(row)}" for row in rows]
+            lines = []
+            for row in rows:
+                role = 'assistant' if row['direction'] == 'out' else 'user'
+                attribution = ''
+                if person or target_ref:
+                    author = None
+                    if row['sender_contact_id'] and row['sender_basis'] in ('native_identifier', 'owner_attested'):
+                        author = queries.contact(str(row['sender_contact_id']))
+                    name = (author.get('display_name') or row['sender_identifier']) if author else 'unverified'
+                    attribution = f" [chat={row['chat_id']}; sender={name}]"
+                lines.append(f"[{row['sent_ms']}] [{role}]{attribution}: {history_text(row)}")
             return f"Found {len(lines)} matching message(s):\n" + '\n'.join(lines)
 
         session_key = f"{self._channel}:{self._chat_id}"

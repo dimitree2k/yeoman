@@ -35,6 +35,8 @@ class HistoryQueries:
         self.snapshot = snapshot
         self._audiences: dict[str, EvidenceAudience] = {}
         self._audience_state = (snapshot.generation, snapshot.connection.total_changes)
+        self._person_names_cache: dict[tuple[tuple[str, ...], int], dict[str, set[str]]] = {}
+        self._person_names_state = self._audience_state
 
     def _rows(self, sql: str, parameters: tuple[Any, ...] = ()) -> list[Row]:
         self.snapshot.assert_current(self.snapshot.generation)
@@ -165,6 +167,215 @@ class HistoryQueries:
             FROM (SELECT chat_id FROM messages WHERE channel='whatsapp'
                   UNION SELECT chat_id FROM message_events WHERE channel='whatsapp') c ORDER BY chat_id
         """)
+
+    def owner_member_chat_ids(self, principal_id: str, now_ms: int) -> tuple[str, ...]:
+        """Return group chats with a proven current roster containing this principal."""
+        _time(now_ms)
+        if not principal_id or now_ms is None:
+            return ()
+        from .ids import classify
+        result = []
+        for row in self.chats():
+            chat_id = str(row['chat_id'])
+            ident = classify(chat_id)
+            if ident is None or ident.kind != 'group':
+                continue
+            audience = self.members(chat_id=chat_id, at_ms=now_ms)
+            if audience.status == 'known' and principal_id in audience.members:
+                result.append(chat_id)
+        return tuple(result)
+
+    def resolve_person(self, name: str, chat_ids: tuple[str, ...], at_ms: int) -> str | None:
+        """Resolve one exact eligible history-contact name in the selected chats."""
+        _time(at_ms)
+        query = ' '.join(name.casefold().split()) if isinstance(name, str) else ''
+        if not query or not chat_ids:
+            return None
+        people = self._eligible_person_names(chat_ids, at_ms)
+        candidates = people.get(query, set())
+        return next(iter(candidates)) if len(candidates) == 1 else None
+
+    def _eligible_person_names(self, chat_ids: tuple[str, ...], at_ms: int) -> dict[str, set[str]]:
+        self.snapshot.assert_current(self.snapshot.generation)
+        state = (self.snapshot.generation, self.snapshot.connection.total_changes)
+        if state != self._person_names_state:
+            self._person_names_cache.clear()
+            self._person_names_state = state
+        cache_key = (tuple(sorted(set(chat_ids))), at_ms)
+        cached = self._person_names_cache.get(cache_key)
+        if cached is not None:
+            return cached
+        # Only names of people proven in each selected current group roster are candidates.
+        contacts: set[str] = set()
+        for chat_id in cache_key[0]:
+            roster = self.members(chat_id=chat_id, at_ms=at_ms)
+            if roster.status != 'known':
+                continue
+            for principal in roster.members:
+                channel, _, value = principal.partition(':')
+                if channel != 'whatsapp' or not value:
+                    continue
+                ident = classify(value)
+                if ident is None or ident.kind not in ('pn_jid', 'lid'):
+                    ident = classify(value + '@s.whatsapp.net')
+                if ident is None or ident.kind not in ('pn_jid', 'lid'):
+                    continue
+                contact_id = self.resolve_identifier(ident.value, at_ms=at_ms, time_basis='native')
+                terminal = self.terminal(contact_id) if contact_id else None
+                if terminal:
+                    contacts.add(terminal)
+        # The owner’s current membership authorizes the chat scope; a person need not
+        # still be a current member to resolve their confirmed historical authorship.
+        scoped_authors = self._rows(
+            f"SELECT DISTINCT sender_contact_id FROM messages_current WHERE {_VISIBLE}"
+            f" AND chat_id IN ({','.join('?' for _ in cache_key[0])})"
+            " AND sender_contact_id IS NOT NULL"
+            " AND sender_basis IN ('native_identifier','owner_attested')",
+            cache_key[0],
+        ) if cache_key[0] else []
+        for row in scoped_authors:
+            terminal = self.terminal(str(row['sender_contact_id']))
+            if terminal:
+                contacts.add(terminal)
+        if not contacts:
+            self._person_names_cache[cache_key] = {}
+            return {}
+        contact_rows = self._rows(
+            "SELECT contact_id,kind,status,display_name,merged_into FROM contacts"
+            " WHERE contact_id IN (SELECT value FROM json_each(?))"
+            " OR merged_into IN (SELECT value FROM json_each(?))",
+            (json.dumps(sorted(contacts)), json.dumps(sorted(contacts))),
+        )
+        eligible = {str(row['contact_id']) for row in contact_rows
+                    if row['kind'] == 'person' and row['status'] == 'confirmed' and not row['merged_into']}
+        if not eligible:
+            self._person_names_cache[cache_key] = {}
+            return {}
+        names: dict[str, set[str]] = {}
+        for row in contact_rows:
+            terminal = self.terminal(str(row['contact_id']))
+            if (terminal in eligible and row['kind'] == 'person' and row['status'] == 'confirmed'
+                    and row['display_name']):
+                alias = ' '.join(str(row['display_name']).casefold().split())
+                names.setdefault(alias, set()).add(terminal)
+        # Weak push-name observations are usable as exact lookup aliases only while current.
+        alias_rows = self._rows(
+            "SELECT contact_id,value,valid_from_ms,valid_until_ms FROM identifier_history"
+            " WHERE channel='whatsapp' AND kind='push_name' AND strength='weak'"
+            " AND contact_id IN (SELECT contact_id FROM contacts"
+            " WHERE contact_id IN (SELECT value FROM json_each(?))"
+            " OR merged_into IN (SELECT value FROM json_each(?)))",
+            (json.dumps(sorted(eligible)), json.dumps(sorted(eligible))),
+        )
+        for row in alias_rows:
+            if _compatible(row['valid_from_ms'], row['valid_until_ms'], at_ms, 'native'):
+                alias = ' '.join(str(row['value']).casefold().split())
+                terminal = self.terminal(str(row['contact_id']))
+                if terminal in eligible:
+                    names.setdefault(alias, set()).add(terminal)
+        self._person_names_cache[cache_key] = names
+        return names
+
+    def resolve_people_in_text(self, content: str, chat_ids: tuple[str, ...], at_ms: int
+                               ) -> tuple[tuple[str, str], ...]:
+        """Find unique eligible person aliases mentioned in content, once per scoped roster."""
+        if not isinstance(content, str) or not content.strip():
+            return ()
+        people = self._eligible_person_names(chat_ids, at_ms)
+        found: dict[str, str] = {}
+        for alias, candidates in people.items():
+            if len(candidates) != 1:
+                continue
+            if re.search(rf"(?<![\w]){re.escape(alias)}(?![\w])", content, re.IGNORECASE):
+                found[alias] = next(iter(candidates))
+        return tuple(sorted(found.items()))
+
+    def person_names(self, contact_id: str, at_ms: int) -> tuple[str, ...]:
+        """Return current exact display/push names for one confirmed person."""
+        _time(at_ms)
+        terminal = self.terminal(contact_id)
+        if terminal is None:
+            return ()
+        rows = self._rows(
+            "SELECT contact_id,kind,status,display_name,merged_into FROM contacts"
+            " WHERE contact_id=? OR merged_into=?", (terminal, terminal),
+        )
+        if not any(row['contact_id'] == terminal and row['kind'] == 'person'
+                   and row['status'] == 'confirmed' and row['merged_into'] is None for row in rows):
+            return ()
+        names = {str(row['display_name']) for row in rows
+                 if row['kind'] == 'person' and row['status'] == 'confirmed' and row['display_name']}
+        aliases = self._rows(
+            "SELECT value,valid_from_ms,valid_until_ms FROM identifier_history"
+            " WHERE channel='whatsapp' AND kind='push_name' AND strength='weak'"
+            " AND contact_id IN (SELECT contact_id FROM contacts WHERE contact_id=? OR merged_into=?)",
+            (terminal, terminal),
+        )
+        names.update(str(row['value']) for row in aliases
+                     if _compatible(row['valid_from_ms'], row['valid_until_ms'], at_ms, 'native'))
+        return tuple(sorted(names, key=str.casefold))
+
+    def search_person(self, *, chat_ids: tuple[str, ...], contact_id: str,
+                      at_ms: int, limit: int, query: str = '') -> list[Row]:
+        """Find messages by or explicitly naming one resolved contact in selected chats."""
+        _limit(limit)
+        _time(at_ms)
+        terminal = self.terminal(contact_id)
+        names = self.person_names(contact_id, at_ms)
+        if not chat_ids or terminal is None:
+            return []
+        # Apostrophes and possessives remain valid name boundaries (e.g. "Alex' Aktien").
+        patterns = [re.compile(rf"(?<![\w]){re.escape(name)}(?![\w])", re.IGNORECASE)
+                    for name in names if name.strip()]
+        authors = self._rows(
+            "WITH RECURSIVE aliases(contact_id) AS (SELECT ? UNION"
+            " SELECT c.contact_id FROM contacts c JOIN aliases a ON c.merged_into=a.contact_id)"
+            f" SELECT m.* FROM messages_current m WHERE {_VISIBLE}"
+            f" AND m.chat_id IN ({','.join('?' for _ in chat_ids)})"
+            " AND m.sender_basis IN ('native_identifier','owner_attested')"
+            " AND m.sender_contact_id IN (SELECT contact_id FROM aliases)",
+            (terminal, *chat_ids),
+        )
+        name_terms = [re.findall(r"[^\W_]+", name, re.UNICODE) for name in names]
+        name_terms = [terms for terms in name_terms if terms]
+        mentioned = []
+        if name_terms:
+            fts_query = ' OR '.join('(' + ' '.join(f'"{term}"*' for term in terms) + ')'
+                                    for terms in name_terms)
+            mentioned = self._rows(
+                "SELECT m.* FROM messages_fts JOIN messages_current m"
+                " ON m.message_id=messages_fts.message_id"
+                f" WHERE {_VISIBLE} AND m.chat_id IN ({','.join('?' for _ in chat_ids)})"
+                " AND messages_fts MATCH ?",
+                (*chat_ids, fts_query),
+            )
+        mention_ids = self._rows(
+            f"SELECT * FROM messages_current WHERE {_VISIBLE}"
+            f" AND chat_id IN ({','.join('?' for _ in chat_ids)}) AND mentions_json IS NOT NULL",
+            chat_ids,
+        )
+        by_id = {str(row['message_id']): row for row in (*authors, *mentioned, *mention_ids)}
+        matches = []
+        terms = tuple(term.casefold() for term in re.findall(r"[^\W_]+", query, flags=re.UNICODE))
+        for row in by_id.values():
+            author = (self.terminal(str(row['sender_contact_id']))
+                      if row['sender_contact_id'] and row['sender_basis'] in ('native_identifier', 'owner_attested')
+                      else None)
+            mentioned = any(pattern.search(str(row['current_text'] or '')) for pattern in patterns)
+            if not mentioned:
+                try:
+                    mention_values = json.loads(row['mentions_json'] or '[]')
+                except (TypeError, ValueError):
+                    mention_values = []
+                mentioned = any(isinstance(value, str) and self.resolve_identifier(
+                    value, at_ms=row['sent_ms'], time_basis=row['time_certainty']) == terminal
+                    for value in mention_values) if row['sent_ms'] is not None else False
+            if author == terminal or mentioned:
+                text = str(row['current_text'] or '').casefold()
+                score = sum(term in text for term in terms)
+                matches.append((score, row))
+        matches.sort(key=lambda item: (-item[0], -(item[1]['sent_ms'] or 0), item[1]['message_id']))
+        return [row for _, row in matches[:limit]]
 
     def media(self, *, chat_id: str, limit: int, native_id: str | None = None) -> list[Row]:
         _limit(limit)

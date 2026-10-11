@@ -17,7 +17,7 @@ from yeoman_gateway.knowledge.models import (
     TrustedReadContext,
 )
 
-from tests.gateway.convhist.test_hist_queries import contact, event, identifier
+from tests.gateway.convhist.test_hist_queries import contact, event, identifier, message
 from tests.gateway.test_history_knowledge_upgrade import digest
 from tests.gateway.test_history_source_compatibility import AUTHOR, MEMBER, old_alias
 from tests.gateway.test_history_source_compatibility import (
@@ -219,3 +219,121 @@ def test_history_alias_delivery_preserves_frozen_release_controls(case):
         identifier(db, 'replacement', '10009@s.whatsapp.net', start=200)
         assert not engine.delivery_identifiers_for_alias('Synthetic', channel='whatsapp', scope_key='global')
     assert frozen(service) == before
+
+
+def test_owner_dm_lookup_reads_author_only_statement_only_with_history_audience_proof(case):
+    service, q, sources, db = case
+    source = sources.issue('m')
+    with service.history_scope(q, sources):
+        sid, _ = capture(service, source)
+        service._store.execute("UPDATE knowledge_statements SET visibility_scope='author_only' WHERE statement_id=?", (sid,))
+        owner_dm = TrustedReadContext(
+            MEMBER, 'whatsapp', '10002@s.whatsapp.net', frozenset({MEMBER}), None, 1,
+            'reply', 150, is_direct=True, owner=True, owner_lookup_person_ids=('a',),
+        )
+        assert service.recall(RecallQuery('Synthetic'), context=owner_dm).statement_ids == (sid,)
+
+        normal_dm = TrustedReadContext(
+            MEMBER, 'whatsapp', '10002@s.whatsapp.net', frozenset({MEMBER}), None, 1,
+            'reply', 150, is_direct=True,
+        )
+        assert not service.recall(RecallQuery('Synthetic'), context=normal_dm).statement_ids
+        group = TrustedReadContext(
+            MEMBER, 'whatsapp', source.chat_id, frozenset({MEMBER}), None, 1,
+            'reply', 150, owner=True, owner_lookup_person_ids=('a',),
+        )
+        assert not service.recall(RecallQuery('Synthetic'), context=group).statement_ids
+
+        event(db, 'owner-left', 'member_remove', 120, {'participants': [['10002@s.whatsapp.net']]})
+        assert not service.recall(RecallQuery('Synthetic'), context=owner_dm).statement_ids
+
+        proactive = TrustedReadContext(
+            MEMBER, 'whatsapp', '10002@s.whatsapp.net', frozenset({MEMBER}), None, 1,
+            'proactive', 150, is_direct=True, owner=True, owner_lookup_person_ids=('a',),
+        )
+        assert not service.recall(RecallQuery('Synthetic'), context=proactive).statement_ids
+
+
+def test_owner_lookup_keeps_an_author_only_statement_from_the_owner_dm(case):
+    service, q, sources, db = case
+    message(db, 'owner-dm', chat='10002@s.whatsapp.net', sender='b',
+            identifier='10002@s.whatsapp.net', text='Synthetic local note')
+    source = sources.issue('owner-dm')
+    with service.history_scope(q, sources):
+        sid, _ = capture(service, source)
+        service._store.execute(
+            "UPDATE knowledge_statements SET visibility_scope='author_only' WHERE statement_id=?",
+            (sid,),
+        )
+        context = TrustedReadContext(
+            MEMBER, 'whatsapp', '10002@s.whatsapp.net', frozenset({MEMBER}), None, 1,
+            'reply', 150, is_direct=True, owner=True, owner_lookup_person_ids=('a',),
+        )
+        assert service.recall(RecallQuery('Synthetic', person_ids=('a',)), context=context).statement_ids == (sid,)
+
+
+def test_owner_german_person_question_retrieves_real_v3_statement(case, monkeypatch):
+    from yeoman_gateway.adapters.responder_llm import LLMResponder
+
+    service, q, sources, db = case
+    source = sources.issue('m')
+    db.execute("UPDATE contacts SET display_name='Alex' WHERE contact_id='a'")
+    with service.history_scope(q, sources):
+        sid, _ = capture(service, source)
+        service._store.execute(
+            "UPDATE knowledge_statements SET visibility_scope='author_only' WHERE statement_id=?",
+            (sid,),
+        )
+        responder = object.__new__(LLMResponder)
+        responder.knowledge = service
+        responder.chat_registry = None
+        responder._history_selected = True
+        monkeypatch.setattr(
+            "yeoman_gateway.history.context.current_history_snapshot", lambda: q.snapshot
+        )
+        text = responder._knowledge_statement_context(
+            query="Was weißt du über Alex' Aktien?", channel='whatsapp',
+            chat_id='10002@s.whatsapp.net', principal=MEMBER, is_owner=True,
+        )
+        assert text == 'Synthetic statement (Alex)'
+        assert not responder._knowledge_statement_context(
+            query="Wie wird das Wetter?", channel='whatsapp',
+            chat_id='10002@s.whatsapp.net', principal=MEMBER, is_owner=True,
+        )
+        assert not responder._knowledge_statement_context(
+            query="Was weißt du über Alex' Aktien?", channel='whatsapp',
+            chat_id='10001@s.whatsapp.net', principal=AUTHOR, is_owner=False,
+        )
+        assert not responder._knowledge_statement_context(
+            query="Was weißt du über Alex' Aktien?", channel='whatsapp',
+            chat_id=source.chat_id, principal=MEMBER, is_owner=True,
+        )
+
+
+def test_owner_lookup_denies_late_joiner_even_when_currently_in_group(case, monkeypatch):
+    from yeoman_gateway.adapters.responder_llm import LLMResponder
+
+    service, q, sources, db = case
+    db.execute("UPDATE message_events SET payload_json=? WHERE event_id='roster'",
+               ('{"complete":true,"participants":[["10001@s.whatsapp.net"]]}',))
+    event(db, 'owner-joined-later', 'member_add', 120,
+          {'participants': [['10002@s.whatsapp.net']]})
+    db.execute("UPDATE contacts SET display_name='Alex' WHERE contact_id='a'")
+    source = sources.issue('m')
+    with service.history_scope(q, sources):
+        sid, _ = capture(service, source)
+        service._store.execute(
+            "UPDATE knowledge_statements SET visibility_scope='author_only' WHERE statement_id=?",
+            (sid,),
+        )
+        responder = object.__new__(LLMResponder)
+        responder.knowledge = service
+        responder.chat_registry = None
+        responder._history_selected = True
+        monkeypatch.setattr(
+            "yeoman_gateway.history.context.current_history_snapshot", lambda: q.snapshot
+        )
+        assert not responder._knowledge_statement_context(
+            query="Was weißt du über Alex' Aktien?", channel='whatsapp',
+            chat_id='10002@s.whatsapp.net', principal=MEMBER, is_owner=True,
+        )
