@@ -17,6 +17,7 @@ from tests.gateway.convhist.consumer_fixtures import (  # noqa: F401
 
 def _probe_record(case, policy_path: Path) -> dict:
     return {
+        "receipts": str(policy_path.parent / "probe-receipts"),
         "layout": {
             "knowledge_live": str(case.knowledge._store.db_path),
             "policy_snapshot": str(policy_path),
@@ -83,19 +84,24 @@ async def test_all_six_probes_exercise_selected_adapters(statement_case, tmp_pat
     generations = set()
     for family, probe in probes.items():
         selection["readers"][family] = True
-        receipt = await asyncio.to_thread(
-            operator.offline_reader_smoke,
-            family=family,
-            db_path=case.path,
-            raw_root=case.raw,
-            selection=selection,
-            probe=probe,
-        )
+        for _ in range(2):
+            receipt = await asyncio.to_thread(
+                operator.offline_reader_smoke,
+                family=family,
+                db_path=case.path,
+                raw_root=case.raw,
+                selection=selection,
+                probe=probe,
+            )
         assert receipt["adapter"] is True and receipt["lease_closed"] is True
         assert receipt["unselected_refused"] is True
         generations.add(receipt["generation"])
         selection["readers"][family] = False
     assert len(generations) == 1
+    assert not list(home.iterdir())
+    scratch = list((Path(record["receipts"])/"reader-smoke").iterdir())
+    assert len(scratch) == 12
+    assert all(p.stat().st_mode & 0o777 == 0o700 for p in scratch)
     # The actual CLI installs these same callbacks, without reader owner_ack files.
     import shutil
     import sys
@@ -155,6 +161,7 @@ def test_build_probes_defers_store_reads_and_requires_canonical_principal(tmp_pa
     from scripts.history_cutover_probes import build_probes
 
     record = {
+        "receipts": str(tmp_path / "deferred-receipts"),
         "layout": {
             "knowledge_live": str(tmp_path / "not-published.db"),
             "policy_snapshot": str(tmp_path / "not-published-policy.json"),
@@ -293,3 +300,107 @@ async def test_secondary_probe_uses_policy_admin_and_refuses_member_export(state
         error='reader_smoke_admin_actor_unavailable' if outcome=='missing_admin' else 'reader_smoke_non_owner_export_allowed'
         with pytest.raises(ValueError,match='^'+error+'$'):
             await asyncio.to_thread(invoke)
+
+
+async def test_rehearsal_whole_tail_repeats_after_final_phase_failure(statement_case, tmp_path):
+    import sqlite3
+    import sys
+    from contextlib import closing
+    from dataclasses import asdict
+    from subprocess import CompletedProcess
+
+    from yeoman_gateway.processing.store import ProcessingStore
+    from yeoman_shared.raw_archive.records import enumerate_committed
+
+    from scripts import history_cutover as m
+    from scripts import history_cutover_host as host
+    from scripts.history_cutover_probes import build_probes
+    from tests.gateway.test_history_cutover import Controls
+    from tests.gateway.test_history_cutover import record as synthetic_record
+    from tests.gateway.test_history_cutover_host import raw_status
+    from tests.gateway.test_history_cutover_resume import resume_record
+
+    case = statement_case
+    await case.publish(old=True, author_only=False)
+    await case.curate()
+    case.append('message', 'tail-probe-media', ms=case.now+1, text='Synthetic media', media={'type':'image'})
+    await case.settle()
+    root = tmp_path/'tail'
+    root.mkdir()
+    path, home, base = synthetic_record(root)
+    policy = case.policy.engine.policy.model_dump(mode='json')
+    policy['owners']['whatsapp'] = [case.author.removeprefix('whatsapp:')]
+    policy_path = root/'policy.json'
+    policy_path.write_text(json.dumps(policy))
+    knowledge = home/'knowledge.db'
+    knowledge.unlink()
+    with closing(sqlite3.connect(case.knowledge._store.db_path)) as src, closing(sqlite3.connect(knowledge)) as dst:
+        src.backup(dst)
+    ProcessingStore(Path(base['inventory']['processing_db'])).close()
+    base.update(python=sys.executable, rehearsal_root=str(tmp_path), layout=dict(raw=str(case.raw), history=str(case.path),
+        knowledge_live=str(knowledge), policy_snapshot=str(policy_path)))
+    base['inventory']['reader_smoke'] = _probe_record(case, policy_path)['inventory']['reader_smoke']
+    base['commands'] = {a:[sys.executable,'-c','pass'] for a in ('import-preview','import','owner-preview','owner-append')}
+    source = Path(base['inventory']['source_dir'])
+    source.mkdir()
+    (source/'pin.py').write_text('synthetic pin')
+    base['inventory']['pinned_files'] = {str(source/'pin.py'):m._hash(source/'pin.py')}
+    (home/'raw-status.json').write_text(json.dumps(raw_status()))
+    (home/'bridge-status.json').write_text(json.dumps(dict(outbox=dict(pending=0), queue=dict(inflight=0))))
+    base['digest'] = m.record_digest(base)
+    path.write_text(json.dumps(base))
+    vector = [asdict(s) for s in enumerate_committed(case.raw)]
+    tail = m._sequence(base)[m._sequence(base).index('verify-deploy-suppression'):]
+    runs = [[], []]
+    def controls(run_index):
+        rehearsal = host.rehearsal_host_controls(copy_home=home, inventory=base['inventory'],
+            rehearsal_root=tmp_path, runner=lambda argv:CompletedProcess(argv, 0,
+                json.dumps([str(source/f'{p}/__init__.py') for p in ('gateway','shared','overseer')]), ''))
+        prepared = m.preparation_controls(host=rehearsal, probes=build_probes(record=base, home=home))
+        fake = Controls(m)
+        def execute(action, payload):
+            if action in tail:
+                runs[run_index].append(action)
+            if action == 'functional-smoke':
+                resume = payload.get('resume')
+                prefix = f'resume-{resume["resume_index"]}-' if resume else ''
+                ack = dict(action=action, record_digest=base['digest'], owner_ack=True,
+                    proof=dict(inbound_message_id_hash='a'*64, outbound_receipt_hash='b'*64,
+                               observed_ms=payload['receipts'][-1]['ended_ns']//1_000_000))
+                if resume:
+                    ack['resume_digest'] = resume['digest']
+                host._write(Path(base['receipts'])/(prefix+'functional-smoke.inputs.json'), b'{}', exclusive=True)
+                host._write(Path(base['receipts'])/(prefix+'functional-smoke.owner_ack.json'), json.dumps(ack).encode(), exclusive=True)
+            if action.startswith('smoke-reader-'):
+                result = prepared(action, payload)
+            elif action in tail or action in host.SERVICE_ACTIONS or action in ('capture-frozen-baseline','resume-preflight'):
+                result = rehearsal(action, payload)
+            else:
+                result = fake(action, payload)
+                if action == 'freeze-verification-prefix':
+                    result['sources'] = vector
+            if action == 'start-timers' and run_index == 0:
+                raise ValueError('synthetic_final_phase_failure')
+            return result
+        execute.mode = 'rehearsal'
+        return execute
+    def first_run():
+        with m.injected_controls(controls(0)):
+            return m.run_cutover(record=path, home=home, apply=True)
+    first = await asyncio.to_thread(first_run)
+    assert not first['ok'] and first['failed_phase'] == 'start-timers', Path(first['receipt']).read_text()
+    second_path = root/'resume.json'
+    resume_record(second_path, base, Path(first['receipt']), candidate='second-code')
+    assert m.run_resume(record=second_path, home=home)['start'] == 'verify-deploy-suppression'
+    def second_run():
+        with m.injected_controls(controls(1)):
+            return m.run_resume(record=second_path, home=home, apply=True)
+    second = await asyncio.to_thread(second_run)
+    assert second['ok'], Path(second['receipt']).read_text()
+    # The release pre-check adds another frozen-watermarks call in each run.
+    expected = tail.copy()
+    expected.insert(expected.index('release-fence'), 'frozen-watermarks')
+    assert runs == [expected, expected]
+    assert not (home/'reader-operational.db').exists()
+    assert not (home/'reader-frozen-sessions').exists()
+    assert len(list((Path(base['receipts'])/'reader-smoke').iterdir())) == 12

@@ -23,9 +23,15 @@ from yeoman_shared.raw_archive.records import (
 )
 
 try:
-    from scripts.history_cutover import _load, _sequence, pause_facts
+    from scripts.history_cutover import (
+        _load,
+        _sequence,
+        _validate_record,
+        pause_facts,
+        record_digest,
+    )
 except ModuleNotFoundError:
-    from history_cutover import _load, _sequence, pause_facts
+    from history_cutover import _load, _sequence, _validate_record, pause_facts, record_digest
 try:
     from scripts.history_cutover_host import _path, _read_db, _write
 except ModuleNotFoundError:
@@ -100,18 +106,33 @@ def _authenticated_fence(record: dict) -> str:
     raise ValueError('smoke_acquisition_fence_unauthenticated')
 
 
-def _release(record: dict) -> int:
+def _release(record: dict, resume: dict | None = None) -> int:
     """The release permission, bound to the authenticated acquired fence state."""
     root = _path(record['receipts'])
-    if (root/'cutover.json').exists():
+    prefix = f'resume-{resume["resume_index"]}' if resume else 'cutover'
+    if (root/(prefix+'.json')).exists():
         raise ValueError('smoke_attempt_finished')
     phases = []
-    for action, suffix in (('release-fence', ''), ('functional-smoke', '-started')):
-        path = root/f'cutover-{_sequence(record).index(action)+1:02}{suffix}.json'
-        phase = json.loads(_path(str(path)).read_bytes())
-        if phase.get('action') != action or phase.get('record_digest') != record['digest']:
+    if resume:
+        candidates = []
+        for path in root.glob(prefix+'-[0-9][0-9].json'):
+            phase = json.loads(_path(str(path)).read_bytes())
+            if phase.get('action') == 'release-fence':
+                candidates.append((path, phase))
+        if len(candidates) != 1:
             raise ValueError('smoke_attempt_mismatch')
-        phases.append(phase)
+        path, release = candidates[0]
+        index = int(path.stem.rsplit('-', 1)[1])
+        smoke = json.loads(_path(str(root/f'{prefix}-{index+1:02}-started.json')).read_bytes())
+        phases = [release, smoke]
+    else:
+        for action, suffix in (('release-fence', ''), ('functional-smoke', '-started')):
+            path = root/f'cutover-{_sequence(record).index(action)+1:02}{suffix}.json'
+            phases.append(json.loads(_path(str(path)).read_bytes()))
+    for phase, action in zip(phases, ('release-fence', 'functional-smoke')):
+        if (phase.get('action') != action or phase.get('record_digest') != record['digest']
+                or (resume and phase.get('resume_digest') != resume['digest'])):
+            raise ValueError('smoke_attempt_mismatch')
     release, smoke = phases
     ended = release.get('ended_ns')
     started = smoke.get('started_ns')
@@ -141,13 +162,23 @@ def publish_ack(*, record: Path, inputs: Path, owner_confirmed_arrival: bool,
                 runner=subprocess.run, clock=time) -> dict:
     """No caller-supplied evidence booleans or hashes can establish delivery."""
     document = json.loads(_path(str(record)).read_bytes())
-    value = _load(record, _path(document['home']), apply=False)
+    resume = document if document.get('kind') == 'resume' else None
+    if resume:
+        value = resume['base']
+        if (resume.get('digest') != record_digest(resume) or resume.get('base_digest') != value.get('digest')
+                or value.get('digest') != record_digest(value)
+                or type(resume.get('resume_index')) is not int or resume['resume_index'] < 1):
+            raise ValueError('smoke_attempt_mismatch')
+        _validate_record(value, _path(value['home']), apply=False, window=False)
+    else:
+        value = _load(record, _path(document['home']), apply=False)
     if value['mode'] != 'live' or value.get('approved') is not True or not value.get('approval'):
         raise ValueError('approved_live_smoke_record_required')
     if owner_confirmed_arrival is not True:
         raise ValueError('owner_arrival_confirmation_required')
     root, home = _path(value['receipts']), _path(value['home'])
-    if _path(str(inputs)) != root/'functional-smoke.inputs.json':
+    prefix = f'resume-{resume["resume_index"]}-' if resume else ''
+    if _path(str(inputs)) != root/(prefix+'functional-smoke.inputs.json'):
         raise ValueError('foreign_smoke_inputs')
     supplied = json.loads(inputs.read_bytes())
     if (not isinstance(supplied, dict) or set(supplied) != {'record_digest', 'chat_id', 'inbound_native_id', 'effect_id'}
@@ -161,7 +192,7 @@ def publish_ack(*, record: Path, inputs: Path, owner_confirmed_arrival: bool,
                 (layout['raw'], home/'data/raw'), (layout['history'], home/'data/history/history.db'))
     if any(_path(path) != target for path, target in expected):
         raise ValueError('foreign_smoke_store')
-    released = _release(value)
+    released = _release(value, resume)
     authenticated = _authenticated_fence(value)
     # The owner must have released the persistent control the fence was taken from.
     _owner_release(value, authenticated=authenticated, released_ms=released)
@@ -268,7 +299,7 @@ def publish_ack(*, record: Path, inputs: Path, owner_confirmed_arrival: bool,
             raise ValueError('smoke_inbound_not_projected')
     # Recheck the attempt and the owner's release after every evidence read, so a
     # timed-out, refenced or re-paused run cannot publish an acknowledgement.
-    if (_release(value) != released or _ready_boundary(value) != boundary
+    if (_release(value, resume) != released or _ready_boundary(value) != boundary
             or _authenticated_fence(value) != authenticated
             or int(clock.time()*1000) > released + value.get('owner_ack_timeout_seconds',1200)*1000):
         raise ValueError('smoke_window_expired')
@@ -276,7 +307,9 @@ def publish_ack(*, record: Path, inputs: Path, owner_confirmed_arrival: bool,
     ack = dict(action='functional-smoke',record_digest=value['digest'],owner_ack=True,
         proof=dict(inbound_message_id_hash=hashlib.sha256(f'whatsapp:{chat}:{native}'.encode()).hexdigest(),
                    outbound_receipt_hash=row_sha256(receipt), observed_ms=int(clock.time()*1000)))
-    _write(root/'functional-smoke.owner_ack.json', json.dumps(ack,sort_keys=True).encode())
+    if resume:
+        ack['resume_digest'] = resume['digest']
+    _write(root/(prefix+'functional-smoke.owner_ack.json'), json.dumps(ack,sort_keys=True).encode())
     return dict(ok=True)
 
 

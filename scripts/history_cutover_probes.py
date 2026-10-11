@@ -3,7 +3,10 @@ from __future__ import annotations
 
 import asyncio
 import os
-from contextlib import contextmanager
+import sqlite3
+import tempfile
+import time
+from contextlib import closing, contextmanager
 from dataclasses import replace
 from pathlib import Path
 from types import SimpleNamespace
@@ -55,7 +58,7 @@ def _inputs(record: Mapping[str, Any]) -> tuple[dict[str, Any], Path, Path]:
 
 
 @contextmanager
-def _knowledge(path: Path, policy_path: Path, workspace_id: str):
+def _knowledge(path: Path, policy_path: Path, workspace_id: str, scratch: Path):
     from yeoman_gateway.knowledge import open_knowledge_store
     from yeoman_gateway.knowledge.runtime import RuntimeKnowledgePolicy, RuntimeKnowledgeSources
     from yeoman_gateway.policy.loader import load_policy
@@ -64,8 +67,12 @@ def _knowledge(path: Path, policy_path: Path, workspace_id: str):
         raise ValueError("reader_smoke_path_missing")
     policy_config = load_policy(policy_path)
     policy = RuntimeKnowledgePolicy(engine=policy_config)
+    copy = scratch / "reader-knowledge.db"
+    with closing(sqlite3.connect(path.as_uri()+"?mode=ro", uri=True)) as src, closing(sqlite3.connect(copy)) as dst:
+        src.backup(dst)
+    copy.chmod(0o600)
     knowledge = open_knowledge_store(
-        path, workspace_id=workspace_id, source_authority=RuntimeKnowledgeSources(),
+        copy, workspace_id=workspace_id, source_authority=RuntimeKnowledgeSources(),
         policy_authority=policy, create=False, history_mode=True,
         legacy_history_disabled=True,
     )
@@ -313,10 +320,19 @@ def build_probes(*, record: Mapping[str, Any], home: Path) -> dict[str, Any]:
     if not home.is_absolute() or any(parent.is_symlink() for parent in (home, *home.parents)):
         raise ValueError("reader_smoke_home_invalid")
 
+    receipts = Path(record["receipts"])
+    if (not receipts.is_absolute() or receipts == home or home in receipts.parents
+            or any(p.is_symlink() for p in (receipts, *receipts.parents))):
+        raise ValueError("reader_smoke_receipts_invalid")
+
     def callback(family: str):
         def probe(snapshot: Any) -> Mapping[str, bool]:
-            home.mkdir(parents=True, exist_ok=True, mode=0o700)
-            with _knowledge(knowledge_path, policy_path, diagnostics["workspace_id"]) as (
+            root = receipts / "reader-smoke"
+            if root.is_symlink():
+                raise ValueError("reader_smoke_receipts_invalid")
+            root.mkdir(parents=True, exist_ok=True, mode=0o700)
+            scratch = Path(tempfile.mkdtemp(prefix=f"smoke-reader-{family}-{time.time_ns()}-", dir=root))
+            with _knowledge(knowledge_path, policy_path, diagnostics["workspace_id"], scratch) as (
                 knowledge, policy, policy_config,
             ):
                 if diagnostics["owner_scope"] != (policy.admin_actor() == diagnostics["principal"]):
@@ -326,7 +342,7 @@ def build_probes(*, record: Mapping[str, Any], home: Path) -> dict[str, Any]:
                         with history_knowledge_scope(snapshot, knowledge):
                             _source_for(knowledge, snapshot, diagnostics)
                             return await _compose(
-                                family, snapshot, diagnostics, home, knowledge, policy, policy_config,
+                                family, snapshot, diagnostics, scratch, knowledge, policy, policy_config,
                             )
                 return asyncio.run(composition())
         return probe

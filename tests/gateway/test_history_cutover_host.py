@@ -1784,3 +1784,23 @@ def test_skipped_import_phase_stays_distinguishable_in_the_journal(tmp_path):
     assert receipt['accepted_absent_content_rows'] == 1
     assert receipt['accepted_absent_identity_missing'] == 0
     assert receipt['absent_by_source'] == {'backfill/alpha.jsonl': {'message': 1}}
+
+
+
+def test_atomic_host_write_can_retry_after_failed_staging(tmp_path, monkeypatch):
+    from scripts import history_cutover_host as host
+    path = tmp_path/'config.json'
+    path.write_bytes(b'prior')
+    real_fsync = host.os.fsync
+    def refuse(fd):
+        raise OSError('synthetic interrupted write')
+    monkeypatch.setattr(host.os, 'fsync', refuse)
+    with pytest.raises(OSError):
+        host._write(path, b'first')
+    assert path.read_bytes() == b'prior'
+    monkeypatch.setattr(host.os, 'fsync', real_fsync)
+    legacy_staging = path.with_name(path.name+'.cutover-new')
+    legacy_staging.write_bytes(b'legacy failed staging')
+    host._write(path, b'second')
+    assert legacy_staging.read_bytes() == b'legacy failed staging'
+    assert path.read_bytes() == b'second'

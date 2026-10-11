@@ -14,6 +14,7 @@ import re
 import socket
 import sqlite3
 import subprocess
+import tempfile
 import time
 from collections.abc import Callable, Iterable, Mapping
 from contextlib import closing
@@ -148,14 +149,24 @@ def _path(value: str) -> Path:
 def _write(path: Path, data: bytes, *, exclusive: bool = False) -> None:
     _path(str(path))
     path.parent.mkdir(parents=True, exist_ok=True, mode=0o700)
-    target = path if exclusive else path.with_name(path.name + '.cutover-new')
-    with target.open('xb') as stream:
-        os.chmod(target, 0o600)
-        stream.write(data)
-        stream.flush()
-        os.fsync(stream.fileno())
-    if not exclusive:
-        os.replace(target, path)
+    if exclusive:
+        stream = path.open('xb')
+        target = path
+    else:
+        fd, name = tempfile.mkstemp(prefix=path.name + '.cutover-', dir=path.parent)
+        target = Path(name)
+        stream = os.fdopen(fd, 'wb')
+    try:
+        with stream:
+            os.chmod(target, 0o600)
+            stream.write(data)
+            stream.flush()
+            os.fsync(stream.fileno())
+        if not exclusive:
+            os.replace(target, path)
+    finally:
+        if not exclusive:
+            target.unlink(missing_ok=True)
     fd = os.open(path.parent, os.O_RDONLY | os.O_DIRECTORY)
     try:
         os.fsync(fd)
@@ -311,7 +322,9 @@ def _ack(action: str, payload: dict, *, wait: bool = False, clock=time) -> dict:
         from history_cutover import validate_ack_timeout
     timeout = validate_ack_timeout(payload['record'])
     root = _path(payload['record']['receipts'])
-    path = _path(str(root / f'{action}.owner_ack.json'))
+    resume = payload.get('resume')
+    prefix = f'resume-{resume["resume_index"]}-' if resume else ''
+    path = _path(str(root / f'{prefix}{action}.owner_ack.json'))
     deadline = clock.monotonic() + timeout
     while True:
         try:
@@ -326,7 +339,9 @@ def _ack(action: str, payload: dict, *, wait: bool = False, clock=time) -> dict:
             clock.sleep(min(1, remaining))
         except (ValueError, UnicodeError):
             raise ValueError('invalid_owner_ack') from None
-    if (not isinstance(proof, dict) or set(proof) != {'action', 'record_digest', 'owner_ack', 'proof'}
+    keys = {'action', 'record_digest', 'owner_ack', 'proof'} | ({'resume_digest'} if resume else set())
+    if (not isinstance(proof, dict) or set(proof) != keys
+            or (resume and proof.get('resume_digest') != resume['digest'])
             or proof.get('record_digest') != payload['record']['digest'] or proof.get('action') != action
             or proof.get('owner_ack') is not True):
         raise ValueError('owner_ack_required')

@@ -277,9 +277,9 @@ def test_resume_smoke_ack_binds_latest_release(tmp_path, stale):
             releases = [p for p in payload['receipts'] if p['action'] == 'release-fence']
             assert len(releases) == 2
             observed = releases[0 if stale else -1]['ended_ns']//1_000_000
-            ack = dict(action=action, record_digest=base['digest'], owner_ack=True,
+            ack = dict(action=action, record_digest=base['digest'], resume_digest=payload['resume']['digest'], owner_ack=True,
                        proof=dict(inbound_message_id_hash='a'*64, outbound_receipt_hash='b'*64, observed_ms=observed))
-            (Path(base['receipts'])/'functional-smoke.owner_ack.json').write_text(json.dumps(ack))
+            (Path(base['receipts'])/f'resume-{payload["resume"]["resume_index"]}-functional-smoke.owner_ack.json').write_text(json.dumps(ack))
             return host._ack(action, payload, wait=True, clock=SimpleNamespace(monotonic=lambda: 1, time=lambda: releases[-1]['ended_ns']/1e9+1))
         return c(action, payload)
     control.mode = 'rehearsal'

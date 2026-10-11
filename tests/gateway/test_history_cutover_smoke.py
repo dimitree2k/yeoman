@@ -428,3 +428,55 @@ def test_helper_rejects_old_provider_timestamp_even_if_newly_received(tmp_path):
             db.execute('UPDATE projector_state SET lines=?,end_offset=?,sha256=? WHERE file=?', (b.line_number,b.end_offset,b.prefix_sha256,b.relative_path))
     with pytest.raises(ValueError,match='inbound_not_fresh'):
         publish_ack(record=path,inputs=inputs,owner_confirmed_arrival=True,runner=runner,clock=FakeClock())
+
+
+
+def test_resume_smoke_ack_is_private_to_each_index(tmp_path):
+    from scripts import history_cutover as m
+    from scripts import history_cutover_host as host
+    from scripts.history_cutover_smoke import publish_ack
+
+    _, base, _, runner, _ = smoke_case(tmp_path)
+    root = Path(base['receipts'])
+    (root/'cutover.json').write_text('{"ok":false}')
+    first_ack = None
+    for k in (1, 2):
+        resume = dict(version=1, kind='resume', base=base, base_digest=base['digest'],
+                      resume_index=k, approved=True, approval='synthetic-owner')
+        resume['digest'] = m.record_digest(resume)
+        path = tmp_path/f'resume-{k}-record.json'
+        path.write_text(json.dumps(resume))
+        release = json.loads((root/f'cutover-{m._sequence(base).index("release-fence")+1:02}.json').read_bytes())
+        release['resume_digest'] = resume['digest']
+        (root/f'resume-{k}-04.json').write_text(json.dumps(release))
+        (root/f'resume-{k}-05-started.json').write_text(json.dumps(dict(
+            action='functional-smoke', started_ns=1000000000,
+            record_digest=base['digest'], resume_digest=resume['digest'])))
+        inputs = root/f'resume-{k}-functional-smoke.inputs.json'
+        inputs.write_text(json.dumps(dict(record_digest=base['digest'], chat_id='synthetic-chat',
+                                         inbound_native_id='synthetic-in', effect_id='synthetic-effect')))
+        ack_path = root/f'resume-{k}-functional-smoke.owner_ack.json'
+        assert publish_ack(record=path, inputs=inputs, owner_confirmed_arrival=True,
+                           runner=runner, clock=FakeClock())['ok']
+        payload = dict(record=base, resume=resume, receipts=[release])
+        assert host._ack('functional-smoke', payload, wait=True, clock=FakeClock())['ok']
+        ack = json.loads(ack_path.read_bytes())
+        assert ack['resume_digest'] == resume['digest']
+        for phase_path in (root/f'resume-{k}-04.json', root/f'resume-{k}-05-started.json'):
+            original_phase = phase_path.read_bytes()
+            bad = json.loads(original_phase)
+            bad['resume_digest'] = 'foreign'
+            phase_path.write_text(json.dumps(bad))
+            with pytest.raises(ValueError, match='smoke_attempt_mismatch'):
+                publish_ack(record=path, inputs=inputs, owner_confirmed_arrival=True,
+                            runner=runner, clock=FakeClock())
+            phase_path.write_bytes(original_phase)
+        if first_ack:
+            ack_path.write_text(json.dumps(first_ack))
+            with pytest.raises(ValueError, match='owner_ack'):
+                host._ack('functional-smoke', payload, wait=True, clock=FakeClock())
+        first_ack = ack
+        (root/f'resume-{k}.json').write_text('{"ok":false}')
+        with pytest.raises(ValueError, match='smoke_attempt_finished'):
+            publish_ack(record=path, inputs=inputs, owner_confirmed_arrival=True,
+                        runner=runner, clock=FakeClock())
