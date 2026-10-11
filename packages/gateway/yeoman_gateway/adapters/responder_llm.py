@@ -144,7 +144,6 @@ _TEXTUAL_TOOL_COERCION_SAFE_TOOLS = frozenset(
         "media_history",
         "ops",
         "recall_conversation",
-        "summarize_history",
         "web_fetch",
         "web_search",
         "youtube_transcript",
@@ -870,19 +869,6 @@ class LLMResponder(ResponderPort):
             from yeoman_gateway.agent.tools.calendar import CalendarTool
             self.tools.register(CalendarTool(self.caldav_service))
 
-        # Summarize history — only if archive is available
-        if self.inbound_archive is not None:
-            from yeoman_gateway.agent.tools.summarize_history import SummarizeHistoryTool
-
-            self.tools.register(
-                SummarizeHistoryTool(
-                    self.inbound_archive,
-                    self.contacts_service,
-                    knowledge=self.knowledge,
-                    group_resolver=self._resolve_group_reference,
-                )
-            )
-
         if self._a2a_registry is not None:
             from yeoman_gateway.agent.tools.a2a import A2ADelegateTool
 
@@ -1013,12 +999,6 @@ class LLMResponder(ResponderPort):
         a2a_tool = self.tools.get("a2a_delegate")
         if isinstance(a2a_tool, A2ADelegateTool):
             a2a_tool.set_context(channel, chat_id, session_key=session_key)
-
-        from yeoman_gateway.agent.tools.summarize_history import SummarizeHistoryTool
-
-        summarize_tool = self.tools.get("summarize_history")
-        if isinstance(summarize_tool, SummarizeHistoryTool):
-            summarize_tool.set_context(channel, chat_id, is_owner=is_owner)
 
         from yeoman_gateway.agent.tools.recall_conversation import RecallConversationTool
 

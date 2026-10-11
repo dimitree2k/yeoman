@@ -19,7 +19,6 @@ from yeoman_gateway.agent.tools.resolve_contact import (
     ResolveContactTool,
     resolve_contact_reference,
 )
-from yeoman_gateway.agent.tools.summarize_history import SummarizeHistoryTool
 from yeoman_gateway.core.intents import SendOutboundIntent
 from yeoman_gateway.core.models import InboundEvent
 from yeoman_gateway.core.pipeline import PipelineContext
@@ -239,35 +238,8 @@ async def test_the_tool_reports_an_unresolved_person_instead_of_a_legacy_match(
     assert "contact_not_resolved" in payload
 
 
-# ── summarize_history ──────────────────────────────────────────────────────────
 
 
-@pytest.mark.asyncio
-async def test_history_names_come_from_proven_bindings(knowledge, tmp_path: Path) -> None:
-    archive = InboundArchive(db_path=tmp_path / "archive.db")
-    knowledge.issue_person(FRANK_PHONE, name="Frank Taeger")
-    archive.record_inbound(
-        channel="whatsapp",
-        chat_id=CHAT,
-        message_id="m-1",
-        participant=None,
-        sender_id=FRANK_PHONE,
-        text=f"hey @{FRANK_PHONE.split('@')[0]} check this",
-        timestamp=int(datetime.now(UTC).timestamp()) - 600,
-        sender_name="push-name-must-not-win",
-    )
-    tool = SummarizeHistoryTool(
-        archive, _PoisonedLegacyContacts(), knowledge=knowledge
-    )
-    tool.set_context("whatsapp", CHAT)
-    try:
-        result = await tool.execute(hours_back=48)
-    finally:
-        archive.close()
-
-    assert "Frank Taeger" in result
-    assert "push-name-must-not-win" not in result
-    assert "@Frank" in result
 
 
 # ── outbound mentions ──────────────────────────────────────────────────────────
@@ -781,25 +753,3 @@ def test_an_unproven_legacy_projection_is_not_a_known_delivery_identifier(
     assert "4917000000000@s.whatsapp.net" not in known
 
 
-@pytest.mark.asyncio
-async def test_a_history_outage_keeps_the_archive_names(knowledge, tmp_path: Path) -> None:
-    archive = InboundArchive(db_path=tmp_path / "outage_history.db")
-    archive.record_inbound(
-        channel="whatsapp",
-        chat_id=CHAT,
-        message_id="m-1",
-        participant=None,
-        sender_id=FRANK_PHONE,
-        text="hey there",
-        timestamp=int(datetime.now(UTC).timestamp()) - 600,
-        sender_name="archive-name",
-    )
-    tool = SummarizeHistoryTool(archive, None, knowledge=_BrokenKnowledge())
-    tool.set_context("whatsapp", CHAT)
-    try:
-        result = await tool.execute(hours_back=48)
-    finally:
-        archive.close()
-
-    assert "archive-name" in result
-    assert "hey there" in result

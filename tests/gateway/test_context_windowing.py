@@ -328,7 +328,6 @@ class TestConversationStateContext:
         system_prompt = str(messages[0]["content"])
 
         assert "owner DM" in system_prompt
-        assert "summarize_history" in system_prompt
         assert "media_history" in system_prompt
 
     def test_current_message_includes_repair_guidance(self, tmp_path):

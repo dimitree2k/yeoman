@@ -71,7 +71,6 @@ CUT_OVER_CONSUMERS = (
     "pipeline/reply_context.py",
     "pipeline/outbound.py",
     "adapters/responder_llm.py",
-    "agent/tools/summarize_history.py",
     "agent/tools/contacts.py",
     "agent/tools/resolve_contact.py",
     "ipc/a2a_invoke.py",

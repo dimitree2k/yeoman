@@ -924,7 +924,7 @@ Expected: PASS
 
 - [ ] **Step 5: Register the tool in the responder**
 
-In `packages/gateway/yeoman_gateway/adapters/responder_llm.py`, in `__init__`, after the `SummarizeHistoryTool` registration block (around line 243), add:
+In `packages/gateway/yeoman_gateway/adapters/responder_llm.py`, in `__init__`, add the registration:
 
 ```python
         # Recall conversation — search session history on demand
@@ -945,7 +945,7 @@ Use the correct attribute name.
 
 - [ ] **Step 6: Set context on the tool per-request**
 
-In the `_set_tool_context` method (around line 280), add after the `SummarizeHistoryTool` context setting:
+In the `_set_tool_context` method (around line 280), add the context setting:
 
 ```python
         from yeoman_gateway.agent.tools.recall_conversation import RecallConversationTool

@@ -390,8 +390,7 @@ uv run pytest tests/gateway/
     "mode": "allowlist",
     "tools": [
       "web_search",
-      "web_fetch",
-      "summarize_history"
+      "web_fetch"
     ],
     "deny": [
       "exec",

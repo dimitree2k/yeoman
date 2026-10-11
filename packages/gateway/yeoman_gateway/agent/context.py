@@ -366,7 +366,7 @@ Skills with available="false" need dependencies installed first - you can try in
         )
         cross_chat_history_guidance = (
             "\n\n## Cross-chat history (owner DM only)\n"
-            "When the owner asks in a DM to see messages from another group, use `summarize_history` with the `group` parameter (group name, alias, or chat id). This only works in owner DMs — never from groups or for non-owners.\n"
+            "When the owner asks in a DM about messages from another group or about a specific person, use `recall_conversation` with the `group` parameter (group name, alias, or chat id) or the `person` parameter (name or nickname). This only works in owner DMs — never from groups or for non-owners.\n"
             "When the owner asks in a DM about previously shared images, screenshots, PDFs, or documents from another group, use `media_history` with the `group` parameter. Set `extract=true` only when the owner asks what the file contains or asks you to analyze it."
             if expose_cross_chat_history
             else "\n\n## Visible Chat Boundary\n"

@@ -24,7 +24,6 @@
 **Files:**
 - Modify: `packages/gateway/yeoman_gateway/storage/inbound_archive.py`
 - Test: `tests/test_whatsapp_channel_v2.py`
-- Test: `tests/gateway/test_summarize_history_tool.py`
 
 **Interfaces:**
 - Produces: `InboundArchive.record_outbound(..., sender_name: str = "Yeoman") -> None`
@@ -47,18 +46,13 @@ assert [row["text"] for row in archive.lookup_messages_in_range(
 assert archive.lookup_message("whatsapp", "group@g.us", "out-1")["direction"] == "outbound"
 ```
 
-Extend `test_returns_formatted_messages` or add a focused
-`test_summarize_history_ignores_outbound_archive_rows` proving the tool returns
-the human line but not the Yeoman line.
-
 - [ ] **Step 2: Run the new tests and verify RED**
 
 Run:
 
 ```bash
 uv run python -m pytest \
-  tests/test_whatsapp_channel_v2.py \
-  tests/gateway/test_summarize_history_tool.py -k 'direction or outbound' -q
+  tests/test_whatsapp_channel_v2.py -k 'direction or outbound' -q
 ```
 
 Expected: failures because the schema has no `direction`, `record_outbound`

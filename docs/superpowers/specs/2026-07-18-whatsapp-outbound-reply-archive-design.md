@@ -98,7 +98,7 @@ Adding outbound rows must not change existing inbound-only behavior:
 
 - long-term memory capture continues to use the current user/assistant turn and
   does not read archived outbound rows;
-- `summarize_history`, persona-evolution evidence, consciousness activity
+- persona-evolution evidence, consciousness activity
   windows, outcome classification, and quiet-gate checks continue to receive
   inbound rows only;
 - exact reply lookup and context-window reconstruction may read both directions

@@ -3546,7 +3546,7 @@ def build_gateway_runtime(
     responder._history_projector = history_projector
     responder._history_selected = config.history.live_projection_enabled and config.history.readers.responder
     responder._history_tools_selected = config.history.live_projection_enabled and config.history.readers.tools
-    for tool_name in ('recall_conversation', 'summarize_history', 'media_history', 'resolve_contact', 'contacts'):
+    for tool_name in ('recall_conversation', 'media_history', 'resolve_contact', 'contacts'):
         tool = responder.tools.get(tool_name)
         if tool is not None:
             setattr(tool, "_history_selected", responder._history_tools_selected)

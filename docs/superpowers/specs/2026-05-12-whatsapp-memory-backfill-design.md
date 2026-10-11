@@ -34,7 +34,6 @@ Use these files as source of truth while implementing:
 | Memory notes queue and flush logic | `packages/gateway/yeoman_gateway/memory/service.py` |
 | Memory capture route config | `packages/shared/yeoman_shared/config/defaults.py`, `~/.yeoman/config.json` |
 | Policy resolution for background notes | `packages/gateway/yeoman_gateway/policy/engine.py`, `packages/gateway/yeoman_gateway/policy/schema.py` |
-| Existing history read tool | `packages/gateway/yeoman_gateway/agent/tools/summarize_history.py` |
 
 Current bridge behavior:
 
