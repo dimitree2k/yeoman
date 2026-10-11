@@ -75,6 +75,76 @@ def _person_lookup_projector():
     return p, owner_phone
 
 
+def _add_named_author(p, contact_id, display_name, phone):
+    p.db.execute("INSERT INTO contacts VALUES (?, 'person',NULL,?,'confirmed',NULL,'[]')",
+                 (contact_id, display_name))
+    p.db.execute("INSERT INTO identifier_history(contact_id,channel,kind,value,strength,evidence,source_refs)"
+                 " VALUES (?,'whatsapp','pn_jid',?,'strong','owner_attested','[]')", (contact_id, phone))
+    message_id = f'named-{contact_id}'
+    p.add(message_id, chat='family@g.us', text=f'{display_name} synthetic history')
+    p.db.execute("UPDATE messages SET sender_contact_id=?,sender_basis='native_identifier',sender_identifier=?"
+                 " WHERE message_id=?", (contact_id, phone, message_id))
+    p.db.execute("INSERT INTO message_events(event_id,kind,channel,chat_id,occurred_ms,time_certainty,"
+                 "payload_json,provenance,actor_basis,source_refs) VALUES (?,?, 'whatsapp', ?,1700000000000,"
+                 "'native',?,'native','unknown','[]')",
+                 (f'subject-{contact_id}', 'group_subject', 'family@g.us',
+                  __import__('json').dumps({'subject': 'Family'})))
+    p.db.execute('DELETE FROM messages_fts')
+    p.db.execute('INSERT INTO messages_fts(message_id,chat_id,text) ' + __import__(
+        'yeoman_gateway.history.schema', fromlist=['FTS_ROWS']).FTS_ROWS)
+    p.db.commit()
+
+
+def test_person_name_normalization_splits_digits_and_drops_symbols():
+    from yeoman_gateway.history.queries import _name_tokens
+
+    assert _name_tokens('𝐀𝐋𝐄𝐗42😈') == ('alex', '42')
+    assert _name_tokens('ＡＬＥＸ—Mu\u0308ller!!') == ('alex', 'müller')
+    assert _name_tokens('😈!!!') == ()
+
+
+async def test_person_resolver_prefix_ambiguity_exact_multword_and_unmatchable_names():
+    import time
+
+    from yeoman_gateway.history.context import history_turn
+    from yeoman_gateway.history.queries import HistoryQueries
+
+    p, _ = _person_lookup_projector()
+    p.db.execute("UPDATE contacts SET display_name='Zed' WHERE contact_id IN ('alex','alex-alias')")
+    p.db.commit()
+    _add_named_author(p, 'alexgr', 'AlexGrrrrr😈', '491000000005@s.whatsapp.net')
+    async with history_turn(p) as snapshot:
+        result = HistoryQueries(snapshot).resolve_person('Alex', ('family@g.us',), time.time_ns() // 1_000_000)
+        assert result.status == 'resolved' and result.person_id == 'alexgr'
+    # Prefixes can be ambiguous while a distinctive multiword prefix still resolves.
+    _add_named_author(p, 'alexander', 'Alexander Müller', '491000000003@s.whatsapp.net')
+    _add_named_author(p, 'alexa', 'Alexa Weber', '491000000004@s.whatsapp.net')
+    async with history_turn(p) as snapshot:
+        queries = HistoryQueries(snapshot)
+        now_ms = time.time_ns() // 1_000_000
+        result = queries.resolve_person('Alex', ('family@g.us',), now_ms)
+        assert result.status == 'ambiguous'
+        assert {candidate.display_name for candidate in result.candidates} >= {
+            'Alexander Müller', 'Alexa Weber', 'AlexGrrrrr😈'}
+        assert all(candidate.group_names == ('Family',) for candidate in result.candidates)
+        assert queries.resolve_person('Alex Müller', ('family@g.us',), now_ms).person_id == 'alexander'
+        assert queries.resolve_person('Alexander Müller', ('family@g.us',), now_ms).person_id == 'alexander'
+        assert queries.resolve_person('Alp', ('family@g.us',), now_ms).status == 'not_found'
+        assert queries.resolve_person('😈', ('family@g.us',), now_ms).status == 'not_found'
+        assert queries.resolve_person('!!!', ('family@g.us',), now_ms).status == 'not_found'
+    _add_named_author(p, 'alex-mueller', 'Alex Müller', '491000000006@s.whatsapp.net')
+    async with history_turn(p) as snapshot:
+        queries = HistoryQueries(snapshot)
+        now_ms = time.time_ns() // 1_000_000
+        assert queries.resolve_person('Alex Müller', ('family@g.us',), now_ms).person_id == 'alex-mueller'
+        assert queries.resolve_person('Al', ('family@g.us',), now_ms).status == 'not_found'
+    _add_named_author(p, 'al', 'Al', '491000000007@s.whatsapp.net')
+    async with history_turn(p) as snapshot:
+        result = HistoryQueries(snapshot).resolve_person('Al', ('family@g.us',), time.time_ns() // 1_000_000)
+        assert result.status == 'resolved' and result.person_id == 'al'
+    p.close()
+
+
 async def test_recall_person_scope_requires_owner_dm_and_current_membership():
     import time
 
@@ -85,8 +155,9 @@ async def test_recall_person_scope_requires_owner_dm_and_current_membership():
         {'family': 'family@g.us', 'other': 'other@g.us'}.get(ref), None))
     async with history_turn(p) as snapshot:
         from yeoman_gateway.history.queries import HistoryQueries
-        assert HistoryQueries(snapshot).resolve_person(
-            'Lex', ('family@g.us',), time.time_ns() // 1_000_000) == 'alex'
+        resolution = HistoryQueries(snapshot).resolve_person(
+            'Lex', ('family@g.us',), time.time_ns() // 1_000_000)
+        assert resolution.status == 'resolved' and resolution.person_id == 'alex'
         token = set_tool_context(ToolInvocationContext(
             channel='whatsapp', chat_id=owner_phone, canonical_user_id='whatsapp:491000000001',
             is_owner=True, history_snapshot=snapshot))
@@ -136,8 +207,10 @@ async def test_recall_person_alias_ambiguity_and_non_whatsapp_refusal_do_not_use
             channel='whatsapp', chat_id=owner_phone, canonical_user_id='whatsapp:491000000001',
             is_owner=True, history_snapshot=snapshot))
         try:
-            assert await tool.execute(query='topic', person='Alex') == (
-                "No unique current person named 'Alex' was found in those chats.")
+            result = await tool.execute(query='topic', person='Alex')
+            assert 'Several people match' in result
+            assert 'Alex' in result and 'Please re-call with a fuller name' in result
+            assert 'other-person' not in result and person_phone not in result
         finally:
             reset_tool_context(token)
     token = set_tool_context(ToolInvocationContext(
@@ -179,9 +252,9 @@ async def test_history_person_search_keeps_older_indexed_match_past_unrelated_ro
     async with history_turn(p) as snapshot:
         queries = HistoryQueries(snapshot)
         now_ms = time.time_ns() // 1_000_000
-        person = queries.resolve_person('Alex', ('family@g.us',), now_ms)
-        assert person == 'alex'
-        rows = queries.search_person(chat_ids=('family@g.us',), contact_id=person,
+        person = queries.resolve_person('Alexandra', ('family@g.us',), now_ms)
+        assert person.status == 'resolved' and person.person_id == 'alex'
+        rows = queries.search_person(chat_ids=('family@g.us',), contact_id=person.person_id,
                                      at_ms=now_ms, limit=10, query='holdings')
         assert 'zz-old' in {row['message_id'] for row in rows}
     p.close()
@@ -213,7 +286,37 @@ async def test_person_recall_excludes_weakly_attributed_authorship():
             snapshot.connection.execute("UPDATE messages SET sender_basis='push_name' WHERE message_id='authored'")
             assert HistoryQueries(snapshot).resolve_person(
                 'Alex', ('family@g.us',), time.time_ns() // 1_000_000
-            ) is None
+            ).status == 'not_found'
+        finally:
+            reset_tool_context(token)
+    p.close()
+
+
+async def test_person_search_ranks_query_prefix_matches_and_warns_when_query_matches_none():
+    import time
+
+    from yeoman_gateway.history.context import history_turn
+    from yeoman_gateway.history.queries import HistoryQueries
+
+    p, owner_phone = _person_lookup_projector()
+    async with history_turn(p) as snapshot:
+        queries = HistoryQueries(snapshot)
+        now_ms = time.time_ns() // 1_000_000
+        person = queries.resolve_person('Alex', ('family@g.us',), now_ms)
+        assert person.status == 'resolved'
+        rows = queries.search_person(chat_ids=('family@g.us',), contact_id=person.person_id,
+                                     at_ms=now_ms, limit=10, query='Aktie')
+        assert rows[0]['message_id'] == 'quoted'
+        assert rows[0]['query_match_count'] == 1
+    tool = RecallConversationTool(None)
+    async with history_turn(p) as snapshot:
+        token = set_tool_context(ToolInvocationContext(
+            channel='whatsapp', chat_id=owner_phone, canonical_user_id='whatsapp:491000000001',
+            is_owner=True, history_snapshot=snapshot))
+        try:
+            result = await tool.execute(query='unmatched-term', person='Alex')
+            assert result.startswith("No messages matched the query terms 'unmatched-term'.")
+            assert 'synthetic author note' in result
         finally:
             reset_tool_context(token)
     p.close()

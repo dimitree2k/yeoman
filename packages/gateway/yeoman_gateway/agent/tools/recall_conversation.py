@@ -68,7 +68,8 @@ class RecallConversationTool(Tool):
             "For an explicit owner question in the owner's WhatsApp DM, use person "
             "for questions such as 'what did Alex say?' or 'what does Alex hold?', "
             "or group/chat for a named group. These parameters search only chats "
-            "whose current membership includes the owner and are refused elsewhere."
+            "whose current membership includes the owner and are refused elsewhere. "
+            "Person names can be partial; if multiple people match, use a fuller name."
         )
 
     @property
@@ -155,10 +156,17 @@ class RecallConversationTool(Tool):
                 else:
                     chat_ids = member_chats
                 if person:
-                    contact_id = queries.resolve_person(person, chat_ids, now_ms)
-                    if contact_id is None:
-                        return f"No unique current person named '{person}' was found in those chats."
-                    rows = queries.search_person(chat_ids=chat_ids, contact_id=contact_id,
+                    resolution = queries.resolve_person(person, chat_ids, now_ms)
+                    if resolution.status == 'ambiguous':
+                        candidates = '; '.join(
+                            f"{candidate.display_name} (groups: {', '.join(candidate.group_names)})"
+                            for candidate in resolution.candidates
+                        )
+                        return (f"Several people match '{person}': {candidates}. "
+                                "Please re-call with a fuller name.")
+                    if resolution.status != 'resolved' or resolution.person_id is None:
+                        return f"No person matching '{person}' was found in those chats."
+                    rows = queries.search_person(chat_ids=chat_ids, contact_id=resolution.person_id,
                                                 at_ms=now_ms, limit=max_messages, query=query)
                 else:
                     rows = queries.search(chat_ids=chat_ids, query=query, limit=max_messages)
@@ -166,6 +174,10 @@ class RecallConversationTool(Tool):
                 rows = queries.search(chat_ids=(self._chat_id,), query=query, limit=max_messages)
             if not rows:
                 return f"No matching messages found for '{query}'."
+            query_warning = (
+                f"No messages matched the query terms '{query}'.\n"
+                if person and all(row['query_match_count'] == 0 for row in rows) else ""
+            )
             lines = []
             for row in rows:
                 role = 'assistant' if row['direction'] == 'out' else 'user'
@@ -177,7 +189,7 @@ class RecallConversationTool(Tool):
                     name = (author.get('display_name') or row['sender_identifier']) if author else 'unverified'
                     attribution = f" [chat={row['chat_id']}; sender={name}]"
                 lines.append(f"[{row['sent_ms']}] [{role}]{attribution}: {history_text(row)}")
-            return f"Found {len(lines)} matching message(s):\n" + '\n'.join(lines)
+            return query_warning + f"Found {len(lines)} matching message(s):\n" + '\n'.join(lines)
 
         session_key = f"{self._channel}:{self._chat_id}"
         session = self._session_manager.get_or_create(session_key)

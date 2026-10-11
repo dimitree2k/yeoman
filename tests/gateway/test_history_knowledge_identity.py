@@ -310,6 +310,65 @@ def test_owner_german_person_question_retrieves_real_v3_statement(case, monkeypa
         )
 
 
+def test_owner_german_natural_prefix_preserves_display_name_in_real_v3_result(case, monkeypatch):
+    from yeoman_gateway.adapters.responder_llm import LLMResponder
+
+    service, q, sources, db = case
+    source = sources.issue('m')
+    db.execute("UPDATE contacts SET display_name='AlexGrrrrr😈' WHERE contact_id='a'")
+    with service.history_scope(q, sources):
+        capture(service, source)
+        responder = object.__new__(LLMResponder)
+        responder.knowledge = service
+        responder.chat_registry = None
+        responder._history_selected = True
+        monkeypatch.setattr(
+            "yeoman_gateway.history.context.current_history_snapshot", lambda: q.snapshot
+        )
+        assert responder._knowledge_statement_context(
+            query="Was weißt du über Alex' Aktien?", channel='whatsapp',
+            chat_id='10002@s.whatsapp.net', principal=MEMBER, is_owner=True,
+        ) == 'Synthetic statement (AlexGrrrrr😈)'
+
+
+def test_owner_ambiguous_natural_prefix_has_no_knowledge_person_targets_or_results(case, monkeypatch):
+    from yeoman_gateway.adapters.responder_llm import LLMResponder
+
+    service, q, sources, db = case
+    source = sources.issue('m')
+    db.execute("UPDATE contacts SET display_name='Alexander Müller' WHERE contact_id='a'")
+    db.execute("UPDATE contacts SET display_name='Alexa Weber' WHERE contact_id='b'")
+    with service.history_scope(q, sources):
+        capture(service, source)
+        capture_context = TrustedCaptureContext('synthetic', 1, 'native', (source,))
+        candidate = StatementCandidate('Other synthetic statement', (source,), people=(
+            PersonLinkCandidate('b', 'subject', source, 'explicit'),
+        ))
+        assert service.capture(candidate, context=capture_context).statement_ids
+
+        recalled = []
+        recall = service.recall
+
+        def record_recall(query, **kwargs):
+            recalled.append(query)
+            return recall(query, **kwargs)
+
+        monkeypatch.setattr(service, 'recall', record_recall)
+        responder = object.__new__(LLMResponder)
+        responder.knowledge = service
+        responder.chat_registry = None
+        responder._history_selected = True
+        monkeypatch.setattr(
+            "yeoman_gateway.history.context.current_history_snapshot", lambda: q.snapshot
+        )
+        assert not responder._knowledge_statement_context(
+            query='Was weißt du über Alex?', channel='whatsapp',
+            chat_id='10002@s.whatsapp.net', principal=MEMBER, is_owner=True,
+        )
+        assert len(recalled) == 1
+        assert recalled[0].person_ids == ()
+
+
 def test_owner_lookup_denies_late_joiner_even_when_currently_in_group(case, monkeypatch):
     from yeoman_gateway.adapters.responder_llm import LLMResponder
 

@@ -5,7 +5,9 @@ from __future__ import annotations
 import hashlib
 import json
 import re
-from typing import Any
+import unicodedata
+from dataclasses import dataclass
+from typing import Any, Literal
 
 from yeoman_gateway.knowledge import EvidenceAudience
 from yeoman_gateway.policy.identity import canonical_user_id
@@ -18,6 +20,28 @@ from .resolve import _compatible
 Row = dict[str, Any]
 _ORDER = "sent_ms, message_id"
 _VISIBLE = "channel='whatsapp' AND deleted=0"
+
+
+@dataclass(frozen=True)
+class PersonLookupCandidate:
+    display_name: str
+    group_names: tuple[str, ...]
+
+
+@dataclass(frozen=True)
+class PersonLookupResult:
+    status: Literal['resolved', 'ambiguous', 'not_found']
+    person_id: str | None = None
+    candidates: tuple[PersonLookupCandidate, ...] = ()
+
+
+def _name_tokens(value: str) -> tuple[str, ...]:
+    normalized = unicodedata.normalize('NFKC', value).casefold()
+    return tuple(re.findall(r"[^\W\d_]+|\d+", normalized, flags=re.UNICODE))
+
+
+def _token_matches(query: str, token: str) -> bool:
+    return token == query or (query.isalpha() and len(query) >= 3 and token.startswith(query))
 
 
 def _limit(value: int) -> None:
@@ -185,15 +209,41 @@ class HistoryQueries:
                 result.append(chat_id)
         return tuple(result)
 
-    def resolve_person(self, name: str, chat_ids: tuple[str, ...], at_ms: int) -> str | None:
-        """Resolve one exact eligible history-contact name in the selected chats."""
+    def resolve_person(self, name: str, chat_ids: tuple[str, ...], at_ms: int) -> PersonLookupResult:
+        """Resolve eligible names, preferring full names and whole tokens over prefixes."""
         _time(at_ms)
-        query = ' '.join(name.casefold().split()) if isinstance(name, str) else ''
+        query = _name_tokens(name) if isinstance(name, str) else ()
         if not query or not chat_ids:
-            return None
+            return PersonLookupResult('not_found')
         people = self._eligible_person_names(chat_ids, at_ms)
-        candidates = people.get(query, set())
-        return next(iter(candidates)) if len(candidates) == 1 else None
+        aliases = [(tokens, ids) for alias, ids in people.items()
+                   if (tokens := _name_tokens(alias))]
+        candidates: set[str] = set()
+        for matches in (
+            lambda tokens: tokens == query,
+            lambda tokens: all(word in tokens for word in query),
+            lambda tokens: all(any(_token_matches(word, token) for token in tokens) for word in query),
+        ):
+            candidates = {person for tokens, ids in aliases if matches(tokens) for person in ids}
+            if candidates:
+                break
+        if len(candidates) == 1:
+            return PersonLookupResult('resolved', next(iter(candidates)))
+        if not candidates:
+            return PersonLookupResult('not_found')
+        groups = {str(row['chat_id']): str(row['subject'] or 'Unnamed group') for row in self.chats()}
+        candidate_groups: dict[str, set[str]] = {person: set() for person in candidates}
+        for chat_id in chat_ids:
+            scoped = self._eligible_person_names((chat_id,), at_ms)
+            for ids in scoped.values():
+                for person in candidates.intersection(ids):
+                    candidate_groups[person].add(groups.get(chat_id, 'Unnamed group'))
+        choices = [PersonLookupCandidate(
+            str((self.contact(person) or {}).get('display_name') or 'Unnamed person'),
+            tuple(sorted(candidate_groups[person], key=str.casefold)),
+        ) for person in candidates]
+        choices.sort(key=lambda candidate: (candidate.display_name.casefold(), candidate.group_names))
+        return PersonLookupResult('ambiguous', candidates=tuple(choices[:8]))
 
     def _eligible_person_names(self, chat_ids: tuple[str, ...], at_ms: int) -> dict[str, set[str]]:
         self.snapshot.assert_current(self.snapshot.generation)
@@ -258,7 +308,7 @@ class HistoryQueries:
                     and row['display_name']):
                 alias = ' '.join(str(row['display_name']).casefold().split())
                 names.setdefault(alias, set()).add(terminal)
-        # Weak push-name observations are usable as exact lookup aliases only while current.
+        # Weak push-name observations are usable as lookup aliases only while current.
         alias_rows = self._rows(
             "SELECT contact_id,value,valid_from_ms,valid_until_ms FROM identifier_history"
             " WHERE channel='whatsapp' AND kind='push_name' AND strength='weak'"
@@ -278,17 +328,27 @@ class HistoryQueries:
 
     def resolve_people_in_text(self, content: str, chat_ids: tuple[str, ...], at_ms: int
                                ) -> tuple[tuple[str, str], ...]:
-        """Find unique eligible person aliases mentioned in content, once per scoped roster."""
+        """Resolve longest name spans through the same resolver; never select an ambiguity."""
         if not isinstance(content, str) or not content.strip():
             return ()
         people = self._eligible_person_names(chat_ids, at_ms)
-        found: dict[str, str] = {}
-        for alias, candidates in people.items():
-            if len(candidates) != 1:
-                continue
-            if re.search(rf"(?<![\w]){re.escape(alias)}(?![\w])", content, re.IGNORECASE):
-                found[alias] = next(iter(candidates))
-        return tuple(sorted(found.items()))
+        width = max((len(_name_tokens(alias)) for alias in people), default=0)
+        words = _name_tokens(content)
+        found: list[tuple[str, str]] = []
+        index = 0
+        while index < len(words):
+            for size in range(min(width, len(words) - index), 0, -1):
+                name = ' '.join(words[index:index + size])
+                result = self.resolve_person(name, chat_ids, at_ms)
+                if result.status == 'ambiguous':
+                    return ()
+                if result.person_id is not None:
+                    found.append((name, result.person_id))
+                    index += size
+                    break
+            else:
+                index += 1
+        return tuple(sorted(set(found)))
 
     def person_names(self, contact_id: str, at_ms: int) -> tuple[str, ...]:
         """Return current exact display/push names for one confirmed person."""
@@ -356,7 +416,7 @@ class HistoryQueries:
         )
         by_id = {str(row['message_id']): row for row in (*authors, *mentioned, *mention_ids)}
         matches = []
-        terms = tuple(term.casefold() for term in re.findall(r"[^\W_]+", query, flags=re.UNICODE))
+        terms = _name_tokens(query)
         for row in by_id.values():
             author = (self.terminal(str(row['sender_contact_id']))
                       if row['sender_contact_id'] and row['sender_basis'] in ('native_identifier', 'owner_attested')
@@ -371,8 +431,9 @@ class HistoryQueries:
                     value, at_ms=row['sent_ms'], time_basis=row['time_certainty']) == terminal
                     for value in mention_values) if row['sent_ms'] is not None else False
             if author == terminal or mentioned:
-                text = str(row['current_text'] or '').casefold()
-                score = sum(term in text for term in terms)
+                tokens = _name_tokens(str(row['current_text'] or ''))
+                score = sum(any(token.startswith(term) for token in tokens) for term in terms)
+                row['query_match_count'] = score
                 matches.append((score, row))
         matches.sort(key=lambda item: (-item[0], -(item[1]['sent_ms'] or 0), item[1]['message_id']))
         return [row for _, row in matches[:limit]]
