@@ -795,7 +795,7 @@ class SignalJournalSink:
                 raise ValueError("strict capture found a conflicting event identity")
         elif strict and stored_event_id != signal.event_id:
             raise ValueError("strict capture found a conflicting event identity")
-        if signal.kind == "membership_snapshot":
+        if signal.kind == "membership_snapshot" and self.legacy_history_disabled is not True:
             self._record_membership_snapshot_pairs(signal, stored_event_id)
         opaque_edit = (
             signal.kind == "message"

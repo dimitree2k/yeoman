@@ -219,7 +219,9 @@ class ContactsMiddleware:
             event = replace(event, raw_metadata=new_meta)
             ctx.event = event
 
-        if self._history_selected and event.channel == 'whatsapp':
+        if (self._history_selected and event.channel == 'whatsapp') or (
+            getattr(self._knowledge, 'legacy_history_disabled', False) is True
+        ):
             await next(ctx)
             return
         observation = self._observation(event.channel, event.participant, event.sender_id, raw)

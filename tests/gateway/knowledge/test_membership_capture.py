@@ -3,8 +3,10 @@
 from __future__ import annotations
 
 import hashlib
+import sqlite3
 from typing import Any
 
+import pytest
 from yeoman_gateway.knowledge.models import Identifier, TrustedIdentityObservation
 from yeoman_gateway.processing.signals import SignalJournalSink
 from yeoman_gateway.processing.store import ProcessingStore
@@ -247,3 +249,110 @@ def test_replayed_snapshot_is_idempotent(knowledge_harness):
         assert bindings_after[0] == bindings_after[1]
     finally:
         store.close()
+
+
+@pytest.mark.parametrize("case", [
+    "message", "edit", "reaction", "delete", "receipt", "membership_change",
+    "membership_snapshot", "group_subject", "group_description",
+    "observation_only", "opaque_edit",
+])
+def test_retired_capture_journals_all_kinds_without_identity_projection(knowledge_harness, case):
+    from yeoman_gateway.knowledge._history_upgrade import FROZEN_IDENTITY_TABLES, _digest
+    from yeoman_gateway.processing.signals import SIGNAL_KINDS
+
+    h = knowledge_harness
+    retired = _retired_knowledge(h)
+    kind = "message" if case in {"observation_only", "opaque_edit"} else case
+    assert kind in SIGNAL_KINDS
+    payload = {"chatJid": CHAT, "messageId": "synthetic-message", "text": "synthetic text",
+               "senderId": "4910000000101@s.whatsapp.net", "timestamp": SNAPSHOT_AT}
+    if kind == "edit":
+        payload["revision"] = 2
+    elif kind == "reaction":
+        payload.update(targetMessageId="synthetic-message", emoji="👍")
+    elif kind == "receipt":
+        payload.update(status="delivered", recipientJid="4910000000101@s.whatsapp.net")
+    elif kind == "membership_change":
+        payload.update(action="add", changeId="synthetic-change", participants=[{"lid": "8420000101@lid"}])
+    elif kind == "membership_snapshot":
+        payload = _snapshot({"phoneJid": "4910000000101@s.whatsapp.net", "lid": "8420000101@lid", "admin": False})
+    elif kind in {"group_subject", "group_description"}:
+        payload = {"chatJid": CHAT, "value": "synthetic metadata", "snapshot": True, "observedAtMs": SNAPSHOT_AT}
+    elif case == "observation_only":
+        payload.update(observationOnly=True, observationType="encrypted_message_edit_undecoded",
+                       encryptedEdit={"kind": "secretEncryptedMessage", "secretEncType": 2})
+    elif case == "opaque_edit":
+        payload.update(observationOnly=True, observationType="encrypted_message_edit_undecoded",
+                       targetMessageId="synthetic-target", encryptedEdit={"kind": "secretEncryptedMessage", "secretEncType": 2, "targetMessageId": "synthetic-target",
+                       "encPayload": "AQID", "encIv": "BAUG", "keyVersion": 1})
+    store = ProcessingStore(h.tmp_path / "retired-processing.db")
+    issuer = _Issuer(h.authority, store, case)
+    ordered = _OrderedKnowledge(h.service, store, case)
+    sink = SignalJournalSink(store, identity_observation_issuer=issuer, statements=ordered,
+                             legacy_history_disabled=True)
+    try:
+        with sqlite3.connect(retired) as db:
+            before = _digest(db, FROZEN_IDENTITY_TABLES)
+            stored = sink.capture(kind, payload, event_id=case, event_key=f"synthetic:{case}",
+                                  account=ACCOUNT, observed_at_ms=SNAPSHOT_AT, strict=True)
+            assert stored == case
+            event = store.get_event(stored)
+            assert event is not None and event.kind == kind
+            assert store.count_events() == 1
+            assert issuer.observations == ordered.observations == []
+            assert _digest(db, FROZEN_IDENTITY_TABLES) == before
+            if case == "membership_snapshot":
+                assert event.payload["participants"][0]["phone_jid"] == "4910000000101@s.whatsapp.net"
+            if case == "opaque_edit":
+                assert event.payload["observation_only"] is True
+                assert event.payload["encrypted_edit"]["encPayload"] == "AQID"
+    finally:
+        store.close()
+
+
+def _retired_knowledge(h):
+    from yeoman_gateway.knowledge import open_knowledge_store
+    from yeoman_gateway.knowledge._history_upgrade import (
+        upgrade_history_knowledge,
+    )
+
+    # Seed nonempty frozen identity tables before producing the retired V3 copy.
+    h.person("Synthetic member")
+    h.service.close()
+    retired = h.tmp_path / "retired.db"
+    upgrade_history_knowledge(source=h.tmp_path / "knowledge.db", target=retired)
+    h.service = open_knowledge_store(
+        retired, workspace_id="test-workspace", source_authority=h.authority,
+        policy_authority=h.policy, clock=h.clock, create=False,
+        history_mode=True, legacy_history_disabled=True,
+    )
+    return retired
+
+
+def test_retired_telegram_turn_skips_frozen_identity_projection(knowledge_harness):
+    import asyncio
+    from datetime import UTC, datetime
+
+    from yeoman_gateway.core.models import InboundEvent
+    from yeoman_gateway.core.pipeline import PipelineContext
+    from yeoman_gateway.knowledge._history_upgrade import FROZEN_IDENTITY_TABLES, _digest
+    from yeoman_gateway.pipeline.contacts import ContactsMiddleware
+
+    h = knowledge_harness
+    retired = _retired_knowledge(h)
+    issued = []
+    progressed = []
+    event = InboundEvent(channel="telegram", chat_id="synthetic-room", sender_id="10001",
+                         content="Synthetic", timestamp=datetime.now(UTC), message_id="synthetic-turn")
+    middleware = ContactsMiddleware(knowledge=h.service, history_selected=True,
+                                    observation_issuer=issued.append)
+
+    async def next_step(ctx):
+        progressed.append(ctx.event)
+
+    with sqlite3.connect(retired) as db:
+        before = _digest(db, FROZEN_IDENTITY_TABLES)
+        asyncio.run(middleware(PipelineContext(event=event), next_step))
+        assert issued == []
+        assert progressed == [event]
+        assert _digest(db, FROZEN_IDENTITY_TABLES) == before

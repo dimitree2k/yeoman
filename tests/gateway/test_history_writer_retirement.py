@@ -403,3 +403,37 @@ def test_knowledge_composition_passes_resolved_flag_to_identity(case, tmp_path, 
     with pytest.raises(LegacyHistoryWriterDisabled):
         resolved._identity.legacy.set_preferred_name('synthetic', 'Changed', context=TrustedAdminContext('synthetic', 1, 'test', True))
     reads.assert_not_called()
+
+
+@pytest.mark.parametrize("retired", [False, True])
+def test_archive_middleware_skips_only_retired_whatsapp_projection(tmp_path, retired):
+    import asyncio
+    from datetime import UTC, datetime
+
+    from yeoman_gateway.adapters.reply_archive_sqlite import SqliteReplyArchiveAdapter
+    from yeoman_gateway.core.models import InboundEvent
+    from yeoman_gateway.core.pipeline import PipelineContext
+    from yeoman_gateway.pipeline.archive import ArchiveMiddleware
+    from yeoman_gateway.storage.inbound_archive import InboundArchive
+
+    archive = InboundArchive(tmp_path / "inbound.db")
+    adapter = SqliteReplyArchiveAdapter(archive, legacy_history_disabled=retired)
+    event = InboundEvent(channel="whatsapp", chat_id="synthetic-room", sender_id="10001",
+                         content="Synthetic", timestamp=datetime.now(UTC), message_id="synthetic-message")
+    progressed = []
+
+    async def next_step(ctx):
+        progressed.append(ctx.event)
+
+    try:
+        asyncio.run(ArchiveMiddleware(archive=adapter)(PipelineContext(event=event), next_step))
+        assert progressed == [event]
+        row = archive.lookup_message("whatsapp", "synthetic-room", "synthetic-message")
+        assert (row is None) is retired
+        # Non-WhatsApp projection remains enabled even when WhatsApp writers retire.
+        other = InboundEvent(channel="telegram", chat_id="synthetic-room", sender_id="10001",
+                             content="Synthetic", timestamp=datetime.now(UTC), message_id="other-message")
+        asyncio.run(ArchiveMiddleware(archive=adapter)(PipelineContext(event=other), next_step))
+        assert archive.lookup_message("telegram", "synthetic-room", "other-message") is not None
+    finally:
+        archive.close()
