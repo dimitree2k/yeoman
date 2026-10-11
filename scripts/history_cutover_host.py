@@ -39,10 +39,14 @@ from yeoman_shared.raw_archive.records import (
 )
 
 try:
-    from scripts.history_cutover import _attempt_pause_digests, resume_preflight
+    from scripts.history_cutover import (
+        _attempt_pause_digests,
+        committed_prefix_proof,
+        resume_preflight,
+    )
     from scripts.history_maintenance_guard import preflight_isolated_paths, runtime_homes
 except ModuleNotFoundError:
-    from history_cutover import _attempt_pause_digests, resume_preflight
+    from history_cutover import _attempt_pause_digests, committed_prefix_proof, resume_preflight
     from history_maintenance_guard import preflight_isolated_paths, runtime_homes
 
 SHOW = '--property=ActiveState,Result,UnitFileState,Restart,ActiveEnterTimestampMonotonic,InactiveEnterTimestampMonotonic,ExecMainStartTimestampMonotonic,ExecMainExitTimestampMonotonic,LoadState,NeedDaemonReload,DropInPaths'
@@ -243,7 +247,10 @@ def _boundary(payload: dict) -> dict:
         snapshot = reader.open_snapshot(HistoryBoundary(runtime['generation'], tuple(SourceBoundary(**s) for s in sources)))
         snapshot.close()
         reopened = True
-    return dict(generation=runtime.get('generation'), sources=sources, all_committed=committed, reopened=reopened)
+    result = dict(generation=runtime.get('generation'), sources=sources, all_committed=committed, reopened=reopened)
+    if payload.get('resume') and committed:
+        result.update(committed_prefix_proof(_path(layout['raw']), payload['sources'], sources))
+    return result
 
 
 def _capture_ready(payload: dict) -> bool:
@@ -256,6 +263,8 @@ def _capture_ready(payload: dict) -> bool:
             handover = json.loads(row[0])
             proof = _boundary(payload)
             actual = {s['relative_path']: s for s in proof['sources']}
+            if payload.get('resume'):
+                committed_prefix_proof(_path(payload['record']['layout']['raw']), handover.get('sources', []), proof['sources'])
             covered = all((o := actual.get(s['relative_path'])) is not None and o['end_offset'] >= s['end_offset'] and o['line_number'] >= s['line_number'] and (o['end_offset'] != s['end_offset'] or o['prefix_sha256'] == s['prefix_sha256']) for s in handover.get('sources', []))
             return handover.get('version') == 1 and type(handover.get('generation')) is int and 0 < handover['generation'] <= proof['generation'] and covered
     except (OSError, sqlite3.DatabaseError):

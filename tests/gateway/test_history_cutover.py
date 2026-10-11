@@ -121,6 +121,8 @@ class Controls:
                       no_duplicate_effects=True, unknown_effects_held=True, imports_verified=True, writers_absent=True, bridge_stopped=True, prior_pauses_preserved=True,
                       pause_baseline_sha256=digest, prior_pauses_sha256=digest, strictly_inactive=True,
                       alert_state='inactive', sources=payload.get('sources', []))
+        if payload.get('resume') and (action.startswith('smoke-reader-') or action == 'all-committed-barrier'):
+            result.update(prefix_preserved=True, prefix_evidence=[{k:s[k] for k in ('relative_path','end_offset','prefix_sha256')} for s in payload.get('sources', [])])
         if action.startswith('smoke-reader-'):
             result.update(adapter=True, lease_closed=True, unselected_refused=True,
                           config_digest=self.module.record_digest(payload['selection']),

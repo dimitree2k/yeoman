@@ -1804,3 +1804,32 @@ def test_atomic_host_write_can_retry_after_failed_staging(tmp_path, monkeypatch)
     host._write(path, b'second')
     assert legacy_staging.read_bytes() == b'legacy failed staging'
     assert path.read_bytes() == b'second'
+
+
+@pytest.mark.parametrize('rewrite', [False, True])
+def test_resume_handover_proves_grown_prefix(tmp_path, monkeypatch, rewrite):
+    import hashlib
+    import sqlite3
+
+    module = host_module()
+    p = capture_payload(tmp_path)
+    p['resume'] = {'resume_index':1}
+    raw = tmp_path/'raw'
+    raw.mkdir()
+    original = b'synthetic frozen line\n'
+    frozen = dict(relative_path='source.jsonl', line_number=1, end_offset=len(original),
+                  prefix_sha256=hashlib.sha256(original).hexdigest())
+    content = (b'X'+original[1:] if rewrite else original)+b'synthetic appended line\n'
+    (raw/'source.jsonl').write_bytes(content)
+    actual = dict(frozen, line_number=2, end_offset=len(content), prefix_sha256=hashlib.sha256(content).hexdigest())
+    monkeypatch.setattr(module, '_boundary', lambda payload:dict(generation=2, sources=[actual]))
+    with sqlite3.connect(tmp_path/'knowledge.db') as db:
+        db.execute("UPDATE knowledge_meta SET value='3' WHERE key='schema_version'")
+        db.execute('CREATE TABLE knowledge_history_capture_state(key TEXT,value_json TEXT,version INTEGER)')
+        db.execute("INSERT INTO knowledge_history_capture_state VALUES ('handover',?,1)",
+                   (json.dumps(dict(version=1, generation=1, sources=[frozen])),))
+    if rewrite:
+        with pytest.raises(ValueError, match='committed_prefix_changed'):
+            module._capture_ready(p)
+    else:
+        assert module._capture_ready(p) is True

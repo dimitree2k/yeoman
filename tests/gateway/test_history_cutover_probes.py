@@ -352,6 +352,13 @@ async def test_rehearsal_whole_tail_repeats_after_final_phase_failure(statement_
     vector = [asdict(s) for s in enumerate_committed(case.raw)]
     tail = m._sequence(base)[m._sequence(base).index('verify-deploy-suppression'):]
     runs = [[], []]
+    loop = asyncio.get_running_loop()
+    old_generation = case.projector.health()['generation']
+    async def live_start():
+        await case.projector.stop()
+        await case.projector.start()
+        await case.projector._startup_task
+        await case.settle()
     def controls(run_index):
         rehearsal = host.rehearsal_host_controls(copy_home=home, inventory=base['inventory'],
             rehearsal_root=tmp_path, runner=lambda argv:CompletedProcess(argv, 0,
@@ -379,6 +386,9 @@ async def test_rehearsal_whole_tail_repeats_after_final_phase_failure(statement_
                 result = fake(action, payload)
                 if action == 'freeze-verification-prefix':
                     result['sources'] = vector
+            if action == 'start-gateway' and run_index == 0:
+                case.append('message', 'post-live-operation', ms=case.now+2, text='Synthetic post-live raw growth')
+                asyncio.run_coroutine_threadsafe(live_start(), loop).result(timeout=30)
             if action == 'start-timers' and run_index == 0:
                 raise ValueError('synthetic_final_phase_failure')
             return result
@@ -389,6 +399,8 @@ async def test_rehearsal_whole_tail_repeats_after_final_phase_failure(statement_
             return m.run_cutover(record=path, home=home, apply=True)
     first = await asyncio.to_thread(first_run)
     assert not first['ok'] and first['failed_phase'] == 'start-timers', Path(first['receipt']).read_text()
+    assert case.projector.health()['generation'] > old_generation
+    assert [asdict(s) for s in enumerate_committed(case.raw)] != vector
     second_path = root/'resume.json'
     resume_record(second_path, base, Path(first['receipt']), candidate='second-code')
     assert m.run_resume(record=second_path, home=home)['start'] == 'verify-deploy-suppression'
@@ -397,6 +409,10 @@ async def test_rehearsal_whole_tail_repeats_after_final_phase_failure(statement_
             return m.run_resume(record=second_path, home=home, apply=True)
     second = await asyncio.to_thread(second_run)
     assert second['ok'], Path(second['receipt']).read_text()
+    phases = json.loads(Path(second['receipt']).read_bytes())['phases']
+    smokes = [p['receipt'] for p in phases if p['action'].startswith('smoke-reader-')]
+    assert len({p['generation'] for p in smokes}) == 1 and smokes[0]['generation'] > old_generation
+    assert all(p['prefix_preserved'] is True and p['sources'] != vector for p in smokes)
     # The release pre-check adds another frozen-watermarks call in each run.
     expected = tail.copy()
     expected.insert(expected.index('release-fence'), 'frozen-watermarks')

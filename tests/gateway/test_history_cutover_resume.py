@@ -92,7 +92,7 @@ def test_two_resumes_and_combined_payload(tmp_path):
     assert any(p['action'] == 'acquire' for p in seen)
 
 
-@pytest.mark.parametrize('generation', [1, 2])
+@pytest.mark.parametrize('generation', [0, 1, 2, 'changes'])
 def test_changed_candidate_reselects_and_enforces_generation(tmp_path, generation):
     _, home, base, parent = failed(tmp_path)
     path = tmp_path/'resume.json'
@@ -102,12 +102,12 @@ def test_changed_candidate_reselects_and_enforces_generation(tmp_path, generatio
     def control(action, payload):
         result = c(action, payload)
         if action.startswith('smoke-reader-'):
-            result['generation'] = generation
+            result['generation'] = (2 if action == 'smoke-reader-knowledge' else 3) if generation == 'changes' else generation
         return result
     control.mode = 'rehearsal'
     with m.injected_controls(control):
         result = m.run_resume(record=path, home=home, apply=True)
-    if generation == 1:
+    if generation in (1, 2):
         assert result['ok']
         assert [x for x in c.calls if x.startswith('select-')] == [f'select-{f}' for f in m.READER_ORDER]
     else:
@@ -411,3 +411,64 @@ def test_candidate_change_ignores_live_tail_generations(tmp_path):
     with m.injected_controls(Controls(m)):
         result = m.run_resume(record=path, home=home, apply=True)
     assert result['ok'], Path(result['receipt']).read_text()
+
+
+@pytest.mark.parametrize("change", ["grow", "new-file", "rewrite", "equal-rewrite", "missing", "shorter"])
+def test_committed_prefix_proof_reads_frozen_bytes(tmp_path, change):
+    raw = tmp_path / "raw"
+    raw.mkdir()
+    original = b"synthetic first line\n"
+    path = raw / "source.jsonl"
+    path.write_bytes(original)
+    frozen = dict(relative_path=path.name, line_number=1, end_offset=len(original),
+                  prefix_sha256=hashlib.sha256(original).hexdigest())
+    current = dict(frozen)
+    if change in {"grow", "new-file", "rewrite"}:
+        content = (b"X"+original[1:] if change == "rewrite" else original) + b"synthetic second line\n"
+        path.write_bytes(content)
+        current.update(line_number=2, end_offset=len(content), prefix_sha256=hashlib.sha256(content).hexdigest())
+    elif change == "equal-rewrite":
+        path.write_bytes(b"X"+original[1:])
+        current['prefix_sha256'] = hashlib.sha256(path.read_bytes()).hexdigest()
+    elif change == "shorter":
+        current.update(line_number=0, end_offset=0)
+    observed = [] if change == "missing" else [current]
+    if change == "new-file":
+        observed.append(dict(relative_path="new.jsonl", line_number=1, end_offset=2, prefix_sha256="a"*64))
+    if change in {"grow", "new-file"}:
+        proof = m.committed_prefix_proof(raw, [frozen], observed)
+        assert proof == dict(prefix_preserved=True, prefix_evidence=[{
+            "relative_path": frozen['relative_path'], "end_offset": frozen['end_offset'],
+            "prefix_sha256": frozen['prefix_sha256']}])
+    else:
+        code = 'committed_source_not_covered' if change in {"missing", "shorter"} else 'committed_prefix_changed'
+        with pytest.raises(ValueError, match=code):
+            m.committed_prefix_proof(raw, [frozen], observed)
+
+
+@pytest.mark.parametrize('action', ['smoke-reader-knowledge', 'all-committed-barrier'])
+@pytest.mark.parametrize('mutation', ['none', 'missing', 'proof', 'digest', 'offset'])
+def test_resume_execute_requires_bound_prefix_evidence(action, mutation):
+    source = dict(relative_path='synthetic.jsonl', line_number=1, end_offset=10, prefix_sha256='a'*64)
+    observed = dict(source, line_number=2, end_offset=20, prefix_sha256='b'*64)
+    payload = dict(resume={'resume_index':1}, sources=[source], selection={'readers':{}}, operation='cutover')
+    result = dict(ok=True, adapter=True, lease_closed=True, unselected_refused=True,
+                  config_digest=m.record_digest(payload['selection']), sources=[observed], generation=2,
+                  all_committed=True, reopened=True, capture_ready=True, raw_deferred=0,
+                  bridge_pending=0, bridge_inflight=0, prefix_preserved=True,
+                  prefix_evidence=[dict(relative_path=source['relative_path'], end_offset=10, prefix_sha256='a'*64)])
+    if mutation == 'missing':
+        result['sources'] = []
+    elif mutation == 'proof':
+        result['prefix_preserved'] = False
+    elif mutation == 'digest':
+        result['prefix_evidence'][0]['prefix_sha256'] = 'c'*64
+    elif mutation == 'offset':
+        result['prefix_evidence'][0]['end_offset'] = 20
+    with m.injected_controls(lambda a,p:result):
+        if mutation == 'none':
+            assert m._execute(action, payload) == result
+        else:
+            code = 'committed_source_not_covered' if mutation == 'missing' else 'committed_prefix_changed'
+            with pytest.raises(ValueError, match=code):
+                m._execute(action, payload)

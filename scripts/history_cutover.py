@@ -411,9 +411,64 @@ def prepare_final_owner_package(*, conversion_manifest: Mapping[str, Any],
 
 
 
+def committed_prefix_proof(raw_root: Path, frozen: list[dict[str, Any]],
+                           observed: list[dict[str, Any]]) -> dict[str, Any]:
+    """Bind current committed files to the immutable bytes of a frozen prefix."""
+    actual = {source['relative_path']: source for source in observed}
+    evidence = []
+    for source in frozen:
+        current = actual.get(source['relative_path'])
+        if (current is None or current['line_number'] < source['line_number']
+                or current['end_offset'] < source['end_offset']):
+            raise ValueError('committed_source_not_covered')
+        digest = current['prefix_sha256']
+        if current['end_offset'] > source['end_offset']:
+            path = raw_root / source['relative_path']
+            _paths(raw_root, path)
+            if raw_root.resolve() not in path.resolve().parents:
+                raise ValueError('committed_source_not_covered')
+            remaining = source['end_offset']
+            prefix = hashlib.sha256()
+            try:
+                with path.open('rb') as stream:
+                    while remaining:
+                        chunk = stream.read(min(remaining, 1024*1024))
+                        if not chunk:
+                            raise ValueError('committed_source_not_covered')
+                        prefix.update(chunk)
+                        remaining -= len(chunk)
+            except OSError as exc:
+                raise ValueError('committed_source_not_covered') from exc
+            digest = prefix.hexdigest()
+        if digest != source['prefix_sha256']:
+            raise ValueError('committed_prefix_changed')
+        evidence.append(dict(relative_path=source['relative_path'], end_offset=source['end_offset'],
+                             prefix_sha256=digest))
+    return dict(prefix_preserved=True, prefix_evidence=evidence)
+
+
+def _verify_resume_prefix(result: dict[str, Any], frozen: list[dict[str, Any]]) -> None:
+    actual = {source['relative_path']: source for source in result.get('sources', [])}
+    evidence = {source['relative_path']: source for source in result.get('prefix_evidence', [])}
+    for source in frozen:
+        current = actual.get(source['relative_path'])
+        if (current is None or current['line_number'] < source['line_number']
+                or current['end_offset'] < source['end_offset']):
+            raise ValueError('committed_source_not_covered')
+        proof = evidence.get(source['relative_path'], {})
+        if (result.get('prefix_preserved') is not True or proof.get('end_offset') != source['end_offset']
+                or proof.get('prefix_sha256') != source['prefix_sha256']
+                or (current['end_offset'] == source['end_offset']
+                    and current['prefix_sha256'] != source['prefix_sha256'])):
+            raise ValueError('committed_prefix_changed')
+    if result.get('prefix_preserved') is not True:
+        raise ValueError('committed_prefix_changed')
+
+
 def offline_reader_smoke(*, family: str, db_path: Path, raw_root: Path,
                          selection: Mapping[str, Any],
-                         probe: Callable[[Any], Mapping[str, bool]]) -> dict[str, Any]:
+                         probe: Callable[[Any], Mapping[str, bool]],
+                         frozen_sources: list[dict[str, Any]] | None = None) -> dict[str, Any]:
     """A stopped-process probe borrows one verified ordinary reader lease.
 
     The injected family composition must exercise its actual adapters and prove
@@ -436,6 +491,7 @@ def offline_reader_smoke(*, family: str, db_path: Path, raw_root: Path,
         checkpoints = {r[0]: tuple(r[1:]) for r in db.execute("SELECT file,lines,end_offset,sha256 FROM projector_state WHERE file<>'@runtime'")}
         if runtime.get('status') != 'ready' or any(checkpoints.get(s.relative_path) != (s.line_number, s.end_offset, s.prefix_sha256) for s in vector):
             raise ValueError('offline_generation_vector_unverified')
+    prefix_proof = committed_prefix_proof(raw_root, frozen_sources, [asdict(s) for s in vector]) if frozen_sources is not None else {}
     reader = HistoryReader(db_path)
     snapshot = reader.open_snapshot(HistoryBoundary(runtime['generation'], vector))
     try:
@@ -449,7 +505,7 @@ def offline_reader_smoke(*, family: str, db_path: Path, raw_root: Path,
         reader.close()
     return dict(ok=True, adapter=True, lease_closed=snapshot._closed, unselected_refused=True,
                 config_digest=record_digest(selection), generation=runtime['generation'],
-                sources=[asdict(s) for s in vector])
+                sources=[asdict(s) for s in vector], **prefix_proof)
 
 
 def preparation_controls(*, host: Callable[[str, dict[str, Any]], dict[str, Any]],
@@ -538,7 +594,8 @@ def preparation_controls(*, host: Callable[[str, dict[str, Any]], dict[str, Any]
         if action.startswith('smoke-reader-') and probes and action.removeprefix('smoke-reader-') in probes:
             family = action.removeprefix('smoke-reader-')
             return offline_reader_smoke(family=family, db_path=layout['history'], raw_root=layout['raw'],
-                selection=payload['selection'], probe=probes[family])
+                selection=payload['selection'], probe=probes[family],
+                frozen_sources=payload['sources'] if payload.get('resume') else None)
         return host(action, payload)
     execute.mode = getattr(host, "mode", None)
     return execute
@@ -883,10 +940,13 @@ def _execute(action: str, payload: dict[str, Any]) -> dict[str, Any]:
                 raise ValueError('committed_source_not_covered')
             if observed['end_offset'] == source['end_offset'] and observed['prefix_sha256'] != source['prefix_sha256']:
                 raise ValueError('committed_prefix_changed')
+    if payload.get('resume') and (action.startswith('smoke-reader-') or action == 'all-committed-barrier'):
+        _verify_resume_prefix(result, payload['sources'])
     if action.startswith('smoke-reader-'):
         if (any(result.get(k) is not True for k in ('adapter', 'lease_closed', 'unselected_refused'))
                 or result.get('config_digest') != record_digest(payload['selection'])
-                or result.get('sources') != payload['sources'] or type(result.get('generation')) is not int):
+                or (not payload.get('resume') and result.get('sources') != payload['sources'])
+                or type(result.get('generation')) is not int):
             raise ValueError('offline_adapter_smoke_unproven')
     return result
 
@@ -948,6 +1008,9 @@ def _run(value: dict[str, Any], home: Path, actions: list[str], *, restore: bool
                 selection['readers'][action.removeprefix('select-')] = True
             if action.startswith('smoke-reader-') and 'generation' in receipt:
                 generation = receipt['generation']
+    minimum_generation = generation if resume else None
+    if resume:
+        generation = None
     try:
         for action in actions:
             started = time.time_ns()
@@ -982,7 +1045,9 @@ def _run(value: dict[str, Any], home: Path, actions: list[str], *, restore: bool
                 if action == 'release-fence':
                     _verify_release_binding(dict(phases=prior_phases + journal['phases']) if resume else journal, result, restore=restore)
             if action.startswith('smoke-reader-'):
-                if generation is not None and result['generation'] != generation:
+                if ((generation is not None and result['generation'] != generation)
+                        or (resume and (result['generation'] < 1 or
+                            (minimum_generation is not None and result['generation'] < minimum_generation)))):
                     raise ValueError('offline_reader_generation_changed')
                 generation = result['generation']
             if action == 'freeze-verification-prefix' and 'sources' in result:
