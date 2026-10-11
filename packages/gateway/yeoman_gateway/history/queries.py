@@ -54,6 +54,20 @@ def _time(value: int | None) -> None:
         raise ValueError("time must be integer milliseconds or None")
 
 
+def _principal_identifiers(principal: str) -> tuple[str, ...]:
+    if not isinstance(principal, str):
+        return ()
+    value = principal.removeprefix('whatsapp:')
+    if value.isascii() and value.isdigit():
+        return (value + '@s.whatsapp.net', value + '@lid')
+    ident = classify(value)
+    if ident and ident.value == value and ident.kind in ('pn_jid', 'lid'):
+        number = ident.value.split('@', 1)[0]
+        if number.isascii() and number.isdigit():
+            return (ident.value,)
+    return ()
+
+
 class HistoryQueries:
     def __init__(self, snapshot: HistorySnapshot):
         self.snapshot = snapshot
@@ -192,12 +206,43 @@ class HistoryQueries:
                   UNION SELECT chat_id FROM message_events WHERE channel='whatsapp') c ORDER BY chat_id
         """)
 
+    def principal_contact(self, principal: str, at_ms: int) -> str | None:
+        """Resolve live WhatsApp principal forms to one temporal terminal contact."""
+        if at_ms is None:
+            return None
+        try:
+            contacts = set()
+            for value in _principal_identifiers(principal):
+                contact = self.resolve_identifier(value, at_ms=at_ms, time_basis='native')
+                if contact:
+                    contacts.add(self.terminal(contact))
+            return contacts.pop() if len(contacts) == 1 else None
+        except HistoryPaused:
+            return None
+
+    def is_owner_direct_chat(self, principal: str, chat_id: str, at_ms: int, *,
+                             is_owner: bool, channel: str = 'whatsapp') -> bool:
+        """Require authenticated ownership and the same temporal direct-chat counterpart."""
+        if not is_owner or channel != 'whatsapp':
+            return False
+        ident = classify(chat_id)
+        if ident is None or ident.kind not in ('pn_jid', 'lid'):
+            return False
+        owner = self.principal_contact(principal, at_ms)
+        if owner is None:
+            return False
+        try:
+            counterpart = self.resolve_identifier(ident.value, at_ms=at_ms, time_basis='native')
+            return counterpart is not None and self.terminal(counterpart) == owner
+        except HistoryPaused:
+            return False
+
     def owner_member_chat_ids(self, principal_id: str, now_ms: int) -> tuple[str, ...]:
         """Return group chats with a proven current roster containing this principal."""
         _time(now_ms)
-        if not principal_id or now_ms is None:
+        owner = self.principal_contact(principal_id, now_ms)
+        if owner is None:
             return ()
-        from .ids import classify
         result = []
         for row in self.chats():
             chat_id = str(row['chat_id'])
@@ -205,7 +250,9 @@ class HistoryQueries:
             if ident is None or ident.kind != 'group':
                 continue
             audience = self.members(chat_id=chat_id, at_ms=now_ms)
-            if audience.status == 'known' and principal_id in audience.members:
+            if audience.status == 'known' and any(
+                self.principal_contact(member, now_ms) == owner for member in audience.members
+            ):
                 result.append(chat_id)
         return tuple(result)
 

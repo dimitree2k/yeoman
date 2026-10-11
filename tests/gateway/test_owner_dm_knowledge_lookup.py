@@ -6,6 +6,13 @@ from unittest.mock import Mock
 import pytest
 from yeoman_gateway.adapters.responder_llm import LLMResponder
 
+OWNER_ENDPOINTS = (
+    ("whatsapp:10001", "10001@s.whatsapp.net"),
+    ("whatsapp:90001@lid", "10001@s.whatsapp.net"),
+    ("whatsapp:10001", "90001@lid"),
+    ("whatsapp:90001@lid", "90001@lid"),
+)
+
 
 @pytest.fixture
 def responder(monkeypatch):
@@ -15,6 +22,8 @@ def responder(monkeypatch):
     responder._history_selected = True
     queries = SimpleNamespace(
         owner_member_chat_ids=Mock(return_value=("stocks@g.us",)),
+        is_owner_direct_chat=Mock(side_effect=lambda principal, chat, at_ms, **kwargs:
+                                  kwargs.get("is_owner") and (principal, chat) in OWNER_ENDPOINTS),
         resolve_people_in_text=Mock(side_effect=lambda text, **kwargs: (("Alex", "alex-person"),) if "Alex" in text else ()),
         chats=lambda: [{"chat_id": "stocks@g.us", "subject": "Aktienrunde"}],
     )
@@ -23,9 +32,10 @@ def responder(monkeypatch):
     return responder
 
 
-def recall(responder, text, *, owner=True, chat="10001@s.whatsapp.net", purpose="reply"):
+def recall(responder, text, *, owner=True, principal="whatsapp:10001",
+           chat="10001@s.whatsapp.net", purpose="reply"):
     return responder._knowledge_statement_context(query=text, channel="whatsapp", chat_id=chat,
-        principal="whatsapp:10001", is_owner=owner, purpose=purpose)
+        principal=principal, is_owner=owner, purpose=purpose)
 
 
 def test_selected_direct_context_has_only_canonical_recipient(responder):
@@ -38,16 +48,18 @@ def test_selected_direct_context_has_only_canonical_recipient(responder):
 
 
 @pytest.mark.parametrize("question", ["Was weißt du über Alex' Aktien?", "Was hält Alex", "Erzähl mir von Alex"])
-def test_explicit_german_person_question_recalls_by_identity(responder, question):
-    assert recall(responder, question) == "Alex holds shares"
+@pytest.mark.parametrize(("principal", "chat"), OWNER_ENDPOINTS)
+def test_explicit_german_person_question_recalls_by_identity(responder, question, principal, chat):
+    assert recall(responder, question, principal=principal, chat=chat) == "Alex holds shares"
     call = responder.knowledge.recall.call_args
     assert call.args[0].person_ids == ("alex-person",)
     assert call.kwargs["context"].owner_lookup_person_ids == ("alex-person",)
     assert call.kwargs["require_match"] is False
 
 
-def test_explicit_chat_question_targets_known_chat(responder):
-    recall(responder, "Was wurde in Aktienrunde besprochen?")
+@pytest.mark.parametrize(("principal", "chat"), OWNER_ENDPOINTS)
+def test_explicit_chat_question_targets_known_chat(responder, principal, chat):
+    recall(responder, "Was wurde in Aktienrunde besprochen?", principal=principal, chat=chat)
     assert responder.knowledge.recall.call_args.kwargs["context"].owner_lookup_chat_ids == ("stocks@g.us",)
 
 

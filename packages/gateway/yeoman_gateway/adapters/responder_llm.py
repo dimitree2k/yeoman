@@ -2723,6 +2723,7 @@ class LLMResponder(ResponderPort):
 
         canonical_id = resolve_canonical_user_id(channel, str(sender_id or ""), metadata)
 
+        binding = None
         if self.sessions.history_selected or self.sessions.legacy_history_disabled:
             from yeoman_gateway.processing.dispatch import CURRENT_TURN
 
@@ -2735,6 +2736,20 @@ class LLMResponder(ResponderPort):
                 current_message_id=str(metadata.get("message_id") or "") or None)
         else:
             session = self.sessions.get_or_create(session_key)
+
+        if not canonical_id and is_owner and channel == "whatsapp" and getattr(self, "_history_selected", False):
+            from yeoman_gateway.history.context import current_history_snapshot
+            from yeoman_gateway.history.queries import HistoryQueries
+
+            turn_principal = str(getattr(getattr(binding, "turn", None), "principal", "") or "")
+            snapshot = history_snapshot or current_history_snapshot()
+            if snapshot is not None:
+                snapshot.assert_current(snapshot.generation)
+                if turn_principal and HistoryQueries(snapshot).is_owner_direct_chat(
+                    turn_principal, chat_id, int(time.time() * 1000),
+                    is_owner=True, channel=channel,
+                ):
+                    canonical_id = turn_principal
 
         # Save session immediately on first message (even if no response yet)
         if session.operational_store is not None:
@@ -3164,14 +3179,24 @@ class LLMResponder(ResponderPort):
         from yeoman_gateway.knowledge.models import TrustedReadContext
 
         is_direct = not str(chat_id).endswith("@g.us")
+        from yeoman_gateway.history.context import current_history_snapshot
+        from yeoman_gateway.history.queries import HistoryQueries
+
+        snapshot = current_history_snapshot()
+        now_ms = int(time.time() * 1000)
+        owner_direct = bool(snapshot is not None and getattr(self, "_history_selected", False)
+            and channel == "whatsapp" and is_owner
+            and HistoryQueries(snapshot).is_owner_direct_chat(
+            principal, chat_id, now_ms, is_owner=bool(is_owner), channel=channel,
+        ))
         members = None
         if self.chat_registry is not None:
             proven = registry_members(self.chat_registry, channel=channel, chat_id=chat_id)
             if proven:
                 members = frozenset(str(item) for item in proven)
         if members is None and is_direct:
-            members = (frozenset({principal}) if getattr(self, "_history_selected", False)
-                       and channel == "whatsapp" and is_owner else frozenset({principal, str(chat_id)}))
+            members = (frozenset({principal}) if owner_direct
+                       else frozenset({principal, str(chat_id)}))
         return TrustedReadContext(
             principal_id=str(principal),
             channel=str(channel),
@@ -3180,7 +3205,7 @@ class LLMResponder(ResponderPort):
             membership_revision=None if members is None else f"{channel}:{chat_id}:{len(members)}",
             policy_revision=self._knowledge_policy_revision(),
             purpose=purpose,
-            now_ms=int(time.time() * 1000),
+            now_ms=now_ms,
             is_direct=is_direct,
             owner=bool(is_owner),
         )
@@ -3193,7 +3218,6 @@ class LLMResponder(ResponderPort):
 
         from yeoman_gateway.history.context import current_history_snapshot
         from yeoman_gateway.history.queries import HistoryQueries
-        from yeoman_gateway.knowledge._history_sources import principal_identifier
         from yeoman_gateway.knowledge.models import RecallQuery
 
         context = self._knowledge_read_context(
@@ -3209,9 +3233,11 @@ class LLMResponder(ResponderPort):
             r"erzähl|erzähle|sag|zeige|tell|show|recall|remember)\b", query, re.IGNORECASE,
         ))
         snapshot = current_history_snapshot()
-        if (is_owner and purpose == "reply" and channel == "whatsapp"
-                and principal_identifier(principal) == chat_id and explicit_request
-                and snapshot is not None):
+        if (context.owner and purpose == "reply" and channel == "whatsapp" and explicit_request
+                and snapshot is not None
+                and HistoryQueries(snapshot).is_owner_direct_chat(
+                    principal, chat_id, context.now_ms, is_owner=is_owner, channel=channel
+                )):
             queries = HistoryQueries(snapshot)
             member_chats = queries.owner_member_chat_ids(principal, context.now_ms)
             named_chats = tuple(dict.fromkeys(

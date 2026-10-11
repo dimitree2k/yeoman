@@ -300,8 +300,8 @@ class RetrievalEngine:
                 + " OR (s.visibility_scope <> 'author_only'))"
             )
             params.append(context.principal_id)
-        # Every verified recipient must be named in the audience.  actor_only resolves
-        # through its author principal, which the gate above read from the current row.
+        # Owner-history candidates are checked against temporal source audiences below;
+        # stored principal strings can differ across phone/LID identifiers.
         placeholders = ",".join("?" for _ in recipients)
         audience_match = (
             "(SELECT COUNT(DISTINCT p.principal_id)"
@@ -313,6 +313,9 @@ class RetrievalEngine:
             clauses.append("s.visibility_scope <> 'author_only' AND " + audience_match)
             params.extend(recipients)
             params.append(len(recipients))
+        elif owner_lookup:
+            # Temporal source proofs below authorize owner aliases, rather than raw strings.
+            clauses.append("1=1")
         elif recipients:
             clauses.append(
                 "((s.visibility_scope <> 'author_only' AND " + audience_match + ")"
@@ -435,20 +438,51 @@ class RetrievalEngine:
             def permits_owner_lookup(source: SourceRef, status: str) -> bool:
                 if status != "active" or source.channel != "whatsapp" or not scope.sources.verify_source(source):
                     return False
-                if source.chat_id == context.chat_id:
-                    return all(scope.sources.permits_principal(
-                        source, principal, now_ms=context.now_ms
-                    ) for principal in decision.recipients)
-                # Cross-chat rights require both source-time audience and current roster proof.
+                # Owner lookup requires source-time and current proof for the same contact.
                 audience = scope.sources.evidence_audience(source, basis="")
                 current = scope.queries.members(chat_id=source.chat_id, at_ms=context.now_ms)
+                viewer_contact = scope.queries.principal_contact(context.principal_id, context.now_ms)
+                if scope.queries.is_owner_direct_chat(
+                    context.principal_id, source.chat_id, context.now_ms,
+                    is_owner=context.owner, channel=context.channel,
+                ):
+                    if audience is not None and audience.status == "known":
+                        same_chat_principals = {
+                            principal for principal in audience.members
+                            if viewer_contact and scope.queries.principal_contact(
+                                principal, context.now_ms
+                            ) == viewer_contact
+                        }
+                    elif audience is not None and audience.status == "author_only":
+                        same_chat_principals = (
+                            {source.author_principal}
+                            if viewer_contact and scope.queries.principal_contact(
+                                source.author_principal, context.now_ms
+                            ) == viewer_contact else set()
+                        )
+                    else:
+                        same_chat_principals = set()
+                    return any(scope.sources.permits_principal(
+                        source, principal, now_ms=context.now_ms
+                    ) for principal in same_chat_principals)
+
+                # Cross-chat rights require both source-time audience and current roster proof.
+                audience_contacts = (
+                    {principal for principal in audience.members
+                     if scope.queries.principal_contact(principal, context.now_ms) == viewer_contact}
+                    if audience is not None and audience.status == "known" and viewer_contact else set()
+                )
+                current_contacts = (
+                    {principal for principal in current.members
+                     if scope.queries.principal_contact(principal, context.now_ms) == viewer_contact}
+                    if current.status == "known" and viewer_contact else set()
+                )
                 return bool(
-                    scope.sources.permits_principal(
-                        source, context.principal_id, now_ms=context.now_ms
-                    )
-                    and audience is not None and audience.status == "known"
-                    and context.principal_id in audience.members
-                    and current.status == "known" and context.principal_id in current.members
+                    audience is not None and audience.status == "known"
+                    and any(scope.sources.permits_principal(
+                        source, principal, now_ms=context.now_ms
+                    ) for principal in audience_contacts)
+                    and current_contacts
                 )
 
             return bool(sources) and all(

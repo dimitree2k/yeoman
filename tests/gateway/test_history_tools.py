@@ -75,6 +75,121 @@ def _person_lookup_projector():
     return p, owner_phone
 
 
+def _owner_test_chat(p, phone, form):
+    aliases = {'lid': '990000000001@lid', 'second_phone': '491000000009@s.whatsapp.net'}
+    for kind, value in (('lid', aliases['lid']), ('pn_jid', aliases['second_phone'])):
+        p.db.execute("INSERT INTO identifier_history(contact_id,channel,kind,value,strength,evidence,source_refs)"
+                     " VALUES ('owner','whatsapp',?,?,'strong','owner_attested','[]')", (kind, value))
+    p.db.commit()
+    return phone if form == 'phone' else aliases[form]
+
+
+OWNER_PRINCIPAL_FORMS = (
+    'whatsapp:491000000001', 'whatsapp:491000000001@s.whatsapp.net',
+    'whatsapp:990000000001@lid', '491000000001', '990000000001',
+    '491000000001@s.whatsapp.net', '990000000001@lid',
+)
+
+
+@pytest.mark.parametrize('principal', OWNER_PRINCIPAL_FORMS)
+@pytest.mark.parametrize('chat,is_owner,channel,allowed', [
+    ('990000000001@lid', True, 'whatsapp', True),
+    ('491000000009@s.whatsapp.net', True, 'whatsapp', True),
+    ('990000000002@lid', True, 'whatsapp', False),
+    ('family@g.us', True, 'whatsapp', False),
+    ('990000000099@lid', True, 'whatsapp', False),
+    ('990000000001@lid', False, 'whatsapp', False),
+    ('990000000001@lid', True, 'telegram', False),
+    ('990000000001@newsletter', True, 'whatsapp', False),
+    ('status@broadcast', True, 'whatsapp', False),
+])
+async def test_owner_direct_chat_uses_temporal_terminal_identity(principal, chat, is_owner, channel, allowed):
+    from yeoman_gateway.history.context import history_turn
+    from yeoman_gateway.history.queries import HistoryQueries
+
+    p, phone = _person_lookup_projector()
+    _owner_test_chat(p, phone, 'phone')
+    p.db.execute("INSERT INTO identifier_history(contact_id,channel,kind,value,strength,evidence,source_refs)"
+                 " VALUES ('alex','whatsapp','lid','990000000002@lid','strong','owner_attested','[]')")
+    p.db.commit()
+    async with history_turn(p) as snapshot:
+        queries = HistoryQueries(snapshot)
+        assert queries.is_owner_direct_chat(principal, chat, 1700000000100,
+                                           is_owner=is_owner, channel=channel) is allowed
+        if allowed:
+            assert queries.owner_member_chat_ids(principal, 1700000000100) == ('family@g.us',)
+    p.close()
+
+
+@pytest.mark.parametrize('principal', OWNER_PRINCIPAL_FORMS)
+@pytest.mark.parametrize('chat,is_owner,allowed', [
+    ('990000000001@lid', True, True),
+    ('491000000009@s.whatsapp.net', True, True),
+    ('990000000002@lid', True, False),
+    ('family@g.us', True, False),
+    ('990000000099@lid', True, False),
+    ('990000000001@lid', False, False),
+])
+async def test_recall_owner_alias_direct_turns(principal, chat, is_owner, allowed):
+    from yeoman_gateway.history.context import history_turn
+
+    p, phone = _person_lookup_projector()
+    _owner_test_chat(p, phone, 'phone')
+    p.db.execute("INSERT INTO identifier_history(contact_id,channel,kind,value,strength,evidence,source_refs)"
+                 " VALUES ('alex','whatsapp','lid','990000000002@lid','strong','owner_attested','[]')")
+    p.db.commit()
+    tool = RecallConversationTool(None)
+    async with history_turn(p) as snapshot:
+        token = set_tool_context(ToolInvocationContext(channel='whatsapp', chat_id=chat,
+            canonical_user_id=principal, is_owner=is_owner, history_snapshot=snapshot))
+        try:
+            text = await tool.execute(person='Alex', query='Aktien Portfolio')
+            if allowed:
+                assert "Alex' Aktien" in text
+            else:
+                assert 'only in the owner' in text
+        finally:
+            reset_tool_context(token)
+    p.close()
+
+
+async def test_owner_direct_chat_refuses_expired_or_ambiguous_identifiers():
+    from yeoman_gateway.history.context import history_turn
+    from yeoman_gateway.history.queries import HistoryQueries
+
+    p, phone = _person_lookup_projector()
+    lid = _owner_test_chat(p, phone, 'lid')
+    p.db.execute("UPDATE identifier_history SET valid_until_ms=1700000000200 WHERE value=?", (lid,))
+    p.db.commit()
+    async with history_turn(p) as snapshot:
+        queries = HistoryQueries(snapshot)
+        assert queries.is_owner_direct_chat('whatsapp:491000000001', lid, 1700000000100, is_owner=True)
+        assert not queries.is_owner_direct_chat('whatsapp:491000000001', lid, 1700000000300, is_owner=True)
+        snapshot.connection.execute("INSERT INTO identifier_history(contact_id,channel,kind,value,strength,evidence,source_refs)"
+                                    " VALUES ('alex','whatsapp','lid',?,'strong','owner_attested','[]')", (lid,))
+        assert not queries.is_owner_direct_chat('whatsapp:491000000001', lid, 1700000000100, is_owner=True)
+    p.close()
+
+
+@pytest.mark.parametrize('principal', ['491000000001', 'whatsapp:491000000001'])
+@pytest.mark.parametrize('lid_contact', ['owner', 'alex'])
+async def test_bare_principal_requires_one_terminal_contact(principal, lid_contact):
+    from yeoman_gateway.history.context import history_turn
+    from yeoman_gateway.history.queries import HistoryQueries
+
+    p, phone = _person_lookup_projector()
+    chat = _owner_test_chat(p, phone, 'lid')
+    p.db.execute("INSERT INTO identifier_history(contact_id,channel,kind,value,strength,evidence,source_refs)"
+                 " VALUES (?,'whatsapp','lid','491000000001@lid','strong','owner_attested','[]')", (lid_contact,))
+    p.db.commit()
+    async with history_turn(p) as snapshot:
+        q = HistoryQueries(snapshot)
+        assert q.principal_contact(principal, 1700000000100) == ('owner' if lid_contact == 'owner' else None)
+        assert q.is_owner_direct_chat(principal, chat, 1700000000100, is_owner=True) is (lid_contact == 'owner')
+        assert q.is_owner_direct_chat(phone, chat, 1700000000100, is_owner=True)
+    p.close()
+
+
 def _add_named_author(p, contact_id, display_name, phone):
     p.db.execute("INSERT INTO contacts VALUES (?, 'person',NULL,?,'confirmed',NULL,'[]')",
                  (contact_id, display_name))
@@ -145,12 +260,14 @@ async def test_person_resolver_prefix_ambiguity_exact_multword_and_unmatchable_n
     p.close()
 
 
-async def test_recall_person_scope_requires_owner_dm_and_current_membership():
+@pytest.mark.parametrize('owner_chat', ['phone', 'lid', 'second_phone'])
+async def test_recall_person_scope_requires_owner_dm_and_current_membership(owner_chat):
     import time
 
     from yeoman_gateway.history.context import history_turn
 
     p, owner_phone = _person_lookup_projector()
+    owner_phone = _owner_test_chat(p, owner_phone, owner_chat)
     tool = RecallConversationTool(None, group_resolver=lambda ref: (
         {'family': 'family@g.us', 'other': 'other@g.us'}.get(ref), None))
     async with history_turn(p) as snapshot:
@@ -260,13 +377,15 @@ async def test_history_person_search_keeps_older_indexed_match_past_unrelated_ro
     p.close()
 
 
-async def test_person_recall_excludes_weakly_attributed_authorship():
+@pytest.mark.parametrize('owner_chat', ['phone', 'lid', 'second_phone'])
+async def test_person_recall_excludes_weakly_attributed_authorship(owner_chat):
     import time
 
     from yeoman_gateway.history.context import history_turn
     from yeoman_gateway.history.queries import HistoryQueries
 
     p, owner_phone = _person_lookup_projector()
+    owner_phone = _owner_test_chat(p, owner_phone, owner_chat)
     p.add('weak-author', chat='family@g.us', text='impostor payload')
     p.db.execute("UPDATE messages SET sender_contact_id='alex',sender_basis='push_name' WHERE message_id='weak-author'")
     p.add('weak-mention', chat='family@g.us', text='Alex appears in this unattributed message')
@@ -292,13 +411,15 @@ async def test_person_recall_excludes_weakly_attributed_authorship():
     p.close()
 
 
-async def test_person_search_ranks_query_prefix_matches_and_warns_when_query_matches_none():
+@pytest.mark.parametrize('owner_chat', ['phone', 'lid', 'second_phone'])
+async def test_person_search_ranks_query_prefix_matches_and_warns_when_query_matches_none(owner_chat):
     import time
 
     from yeoman_gateway.history.context import history_turn
     from yeoman_gateway.history.queries import HistoryQueries
 
     p, owner_phone = _person_lookup_projector()
+    owner_phone = _owner_test_chat(p, owner_phone, owner_chat)
     async with history_turn(p) as snapshot:
         queries = HistoryQueries(snapshot)
         now_ms = time.time_ns() // 1_000_000

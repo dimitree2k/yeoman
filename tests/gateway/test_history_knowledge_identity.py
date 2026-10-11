@@ -221,20 +221,23 @@ def test_history_alias_delivery_preserves_frozen_release_controls(case):
     assert frozen(service) == before
 
 
-def test_owner_dm_lookup_reads_author_only_statement_only_with_history_audience_proof(case):
+@pytest.mark.parametrize("principal", [MEMBER, "whatsapp:20002@lid"])
+def test_owner_dm_lookup_reads_author_only_statement_only_with_history_audience_proof(case, principal):
     service, q, sources, db = case
+    if principal.endswith("@lid"):
+        identifier(db, 'b', '20002@lid', start=1)
     source = sources.issue('m')
     with service.history_scope(q, sources):
         sid, _ = capture(service, source)
         service._store.execute("UPDATE knowledge_statements SET visibility_scope='author_only' WHERE statement_id=?", (sid,))
         owner_dm = TrustedReadContext(
-            MEMBER, 'whatsapp', '10002@s.whatsapp.net', frozenset({MEMBER}), None, 1,
+            principal, 'whatsapp', '10002@s.whatsapp.net', frozenset({principal}), None, 1,
             'reply', 150, is_direct=True, owner=True, owner_lookup_person_ids=('a',),
         )
         assert service.recall(RecallQuery('Synthetic'), context=owner_dm).statement_ids == (sid,)
 
         normal_dm = TrustedReadContext(
-            MEMBER, 'whatsapp', '10002@s.whatsapp.net', frozenset({MEMBER}), None, 1,
+            principal, 'whatsapp', '10002@s.whatsapp.net', frozenset({principal}), None, 1,
             'reply', 150, is_direct=True,
         )
         assert not service.recall(RecallQuery('Synthetic'), context=normal_dm).statement_ids
@@ -254,8 +257,11 @@ def test_owner_dm_lookup_reads_author_only_statement_only_with_history_audience_
         assert not service.recall(RecallQuery('Synthetic'), context=proactive).statement_ids
 
 
-def test_owner_lookup_keeps_an_author_only_statement_from_the_owner_dm(case):
+@pytest.mark.parametrize("principal", [MEMBER, "whatsapp:20002@lid"])
+def test_owner_lookup_keeps_an_author_only_statement_from_the_owner_dm(case, principal):
     service, q, sources, db = case
+    if principal.endswith("@lid"):
+        identifier(db, 'b', '20002@lid', start=1)
     message(db, 'owner-dm', chat='10002@s.whatsapp.net', sender='b',
             identifier='10002@s.whatsapp.net', text='Synthetic local note')
     source = sources.issue('owner-dm')
@@ -266,16 +272,134 @@ def test_owner_lookup_keeps_an_author_only_statement_from_the_owner_dm(case):
             (sid,),
         )
         context = TrustedReadContext(
-            MEMBER, 'whatsapp', '10002@s.whatsapp.net', frozenset({MEMBER}), None, 1,
+            principal, 'whatsapp', '10002@s.whatsapp.net', frozenset({principal}), None, 1,
             'reply', 150, is_direct=True, owner=True, owner_lookup_person_ids=('a',),
         )
         assert service.recall(RecallQuery('Synthetic', person_ids=('a',)), context=context).statement_ids == (sid,)
 
 
-def test_owner_german_person_question_retrieves_real_v3_statement(case, monkeypatch):
+@pytest.mark.asyncio
+@pytest.mark.parametrize('principal', [
+    'whatsapp:10002', 'whatsapp:10002@s.whatsapp.net', 'whatsapp:20002@lid',
+    '10002', '20002', '10002@s.whatsapp.net', '20002@lid',
+])
+async def test_responder_handoff_uses_frozen_lid_principal_when_sender_canonicalization_is_empty(case, monkeypatch, principal):
+    from types import SimpleNamespace
+    from unittest.mock import Mock
+
+    from yeoman_gateway.adapters import responder_llm
+    from yeoman_gateway.adapters.responder_llm import LLMResponder
+    from yeoman_gateway.policy.identity import canonical_user_id
+    from yeoman_gateway.processing.dispatch import CURRENT_PRINCIPAL, CURRENT_TURN
+    from yeoman_gateway.processing.models import StoredTurn, TurnBinding
+
+    service, q, sources, db = case
+    identifier(db, 'b', '20002@lid', start=1)
+    assert canonical_user_id("whatsapp", "20002@lid", {}) == ""
+    responder = object.__new__(LLMResponder)
+    responder._history_selected = True
+    session = SimpleNamespace(operational_store=None, messages=[])
+    session.add_message = Mock()
+    responder.sessions = SimpleNamespace(
+        history_selected=True, legacy_history_disabled=False,
+        get_or_create=Mock(return_value=session), save=Mock(),
+    )
+    responder._model_for_profile = lambda profile: "test-model"
+    responder._session_user_metadata = lambda *args, **kwargs: {}
+    handed_off = {}
+
+    class HandoffReachedError(Exception):
+        pass
+
+    def set_context(**kwargs):
+        handed_off.update(kwargs)
+        raise HandoffReachedError
+
+    responder._set_tool_context = set_context
+    monkeypatch.setattr(responder_llm.lf, "start_trace", lambda **kwargs: object())
+    binding = TurnBinding(StoredTurn("turn-1", "thread-1", principal))
+    turn_token = CURRENT_TURN.set(binding)
+    principal_token = CURRENT_PRINCIPAL.set("")
+    try:
+        with service.history_scope(q, sources):
+            with pytest.raises(HandoffReachedError):
+                await responder._generate_locked(
+                    session_key="whatsapp:20002@lid", channel="whatsapp", chat_id="20002@lid",
+                    content="Was weißt du?", sender_id="20002@lid", media=(), metadata={},
+                    allowed_tools=set(), persona_text=None, is_owner=True, history_snapshot=q.snapshot,
+                )
+    finally:
+        CURRENT_PRINCIPAL.reset(principal_token)
+        CURRENT_TURN.reset(turn_token)
+    assert handed_off["canonical_user_id"] == principal
+
+    from yeoman_gateway.agent.tools.recall_conversation import RecallConversationTool
+    from yeoman_gateway.processing.tool_context import (
+        ToolInvocationContext,
+        reset_tool_context,
+        set_tool_context,
+    )
+
+    db.execute("UPDATE contacts SET display_name='Alex' WHERE contact_id='a'")
+    responder.knowledge = service
+    responder.chat_registry = None
+    monkeypatch.setattr("yeoman_gateway.history.context.current_history_snapshot", lambda: q.snapshot)
+    with service.history_scope(q, sources):
+        sid, _ = capture(service, sources.issue('m'))
+        service._store.execute("UPDATE knowledge_statements SET visibility_scope='author_only' WHERE statement_id=?", (sid,))
+        token = set_tool_context(ToolInvocationContext(
+            channel=handed_off['channel'], chat_id=handed_off['chat_id'],
+            canonical_user_id=handed_off['canonical_user_id'], is_owner=handed_off['is_owner'],
+            history_snapshot=q.snapshot,
+        ))
+        try:
+            text = await RecallConversationTool(None).execute(person='Alex', query='Synthetic')
+            assert 'Synthetic A' in text
+        finally:
+            reset_tool_context(token)
+        recall = Mock(wraps=service.recall)
+        monkeypatch.setattr(service, 'recall', recall)
+        assert responder._knowledge_statement_context(
+            query="Was weißt du über Alex' Aktien?", channel=handed_off['channel'],
+            chat_id=handed_off['chat_id'], principal=handed_off['canonical_user_id'],
+            is_owner=handed_off['is_owner'],
+        ) == 'Synthetic statement (Alex)'
+        assert recall.call_args.args[0].person_ids == ('a',)
+
+
+def test_owner_local_dm_does_not_read_author_only_statement_by_another_contact(case):
+    service, q, sources, db = case
+    identifier(db, 'b', '20002@lid', start=1)
+    # This phone DM belonged to the other person at source time, then changed hands.
+    db.execute("UPDATE identifier_history SET valid_until_ms=120 WHERE value='10001@s.whatsapp.net'")
+    identifier(db, 'b', '10001@s.whatsapp.net', start=120)
+    message(db, 'other-author-dm', chat='10001@s.whatsapp.net', sender='a',
+            identifier='10001@s.whatsapp.net', text='Other person private note')
+    source = sources.issue('other-author-dm')
+    with service.history_scope(q, sources):
+        sid, _ = capture(service, source)
+        service._store.execute(
+            "UPDATE knowledge_statements SET visibility_scope='author_only' WHERE statement_id=?",
+            (sid,),
+        )
+        owner_dm = TrustedReadContext(
+            'whatsapp:20002@lid', 'whatsapp', '10001@s.whatsapp.net',
+            frozenset({'whatsapp:20002@lid'}), None, 1, 'reply', 150,
+            is_direct=True, owner=True, owner_lookup_person_ids=('a',),
+        )
+        assert not service.recall(RecallQuery('Other person private note'), context=owner_dm).statement_ids
+
+
+@pytest.mark.parametrize(("principal", "chat"), [
+    (MEMBER, "10002@s.whatsapp.net"), ("whatsapp:20002@lid", "10002@s.whatsapp.net"),
+    (MEMBER, "20002@lid"), ("whatsapp:20002@lid", "20002@lid"),
+])
+def test_owner_german_person_question_retrieves_real_v3_statement(case, monkeypatch, principal, chat):
     from yeoman_gateway.adapters.responder_llm import LLMResponder
 
     service, q, sources, db = case
+    if principal.endswith("@lid") or chat.endswith("@lid"):
+        identifier(db, 'b', '20002@lid', start=1)
     source = sources.issue('m')
     db.execute("UPDATE contacts SET display_name='Alex' WHERE contact_id='a'")
     with service.history_scope(q, sources):
@@ -293,7 +417,7 @@ def test_owner_german_person_question_retrieves_real_v3_statement(case, monkeypa
         )
         text = responder._knowledge_statement_context(
             query="Was weißt du über Alex' Aktien?", channel='whatsapp',
-            chat_id='10002@s.whatsapp.net', principal=MEMBER, is_owner=True,
+            chat_id=chat, principal=principal, is_owner=True,
         )
         assert text == 'Synthetic statement (Alex)'
         assert not responder._knowledge_statement_context(
@@ -310,10 +434,16 @@ def test_owner_german_person_question_retrieves_real_v3_statement(case, monkeypa
         )
 
 
-def test_owner_german_natural_prefix_preserves_display_name_in_real_v3_result(case, monkeypatch):
+@pytest.mark.parametrize(("principal", "chat"), [
+    (MEMBER, "10002@s.whatsapp.net"), ("whatsapp:20002@lid", "10002@s.whatsapp.net"),
+    (MEMBER, "20002@lid"), ("whatsapp:20002@lid", "20002@lid"),
+])
+def test_owner_german_natural_prefix_preserves_display_name_in_real_v3_result(case, monkeypatch, principal, chat):
     from yeoman_gateway.adapters.responder_llm import LLMResponder
 
     service, q, sources, db = case
+    if principal.endswith("@lid") or chat.endswith("@lid"):
+        identifier(db, 'b', '20002@lid', start=1)
     source = sources.issue('m')
     db.execute("UPDATE contacts SET display_name='AlexGrrrrr😈' WHERE contact_id='a'")
     with service.history_scope(q, sources):
@@ -327,14 +457,20 @@ def test_owner_german_natural_prefix_preserves_display_name_in_real_v3_result(ca
         )
         assert responder._knowledge_statement_context(
             query="Was weißt du über Alex' Aktien?", channel='whatsapp',
-            chat_id='10002@s.whatsapp.net', principal=MEMBER, is_owner=True,
+            chat_id=chat, principal=principal, is_owner=True,
         ) == 'Synthetic statement (AlexGrrrrr😈)'
 
 
-def test_owner_ambiguous_natural_prefix_has_no_knowledge_person_targets_or_results(case, monkeypatch):
+@pytest.mark.parametrize(("principal", "chat"), [
+    (MEMBER, "10002@s.whatsapp.net"), ("whatsapp:20002@lid", "10002@s.whatsapp.net"),
+    (MEMBER, "20002@lid"), ("whatsapp:20002@lid", "20002@lid"),
+])
+def test_owner_ambiguous_natural_prefix_has_no_knowledge_person_targets_or_results(case, monkeypatch, principal, chat):
     from yeoman_gateway.adapters.responder_llm import LLMResponder
 
     service, q, sources, db = case
+    if principal.endswith("@lid") or chat.endswith("@lid"):
+        identifier(db, 'b', '20002@lid', start=1)
     source = sources.issue('m')
     db.execute("UPDATE contacts SET display_name='Alexander Müller' WHERE contact_id='a'")
     db.execute("UPDATE contacts SET display_name='Alexa Weber' WHERE contact_id='b'")
@@ -363,16 +499,22 @@ def test_owner_ambiguous_natural_prefix_has_no_knowledge_person_targets_or_resul
         )
         assert not responder._knowledge_statement_context(
             query='Was weißt du über Alex?', channel='whatsapp',
-            chat_id='10002@s.whatsapp.net', principal=MEMBER, is_owner=True,
+            chat_id=chat, principal=principal, is_owner=True,
         )
         assert len(recalled) == 1
         assert recalled[0].person_ids == ()
 
 
-def test_owner_lookup_denies_late_joiner_even_when_currently_in_group(case, monkeypatch):
+@pytest.mark.parametrize(("principal", "chat"), [
+    (MEMBER, "10002@s.whatsapp.net"), ("whatsapp:20002@lid", "10002@s.whatsapp.net"),
+    (MEMBER, "20002@lid"), ("whatsapp:20002@lid", "20002@lid"),
+])
+def test_owner_lookup_denies_late_joiner_even_when_currently_in_group(case, monkeypatch, principal, chat):
     from yeoman_gateway.adapters.responder_llm import LLMResponder
 
     service, q, sources, db = case
+    if principal.endswith("@lid") or chat.endswith("@lid"):
+        identifier(db, 'b', '20002@lid', start=1)
     db.execute("UPDATE message_events SET payload_json=? WHERE event_id='roster'",
                ('{"complete":true,"participants":[["10001@s.whatsapp.net"]]}',))
     event(db, 'owner-joined-later', 'member_add', 120,
@@ -394,5 +536,30 @@ def test_owner_lookup_denies_late_joiner_even_when_currently_in_group(case, monk
         )
         assert not responder._knowledge_statement_context(
             query="Was weißt du über Alex' Aktien?", channel='whatsapp',
-            chat_id='10002@s.whatsapp.net', principal=MEMBER, is_owner=True,
+            chat_id=chat, principal=principal, is_owner=True,
         )
+
+
+def test_owner_cross_chat_lookup_denies_reassigned_original_audience_identifier(case):
+    service, q, sources, db = case
+    identifier(db, 'b', '20002@lid', start=1)
+    source = sources.issue('m')
+    with service.history_scope(q, sources):
+        sid, _ = capture(service, source)
+        service._store.execute(
+            "UPDATE knowledge_statements SET visibility_scope='author_only' WHERE statement_id=?",
+            (sid,),
+        )
+        owner_dm = TrustedReadContext(
+            'whatsapp:20002@lid', 'whatsapp', '20002@lid',
+            frozenset({'whatsapp:20002@lid'}), None, 1, 'reply', 150,
+            is_direct=True, owner=True, owner_lookup_person_ids=('a',),
+        )
+        assert service.recall(RecallQuery('Synthetic'), context=owner_dm).statement_ids == (sid,)
+        db.execute("UPDATE identifier_history SET valid_until_ms=160 WHERE contact_id='b' AND value='10002@s.whatsapp.net'")
+        contact(db, 'reassigned')
+        identifier(db, 'reassigned', '10002@s.whatsapp.net', start=160)
+        from dataclasses import replace
+        assert not service.recall(
+            RecallQuery('Synthetic'), context=replace(owner_dm, now_ms=170)
+        ).statement_ids

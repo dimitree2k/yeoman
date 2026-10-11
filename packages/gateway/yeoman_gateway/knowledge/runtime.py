@@ -137,11 +137,18 @@ class RuntimeKnowledgePolicy:
             audience = scope.queries.members(chat_id=context.chat_id, at_ms=context.now_ms)
             if context.is_direct:
                 # Direct peers still require temporal ownership in the source gate.
-                from yeoman_gateway.knowledge._history_sources import principal_identifier
-                value = principal_identifier(context.principal_id)
-                owner = scope.queries.resolve_identifier(value, at_ms=context.now_ms, time_basis='native') if value else None
-                if owner is None or context.chat_id != value:
-                    return None
+                if context.owner:
+                    if not scope.queries.is_owner_direct_chat(
+                        context.principal_id, context.chat_id, context.now_ms,
+                        is_owner=True, channel=context.channel,
+                    ):
+                        return None
+                else:
+                    from yeoman_gateway.knowledge._history_sources import principal_identifier
+                    value = principal_identifier(context.principal_id)
+                    owner = scope.queries.resolve_identifier(value, at_ms=context.now_ms, time_basis='native') if value else None
+                    if owner is None or context.chat_id != value:
+                        return None
                 return PolicyMembership(frozenset({context.principal_id}), str(scope.queries.snapshot.generation))
             if audience.status != 'known':
                 return None

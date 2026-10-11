@@ -127,14 +127,18 @@ class RecallConversationTool(Tool):
             return "Error: supply either 'group' or 'chat', not both."
         target_ref = group or chat
         if person or target_ref:
-            from yeoman_gateway.knowledge._history_sources import principal_identifier
-            principal = context.canonical_user_id if context is not None else ''
-            owner_dm = (self._is_owner and principal_identifier(principal) == self._chat_id
-                        and self._channel == 'whatsapp')
-            if not owner_dm:
+            from yeoman_gateway.history.queries import HistoryQueries
+
+            if not self._is_owner or self._channel != 'whatsapp':
                 return "Person and cross-chat history lookup is available only in the owner's direct chat."
-            if context is None or context.history_snapshot is None or self._channel != 'whatsapp':
+            if context is None or context.history_snapshot is None:
                 return "Owner history lookup is unavailable in this context."
+            principal = context.canonical_user_id
+            now_ms = __import__('time').time_ns() // 1_000_000
+            if not HistoryQueries(context.history_snapshot).is_owner_direct_chat(
+                principal, self._chat_id, now_ms, is_owner=self._is_owner, channel=self._channel
+            ):
+                return "Person and cross-chat history lookup is available only in the owner's direct chat."
         snapshot = tool_history_snapshot(selected=getattr(self, '_history_selected', False))
         if snapshot is not None and self._channel == 'whatsapp':
             from yeoman_gateway.adapters.reply_archive_history import history_text
