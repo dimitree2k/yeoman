@@ -211,7 +211,7 @@ class OrchestratorService:
         orchestrator: Orchestrator,
         typing_adapter: ChannelManagerTypingAdapter,
         telemetry: InMemoryTelemetry,
-        memory: MemoryService,
+        memory: MemoryService | None,
         effect_router: "IntentEffectRouter | None" = None,
         processing_store: object | None = None,
         control_acknowledgements: "OwnerControlAcknowledgements | None" = None,
@@ -231,6 +231,7 @@ class OrchestratorService:
         self._typing_adapter = typing_adapter
         self._telemetry = telemetry
         self._memory = memory
+        self._retired_manual_memory_logged = False
         self._effect_router = effect_router
         self._processing_store = processing_store
         self._control_acknowledgements = control_acknowledgements
@@ -350,61 +351,31 @@ class OrchestratorService:
     async def _dispatch_intents(
         self, intents: list[OrchestratorIntent], *, principal: str = ""
     ) -> None:
-        from yeoman_gateway.history.context import history_effect_metadata
         for intent in intents:
-            proof = history_effect_metadata()
-            if isinstance(intent, SendOutboundIntent) and proof:
-                intent = replace(intent, event=replace(intent.event,
-                    metadata={**dict(intent.event.metadata or {}), **proof}))
-            if isinstance(intent, SendOutboundIntent) and self._history_mentions_selected and intent.event.channel == 'whatsapp':
-                from yeoman_gateway.channels.whatsapp import resolve_history_mentions
-                from yeoman_gateway.history.context import current_history_snapshot
-                text, mentions = resolve_history_mentions(intent.event.content, intent.event.metadata,
-                    chat_id=intent.event.chat_id, snapshot=current_history_snapshot())
-                intent = replace(intent, event=replace(intent.event, content=text,
-                    metadata={**dict(intent.event.metadata or {}), **mentions}))
-            match intent:
-                case SetTypingIntent():
-                    await self._typing_adapter(intent.channel, intent.chat_id, intent.enabled)
-                case SendOutboundIntent():
-                    if self._is_control_ack(intent):
-                        await self._bus.publish_outbound(
-                            OutboundMessage(
-                                channel=intent.event.channel,
-                                chat_id=intent.event.chat_id,
-                                content=intent.event.content,
-                                reply_to=intent.event.reply_to,
-                                media=list(intent.event.media),
-                                metadata=dict(intent.event.metadata or {}),
-                            )
-                        )
-                        continue
-                    if self._effect_router is not None:
-                        try:
-                            if await self._effect_router.submit_outbound(
-                                intent, principal=principal
-                            ):
-                                continue
-                        except ForwardDispatchError as exc:
-                            error_intent = SendOutboundIntent(
-                                event=OutboundEvent(
-                                    channel="whatsapp",
-                                    chat_id=exc.source_chat_id,
-                                    content=exc.user_message,
-                                    reply_to=exc.source_message_id,
-                                    metadata={"message_id": exc.source_message_id},
-                                )
-                            )
-                            managed = await self._effect_router.submit_outbound(
-                                error_intent, principal=principal
-                            )
-                            if not managed:
-                                logger.warning(
-                                    "forward_error_not_managed chat={} source_message_id={}",
-                                    exc.source_chat_id,
-                                    exc.source_message_id,
-                                )
-                            continue
+            try:
+                await self._dispatch_intent(intent, principal=principal)
+            except Exception as exc:
+                logger.error("orchestrator_intent_failed intent={} error_type={}",
+                             type(intent).__name__, type(exc).__name__)
+
+    async def _dispatch_intent(self, intent: OrchestratorIntent, *, principal: str) -> None:
+        from yeoman_gateway.history.context import history_effect_metadata
+        proof = history_effect_metadata()
+        if isinstance(intent, SendOutboundIntent) and proof:
+            intent = replace(intent, event=replace(intent.event,
+                metadata={**dict(intent.event.metadata or {}), **proof}))
+        if isinstance(intent, SendOutboundIntent) and self._history_mentions_selected and intent.event.channel == 'whatsapp':
+            from yeoman_gateway.channels.whatsapp import resolve_history_mentions
+            from yeoman_gateway.history.context import current_history_snapshot
+            text, mentions = resolve_history_mentions(intent.event.content, intent.event.metadata,
+                chat_id=intent.event.chat_id, snapshot=current_history_snapshot())
+            intent = replace(intent, event=replace(intent.event, content=text,
+                metadata={**dict(intent.event.metadata or {}), **mentions}))
+        match intent:
+            case SetTypingIntent():
+                await self._typing_adapter(intent.channel, intent.chat_id, intent.enabled)
+            case SendOutboundIntent():
+                if self._is_control_ack(intent):
                     await self._bus.publish_outbound(
                         OutboundMessage(
                             channel=intent.event.channel,
@@ -415,58 +386,107 @@ class OrchestratorService:
                             metadata=dict(intent.event.metadata or {}),
                         )
                     )
-                case SendReactionIntent():
-                    if self._effect_router is not None and await self._effect_router.submit_reaction(
-                        intent, principal=principal
-                    ):
-                        continue
-                    await self._bus.publish_reaction(
-                        ReactionMessage(
-                            channel=intent.channel,
-                            chat_id=intent.chat_id,
-                            message_id=intent.message_id,
-                            emoji=intent.emoji,
-                            participant_jid=intent.participant_jid,
-                            metadata=proof,
+                    return
+                if self._effect_router is not None:
+                    try:
+                        if await self._effect_router.submit_outbound(
+                            intent, principal=principal
+                        ):
+                            return
+                    except ForwardDispatchError as exc:
+                        error_intent = SendOutboundIntent(
+                            event=OutboundEvent(
+                                channel="whatsapp",
+                                chat_id=exc.source_chat_id,
+                                content=exc.user_message,
+                                reply_to=exc.source_message_id,
+                                metadata={"message_id": exc.source_message_id},
+                            )
                         )
+                        managed = await self._effect_router.submit_outbound(
+                            error_intent, principal=principal
+                        )
+                        if not managed:
+                            logger.warning(
+                                "forward_error_not_managed chat={} source_message_id={}",
+                                exc.source_chat_id,
+                                exc.source_message_id,
+                            )
+                        return
+                await self._bus.publish_outbound(
+                    OutboundMessage(
+                        channel=intent.event.channel,
+                        chat_id=intent.event.chat_id,
+                        content=intent.event.content,
+                        reply_to=intent.event.reply_to,
+                        media=list(intent.event.media),
+                        metadata=dict(intent.event.metadata or {}),
                     )
-                case PersistSessionIntent():
-                    # Sessions are persisted by the responder implementation.
-                    continue
-                case QueueMemoryNotesCaptureIntent():
-                    self._memory.enqueue_background_note(
+                )
+            case SendReactionIntent():
+                if self._effect_router is not None and await self._effect_router.submit_reaction(
+                    intent, principal=principal
+                ):
+                    return
+                await self._bus.publish_reaction(
+                    ReactionMessage(
                         channel=intent.channel,
                         chat_id=intent.chat_id,
-                        sender_id=intent.sender_id,
                         message_id=intent.message_id,
-                        content=intent.content,
-                        is_group=intent.is_group,
-                        mode=intent.mode,
-                        batch_interval_seconds=intent.batch_interval_seconds,
-                        batch_max_messages=intent.batch_max_messages,
+                        emoji=intent.emoji,
+                        participant_jid=intent.participant_jid,
+                        metadata=proof,
                     )
-                case RecordManualMemoryIntent():
-                    mapped_kind = "decision" if intent.entry_kind == "backlog" else "episodic"
-                    salience = 0.9 if intent.entry_kind == "backlog" else 0.8
-                    self._memory.record_manual(
-                        channel=intent.channel,
-                        chat_id=intent.chat_id,
-                        sender_id=intent.sender_id,
-                        scope_type="chat",
-                        kind=mapped_kind,
-                        text=intent.content,
-                        importance=salience,
-                        confidence=1.0,
-                    )
-                    self._memory.record_idea_backlog_capture(
-                        entry_kind=intent.entry_kind,
-                        content=intent.content,
-                        source="orchestrator_manual_capture",
-                    )
-                case RecordMetricIntent():
-                    self._telemetry.incr(intent.name, intent.value, intent.labels)
-                case _:
-                    assert_never(intent)
+                )
+            case PersistSessionIntent():
+                # Sessions are persisted by the responder implementation.
+                return
+            case QueueMemoryNotesCaptureIntent():
+                if self._memory is None:
+                    return
+                self._memory.enqueue_background_note(
+                    channel=intent.channel,
+                    chat_id=intent.chat_id,
+                    sender_id=intent.sender_id,
+                    message_id=intent.message_id,
+                    content=intent.content,
+                    is_group=intent.is_group,
+                    mode=intent.mode,
+                    batch_interval_seconds=intent.batch_interval_seconds,
+                    batch_max_messages=intent.batch_max_messages,
+                )
+            case RecordManualMemoryIntent():
+                if self._memory is None:
+                    from yeoman_gateway.pipeline.idea_capture import RETIRED_MEMORY_MESSAGE
+                    if not self._retired_manual_memory_logged:
+                        logger.info("manual_memory_unavailable_after_history_migration")
+                        self._retired_manual_memory_logged = True
+                    await self._dispatch_intent(SendOutboundIntent(event=OutboundEvent(
+                        channel=intent.channel, chat_id=intent.chat_id,
+                        content=RETIRED_MEMORY_MESSAGE,
+                    )), principal=principal)
+                    return
+                mapped_kind = "decision" if intent.entry_kind == "backlog" else "episodic"
+                salience = 0.9 if intent.entry_kind == "backlog" else 0.8
+                self._memory.record_manual(
+                    channel=intent.channel,
+                    chat_id=intent.chat_id,
+                    sender_id=intent.sender_id,
+                    scope_type="chat",
+                    kind=mapped_kind,
+                    text=intent.content,
+                    importance=salience,
+                    confidence=1.0,
+                )
+                self._memory.record_idea_backlog_capture(
+                    entry_kind=intent.entry_kind,
+                    content=intent.content,
+                    source="orchestrator_manual_capture",
+                )
+            case RecordMetricIntent():
+                self._telemetry.incr(intent.name, intent.value, intent.labels)
+            case _:
+                assert_never(intent)
 
 
 def build_history_projector(config: Config, channels: ChannelManager) -> HistoryProjector | None:
@@ -3502,6 +3522,9 @@ def build_gateway_runtime(
             )
 
     history_projector = build_history_projector(config, channels)
+    if channels.processing_signals is not None and history_identity_selected:
+        channels.processing_signals._history_projector = history_projector
+        channels.processing_signals._history_knowledge = knowledge_service
     if effect_router is not None and config.history.live_projection_enabled and any((
         config.history.readers.participation, config.history.readers.whatsapp,
         config.history.readers.responder, config.history.readers.tools, config.history.readers.secondary)):

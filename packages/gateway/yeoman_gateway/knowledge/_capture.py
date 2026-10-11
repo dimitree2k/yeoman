@@ -267,6 +267,17 @@ class ObservedSourceRegistrar:
         if not channel or not chat_id or not principal:
             return False
         source = observed_event(event).source
+        from yeoman_gateway.knowledge._history_identity import current_history_scope
+
+        scope = current_history_scope(getattr(self._knowledge, "_store", None))
+        if scope is not None and channel == "whatsapp":
+            # Bridge event IDs and policy journal IDs differ from Layer-1 message IDs.
+            native_id = str(getattr(event, "source_message_id", "") or "")
+            message = scope.queries.native_message(chat_id=chat_id, native_id=native_id)
+            if message is None:
+                return False
+            # In selected mode, history owns source identity as well as audience proof.
+            source = scope.sources.issue(message["message_id"])
         if not chat_id.endswith("@g.us"):
             # A direct conversation has exactly one proven reader: its author.
             return bool(
@@ -277,7 +288,11 @@ class ObservedSourceRegistrar:
                     author_only=True,
                 )
             )
-        members = self._proven_members(channel, chat_id)
+        if scope is not None and channel == "whatsapp":
+            audience = scope.queries.members(chat_id=chat_id, at_ms=source.occurred_at_ms)
+            members = frozenset(audience.members) if audience.status == "known" else frozenset()
+        else:
+            members = self._proven_members(channel, chat_id)
         if not members:
             return False
         return bool(

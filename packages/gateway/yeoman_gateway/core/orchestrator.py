@@ -165,7 +165,8 @@ class Orchestrator:
                 handler=policy_admin_handler,
                 acknowledgements=control_acknowledgements,
             ),
-            PolicyMiddleware(policy=policy),
+            PolicyMiddleware(policy=policy, legacy_history_disabled=bool(
+                history_secondary_config and history_secondary_config.legacy_writers_disabled)),
             ForwardCommandMiddleware(
                 target_resolver=forward_target_resolver,
                 source_lookup=forward_source_lookup,
@@ -203,7 +204,8 @@ class Orchestrator:
         if workflow_state and approval_trigger:
             layers.append(ApprovalMiddleware(workflow_state=workflow_state, trigger_callback=approval_trigger))
         layers.extend([
-            IdeaCaptureMiddleware(security=security),
+            IdeaCaptureMiddleware(security=security, legacy_history_disabled=bool(
+                history_secondary_config and history_secondary_config.legacy_writers_disabled)),
             AccessControlMiddleware(security=security),
             NewChatNotifyMiddleware(
                 owner_alert_resolver=owner_alert_resolver,

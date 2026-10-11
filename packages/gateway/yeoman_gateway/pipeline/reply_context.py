@@ -79,7 +79,7 @@ class ReplyContextMiddleware:
     def _resolve_reply_context(
         self, event: InboundEvent
     ) -> tuple[InboundEvent, bool, bool]:
-        if self._archive is None or event.channel != "whatsapp":
+        if event.channel != "whatsapp" or self._archive is None:
             return event, False, False
 
         reply_to_message_id = (event.reply_to_message_id or "").strip()

@@ -709,6 +709,8 @@ class SignalJournalSink:
         statements: Any | None = None,
         identity_observation_issuer: Any | None = None,
         legacy_history_disabled: bool = False,
+        history_projector: Any | None = None,
+        history_knowledge: Any | None = None,
     ) -> None:
         self.legacy_history_disabled = legacy_history_writers_disabled(legacy_history_disabled)
         self._store = store
@@ -727,6 +729,8 @@ class SignalJournalSink:
         self._statements = statements
         #: Issues verified provider identity observations before the knowledge projection.
         self._identity_observation_issuer = identity_observation_issuer
+        self._history_projector = history_projector
+        self._history_knowledge = history_knowledge
 
     def __call__(self, kind: str, payload: Mapping[str, Any]) -> str | None:
         return self.capture(kind, payload)
@@ -821,7 +825,12 @@ class SignalJournalSink:
                         "canonical message FTS projection failed error_type={}",
                         type(exc).__name__,
                     )
-        if signal.kind == "message" and not opaque_edit:
+        if (
+            signal.kind == "message"
+            and not opaque_edit
+            and self._history_projector is None
+            and self.legacy_history_disabled is not True
+        ):
             self.register_observed_source(stored_event_id)
         if str(kind) in ("edit", "delete"):
             revoked_sources = self.project_source_revocation(signal, now_ms=now, strict=strict)
@@ -941,6 +950,22 @@ class SignalJournalSink:
         try:
             return bool(registrar(str(event_id)))
         except Exception as exc:  # projection must never block the ACK boundary
+            logger.warning(
+                "observed source registration failed error_type={}", type(exc).__name__
+            )
+            return False
+
+    async def register_observed_source_live(self, event_id: str | None) -> bool:
+        """Register an observation under a fresh selected-history reader lease."""
+        if self._history_projector is None or self._sources is None or not event_id:
+            return False
+        from yeoman_gateway.history.context import history_knowledge_scope, history_turn
+
+        try:
+            async with history_turn(self._history_projector) as snapshot:
+                with history_knowledge_scope(snapshot, self._history_knowledge):
+                    return bool(self._sources(str(event_id)))
+        except Exception as exc:  # noqa: BLE001 - source proof cannot block the ACK boundary
             logger.warning(
                 "observed source registration failed error_type={}", type(exc).__name__
             )

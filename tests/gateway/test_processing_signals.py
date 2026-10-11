@@ -1,10 +1,21 @@
 """Plan 04 / R01 signals: provider events map deterministically into the journal."""
+# ruff: noqa: F811
 
 from __future__ import annotations
 
+import json
+import sqlite3
 from pathlib import Path
+from types import SimpleNamespace
 
 import pytest
+from yeoman_gateway.history.reader import HistorySnapshot
+from yeoman_gateway.history.schema import create as create_history
+from yeoman_gateway.knowledge._capture import ObservedSourceRegistrar
+from yeoman_gateway.knowledge._history_upgrade import upgrade_history_knowledge
+from yeoman_gateway.knowledge._store import KnowledgeStore
+from yeoman_gateway.knowledge.api import open_knowledge_store
+from yeoman_gateway.knowledge.runtime import RuntimeKnowledgePolicy, RuntimeKnowledgeSources
 from yeoman_gateway.processing.models import JournalConflictError
 from yeoman_gateway.processing.signals import (
     SignalJournalSink,
@@ -59,6 +70,133 @@ def test_same_identity_with_other_content_is_a_conflict(tmp_path: Path) -> None:
     with pytest.raises(JournalConflictError):
         _append(db, mapper.map({"chatJid": CHAT, "messageId": "3EB0", "text": "two"}, kind="message"))
     db.close()
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    ("chat_id", "event_id"),
+    [
+        ("synthetic@g.us", "bridge-event-group"),
+        ("synthetic@g.us", "policy-ingest-group"),
+        ("10001@s.whatsapp.net", "bridge-event-dm"),
+        ("10001@s.whatsapp.net", "policy-ingest-dm"),
+    ],
+)
+@pytest.mark.parametrize("lookup", ["known", "missing", "ambiguous"])
+async def test_observed_registration_uses_live_history_snapshot(
+    tmp_path, chat_id, event_id, lookup
+):
+    native_id = f"native-{event_id}"
+    old_knowledge_path = tmp_path / "knowledge-v2.db"
+    old_store = KnowledgeStore(old_knowledge_path)
+    old_store.set_meta("migration_complete", "1")
+    old_store.close()
+    knowledge_path = tmp_path / "knowledge-v3.db"
+    upgrade_history_knowledge(source=old_knowledge_path, target=knowledge_path)
+    knowledge = open_knowledge_store(
+        knowledge_path,
+        workspace_id="synthetic",
+        source_authority=RuntimeKnowledgeSources(),
+        policy_authority=RuntimeKnowledgePolicy(
+            engine=None, chat_registry=None, policy_revision=1
+        ),
+        history_mode=True,
+    )
+    history_path = tmp_path / "history.db"
+    with sqlite3.connect(history_path) as db:
+        create_history(db)
+        db.execute("INSERT INTO contacts VALUES ('author','person',NULL,'Synthetic','confirmed',NULL,'[]')")
+        db.execute(
+            "INSERT INTO identifier_history (contact_id,channel,kind,value,strength,evidence,"
+            "valid_from_ms,source_refs) VALUES ('author','whatsapp','pn_jid',?,'strong',"
+            "'owner_attested',1,'[]')",
+            ("10001@s.whatsapp.net",),
+        )
+        message_id = f"whatsapp:{chat_id}:{native_id}"
+        db.execute(
+            "INSERT INTO messages (message_id,channel,chat_id,native_message_id,"
+            "sender_contact_id,sender_identifier,sender_basis,direction,sent_ms,time_certainty,"
+            "text,provenance,source_refs) VALUES (?,'whatsapp',?,?, 'author',"
+            "'10001@s.whatsapp.net','native_identifier','in',1791000000000,'native',"
+            "'Synthetic source','native','[]')",
+            (message_id, chat_id, native_id),
+        )
+        if chat_id.endswith("@g.us"):
+            db.execute(
+                "INSERT INTO message_events (event_id,kind,channel,chat_id,actor_basis,"
+                "occurred_ms,time_certainty,payload_json,provenance,source_refs) "
+                "VALUES ('roster','member_snapshot','whatsapp',?,'unknown',"
+                "1790999999999,'native',?,'native','[]')",
+                (chat_id, json.dumps({"complete": True, "participants": [["10001@s.whatsapp.net"]]})),
+            )
+    with sqlite3.connect(history_path) as db:
+        if lookup == "missing":
+            db.execute("DELETE FROM messages")
+        elif lookup == "ambiguous":
+            db.execute("INSERT INTO messages (message_id,channel,chat_id,native_message_id,"
+                       "sender_contact_id,sender_identifier,sender_basis,direction,sent_ms,"
+                       "time_certainty,text,provenance,source_refs) SELECT message_id || ':duplicate',"
+                       "channel,chat_id,native_message_id,sender_contact_id,sender_identifier,"
+                       "sender_basis,direction,sent_ms,time_certainty,text,provenance,source_refs "
+                       "FROM messages")
+    processing = ProcessingStore(tmp_path / "processing.db")
+    registrar = ObservedSourceRegistrar(
+        knowledge=knowledge, processing=processing, chat_registry=None
+    )
+    registration_scopes = []
+
+    def register(event_id):
+        from yeoman_gateway.knowledge._history_identity import current_history_scope
+
+        registration_scopes.append(current_history_scope(knowledge._store) is not None)
+        return registrar(event_id)
+
+    async def read_turn():
+        return HistorySnapshot(
+            1,
+            (),
+            sqlite3.connect(f"file:{history_path}?mode=ro", uri=True),
+        )
+
+    sink = SignalJournalSink(
+        processing,
+        sources=register,
+        history_projector=SimpleNamespace(
+            read_turn=read_turn,
+            health=lambda: {"status": "ready", "generation": 1},
+        ),
+        history_knowledge=knowledge,
+    )
+    sink.capture(
+        "message",
+        {
+            "chatJid": chat_id,
+            "messageId": native_id,
+            "senderId": "10001@s.whatsapp.net",
+            "text": "Synthetic source",
+            "isGroup": chat_id.endswith("@g.us"),
+            "timestamp": 1_791_000_000,
+        },
+        event_id=event_id,
+        event_key=f"whatsapp:synthetic:{chat_id}:message:{event_id}",
+        account="synthetic",
+        observed_at_ms=1_791_000_000_000,
+        strict=True,
+    )
+    assert event_id != native_id
+    assert registration_scopes == []
+
+    try:
+        assert await sink.register_observed_source_live(event_id) is (lookup == "known")
+        assert registration_scopes == [True]
+        source = knowledge.history_source_ledger.lookup(message_id, 1)
+        if lookup == "known":
+            assert source is not None and source.source.event_id == message_id
+        else:
+            assert source is None
+    finally:
+        processing.close()
+        knowledge.close()
 
 
 def test_reaction_without_a_target_stays_unresolved(tmp_path: Path) -> None:

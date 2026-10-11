@@ -1595,8 +1595,9 @@ class WhatsAppChannel(BaseChannel):
                 await self._close_bridge_intake("capture_unavailable")
             return False
 
+        stored_event_id = None
         try:
-            await self._capture_off_loop(
+            stored_event_id = await self._capture_off_loop(
                 capture,
                 kind,
                 payload,
@@ -1648,6 +1649,17 @@ class WhatsAppChannel(BaseChannel):
             if self._ws is not None:
                 await self._close_bridge_intake("capture_failed")
             return False
+
+        register_source = getattr(
+            self._processing_signals, "register_observed_source_live", None
+        )
+        if kind == "message" and callable(register_source):
+            try:
+                await register_source(stored_event_id or event_id)
+            except Exception as exc:  # noqa: BLE001 - source proof cannot block the ACK boundary
+                logger.warning(
+                    "observed source registration failed error_type={}", type(exc).__name__
+                )
 
         if self._bridge_intake_closed or self._stopping:
             await self._forget_bridge_work(work)

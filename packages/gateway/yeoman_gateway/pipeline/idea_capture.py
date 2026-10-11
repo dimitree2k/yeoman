@@ -10,6 +10,8 @@ from __future__ import annotations
 import re
 import unicodedata
 
+from loguru import logger
+
 from yeoman_gateway.core.intents import (
     RecordManualMemoryIntent,
     SendOutboundIntent,
@@ -17,6 +19,8 @@ from yeoman_gateway.core.intents import (
 from yeoman_gateway.core.models import OutboundEvent
 from yeoman_gateway.core.pipeline import NextFn, PipelineContext
 from yeoman_gateway.core.ports import SecurityPort
+
+RETIRED_MEMORY_MESSAGE = "Manual memory and idea/backlog capture are not available after the history migration."
 
 _IDEA_MARKERS = ("[idea]", "#idea", "idea:", "inbox idea")
 _BACKLOG_MARKERS = ("[backlog]", "#backlog", "backlog:")
@@ -35,8 +39,10 @@ _BACKLOG_PREFIX_PHRASES = {"to do"}
 class IdeaCaptureMiddleware:
     """Intercept idea/backlog messages and capture directly to memory."""
 
-    def __init__(self, *, security: SecurityPort | None = None) -> None:
+    def __init__(self, *, security: SecurityPort | None = None, legacy_history_disabled: bool = False) -> None:
         self._security = security
+        self._legacy_history_disabled = legacy_history_disabled
+        self._retirement_logged = False
 
     async def __call__(self, ctx: PipelineContext, next: NextFn) -> None:
         # Only capture on WhatsApp and only when message is accepted.
@@ -81,6 +87,17 @@ class IdeaCaptureMiddleware:
                 )
                 ctx.halt()
                 return
+
+        if self._legacy_history_disabled:
+            if not self._retirement_logged:
+                logger.info("manual_memory_unavailable_after_history_migration")
+                self._retirement_logged = True
+            ctx.intents.append(SendOutboundIntent(event=OutboundEvent(
+                channel=ctx.event.channel, chat_id=ctx.event.chat_id,
+                content=RETIRED_MEMORY_MESSAGE, reply_to=ctx.event.message_id,
+            )))
+            ctx.halt()
+            return
 
         # Persist the capture.
         ctx.intents.append(
