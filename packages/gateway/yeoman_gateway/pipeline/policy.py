@@ -6,8 +6,6 @@ engine and store the decision in ``ctx.decision`` for downstream middleware.
 
 from __future__ import annotations
 
-from dataclasses import replace
-
 from yeoman_gateway.core.pipeline import NextFn, PipelineContext
 from yeoman_gateway.core.ports import PolicyPort
 
@@ -19,5 +17,5 @@ class PolicyMiddleware:
         self._policy = policy
 
     async def __call__(self, ctx: PipelineContext, next: NextFn) -> None:
-        ctx.decision = replace(self._policy.evaluate(ctx.event), notes_enabled=False)
+        ctx.decision = self._policy.evaluate(ctx.event)
         await next(ctx)

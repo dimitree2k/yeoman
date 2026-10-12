@@ -51,11 +51,6 @@ class PolicyDecision:
     when_to_reply_mode: Literal["all", "mention_only", "allowed_senders", "owner_only", "off"] = "all"
     persona_text: str | None = None
     persona_file: str | None = None
-    notes_enabled: bool = False
-    notes_mode: Literal["adaptive", "heuristic", "hybrid"] = "adaptive"
-    notes_allow_blocked_senders: bool = False
-    notes_batch_interval_seconds: int = 1800
-    notes_batch_max_messages: int = 100
     voice_output_mode: Literal["text", "in_kind", "always", "off"] = "text"
     voice_output_tts_route: str = "tts.speak"
     voice_output_voice: str = "alloy"

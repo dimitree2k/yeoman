@@ -276,6 +276,7 @@ def assign(
         path = get_policy_path()
         original = path.read_bytes()
         policy = json.loads(original)
+        policy.pop("memoryNotes", None)
         chats = policy.get("channels", {}).get(channel, {}).get("chats", {})
         targets = [jid for jid, value in chats.items()
                    if jid == chat or (persona is not None and value.get("personaFile") == persona)]

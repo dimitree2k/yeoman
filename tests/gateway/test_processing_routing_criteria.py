@@ -361,7 +361,6 @@ async def test_criterion_9_silence_halts_before_any_typing_or_reply() -> None:
         accept_message = True
         should_respond = False
         reason = "when_to_reply:off"
-        notes_enabled = False
 
     middleware = NoReplyFilterMiddleware()
     reached: list[str] = []
