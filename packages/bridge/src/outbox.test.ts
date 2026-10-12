@@ -38,6 +38,104 @@ async function temporaryOutbox(): Promise<{ root: string; outbox: any }> {
   return { root, outbox };
 }
 
+async function durableDirectory(path: string): Promise<void> {
+  const handle = await openFile(path, 'r');
+  try {
+    await handle.sync();
+  } finally {
+    await handle.close();
+  }
+}
+
+test('concurrent appends and ACKs share barriers and preserve durable replay order', async (t) => {
+  const { BridgeOutbox } = await loadOutbox();
+  const root = await mkdtemp(join(tmpdir(), 'yeoman-bridge-outbox-burst-'));
+  t.after(() => rm(root, { recursive: true, force: true }));
+  let barriers = 0;
+  const outbox = new BridgeOutbox(root, async (path: string) => {
+    await durableDirectory(path);
+    barriers++;
+  });
+  const expected = Array.from({ length: 200 }, (_, i) => event({
+    eventId: `burst-${i}`, eventKey: `key-${i}`,
+  }));
+  assert.deepEqual(await Promise.all(expected.map(item => outbox.append(item))), expected);
+  assert.ok(barriers <= 7, `append barriers: ${barriers}`);
+  assert.deepEqual(await new BridgeOutbox(root).pending(), expected);
+  const beforeAcks = barriers;
+  assert.deepEqual(await Promise.all(expected.map(item => outbox.ack(item.eventId))),
+    Array(200).fill(true));
+  assert.ok(barriers - beforeAcks <= 7, `ACK barriers: ${barriers - beforeAcks}`);
+  assert.deepEqual(await new BridgeOutbox(root).pending(), []);
+});
+
+test('append and ACK promises wait for their shared directory barrier', async (t) => {
+  const { BridgeOutbox } = await loadOutbox();
+  const root = await mkdtemp(join(tmpdir(), 'yeoman-bridge-outbox-barrier-'));
+  t.after(() => rm(root, { recursive: true, force: true }));
+  const outbox = new BridgeOutbox(root);
+  await outbox.append(event({ eventId: 'seed', eventKey: 'seed' }));
+  let entered!: () => void;
+  const atBarrier = new Promise<void>(resolve => { entered = resolve; });
+  let release!: () => void;
+  const held = new Promise<void>(resolve => { release = resolve; });
+  outbox.commitDirectory = async (path: string) => {
+    entered();
+    await held;
+    await durableDirectory(path);
+  };
+  let settled = 0;
+  const append = outbox.append(event({ eventId: 'next', eventKey: 'next' }))
+    .then(() => { settled++; });
+  const ack = outbox.ack('seed').then(() => { settled++; });
+  const flush = outbox.flush().then(() => { settled++; });
+  await atBarrier;
+  assert.equal(settled, 0);
+  release();
+  await Promise.all([append, ack, flush]);
+  assert.equal(settled, 3);
+  assert.deepEqual((await new BridgeOutbox(root).pending()).map((e: any) => e.eventId), ['next']);
+});
+
+test('failed group barrier rejects every append and retries make recovered records durable', async (t) => {
+  const { BridgeOutbox } = await loadOutbox();
+  const root = await mkdtemp(join(tmpdir(), 'yeoman-bridge-outbox-crash-'));
+  t.after(() => rm(root, { recursive: true, force: true }));
+  const outbox = new BridgeOutbox(root, async () => { throw new Error('crash-before-barrier'); });
+  const expected = Array.from({ length: 8 }, (_, i) => event({
+    eventId: `crash-${i}`, eventKey: `key-${i}`,
+  }));
+  const results = await Promise.allSettled(expected.map(item => outbox.append(item)));
+  assert.ok(results.every(result => result.status === 'rejected' &&
+    /crash-before-barrier/.test(String(result.reason))));
+  assert.deepEqual(await new BridgeOutbox(root).pending(), expected);
+  let retriedBarrier = false;
+  outbox.commitDirectory = async (path: string) => {
+    await durableDirectory(path);
+    retriedBarrier = true;
+  };
+  assert.deepEqual(await Promise.all(expected.map(item => outbox.append(item))), expected);
+  assert.equal(retriedBarrier, true);
+  assert.equal((await readdir(root)).filter(name => name.endsWith('.json')).length, 8);
+});
+
+test('failed ACK barrier rejects the group and reload permits harmless ACK retries', async (t) => {
+  const { root, outbox } = await temporaryOutbox();
+  const { BridgeOutbox } = await loadOutbox();
+  t.after(() => rm(root, { recursive: true, force: true }));
+  const persisted = await outbox.append(event());
+  outbox.commitDirectory = async () => { throw new Error('crash-after-unlink'); };
+  await assert.rejects(outbox.ack(persisted.eventId), /crash-after-unlink/);
+  // A power loss can retain the old directory entry; both replay outcomes are harmless.
+  const restarted = new BridgeOutbox(root);
+  assert.equal(await restarted.ack(persisted.eventId), false);
+  await writeFile(join(root, eventFileName(persisted)), JSON.stringify(persisted), { mode: 0o600 });
+  const replayed = new BridgeOutbox(root);
+  assert.deepEqual(await replayed.pending(), [persisted]);
+  assert.equal(await replayed.ack(persisted.eventId), true);
+  assert.deepEqual(await new BridgeOutbox(root).pending(), []);
+});
+
 test('membership changes and snapshots survive restart and separate copy ACKs', async (t) => {
   const { root, outbox } = await temporaryOutbox();
   t.after(() => rm(root, { recursive: true, force: true }));

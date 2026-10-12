@@ -190,8 +190,16 @@ export class BridgeOutbox {
   private opened = false;
   private opening: Promise<void> | null = null;
   private writeTail: Promise<void> = Promise.resolve();
+  private writing = false;
+  private readonly writes: Array<{
+    run: () => Promise<() => void>;
+    reject: (error: unknown) => void;
+  }> = [];
 
-  constructor(private readonly directory: string = defaultBridgeOutboxDir()) {}
+  constructor(
+    private readonly directory: string = defaultBridgeOutboxDir(),
+    private readonly commitDirectory: (path: string) => Promise<void> = syncDirectory,
+  ) {}
 
   async open(): Promise<void> {
     if (this.opened) return;
@@ -453,9 +461,40 @@ export class BridgeOutbox {
   }
 
   private enqueue<T>(operation: () => Promise<T>): Promise<T> {
-    const result = this.writeTail.then(operation, operation);
-    this.writeTail = result.then(() => undefined, () => undefined);
-    return result;
+    return new Promise<T>((resolve, reject) => {
+      this.writes.push({
+        run: async () => {
+          try {
+            const result = await operation();
+            return () => resolve(result);
+          } catch (error) {
+            return () => reject(error);
+          }
+        },
+        reject,
+      });
+      if (!this.writing) {
+        this.writing = true;
+        this.writeTail = Promise.resolve().then(() => this.commitWrites());
+      }
+    });
+  }
+
+  private async commitWrites(): Promise<void> {
+    while (this.writes.length) {
+      // Bound the group so a continuous producer cannot postpone durable ACKs indefinitely.
+      const batch = this.writes.splice(0, 32);
+      const settled: Array<() => void> = [];
+      for (const write of batch) settled.push(await write.run());
+      try {
+        await this.commitDirectory(this.directory);
+      } catch (error) {
+        for (const write of batch) write.reject(error);
+        continue;
+      }
+      for (const settle of settled) settle();
+    }
+    this.writing = false;
   }
 
   private async rememberStaged(
@@ -517,8 +556,6 @@ export class BridgeOutbox {
         staged = true;
         await handle.close();
         handle = undefined;
-        // Make the retry filename durable before attempting the canonical rename.
-        await syncDirectory(this.directory);
       } catch (error) {
         await handle?.close().catch(() => undefined);
         if (!staged) await unlink(temporaryPath).catch(() => undefined);
@@ -526,14 +563,10 @@ export class BridgeOutbox {
         throw error;
       }
 
-      let renamed = false;
       try {
         await rename(temporaryPath, finalPath);
-        renamed = true;
-        await syncDirectory(this.directory);
       } catch (error) {
-        if (renamed) await this.reconcilePersisted(sequence, fileName, replayable);
-        else await this.rememberStaged(sequence, temporaryFileName, replayable).catch(() => undefined);
+        await this.rememberStaged(sequence, temporaryFileName, replayable).catch(() => undefined);
         throw error;
       }
 
@@ -541,27 +574,6 @@ export class BridgeOutbox {
       this.entries.set(replayable.eventId, { sequence, fileName, event: replayable });
       return replayable;
     });
-  }
-
-  private async reconcilePersisted(
-    sequence: number,
-    fileName: string,
-    expected: ReplayableBridgeEvent,
-  ): Promise<void> {
-    try {
-      const path = join(this.directory, fileName);
-      const stats = await lstat(path);
-      if (!stats.isFile()) throw new Error('not regular');
-      await enforceOwnerOnly(path, stats, OWNER_FILE_MODE);
-      const parsed: unknown = JSON.parse(await readFile(path, 'utf8'));
-      if (!this.isReplayableEvent(parsed) || JSON.stringify(parsed) !== JSON.stringify(expected)) {
-        throw new Error('mismatch');
-      }
-      this.entries.set(expected.eventId, { sequence, fileName, event: expected });
-      this.nextSequence = Math.max(this.nextSequence, sequence + 1);
-    } catch {
-      throw new Error('Bridge outbox write outcome could not be reconciled');
-    }
   }
 
   async pending(): Promise<ReplayableBridgeEvent[]> {
@@ -581,7 +593,6 @@ export class BridgeOutbox {
         const code = error && typeof error === 'object' ? (error as { code?: string }).code : undefined;
         if (code !== 'ENOENT') throw error;
       });
-      await syncDirectory(this.directory);
       this.entries.delete(eventId);
       return true;
     });

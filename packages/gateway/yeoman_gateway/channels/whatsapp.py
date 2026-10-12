@@ -242,6 +242,10 @@ class BridgeProtocolMismatchError(RuntimeError):
     """Bridge protocol version mismatch."""
 
 
+class _BridgeIntakeClosedError(RuntimeError):
+    """Command failed because another event closed the intake for replay."""
+
+
 class BridgeProtocolError(RuntimeError):
     """Bridge returned a protocol-level error."""
 
@@ -1645,10 +1649,14 @@ class WhatsAppChannel(BaseChannel):
             return
         self._bridge_intake_closed = True
         self._connected = False
-        logger.warning("WhatsApp bridge intake closed reason={}", reason)
+        logger.warning(
+            "WhatsApp bridge intake closed reason={} in_flight_for_replay={}",
+            reason,
+            len(self._bridge_inflight),
+        )
         # Wake every command waiter so the outer channel loop can tear down and
         # reconnect instead of leaving the Bridge outbox pending on a live socket.
-        self._fail_pending(f"Bridge intake closed: {reason}")
+        self._fail_pending(_BridgeIntakeClosedError(f"Bridge intake closed: {reason}"))
         websocket = self._ws
         if websocket is not None:
             with contextlib.suppress(Exception):
@@ -1671,6 +1679,8 @@ class WhatsAppChannel(BaseChannel):
     async def _ack_and_project_bridge_work(self, work: _BridgeEventWork) -> None:
         succeeded = False
         try:
+            if self._bridge_intake_closed:
+                raise _BridgeIntakeClosedError("Bridge intake is closing")
             await self._send_command(
                 "ack_event",
                 {"eventId": work.event_id},
@@ -1679,6 +1689,8 @@ class WhatsAppChannel(BaseChannel):
             succeeded = True
         except asyncio.CancelledError:
             raise
+        except _BridgeIntakeClosedError:
+            logger.debug("WhatsApp canonical ACK deferred to bridge replay type={}", work.kind)
         except Exception as exc:
             logger.warning(
                 "WhatsApp canonical ACK failed type={} error_type={}",
@@ -3042,7 +3054,7 @@ class WhatsAppChannel(BaseChannel):
         # Do not register a new waiter after the shed-replay reconnect fence.
         # Startup health runs before subscription and is allowed on the new socket.
         if getattr(self, "_bridge_intake_closed", False) and getattr(self, "_events_subscribed", False):
-            raise RuntimeError("Bridge intake is closing")
+            raise _BridgeIntakeClosedError("Bridge intake is closing")
         future: asyncio.Future[dict[str, Any]] = asyncio.get_running_loop().create_future()
         self._pending[request_id] = future
 
@@ -3296,10 +3308,10 @@ class WhatsAppChannel(BaseChannel):
         retryable = bool(error.get("retryable", False))
         future.set_exception(BridgeProtocolError(code, message, retryable))
 
-    def _fail_pending(self, reason: str) -> None:
+    def _fail_pending(self, reason: str | RuntimeError) -> None:
         for future in self._pending.values():
             if not future.done():
-                future.set_exception(RuntimeError(reason))
+                future.set_exception(reason if isinstance(reason, RuntimeError) else RuntimeError(reason))
         self._pending.clear()
 
     def _compute_backoff_ms(self, attempt: int) -> int:

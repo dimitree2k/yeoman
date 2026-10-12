@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import asyncio
 import json
+import logging
 import time
 from pathlib import Path
 
@@ -451,6 +452,102 @@ def test_ack_failure_closes_live_intake_for_reconnect(tmp_path: Path) -> None:
     assert channel._running is True
     assert store.get_event("event-ack-timeout") is not None
     store.close()
+
+
+def test_ack_failure_cascade_logs_one_failure_and_one_replay_summary(caplog) -> None:
+    from loguru import logger
+    from yeoman_gateway.channels.whatsapp import _BridgeEventWork, _BridgeIntakeClosedError
+
+    channel = WhatsAppChannel(WhatsAppConfig(), MessageBus())
+
+    class Socket:
+        closed = False
+
+        async def close(self):
+            self.closed = True
+
+    socket = Socket()
+    channel._ws = socket
+    channel._connected = True
+    published = []
+
+    async def project(work):
+        published.append(work.event_id)
+
+    channel._project_bridge_event = project
+    sink = logger.add(lambda message: logging.getLogger("whatsapp-test").log(
+        message.record["level"].no, str(message).strip()
+    ), level="DEBUG")
+    caplog.set_level(logging.DEBUG, logger="whatsapp-test")
+
+    async def run():
+        works = [
+            _BridgeEventWork({}, "message", {}, f"cascade-{i}", (),
+                             asyncio.get_running_loop().create_future())
+            for i in range(40)
+        ]
+        channel._bridge_event_lock = asyncio.Lock()
+        channel._bridge_inflight = {work.event_id: work for work in works}
+        pending = asyncio.get_running_loop().create_future()
+        channel._pending["other-command"] = pending
+        calls = 0
+
+        async def ack(*args, **kwargs):
+            nonlocal calls
+            calls += 1
+            raise TimeoutError("original ACK timed out")
+
+        channel._send_command = ack
+        for work in works:
+            await channel._ack_and_project_bridge_work(work)
+        await channel._close_bridge_intake("ack_failed")
+        assert calls == 1
+        assert all(work.completion.result() is False for work in works)
+        assert not channel._bridge_inflight
+        with pytest.raises(_BridgeIntakeClosedError):
+            await pending
+
+    try:
+        asyncio.run(run())
+    finally:
+        logger.remove(sink)
+    warnings = [record.message for record in caplog.records if record.levelno == logging.WARNING]
+    assert len(warnings) == 2
+    assert "canonical ACK failed type=message error_type=TimeoutError" in warnings[0]
+    assert "intake closed reason=ack_failed in_flight_for_replay=40" in warnings[1]
+    assert sum("ACK deferred to bridge replay" in record.message for record in caplog.records) == 39
+    assert socket.closed and not channel._connected and channel._bridge_intake_closed
+    assert published == []
+
+
+def test_unrelated_ack_failure_still_warns_after_intake_closes(caplog) -> None:
+    from loguru import logger
+    from yeoman_gateway.channels.whatsapp import _BridgeEventWork
+
+    channel = WhatsAppChannel(WhatsAppConfig(), MessageBus())
+
+    async def ack(*args, **kwargs):
+        channel._bridge_intake_closed = True
+        raise ValueError("independent failure")
+
+    channel._send_command = ack
+    sink = logger.add(lambda message: logging.getLogger("whatsapp-test").log(
+        message.record["level"].no, str(message).strip()
+    ))
+    caplog.set_level(logging.DEBUG, logger="whatsapp-test")
+
+    async def run():
+        work = _BridgeEventWork({}, "message", {}, "independent", (),
+                                asyncio.get_running_loop().create_future())
+        await channel._ack_and_project_bridge_work(work)
+        assert work.completion.result() is False
+
+    try:
+        asyncio.run(run())
+    finally:
+        logger.remove(sink)
+    assert any(record.levelno == logging.WARNING and "error_type=ValueError" in record.message
+               for record in caplog.records)
 
 
 def test_stop_drains_acknowledged_projection_before_return(tmp_path: Path) -> None:
