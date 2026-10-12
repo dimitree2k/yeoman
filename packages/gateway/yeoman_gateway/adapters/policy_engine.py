@@ -221,7 +221,6 @@ class EnginePolicyAdapter(PolicyPort):
         *,
         event: InboundEvent,
         handoff: "PrivateHandoff",
-        notes: Any,
         is_owner: bool,
     ) -> PolicyDecision:
         persona_file: str | None = None
@@ -244,11 +243,6 @@ class EnginePolicyAdapter(PolicyPort):
             when_to_reply_mode="all",
             persona_file=persona_file,
             persona_text=persona_text,
-            notes_enabled=notes.enabled,
-            notes_mode=notes.mode,
-            notes_allow_blocked_senders=notes.allow_blocked_senders,
-            notes_batch_interval_seconds=notes.batch_interval_seconds,
-            notes_batch_max_messages=notes.batch_max_messages,
             reply_budget=reply_budget,
             model_profile=model_profile,
             is_owner=is_owner,
@@ -787,11 +781,6 @@ class EnginePolicyAdapter(PolicyPort):
                 allowed_tools=frozenset(self._known_tools),
                 reason="policy_disabled",
                 when_to_reply_mode="all",
-                notes_enabled=False,
-                notes_mode="adaptive",
-                notes_allow_blocked_senders=False,
-                notes_batch_interval_seconds=1800,
-                notes_batch_max_messages=100,
                 voice_output_mode="text",
                 voice_output_tts_route="tts.speak",
                 voice_output_voice="alloy",
@@ -868,11 +857,6 @@ class EnginePolicyAdapter(PolicyPort):
             except Exception:
                 # Policy voice output settings are optional and should never break evaluation.
                 pass
-        notes = self._engine.resolve_memory_notes(
-            channel=event.channel,
-            chat_id=event.chat_id,
-            is_group=event.is_group,
-        )
         pause_reason = self._pause_reason_for_chat(event.channel, event.chat_id)
         should_respond = decision.should_respond
         reason = decision.reason
@@ -888,7 +872,6 @@ class EnginePolicyAdapter(PolicyPort):
             return self._private_handoff_decision(
                 event=event,
                 handoff=handoff,
-                notes=notes,
                 is_owner=is_owner,
             )
         return PolicyDecision(
@@ -899,11 +882,6 @@ class EnginePolicyAdapter(PolicyPort):
             when_to_reply_mode=when_to_reply_mode,
             persona_file=decision.persona_file,
             persona_text=self._engine.persona_text(decision.persona_file),
-            notes_enabled=notes.enabled,
-            notes_mode=notes.mode,
-            notes_allow_blocked_senders=notes.allow_blocked_senders,
-            notes_batch_interval_seconds=notes.batch_interval_seconds,
-            notes_batch_max_messages=notes.batch_max_messages,
             voice_output_mode=voice_output_mode,
             voice_output_tts_route=voice_output_tts_route,
             voice_output_voice=voice_output_voice,
@@ -948,16 +926,8 @@ class EnginePolicyAdapter(PolicyPort):
         decision = self.evaluate(event)
 
         effective = None
-        notes = None
         if self._engine is not None and channel in self._engine.apply_channels:
             effective = self._engine.resolve_policy(channel, chat_id)
-        if self._engine is not None:
-            notes = self._engine.resolve_memory_notes(
-                channel=channel,
-                chat_id=chat_id,
-                is_group=is_group,
-            )
-
         return {
             "policySource": decision.source,
             "channel": channel,
@@ -1018,22 +988,7 @@ class EnginePolicyAdapter(PolicyPort):
                 "reason": decision.reason,
                 "allowedTools": sorted(decision.allowed_tools),
                 "personaFile": decision.persona_file,
-                "memoryNotesEnabled": decision.notes_enabled,
-                "memoryNotesMode": decision.notes_mode,
-                "memoryNotesAllowBlockedSenders": decision.notes_allow_blocked_senders,
             },
-            "memoryNotes": (
-                {
-                    "enabled": notes.enabled,
-                    "mode": notes.mode,
-                    "allowBlockedSenders": notes.allow_blocked_senders,
-                    "batchIntervalSeconds": notes.batch_interval_seconds,
-                    "batchMaxMessages": notes.batch_max_messages,
-                    "source": notes.source,
-                }
-                if notes is not None
-                else None
-            ),
         }
 
     def maybe_handle_admin_command(self, event: InboundEvent) -> str | None:

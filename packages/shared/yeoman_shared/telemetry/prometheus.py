@@ -123,11 +123,6 @@ class PrometheusTelemetry:
         )
 
         # Memory metrics
-        self._metrics["memory_notes_total"] = self._Counter(
-            "yeoman_memory_notes_total",
-            "Total memory notes captured",
-            labelnames=["mode", "channel"],
-        )
         self._metrics["memory_recall_total"] = self._Counter(
             "yeoman_memory_recall_total",
             "Total memory recall operations",

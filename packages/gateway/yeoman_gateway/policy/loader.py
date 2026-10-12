@@ -21,6 +21,8 @@ def load_policy(path: Path | None = None) -> PolicyConfig:
         return PolicyConfig()
     with open(policy_path) as f:
         data = json.load(f)
+    if isinstance(data, dict):
+        data.pop("memoryNotes", None)
     return PolicyConfig.model_validate(data)
 
 

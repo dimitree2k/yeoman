@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import json
 from pathlib import Path
 from typing import Any
 
@@ -209,3 +210,14 @@ def test_non_group_policy_command_does_not_read_history(tmp_path: Path) -> None:
 
     assert result.outcome == "noop"
     assert reads == []
+
+
+def test_retired_memory_notes_loads_and_saves_without_block(tmp_path: Path) -> None:
+    path = tmp_path / "legacy-policy-input.json"
+    data = {"memoryNotes": {"enabled": True, "defaults": {"mode": "hybrid"}}}
+    path.write_text(json.dumps(data))
+    policy = load_policy(path)
+    save_policy(policy, path)
+    saved = json.loads(path.read_text())
+    assert "memoryNotes" not in saved
+    assert load_policy(path) == policy

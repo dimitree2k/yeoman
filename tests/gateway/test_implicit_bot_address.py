@@ -811,8 +811,6 @@ async def test_denied_early_bait_reaches_access_control(
         decision=_mention_only_decision(
             accept_message=False,
             should_respond=False,
-            notes_enabled=True,
-            notes_allow_blocked_senders=True,
         ),
     )
 
