@@ -217,6 +217,13 @@ def test_gateway_cleanup_closes_processing_when_retention_stop_fails(monkeypatch
         def close(self):
             closed.append("processing")
 
+    class Catchup(AsyncNoop):
+        async def start(self):
+            closed.append("catchup_start")
+
+        async def stop(self):
+            closed.append("catchup_stop")
+
     class Closing:
         def close(self):
             closed.append("close")
@@ -230,6 +237,7 @@ def test_gateway_cleanup_closes_processing_when_retention_stop_fails(monkeypatch
         responder=AsyncNoop(),
         processing=Processing(),
         retention=FailingRetention(),
+        source_catchup=Catchup(),
     )
 
     monkeypatch.setattr("yeoman_gateway.app.bootstrap.tracing.init", lambda: None)
@@ -240,6 +248,7 @@ def test_gateway_cleanup_closes_processing_when_retention_stop_fails(monkeypatch
 
     assert "processing" in closed
     assert "channels" in closed
+    assert closed.index("catchup_start") < closed.index("catchup_stop") < closed.index("processing")
 
 
 def test_runtime_refreshes_when_non_entry_dist_module_changes(tmp_path, monkeypatch) -> None:

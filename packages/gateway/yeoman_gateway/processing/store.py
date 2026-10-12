@@ -1481,7 +1481,9 @@ class ProcessingStore:
         return tuple(self._event_from_row(row) for row in rows)
 
     def unproven_event_sources(
-        self, *, limit: int = 500, kinds: Iterable[str] = ("message",)
+        self, *, limit: int = 500, kinds: Iterable[str] = ("message",),
+        since_ms: int | None = None, after: tuple[int, str] | None = None,
+        inbound_only: bool = False,
     ) -> tuple[dict[str, Any], ...]:
         """Journaled events whose audience was never proven, oldest first.
 
@@ -1495,6 +1497,17 @@ class ProcessingStore:
         if not wanted:
             return ()
         placeholders = ",".join("?" for _ in wanted)
+        filters = ""
+        params: list[Any] = list(wanted)
+        if since_ms is not None:
+            filters += " AND COALESCE(e.occurred_ms, e.created_ms) >= ?"
+            params.append(int(since_ms))
+        if after is not None:
+            filters += " AND (e.created_ms > ? OR (e.created_ms = ? AND e.event_id > ?))"
+            params.extend((after[0], after[0], after[1]))
+        if inbound_only:
+            filters += " AND e.direction = 'in'"
+        params.append(int(limit))
         with self._lock:
             rows = self._conn.execute(
                 f"""
@@ -1509,10 +1522,11 @@ class ProcessingStore:
                     ON a.event_id = e.event_id AND a.revision = e.revision
                  WHERE e.kind IN ({placeholders})
                    AND (a.audience_status IS NULL OR a.audience_status = 'unknown')
+                   {filters}
                  ORDER BY e.created_ms, e.event_id
                  LIMIT ?
                 """,
-                (*wanted, int(limit)),
+                tuple(params),
             ).fetchall()
         return tuple(dict(row) for row in rows)
 

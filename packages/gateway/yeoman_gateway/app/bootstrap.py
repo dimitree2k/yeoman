@@ -41,6 +41,7 @@ from yeoman_gateway.cron.types import CronJob
 from yeoman_gateway.cron.voice import evaluate_voice_quiet_gate
 from yeoman_gateway.heartbeat.service import HeartbeatService
 from yeoman_gateway.knowledge._capture import ObservedSourceRegistrar
+from yeoman_gateway.knowledge._source_catchup import ObservedSourceCatchup
 from yeoman_gateway.media.document_cache import DocumentCache
 from yeoman_gateway.media.document_processing import DocumentProcessor
 from yeoman_gateway.media.lazy_resolver import LazyMediaResolver
@@ -460,6 +461,7 @@ class GatewayRuntime:
     statement_capture: object | None = None
     knowledge_embeddings: Any | None = None
     startup_hook: Callable[[], Awaitable[None]] | None = None
+    source_catchup: ObservedSourceCatchup | None = None
 
     async def _start_processing_services(self) -> None:
         """Plan 04 start order: recover and reconcile before any channel consumes input.
@@ -493,6 +495,8 @@ class GatewayRuntime:
         try:
             await self._start_processing_services()
             await self.history_projector.start()
+            if self.source_catchup is not None:
+                await self.source_catchup.start()
             self._resume_a2a_research()
             await self.cron.start()
             await self.heartbeat.start()
@@ -577,6 +581,8 @@ class GatewayRuntime:
                     attempt_sync(self.statement_capture.stop)
             if self.knowledge_embeddings is not None:
                 await attempt_async(self.knowledge_embeddings.stop)
+            if self.source_catchup is not None:
+                await attempt_async(self.source_catchup.stop)
             if self.processing is not None:
                 attempt_sync(self.processing.close)
             await attempt_async(self.history_projector.stop)
@@ -3956,4 +3962,8 @@ def build_gateway_runtime(
         statement_capture=statement_capture,
         knowledge_embeddings=knowledge_embeddings,
         startup_hook=_notify_pending_persona_evolution_reviews,
+        source_catchup=(ObservedSourceCatchup(
+            processing=processing_store, knowledge=knowledge_service,
+            registrar=observed_sources, projector=history_projector,
+        ) if observed_sources is not None else None),
     )
