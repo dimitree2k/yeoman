@@ -114,16 +114,9 @@ def chats_sync(
 
 
 def _selected_chats() -> list[dict]:
-    from yeoman_shared.config.loader import load_config
 
     from yeoman_gateway.history.export import cli_secondary_request
-    from yeoman_gateway.history.live import HistoryPaused
-    history = load_config().history
-    if history.live_projection_enabled and history.readers.secondary:
-        result = cli_secondary_request('history_chats', {})
-        return [dict(row, readable_name=row['subject'], chat_type='group' if row['chat_id'].endswith('@g.us') else 'dm',
-                     participant_count=None, first_seen_at=None, last_seen_at=None, owner_id=None,
-                     is_community=False, invite_code=None) for row in result['chats']]
-    if history.legacy_writers_disabled:
-        raise HistoryPaused('secondary_reader_unselected')
-    raise HistoryPaused('legacy_history_mode_unsupported')
+    result = cli_secondary_request('history_chats', {})
+    return [dict(row, readable_name=row['subject'], chat_type='group' if row['chat_id'].endswith('@g.us') else 'dm',
+                 participant_count=None, first_seen_at=None, last_seen_at=None, owner_id=None,
+                 is_community=False, invite_code=None) for row in result['chats']]

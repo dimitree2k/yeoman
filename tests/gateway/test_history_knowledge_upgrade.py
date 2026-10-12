@@ -23,7 +23,8 @@ def v2(path):
     store.execute("INSERT INTO contact_aliases(contact_id,alias,source,first_seen,last_seen,status,address_allowed,normalized_alias)"
                   " VALUES ('curated','Synthetic','owner_confirmed','date','date','confirmed',1,'synthetic')")
     store.commit_if_idle()
-    from yeoman_gateway.knowledge.api import KnowledgeService
+    from yeoman_gateway.knowledge._identity import IdentityEngine
+    from yeoman_gateway.knowledge._statements import StatementEngine
     from yeoman_gateway.knowledge.authority import EvidenceAudience
     from yeoman_gateway.knowledge.models import (
         AttributeCandidate,
@@ -36,24 +37,31 @@ def v2(path):
     authority = RuntimeKnowledgeSources()
     source = SourceRef('curated-source', 4, 'whatsapp', 'curated@g.us', 'whatsapp:10009', 100)
     authority.register_source(source, EvidenceAudience.author_only())
-    service = KnowledgeService(store=store, workspace_id='synthetic', source_authority=authority,
-                               policy_authority=RuntimeKnowledgePolicy(engine=None))
+    policy = RuntimeKnowledgePolicy(engine=None)
+    identity = IdentityEngine(store, authority=authority, policy=policy, legacy_history_disabled=True)
+    statements = StatementEngine(store, identity=identity, authority=authority, policy=policy,
+                                 workspace_id='synthetic')
     context = TrustedCaptureContext('synthetic', 1, 'native', (source,))
-    result = service.capture(StatementCandidate('Curated synthetic source', (source,), people=(
-        PersonLinkCandidate('curated', 'subject', source, 'confirmed'),), attributes=(
-        AttributeCandidate('curated', 'description', AttributeValue('Synthetic attribute')),)), context=context)
-    service.correct_statement(result.statement_ids[0], StatementCandidate('Curated synthetic correction', (source,)),
-                              expected_source=source, context=context)
-    service.enqueue_capture((source,), context=context)
+    with store.transaction():
+        result = statements.capture(StatementCandidate('Curated synthetic source', (source,), people=(
+            PersonLinkCandidate('curated', 'subject', source, 'confirmed'),), attributes=(
+            AttributeCandidate('curated', 'description', AttributeValue('Synthetic attribute')),)), context=context)
+    with store.transaction():
+        statements.correct_statement(result.statement_ids[0],
+                                     StatementCandidate('Curated synthetic correction', (source,)),
+                                     expected_source=source, context=context)
+    with store.transaction():
+        statements.enqueue_job((source,), context=context, extractor_version='pending',
+                               scope_key='channel:whatsapp:chat:curated@g.us')
     # A persisted suppression/curation control remains opaque to the copy tool.
     store.set_meta('curated_suppression', 'synthetic-withheld-ref')
-    service.close()
+    store.close()
     return path
 
 
-def open_service(path, *, history_mode=False):
+def open_service(path):
     return open_knowledge_store(path, workspace_id="synthetic", source_authority=RuntimeKnowledgeSources(),
-                                policy_authority=RuntimeKnowledgePolicy(engine=None), history_mode=history_mode)
+                                policy_authority=RuntimeKnowledgePolicy(engine=None))
 
 
 def test_history_knowledge_upgrade_preserves_curated_rows_and_frozen_identity(tmp_path):
@@ -83,7 +91,7 @@ def test_history_knowledge_upgrade_preserves_curated_rows_and_frozen_identity(tm
         assert {row[0] for row in db.execute("SELECT name FROM sqlite_master WHERE name LIKE 'knowledge_history_%' AND type='table'")} == {
             'knowledge_history_source_aliases', 'knowledge_history_sources',
             'knowledge_history_capture', 'knowledge_history_capture_state'}
-    service = open_service(target, history_mode=True)
+    service = open_service(target)
     service.close()
 
 
@@ -97,14 +105,10 @@ def test_upgrade_refuses_existing_target_and_normal_start_does_not_migrate(tmp_p
         upgrade_history_knowledge(source=source, target=target)
     assert {p.name: p.read_bytes() for p in tmp_path.iterdir()} == before
     with pytest.raises(KnowledgeStartupError):
-        open_service(source, history_mode=True)
+        open_service(source)
     assert {p.name: p.read_bytes() for p in tmp_path.iterdir()} == before
-    service = open_service(source)
-    assert service._store.schema_version == 2
-    assert not any(name.startswith('knowledge_history_') for name in service._store.table_names())
-    service.close()
     with pytest.raises(KnowledgeStartupError):
-        open_service(tmp_path / 'fresh-v3.db', history_mode=True)
+        open_service(tmp_path / 'fresh-v3.db')
     assert not (tmp_path / 'fresh-v3.db').exists()
 
 

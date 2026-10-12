@@ -12,6 +12,7 @@ from yeoman_gateway.processing.tool_context import (
     ToolInvocationContext,
     reset_tool_context,
     set_tool_context,
+    tool_history_snapshot,
 )
 
 
@@ -612,7 +613,7 @@ async def test_background_subagent_clears_selected_lease_and_keeps_dormant_conte
 
 
 @pytest.mark.parametrize('has_mention', [False, True])
-async def test_scope_less_bus_send_resolves_mentions_and_closes_before_transport(has_mention):
+async def test_scope_less_bus_send_resolves_mentions_from_projected_roster_before_transport(tmp_path, has_mention):
     import json
     from unittest.mock import AsyncMock
 
@@ -622,17 +623,16 @@ async def test_scope_less_bus_send_resolves_mentions_and_closes_before_transport
     from yeoman_gateway.channels.whatsapp import WhatsAppChannel
     from yeoman_gateway.history.context import current_history_snapshot
     from yeoman_shared.config.schema import WhatsAppConfig
-    p = Projector()
+
+    from tests.gateway.history_test_helpers import ProjectedHistory
     phone, lid = '491000000001@s.whatsapp.net', '100000000001@lid'
-    p.db.execute("INSERT INTO contacts VALUES ('person','person',NULL,'synthetic','confirmed',NULL,'[]')")
-    for kind, value in (('pn_jid', phone), ('lid', lid)):
-        p.db.execute("INSERT INTO identifier_history(contact_id,channel,kind,value,strength,evidence,source_refs) VALUES ('person','whatsapp',?,?,'strong','owner_attested','[]')", (kind, value))
-    p.db.execute("INSERT INTO message_events(event_id,channel,chat_id,kind,occurred_ms,time_certainty,payload_json,provenance,actor_basis,source_refs) VALUES ('roster','whatsapp','a@g.us','member_snapshot',1700000000000,'native',?,'native','unknown','[]')", (json.dumps({'complete': True, 'participants': [[phone, lid]]}),))
-    p.db.commit()
+    projected = ProjectedHistory(
+        tmp_path / 'scope-less-send-history',
+        groups=[dict(chat_id='a@g.us', participants=[{'phoneJid': phone, 'lid': lid}], timestamp=1700000000000)],
+    )
     bus = MessageBus()
     channel = WhatsAppChannel(WhatsAppConfig(bridge_token='synthetic-token'), bus)
-    channel._history_projector = p
-    channel._history_mentions_selected = True
+    channel._history_projector = projected
     channel._connected = True
     channel._stop_typing = AsyncMock()
     channel._raw_archive_outbound = AsyncMock()
@@ -647,7 +647,7 @@ async def test_scope_less_bus_send_resolves_mentions_and_closes_before_transport
             completed.set()
     channel.send = send
     async def ws_send(encoded):
-        assert p.live_snapshot_count == 0 and current_history_snapshot() is None
+        assert current_history_snapshot() is None
         frame = json.loads(encoded)
         sent.append(frame['payload'])
         channel._pending[frame['requestId']].set_result({'providerMessageId': 'synthetic-sent'})
@@ -664,13 +664,22 @@ async def test_scope_less_bus_send_resolves_mentions_and_closes_before_transport
         assert sent[0]['historyMentionsResolved'] is True
         assert sent[0].get('mentions', []) == ([phone] if has_mention else [])
         assert sent[0]['text'] == ('synthetic @491000000001' if has_mention else text)
-        assert p.acquisitions == 1 and p.live_snapshot_count == 0
-        completed.clear()
-        p.status = 'rebuilding'
-        await bus.publish_outbound(message)
-        await asyncio.wait_for(completed.wait(), 30)
-        assert len(sent) == 1 and p.live_snapshot_count == 0
+        assert len(projected.snapshots) == 1
+        assert all(snapshot._closed for snapshot in projected.snapshots)
     finally:
         dispatcher.cancel()
+        projected.close()
         await dispatcher
-        p.close()
+
+
+def test_tool_history_snapshot_requires_scope_except_for_explicit_non_whatsapp():
+    from yeoman_gateway.history.live import HistoryPaused
+
+    with pytest.raises(HistoryPaused, match="tool_history_scope_required"):
+        tool_history_snapshot()
+
+    token = set_tool_context(ToolInvocationContext(channel="telegram", chat_id="chat"))
+    try:
+        assert tool_history_snapshot() is None
+    finally:
+        reset_tool_context(token)

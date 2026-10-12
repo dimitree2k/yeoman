@@ -1,10 +1,7 @@
 """Read-only contact resolution for delivery targets.
 
-Person resolution has one authority at a time.  With a knowledge facade wired, a target
-exists only for a person with an *active proven* binding: an unproven legacy identifier
-never names a delivery target, and two candidates stay "unresolved" instead of becoming a
-first match.  The legacy contacts cache answers only for callers that run without
-knowledge at all - it is never a second opinion after knowledge already answered.
+Person resolution uses Knowledge only. A target exists only for a person with an
+active proven binding; no channel falls back to an in-memory ContactsService cache.
 """
 
 from __future__ import annotations
@@ -12,17 +9,12 @@ from __future__ import annotations
 import json
 import re
 from dataclasses import dataclass
-from typing import TYPE_CHECKING, Any
+from typing import Any
 
 from loguru import logger
 
 from yeoman_gateway.agent.tools.base import Tool
 from yeoman_gateway.history.live import HistoryPaused
-
-if TYPE_CHECKING:
-    from yeoman_gateway.knowledge._contacts.models import Contact
-    from yeoman_gateway.knowledge._contacts.service import ContactsService
-
 
 _MENTION_TOKEN_RE = re.compile(
     r"(?<![\w@\x80-\U0010ffff])"
@@ -40,19 +32,6 @@ class ContactResolution:
     matched_identifier: str | None = None
 
 
-def _normalise_whatsapp_identifier(value: str) -> str:
-    token = str(value or "").strip()
-    if not token:
-        return ""
-    if token.startswith("@"):
-        token = token[1:]
-    if "@" in token:
-        return token
-    if token.isdigit():
-        return f"{token}@s.whatsapp.net"
-    return token
-
-
 def _mention_candidates(text: str) -> list[str]:
     candidates: list[str] = []
     for match in _MENTION_TOKEN_RE.finditer(str(text or "")):
@@ -66,48 +45,6 @@ def _mention_candidates(text: str) -> list[str]:
             candidates.append(f"{digits}@lid")
             candidates.append(f"{digits}@s.whatsapp.net")
     return candidates
-
-
-def _participant_phone_map(
-    chat_registry: "Any | None",
-    *,
-    channel: str,
-    chat_id: str,
-) -> dict[str, str]:
-    if chat_registry is None or channel != "whatsapp" or not chat_id:
-        return {}
-    try:
-        chat = chat_registry.get_chat(channel, chat_id)
-    except Exception:
-        return {}
-    if not chat:
-        return {}
-    metadata = chat.get("metadata")
-    if not isinstance(metadata, dict):
-        return {}
-    raw_participants = metadata.get("participants")
-    if not isinstance(raw_participants, list):
-        return {}
-    mapped: dict[str, str] = {}
-    for item in raw_participants:
-        if not isinstance(item, dict):
-            continue
-        lid = str(item.get("id") or "").strip()
-        phone = str(item.get("phoneNumber") or "").strip()
-        if lid and phone:
-            mapped[lid] = phone
-    return mapped
-
-
-def chat_participant_identifiers(
-    chat_registry: "Any | None",
-    *,
-    channel: str,
-    chat_id: str,
-) -> set[str]:
-    """Return the proven LID and phone JIDs recorded for a chat."""
-    mapped = _participant_phone_map(chat_registry, channel=channel, chat_id=chat_id)
-    return set(mapped) | set(mapped.values())
 
 
 def _reference_matches_labels(
@@ -173,8 +110,6 @@ def resolve_contact_reference(
     reference: str,
     channel: str,
     chat_id: str,
-    chat_registry: "Any | None" = None,
-    contacts: "ContactsService | None" = None,
     knowledge: object | None = None,
 ) -> ContactResolution | None:
     """Resolve a human name, phone JID, or WhatsApp LID mention to one delivery target.
@@ -192,38 +127,25 @@ def resolve_contact_reference(
     if not ref:
         return None
 
-    participant_map = _participant_phone_map(chat_registry, channel=channel, chat_id=chat_id)
-    participant_ids = set(participant_map.keys()) | set(participant_map.values())
-
-    if knowledge is not None:
-        try:
-            return _resolve_through_knowledge(
-                knowledge,
-                ref,
-                channel=channel,
-                chat_id=chat_id,
-                participant_map=participant_map,
-                participant_ids=participant_ids,
-            )
-        except HistoryPaused:
-            raise
-        except Exception as exc:
-            # Knowledge is optional for the turn: no authority, no target.  The failure
-            # stays visible instead of looking exactly like "no proven person".
-            logger.warning(
-                "contact resolution degraded: knowledge lookup failed ({})",
-                getattr(exc, "code", type(exc).__name__),
-            )
-            return None
-    if contacts is None:
+    if knowledge is None:
         return None
-    return _resolve_through_legacy(
-        contacts,
-        ref,
-        channel=channel,
-        participant_map=participant_map,
-        participant_ids=participant_ids,
-    )
+    try:
+        return _resolve_through_knowledge(
+            knowledge,
+            ref,
+            channel=channel,
+            chat_id=chat_id,
+        )
+    except HistoryPaused:
+        raise
+    except Exception as exc:
+        # Knowledge is optional for the turn: no authority, no target. The failure
+        # stays visible instead of looking exactly like "no proven person".
+        logger.warning(
+            "contact resolution degraded: knowledge lookup failed ({})",
+            getattr(exc, "code", type(exc).__name__),
+        )
+        return None
 
 
 def _resolve_through_knowledge(
@@ -232,43 +154,67 @@ def _resolve_through_knowledge(
     *,
     channel: str,
     chat_id: str,
-    participant_map: dict[str, str],
-    participant_ids: set[str],
 ) -> ContactResolution | None:
     """Resolve proven targets through the selected chat scope or Knowledge facade."""
+    from yeoman_gateway.history.ids import classify
     from yeoman_gateway.knowledge._history_identity import current_history_scope
+
     scope = current_history_scope()
+    ident = classify(chat_id) if channel == "whatsapp" else None
+    whatsapp_group = ident is not None and ident.kind == "group"
+    if whatsapp_group and scope is None:
+        return None
+    now_ms = int(__import__("time").time() * 1000)
+    roster: set[str] | None = None
+    if whatsapp_group:
+        if scope is None:
+            return None
+        audience = scope.queries.members(chat_id=chat_id, at_ms=now_ms)
+        if audience.status != "known":
+            return None
+        roster = {
+            terminal
+            for principal in audience.members
+            if (contact := scope.queries.principal_contact(principal, now_ms))
+            and (terminal := scope.queries.terminal(contact))
+        }
+
     mention_candidates = _mention_candidates(ref)
     if mention_candidates:
-        # A mention is an identifier, not a name: only a proven binding on this channel
-        # names a person, and only with an address that person actually has.
+        # In a group, a mention only resolves through the projected current roster;
+        # the original token is never used as a fallback when History cannot prove it.
         for candidate in mention_candidates:
-            mapped = participant_map.get(candidate, candidate)
+            values = (candidate,)
             if scope is not None and channel == "whatsapp":
-                import time
-                mapped = scope.queries.mention(
-                    candidate, chat_id=chat_id, at_ms=int(time.time() * 1000)
-                ) or candidate
-            for value in dict.fromkeys((mapped, candidate)):
+                mapped = scope.queries.mention(candidate, chat_id=chat_id, at_ms=now_ms)
+                if whatsapp_group and mapped is None:
+                    continue
+                values = (mapped,) if mapped else (candidate,)
+            for value in values:
                 proven = _proven_mention_target(knowledge, channel=channel, value=value)
                 if proven is None:
                     continue
                 person_id, proven_value = proven
+                if roster is not None and scope.queries.terminal(person_id) not in roster:
+                    continue
                 display = knowledge.person_display_name(person_id)
                 if display:
                     return ContactResolution(
                         display_name=display,
                         jid=proven_value,
-                        matched_identifier=(
-                            candidate if candidate != proven_value else None
-                        ),
+                        matched_identifier=(candidate if candidate != proven_value else None),
                     )
         return None
 
     if scope is not None and channel == "whatsapp":
-        import time
-        found = scope.queries.resolve_person(ref, (chat_id,), int(time.time() * 1000))
+        found = scope.queries.resolve_person(ref, (chat_id,), now_ms)
         people = [(found.person_id, (scope.queries.contact(found.person_id) or {}).get("display_name"))] if found.person_id else []
+        if roster is not None:
+            people = [
+                (person_id, display_name)
+                for person_id, display_name in people
+                if scope.queries.terminal(person_id) in roster
+            ]
     else:
         people = [(person.person_id, person.display_name) for person in knowledge.search_people_with_policy(
             ref, channel=channel, chat_id=chat_id
@@ -284,82 +230,10 @@ def _resolve_through_knowledge(
             for item in knowledge.person_identifiers(person_id)
             if item.channel == channel
         ]
-        if participant_ids:
-            identifiers = [item for item in identifiers if item in participant_ids]
         chosen = _pick_delivery_value(identifiers)
         if not chosen:
             continue
-        candidates.append(
-            ContactResolution(
-                display_name=display_name or chosen,
-                jid=chosen,
-            )
-        )
-
-    if len(candidates) == 1:
-        return candidates[0]
-    return None
-
-
-def _resolve_through_legacy(
-    contacts: "ContactsService",
-    ref: str,
-    *,
-    channel: str,
-    participant_map: dict[str, str],
-    participant_ids: set[str],
-) -> ContactResolution | None:
-    """Transitional resolver for callers that run without a knowledge facade.
-
-    It answers from the legacy contacts cache it was built with and disappears together
-    with that cache.  It never widens knowledge authority - knowledge is not wired here.
-    """
-    mention_candidates = _mention_candidates(ref)
-    if mention_candidates:
-        for candidate in mention_candidates:
-            mapped = participant_map.get(candidate, candidate)
-            for identifier in (mapped, candidate):
-                contact_id = getattr(contacts, "known_jids", {}).get(identifier)
-                display = contacts.get_display_name(contact_id) if contact_id else None
-                if display:
-                    return ContactResolution(
-                        display_name=display,
-                        jid=mapped,
-                        matched_identifier=candidate if candidate != mapped else None,
-                    )
-        return None
-
-    matches: dict[str, "Contact"] = {}
-    for contact in contacts.store.search_by_display_name(ref):
-        matches[contact.id] = contact
-    for contact in contacts.store.search_by_alias(ref):
-        matches[contact.id] = contact
-
-    candidates: list[ContactResolution] = []
-    for contact in matches.values():
-        labels = [
-            contact.display_name,
-            *[
-                alias.alias
-                for alias in contacts.store.get_aliases(contact.id)
-            ],
-        ]
-        if not _reference_matches_labels(ref, labels):
-            continue
-        identifiers = [
-            ident.identifier
-            for ident in contacts.store.get_identifiers(contact.id)
-            if ident.channel == channel
-        ]
-        if participant_ids:
-            identifiers = [
-                ident for ident in identifiers
-                if ident in participant_ids or ident in participant_map.values()
-            ]
-        chosen = _pick_delivery_value(identifiers)
-        if not chosen:
-            continue
-        candidates.append(ContactResolution(display_name=contact.display_name, jid=chosen))
+        candidates.append(ContactResolution(display_name=display_name or chosen, jid=chosen))
 
     if len(candidates) == 1:
         return candidates[0]
@@ -378,50 +252,26 @@ def contact_resolution_matches_reference(
     *,
     reference: str,
     resolution: ContactResolution,
-    contacts: "ContactsService | None" = None,
     knowledge: object | None = None,
 ) -> bool:
-    """Check that an exact mention resolves to one candidate for a name/alias."""
-    if knowledge is not None:
-        person_id = _proven_person_for_value(knowledge, resolution.jid)
-        if person_id is None and resolution.matched_identifier:
-            person_id = _proven_person_for_value(knowledge, resolution.matched_identifier)
-        if person_id is None:
-            # An unproven person has no labels to confirm against, and the legacy cache
-            # is not a second opinion once knowledge is the authority.
-            return False
-        labels = [knowledge.person_display_name(person_id) or ""]
-        labels.extend(knowledge.alias_names(person_id))
-        return _reference_matches_labels(reference, [label for label in labels if label])
-
-    if contacts is None:
+    """Check that a resolved identifier belongs to one knowledge-backed name."""
+    if knowledge is None:
         return False
-    contact_id = getattr(contacts, "known_jids", {}).get(resolution.jid)
-    if not contact_id and resolution.matched_identifier:
-        contact_id = getattr(contacts, "known_jids", {}).get(resolution.matched_identifier)
-    if not contact_id:
+    person_id = _proven_person_for_value(knowledge, resolution.jid)
+    if person_id is None and resolution.matched_identifier:
+        person_id = _proven_person_for_value(knowledge, resolution.matched_identifier)
+    if person_id is None:
         return False
-    contact = contacts.store.get_contact(contact_id)
-    if contact is None:
-        return False
-    labels = [contact.display_name]
-    labels.extend(alias.alias for alias in contacts.store.get_aliases(contact_id))
+    labels = [knowledge.person_display_name(person_id) or ""]
+    labels.extend(knowledge.alias_names(person_id))
     return _reference_matches_labels(reference, [label for label in labels if label])
 
 
 class ResolveContactTool(Tool):
     """Resolve a contact name or WhatsApp mention to one delivery JID."""
 
-    def __init__(
-        self,
-        *,
-        contacts: "ContactsService | None" = None,
-        knowledge: object | None = None,
-        chat_registry: "Any | None" = None,
-    ) -> None:
-        self._contacts = contacts
+    def __init__(self, *, knowledge: object | None = None) -> None:
         self._knowledge = knowledge
-        self._chat_registry = chat_registry
         self._channel = ""
         self._chat_id = ""
 
@@ -474,18 +324,16 @@ class ResolveContactTool(Tool):
 
     async def execute(self, query: str, **kwargs: Any) -> str:
         from yeoman_gateway.processing.tool_context import tool_history_snapshot
-        snapshot = tool_history_snapshot(selected=getattr(self, '_history_selected', False))
+        snapshot = tool_history_snapshot()
         if snapshot is not None and self._knowledge is None:
             from yeoman_gateway.history.live import HistoryPaused
             raise HistoryPaused('history_knowledge_required')
         del kwargs
         result = resolve_contact_reference(
-            contacts=self._contacts,
             knowledge=self._knowledge,
             reference=query,
             channel=self._channel,
             chat_id=self._chat_id,
-            chat_registry=self._chat_registry,
         )
         if result is None:
             return json.dumps(

@@ -5,6 +5,22 @@ import sqlite3
 from pathlib import Path
 
 
+def prepare_empty_history_knowledge(tmp_path: Path, name: str = "knowledge") -> Path:
+    """Publish an empty synthetic schema-3 copy for native capture fixtures."""
+    from yeoman_gateway.knowledge._history_upgrade import upgrade_history_knowledge
+    from yeoman_gateway.knowledge._store import KnowledgeStore
+
+    directory = tmp_path / name
+    directory.mkdir(parents=True, exist_ok=True)
+    source = directory / "knowledge-v2.db"
+    store = KnowledgeStore(source)
+    store.set_meta("migration_complete", "1")
+    store.close()
+    target = directory / "knowledge-v3.db"
+    upgrade_history_knowledge(source=source, target=target)
+    return target
+
+
 def prepare_history_retirement_knowledge(tmp_path: Path, name: str = "knowledge") -> Path:
     """Upgrade a real synthetic v2 store and persist its durable cutover handover."""
     from yeoman_gateway.knowledge._history_upgrade import upgrade_history_knowledge
@@ -106,7 +122,6 @@ class ProjectedHistory:
         return history_turn(self)
 
     def wire(self, consumer):
-        consumer._history_selected = True
         consumer._history_projector = self
         consumer._history_knowledge = None
         return consumer
@@ -114,3 +129,136 @@ class ProjectedHistory:
     def close(self):
         for snapshot in self.snapshots:
             snapshot.close()
+
+
+def install_projected_responder_history(monkeypatch, request, tmp_path: Path) -> None:
+    """Give ordinary WhatsApp responder tests a real projected History turn."""
+    import time
+
+    from yeoman_gateway.adapters.responder_llm import LLMResponder
+
+    original = LLMResponder.generate_reply
+    histories: dict[int, ProjectedHistory] = {}
+    sequence = 0
+    last_timestamp = 0
+
+    async def generate_reply(responder, event, decision, **kwargs):
+        nonlocal sequence, last_timestamp
+        key = id(responder)
+        history = histories.get(key)
+        if (event.channel != "whatsapp" or (history is None and (
+                responder._history_projector is not None))):
+            return await original(responder, event, decision, **kwargs)
+
+        if history is None:
+            history = ProjectedHistory(tmp_path / f"responder-history-{key}")
+            history.wire(responder)
+            histories[key] = history
+            responder._test_projected_history = history
+
+        sequence += 1
+        timestamp = max(int(time.time() * 1000), last_timestamp + 2)
+        message_id = event.message_id or f"test-in-{sequence}"
+        if event.message_id is None:
+            from dataclasses import replace
+
+            event = replace(event, message_id=message_id)
+        history.add_message(
+            chat_id=event.chat_id,
+            message_id=message_id,
+            text=event.content,
+            timestamp=timestamp,
+            sender_id=event.sender_id,
+            sender_name=event.raw_metadata.get("sender_name"),
+            direction="in",
+        )
+        async with history.turn() as snapshot:
+            kwargs["history_snapshot"] = kwargs.get("history_snapshot") or snapshot
+            result = await original(responder, event, decision, **kwargs)
+        if result:
+            sequence += 1
+            last_timestamp = timestamp + 1
+            history.add_message(
+                chat_id=event.chat_id,
+                message_id=f"test-out-{sequence}",
+                text=result,
+                timestamp=timestamp + 1,
+                sender_id="yeoman",
+                direction="out",
+            )
+        else:
+            last_timestamp = timestamp
+        return result
+
+    original_direct = LLMResponder.process_direct
+
+    async def process_direct(responder, content, **kwargs):
+        channel = kwargs.get("channel", "cli")
+        if channel not in {"whatsapp", "cli", "system"}:
+            return await original_direct(responder, content, **kwargs)
+        key = id(responder)
+        history = histories.get(key)
+        if history is None:
+            if responder._history_projector is not None:
+                return await original_direct(responder, content, **kwargs)
+            history = ProjectedHistory(tmp_path / f"responder-history-{key}")
+            history.wire(responder)
+            histories[key] = history
+        async with history.turn():
+            return await original_direct(responder, content, **kwargs)
+
+    monkeypatch.setattr(LLMResponder, "process_direct", process_direct)
+    monkeypatch.setattr(LLMResponder, "generate_reply", generate_reply)
+    request.addfinalizer(lambda: [history.close() for history in histories.values()])
+
+
+def install_projected_thread_history(monkeypatch, request, tmp_path: Path) -> None:
+    """Give actor test doubles the projected journal their generation consumes."""
+    from yeoman_gateway.processing.responder import ThreadActorResponder
+
+    original = ThreadActorResponder.generate_reply
+    histories = {}
+    projected = {}
+
+    async def generate_reply(wrapper, event, decision):
+        key = id(wrapper)
+        history = histories.get(key)
+        if history is None:
+            if getattr(wrapper._inner, "_history_projector", None) is not None:
+                return await original(wrapper, event, decision)
+            history = ProjectedHistory(tmp_path / f"thread-history-{key}")
+            history.wire(wrapper._inner)
+            histories[key] = history
+            projected[key] = set()
+        for source in wrapper._store.events_after(after_ms=0):
+            if source.event_id in projected[key] or source.channel != "whatsapp":
+                continue
+            history.add_message(chat_id=source.chat_id,
+                message_id=source.source_message_id or source.event_id,
+                text=str((source.payload or {}).get("text", "")),
+                timestamp=source.occurred_ms, sender_id=source.principal,
+                participant=source.principal)
+            projected[key].add(source.event_id)
+        return await original(wrapper, event, decision)
+
+    monkeypatch.setattr(ThreadActorResponder, "generate_reply", generate_reply)
+    request.addfinalizer(lambda: [history.close() for history in histories.values()])
+
+
+def install_projected_effect_history(monkeypatch, request, tmp_path: Path) -> None:
+    """Wire native history for effect tests that use the real bus executor."""
+    from yeoman_gateway.processing.dispatch import BusEffectExecutor
+    from yeoman_gateway.processing.effects import EffectGateway
+
+    original = EffectGateway.__init__
+    histories = []
+
+    def initialize(gateway, *args, **kwargs):
+        original(gateway, *args, **kwargs)
+        if isinstance(gateway._executor, BusEffectExecutor):
+            history = ProjectedHistory(tmp_path / f"effect-history-{id(gateway)}")
+            gateway.set_history_scope(history, None)
+            histories.append(history)
+
+    monkeypatch.setattr(EffectGateway, "__init__", initialize)
+    request.addfinalizer(lambda: [history.close() for history in histories])

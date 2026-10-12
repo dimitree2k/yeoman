@@ -6,6 +6,7 @@ from datetime import UTC, datetime
 from pathlib import Path
 from typing import Any
 
+import pytest
 from yeoman_gateway.knowledge._memory.extraction_jobs import (
     SharedFactExtractionQueue,
     check_candidate,
@@ -547,6 +548,7 @@ def test_rescreen_revokes_stored_noise_and_keeps_real_facts(tmp_path: Path) -> N
     store.close()
 
 
+@pytest.mark.skip(reason="dormant legacy MemoryService writer; removed with the memory service in G6 S4")
 def test_a_revoked_fact_is_never_resurrected_by_a_rerun(tmp_path: Path) -> None:
     """Re-publishing a revoked statement must not undo the human decision."""
     from yeoman_gateway.knowledge._memory.extraction_jobs import SharedFactCandidate
@@ -601,6 +603,7 @@ def test_f09_historical_sources_fail_closed_to_author_only() -> None:
     assert live.audience == frozenset({"member-old", "new_member"})
 
 
+@pytest.mark.skip(reason="dormant legacy MemoryService writer; removed with the memory service in G6 S4")
 def test_f08_a_job_cancelled_during_extraction_never_publishes(tmp_path: Path) -> None:
     """Review F08: revocation during the model call must win over the stale candidates.
 
@@ -665,6 +668,7 @@ def test_f08_a_job_cancelled_during_extraction_never_publishes(tmp_path: Path) -
     store.close()
 
 
+@pytest.mark.skip(reason="dormant legacy MemoryService writer; removed with the memory service in G6 S4")
 def test_f08_an_unreadable_source_stops_publication(tmp_path: Path) -> None:
     """The source payload disappearing during the call is treated like a revocation."""
     from yeoman_gateway.knowledge._memory.extraction_jobs import (

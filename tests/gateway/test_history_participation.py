@@ -135,15 +135,14 @@ async def test_native_approval_proof_survives_real_staging(tmp_path, with_knowle
 async def test_non_dict_history_evidence_with_stale_proof_is_refused():
     from collections import UserDict
 
-    from yeoman_gateway.app.bootstrap import _KnowledgeDecisionValidator
+    from yeoman_gateway.app.bootstrap import _history_decision_validator
     from yeoman_gateway.history.context import history_turn, validate_history_evidence
     p = Projector()
     evidence = UserDict({'history': {'generation': 0, 'revisions': {'source': 'stale'}}})
-    validator = _KnowledgeDecisionValidator(selector=None, chat_registry=None, knowledge=None)
     try:
         async with history_turn(p):
             assert not validate_history_evidence(evidence)
-            assert validator(SimpleNamespace(knowledge_evidence=evidence)) == (False, 'history_sources_changed')
+            assert _history_decision_validator(SimpleNamespace(knowledge_evidence=evidence)) == (False, 'history_sources_changed')
     finally:
         p.close()
 

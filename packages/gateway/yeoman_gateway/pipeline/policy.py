@@ -15,12 +15,9 @@ from yeoman_gateway.core.ports import PolicyPort
 class PolicyMiddleware:
     """Evaluate inbound event and set ``ctx.decision``."""
 
-    def __init__(self, *, policy: PolicyPort, legacy_history_disabled: bool = False) -> None:
+    def __init__(self, *, policy: PolicyPort) -> None:
         self._policy = policy
-        self._legacy_history_disabled = legacy_history_disabled
 
     async def __call__(self, ctx: PipelineContext, next: NextFn) -> None:
-        ctx.decision = self._policy.evaluate(ctx.event)
-        if self._legacy_history_disabled:
-            ctx.decision = replace(ctx.decision, notes_enabled=False)
+        ctx.decision = replace(self._policy.evaluate(ctx.event), notes_enabled=False)
         await next(ctx)

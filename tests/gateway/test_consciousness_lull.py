@@ -31,7 +31,7 @@ def _config(**overrides: object) -> Config:
         "ownerDmDefaultEnabled": False,
     }
     payload.update(overrides)
-    return Config(history={"readers": {"secondary": True}}, consciousness=ConsciousnessConfig.model_validate(payload))
+    return Config(consciousness=ConsciousnessConfig.model_validate(payload))
 
 
 class _FakeSecurity:
@@ -305,8 +305,8 @@ async def test_lull_rejects_reply_to_outside_activity_window(tmp_path: Path) -> 
         policy_engine=PolicyEngine(_policy(), workspace=tmp_path),
         bus=MessageBus(),
         log=SpeakupLog(tmp_path / "speakups.db"),
-        inbound_archive=SecondaryArchive(object(), cfg.history),
-        memory=None,
+        inbound_archive=SecondaryArchive(),
+
         security=_FakeSecurity(),
         approval_store=None,
         now=lambda: now,

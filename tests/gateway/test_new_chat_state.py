@@ -10,6 +10,8 @@ from yeoman_gateway.core.pipeline import PipelineContext
 from yeoman_gateway.pipeline.new_chat import NewChatNotifyMiddleware, merge_seen_chat_files
 from yeoman_shared.utils.helpers import get_operational_store_path
 
+from tests.gateway.history_test_helpers import ProjectedHistory
+
 
 def test_merge_unions_sources_and_keeps_earliest_known_timestamp(tmp_path: Path) -> None:
     root = tmp_path / "seen_chats.json"
@@ -103,7 +105,8 @@ def test_merge_fails_closed_without_writing_partial_output(
     assert not output.exists()
 
 
-def test_fresh_turn_writes_only_canonical_seen_chats(tmp_path: Path, monkeypatch) -> None:
+@pytest.mark.asyncio
+async def test_fresh_turn_writes_only_canonical_seen_chats(tmp_path: Path, monkeypatch) -> None:
     monkeypatch.setenv("YEOMAN_HOME", str(tmp_path))
     canonical = get_operational_store_path("seen_chats")
     middleware = NewChatNotifyMiddleware(owner_alert_resolver=lambda _channel: ["123"])
@@ -116,7 +119,17 @@ def test_fresh_turn_writes_only_canonical_seen_chats(tmp_path: Path, monkeypatch
         raw_metadata={"group_name": "New group"},
     )
 
-    middleware._maybe_notify(PipelineContext(event=event))
+    history = ProjectedHistory(
+        tmp_path / "projected-history",
+        groups=[dict(chat_id="new@g.us", participants=[], timestamp=1791259200000, name="New group")],
+        messages=[dict(channel="whatsapp", chat_id="new@g.us", message_id="join-event",
+                       text="joined", timestamp=1791259200000, sender_id="sender")],
+    )
+    try:
+        async with history.turn():
+            middleware._maybe_notify(PipelineContext(event=event))
+    finally:
+        history.close()
 
     assert canonical.exists()
     assert json.loads(canonical.read_text()) == {
@@ -125,3 +138,14 @@ def test_fresh_turn_writes_only_canonical_seen_chats(tmp_path: Path, monkeypatch
     }
     assert not (tmp_path / "seen_chats.json").exists()
     assert not (tmp_path / "data" / "seen_chats.json").exists()
+
+
+def test_paused_history_does_not_consume_new_chat_notification() -> None:
+    from yeoman_gateway.history.live import HistoryPaused
+
+    middleware = NewChatNotifyMiddleware(owner_alert_resolver=lambda _channel: ["123"])
+    event = InboundEvent(channel="whatsapp", chat_id="paused-new@g.us", sender_id="sender", content="")
+    with pytest.raises(HistoryPaused, match="secondary_history_scope_required"):
+        middleware._maybe_notify(PipelineContext(event=event))
+    assert middleware._notified == set()
+    assert not get_operational_store_path("seen_chats").exists()

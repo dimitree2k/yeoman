@@ -98,10 +98,9 @@ async def test_observed_registration_uses_live_history_snapshot(
         workspace_id="synthetic",
         source_authority=RuntimeKnowledgeSources(),
         policy_authority=RuntimeKnowledgePolicy(
-            engine=None, chat_registry=None, policy_revision=1
+            engine=None, policy_revision=1
         ),
-        history_mode=True,
-    )
+            )
     history_path = tmp_path / "history.db"
     with sqlite3.connect(history_path) as db:
         create_history(db)
@@ -141,7 +140,7 @@ async def test_observed_registration_uses_live_history_snapshot(
                        "FROM messages")
     processing = ProcessingStore(tmp_path / "processing.db")
     registrar = ObservedSourceRegistrar(
-        knowledge=knowledge, processing=processing, chat_registry=None
+        knowledge=knowledge, processing=processing
     )
     registration_scopes = []
 

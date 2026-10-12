@@ -16,6 +16,8 @@ from yeoman_shared.config.schema import WhatsAppConfig
 from yeoman_shared.raw_archive.records import iter_records
 from yeoman_shared.raw_archive.writer import RawArchive, RawArchiveCapacityError
 
+from tests.gateway.history_test_helpers import ProjectedHistory
+
 
 def _record(
     cache: DocumentCache,
@@ -361,11 +363,29 @@ async def test_media_history_requires_explicit_query_before_extracting(
     processor = _Processor()
     tool = MediaHistoryTool(cache=cache, processor=processor)
     tool.set_context("whatsapp", "docs@g.us")
-
-    result = await tool.execute(
-        message_id="pdf-tool-empty-query",
-        extract=True,
+    history = ProjectedHistory(tmp_path / "media-tool-history", messages=[dict(
+        chat_id="docs@g.us", message_id="pdf-tool-empty-query", text="",
+        timestamp=time.time_ns() // 1_000_000,
+        media={"kind": "document", "mimeType": "application/pdf", "fileName": "report.pdf"},
+    )])
+    from yeoman_gateway.processing.tool_context import (
+        ToolInvocationContext,
+        reset_tool_context,
+        set_tool_context,
     )
+
+    async with history.turn() as snapshot:
+        token = set_tool_context(ToolInvocationContext(
+            channel="whatsapp", chat_id="docs@g.us", history_snapshot=snapshot,
+        ))
+        try:
+            result = await tool.execute(
+                message_id="pdf-tool-empty-query",
+                extract=True,
+            )
+        finally:
+            reset_tool_context(token)
+    history.close()
 
     assert processor.calls == 0
     assert "explicit" in result.lower()

@@ -163,8 +163,11 @@ class MediaHistoryTool(Tool):
         limit = max(1, min(12, int(kwargs.get("limit") or self._max_results)))
 
         from yeoman_gateway.processing.tool_context import tool_history_snapshot
-        snapshot = tool_history_snapshot(selected=getattr(self, '_history_selected', False))
-        if snapshot is not None and target_channel == 'whatsapp':
+        snapshot = tool_history_snapshot()
+        if target_channel == 'whatsapp':
+            if snapshot is None:
+                from yeoman_gateway.history.live import HistoryPaused
+                raise HistoryPaused('tool_history_scope_required')
             from dataclasses import replace
 
             from yeoman_gateway.adapters.reply_archive_history import archive_row

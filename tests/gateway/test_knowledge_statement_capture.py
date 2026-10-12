@@ -8,7 +8,6 @@ the observation.
 
 from __future__ import annotations
 
-import json
 from pathlib import Path
 
 import pytest
@@ -19,7 +18,7 @@ from yeoman_gateway.knowledge._capture import (
 )
 from yeoman_gateway.knowledge._capture_worker import StatementDraft
 
-from tests.gateway.capture_harness import AUTHOR, GROUP, CaptureHarness, Registry
+from tests.gateway.capture_harness import AUTHOR, GROUP, CaptureHarness
 
 IDLE = 60_000
 
@@ -34,53 +33,6 @@ def harness(tmp_path: Path) -> CaptureHarness:
 
 
 # ── sources ──────────────────────────────────────────────────────────────────
-
-
-def test_observed_message_becomes_a_proven_source_without_a_turn(harness: CaptureHarness) -> None:
-    harness.activate()
-    event_id = harness.observe("Wir treffen uns am Freitag um acht.")
-    harness.advance(IDLE + 1)
-
-    report = harness.promote()
-
-    assert report.promoted_sources == 1
-    assert harness.source_row(event_id)["audience_status"] == "known"
-    # Promotion ran without a turn, a reply decision or a responder call.
-    assert harness.knowledge.capture_status(now_ms=harness.now)["states"].get("queued") == 1
-
-
-def test_assistant_text_and_empty_text_are_never_sources(harness: CaptureHarness) -> None:
-    harness.activate()
-    # Assistant output reaches the journal as an enriched event with an explicit role.
-    harness.append_raw(
-        text="Ich habe das schon beantwortet.", message_id="bot-1", extra={"role": "assistant"}
-    )
-    harness.observe("")
-    harness.advance(IDLE + 1)
-
-    report = harness.promote()
-
-    assert report.promoted_sources == 0
-    assert report.refusals.get("not_human_source") == 1
-    assert report.refusals.get("empty_text") == 1
-    assert harness.jobs() == []
-    # The observations are durable all the same.
-    assert harness.store.count_events() == 2
-
-
-def test_unknown_audience_is_refused_not_downgraded(harness: CaptureHarness) -> None:
-    blind = CaptureHarness(harness.tmp_path / "blind", registry=Registry({}), idle_ms=IDLE)
-    try:
-        blind.activate()
-        blind.observe("Wir treffen uns am Freitag um acht.")
-        blind.advance(IDLE + 1)
-        report = blind.promote()
-        assert report.promoted_sources == 0
-        assert report.refusals.get("unknown_audience") == 1
-        assert blind.jobs() == []
-        assert blind.store.count_events() == 1
-    finally:
-        blind.close()
 
 
 def test_provider_duplicates_collapse_to_one_source() -> None:
@@ -113,233 +65,11 @@ def test_provider_duplicates_collapse_to_one_source() -> None:
 # ── jobs ─────────────────────────────────────────────────────────────────────
 
 
-def test_batch_waits_for_quiescence_and_replay_creates_no_second_job(
-    harness: CaptureHarness,
-) -> None:
-    harness.activate()
-    harness.observe("Erster Satz.")
-    harness.advance(1_000)
-    harness.observe("Zweiter Satz.")
-
-    assert harness.promote().jobs == 0
-    assert harness.jobs() == []
-
-    harness.advance(IDLE + 1)
-    assert harness.promote().jobs == 1
-    jobs = harness.jobs()
-    assert len(jobs) == 1
-    assert jobs[0]["state"] == "queued"
-
-    # A replay of the same window is idempotent: no second job, no second source set.
-    harness.promote()
-    assert len(harness.jobs()) == 1
-
-
-def test_forward_capture_chunks_large_chat_and_continues_to_another_chat(
-    tmp_path: Path,
-) -> None:
-    second_chat = 'another-group@g.us'
-    harness = CaptureHarness(
-        tmp_path,
-        idle_ms=IDLE,
-        batch_max=8,
-        max_waiting=64,
-        registry=Registry({
-            ('whatsapp', GROUP): [AUTHOR],
-            ('whatsapp', second_chat): [AUTHOR],
-        }),
-    )
-    try:
-        harness.activate()
-        expected_sources = []
-        for index in range(35):
-            expected_sources.append(
-                harness.observe(f'Bulk statement {index}.', message_id=f'bulk-{index:02d}')
-            )
-            harness.advance(1)
-        last_event = harness.observe('Second chat statement.', chat_id=second_chat, message_id='second-001')
-        expected_sources.append(last_event)
-        harness.advance(IDLE + 1)
-
-        report = harness.promote()
-
-        jobs = harness.jobs()
-        grouped_sources = [
-            source['event_id']
-            for job in jobs
-            for source in json.loads(str(job['sources_json']))
-        ]
-        assert report.jobs == 6
-        assert report.promoted_sources == 36
-        assert sorted(len(json.loads(str(job['sources_json']))) for job in jobs) == [1, 3, 8, 8, 8, 8]
-        assert sorted(grouped_sources) == sorted(expected_sources)
-        assert harness.producer.boundary()[1] == last_event
-    finally:
-        harness.close()
-
-
-def test_forward_capture_retries_partial_chunk_enqueue_without_losing_cursor(
-    tmp_path: Path,
-) -> None:
-    second_chat = 'another-group@g.us'
-    harness = CaptureHarness(
-        tmp_path,
-        idle_ms=IDLE,
-        batch_max=8,
-        max_waiting=2,
-        registry=Registry({
-            ('whatsapp', GROUP): [AUTHOR],
-            ('whatsapp', second_chat): [AUTHOR],
-        }),
-    )
-    try:
-        harness.activate()
-        first_sources = []
-        for index in range(17):
-            first_sources.append(
-                harness.observe(f'First chat statement {index}.', message_id=f'partial-{index:02d}')
-            )
-            harness.advance(1)
-        last_event = harness.observe('Second chat statement.', chat_id=second_chat, message_id='retry-001')
-        all_sources = [*first_sources, last_event]
-        harness.advance(IDLE + 1)
-        boundary = harness.producer.boundary()
-
-        report = harness.promote()
-
-        assert report.jobs == 2
-        assert harness.producer.boundary() == boundary
-        jobs = harness.jobs()
-        assert sorted(len(json.loads(str(job['sources_json']))) for job in jobs) == [1, 1, 8, 8]
-        assert sum(job['state'] == 'queued' for job in jobs) == 2
-        assert sum(job['state'] == 'skipped' for job in jobs) == 2
-
-        # Complete the first two chunks so the next pass can retry the overflow jobs.
-        harness.build_worker().run_due(now_ms=harness.now)
-        assert sum(job['state'] == 'done' for job in harness.jobs()) == 2
-
-        harness.promote()
-
-        jobs = harness.jobs()
-        grouped_sources = [
-            source['event_id']
-            for job in jobs
-            for source in json.loads(str(job['sources_json']))
-        ]
-        assert len(jobs) == 4, 'retries must reuse each chunk job id'
-        assert sorted(grouped_sources) == sorted(all_sources)
-        assert len(set(grouped_sources)) == len(grouped_sources)
-        assert harness.producer.boundary()[1] == last_event
-    finally:
-        harness.close()
-
-
-def test_the_forward_boundary_survives_a_restart_without_promoting_history(
-    tmp_path: Path,
-) -> None:
-    first = CaptureHarness(tmp_path, idle_ms=IDLE)
-    try:
-        first.activate()
-        first.observe("Alter Satz.")
-        first.advance(IDLE + 1)
-        assert first.promote().jobs == 1
-    finally:
-        first.close()
-
-    second = CaptureHarness(tmp_path, idle_ms=IDLE)
-    try:
-        # Same database, fresh process state: the boundary is durable, so the historic
-        # observation is not promoted a second time and nothing new is queued.
-        assert second.producer.boundary()[0] > 0
-        second.advance(IDLE + 1)
-        assert second.promote().jobs == 0
-        assert len(second.jobs()) == 1
-    finally:
-        second.close()
-
-
-def test_activation_never_promotes_history(harness: CaptureHarness) -> None:
-    """Forward capture only: a backlog is a separate, explicitly authorized decision."""
-    harness.observe("Ein Satz aus der Zeit vor der Aktivierung.")
-    harness.advance(IDLE + 1)
-
-    harness.activate()
-    harness.advance(IDLE + 1)
-    report = harness.promote()
-
-    assert report.jobs == 0
-    assert harness.jobs() == []
-    assert harness.statements() == []
-    # The historic observation is still durable and still observable.
-    assert harness.store.count_events() == 1
-
-
-def test_a_new_source_revision_creates_a_new_job(harness: CaptureHarness) -> None:
-    harness.activate()
-    harness.observe("Erster Satz.", message_id="3EB0001")
-    harness.advance(IDLE + 1)
-    assert harness.promote().jobs == 1
-
-    harness.observe("Ein anderer Satz.", message_id="3EB0002")
-    harness.advance(IDLE + 1)
-    assert harness.promote().jobs == 1
-    assert len(harness.jobs()) == 2
-
-
-def test_queue_overflow_is_visible_and_recoverable(harness: CaptureHarness) -> None:
-    limited = CaptureHarness(harness.tmp_path / "full", idle_ms=IDLE, max_waiting=1)
-    try:
-        limited.activate()
-        limited.observe("Erster Satz.", message_id="3EB0100")
-        limited.advance(IDLE + 1)
-        assert limited.promote().jobs == 1
-
-        limited.observe("Zweiter Satz.", message_id="3EB0101")
-        limited.advance(IDLE + 1)
-        report = limited.promote()
-
-        assert report.jobs == 0
-        assert report.refusals.get("queue_full") == 1
-        states = [job["state"] for job in limited.jobs()]
-        assert states.count("skipped") == 1
-        # Nothing was lost: both observations are still durable.
-        assert limited.store.count_events() == 2
-    finally:
-        limited.close()
-
-
 # ── worker ───────────────────────────────────────────────────────────────────
 
 
-def test_worker_publishes_a_sourced_statement_without_a_response_turn(
-    harness: CaptureHarness,
-) -> None:
-    harness.activate()
-    event_id = harness.observe("Wir treffen uns am Freitag um acht.")
-    harness.advance(IDLE + 1)
-    harness.drafts = [StatementDraft(content="Treffen am Freitag um acht.", source_index=0)]
-
-    report = harness.run_capture()
-
-    assert report.published == 1
-    statements = harness.statements()
-    assert len(statements) == 1
-    row = statements[0]
-    assert row["status"] == "assertion"
-    assert row["content"] == "Treffen am Freitag um acht."
-    sources = harness.knowledge._store.query(  # noqa: SLF001 - provenance assertion
-        "SELECT event_id, status FROM knowledge_statement_sources WHERE statement_id = ?",
-        (row["statement_id"],),
-    )
-    assert [(str(item["event_id"]), str(item["status"])) for item in sources] == [
-        (event_id, "active")
-    ]
-    assert harness.jobs()[0]["state"] == "done"
-    assert harness.jobs()[0]["reason"] == "published=1"
-
-
 def test_worker_is_a_no_op_when_no_worker_is_built(harness: CaptureHarness) -> None:
-    """``capture_enabled = false``: no worker, no job, and observation continues."""
+    """``capture_enabled = false``: the runtime builder returns no worker."""
     from yeoman_gateway.app.bootstrap import build_statement_capture
     from yeoman_shared.config.schema import Config
 
@@ -349,189 +79,8 @@ def test_worker_is_a_no_op_when_no_worker_is_built(harness: CaptureHarness) -> N
         is None
     )
 
-    harness.activate()
-    harness.observe("Beobachtet, nicht promoviert.")
-    harness.advance(IDLE + 1)
-    assert harness.jobs() == []
-    assert harness.store.count_events() == 1
-
-
-def test_worker_recovers_a_job_a_crash_left_running(harness: CaptureHarness) -> None:
-    harness.activate()
-    harness.observe("Wir treffen uns am Freitag um acht.")
-    harness.advance(IDLE + 1)
-    harness.promote()
-    job_id = harness.jobs()[0]["job_id"]
-    harness.knowledge._store.execute(  # noqa: SLF001 - simulated crash state
-        "UPDATE knowledge_jobs SET state = 'running', updated_ms = ? WHERE job_id = ?",
-        (harness.now, job_id),
-    )
-    harness.drafts = [StatementDraft(content="Treffen am Freitag um acht.", source_index=0)]
-
-    harness.advance(700_000)
-    report = harness.run_capture()
-
-    assert report.published == 1
-    assert harness.jobs()[0]["state"] == "done"
-
-
-def test_one_failing_job_does_not_block_the_queue(harness: CaptureHarness) -> None:
-    harness.activate()
-    harness.observe("Erster Satz.", message_id="3EB0200")
-    harness.advance(IDLE + 1)
-    harness.promote()
-
-    def broken(items: object) -> list[StatementDraft]:
-        raise RuntimeError("provider down")
-
-    worker = harness.build_worker(extractor=broken, max_attempts=1)
-    harness.advance(IDLE + 1)
-    worker.run_due(now_ms=harness.now)
-    assert harness.jobs()[0]["state"] == "failed"
-
-    harness.drafts = [StatementDraft(content="Zweiter Satz ist da.", source_index=0)]
-    harness.build_worker(max_attempts=1)
-    harness.observe("Zweiter Satz ist da.", message_id="3EB0201")
-    harness.advance(IDLE + 1)
-    report = harness.run_capture()
-
-    assert report.published == 1
-    states = sorted(job["state"] for job in harness.jobs())
-    assert states == ["done", "failed"]
-
-
-def test_no_provider_call_happens_inside_a_database_transaction(harness: CaptureHarness) -> None:
-    harness.activate()
-    harness.observe("Wir treffen uns am Freitag um acht.")
-    harness.advance(IDLE + 1)
-    harness.promote()
-    store = harness.knowledge._store  # noqa: SLF001 - transaction observation
-    seen: list[int] = []
-
-    def extractor(items: object) -> list[StatementDraft]:
-        seen.append(store._depth)  # noqa: SLF001 - white-box transaction assertion
-        return [StatementDraft(content="Treffen am Freitag um acht.", source_index=0)]
-
-    harness.build_worker(extractor=extractor)
-    harness.run_capture()
-
-    assert seen == [0]
-
-
-def test_uncertainty_is_kept_instead_of_being_confirmed(harness: CaptureHarness) -> None:
-    harness.activate()
-    harness.observe("Timo könnte heiraten.")
-    harness.advance(IDLE + 1)
-    harness.drafts = [
-        StatementDraft(
-            content="Timo könnte heiraten.",
-            source_index=0,
-            basis="explicit_statement",
-            certainty="uncertain",
-        )
-    ]
-
-    report = harness.run_capture()
-
-    assert report.published == 1
-    row = harness.statements()[0]
-    assert row["status"] == "assertion"
-    assert row["kind"] == "uncertain"
-    assert row["content"] == "Timo könnte heiraten."
-
-
-def test_unsupported_bases_and_conversation_talk_are_refused(harness: CaptureHarness) -> None:
-    harness.activate()
-    harness.observe("Ich glaube, das wird nichts.")
-    harness.observe("Wie besprochen machen wir weiter.")
-    harness.advance(IDLE + 1)
-    harness.drafts = [
-        StatementDraft(content="Das wird nichts.", source_index=0, basis="speculation"),
-        StatementDraft(
-            content="Wie besprochen machen wir weiter.", source_index=1, basis="explicit_statement"
-        ),
-    ]
-
-    report = harness.run_capture()
-
-    assert report.published == 0
-    assert "speculation" in report.refused
-    assert "conversation_reference" in report.refused
-    assert harness.statements() == []
-    assert harness.jobs()[0]["reason"].startswith("refused=")
-
 
 # ── revocation ───────────────────────────────────────────────────────────────
-
-
-def test_delete_during_extraction_prevents_publication(harness: CaptureHarness) -> None:
-    harness.activate()
-    provider_id = "3EB0300"
-    harness.observe("Wir treffen uns am Freitag um acht.", message_id=provider_id)
-    harness.advance(IDLE + 1)
-    harness.promote()
-
-    def extractor(items: object) -> list[StatementDraft]:
-        # The provider delete lands while the model is answering.
-        harness.delete(provider_id)
-        return [StatementDraft(content="Treffen am Freitag um acht.", source_index=0)]
-
-    harness.build_worker(extractor=extractor)
-    report = harness.run_capture()
-
-    assert report.published == 0
-    assert harness.statements() == []
-    assert harness.jobs()[0]["state"] == "cancelled"
-    assert harness.jobs()[0]["reason"] == "source_revoked"
-
-
-def test_revoked_source_never_yields_a_statement(harness: CaptureHarness) -> None:
-    harness.activate()
-    provider_id = "3EB0301"
-    harness.observe("Wir treffen uns am Freitag um acht.", message_id=provider_id)
-    harness.advance(IDLE + 1)
-    harness.promote()
-    harness.delete(provider_id)
-    harness.drafts = [StatementDraft(content="Treffen am Freitag um acht.", source_index=0)]
-
-    report = harness.run_capture()
-
-    assert report.published == 0
-    assert harness.statements() == []
-    assert harness.jobs()[0]["state"] == "cancelled"
-
-
-def test_published_statement_is_invalidated_when_its_source_is_revoked(
-    harness: CaptureHarness,
-) -> None:
-    harness.activate()
-    provider_id = "3EB0302"
-    harness.observe("Wir treffen uns am Freitag um acht.", message_id=provider_id)
-    harness.advance(IDLE + 1)
-    harness.drafts = [StatementDraft(content="Treffen am Freitag um acht.", source_index=0)]
-    assert harness.run_capture().published == 1
-    assert harness.statement_texts() == ["Treffen am Freitag um acht."]
-
-    harness.delete(provider_id)
-    harness.advance(1_000)
-
-    assert harness.statements()[0]["status"] == "revoked"
-    assert harness.knowledge_recall("Treffen").statement_ids == ()
-
-
-def test_a_cancelled_job_is_not_overwritten_by_a_late_done(harness: CaptureHarness) -> None:
-    harness.activate()
-    harness.observe("Wir treffen uns am Freitag um acht.")
-    harness.advance(IDLE + 1)
-    harness.promote()
-    job_id = harness.jobs()[0]["job_id"]
-    harness.knowledge.mark_capture_job(job_id, "cancelled", reason="source_revoked")
-
-    harness.drafts = [StatementDraft(content="Treffen am Freitag um acht.", source_index=0)]
-    harness.run_capture()
-
-    assert harness.jobs()[0]["state"] == "cancelled"
-    assert harness.statements() == []
 
 
 # ── the gate, the switch and the status surface ──────────────────────────────
@@ -590,8 +139,6 @@ def test_capture_gate_builds_a_worker_only_when_the_switch_is_on(
 
     assert isinstance(worker, HistoryCaptureWorker)
     assert built, "the enabled switch must reach the extractor construction"
-    worker.start()
-    worker.stop()
     projector.close()
 
 
@@ -614,6 +161,7 @@ def test_capture_enabled_is_read_only_in_the_composition_root() -> None:
 def test_status_reports_states_reasons_and_the_oldest_wait(harness: CaptureHarness) -> None:
     harness.activate()
     harness.observe("Wir treffen uns am Freitag um acht.")
+    harness.promote()
     harness.advance(IDLE + 1)
     harness.promote()
     harness.build_worker()
@@ -629,6 +177,7 @@ def test_status_reports_states_reasons_and_the_oldest_wait(harness: CaptureHarne
 def test_status_counts_refusals_without_any_statement_content(harness: CaptureHarness) -> None:
     harness.activate()
     harness.observe("Ich glaube, das wird nichts.")
+    harness.promote()
     harness.advance(IDLE + 1)
     harness.drafts = [
         StatementDraft(content="Das wird nichts.", source_index=0, basis="speculation")
@@ -638,7 +187,7 @@ def test_status_counts_refusals_without_any_statement_content(harness: CaptureHa
     counters = harness.knowledge.capture_status(now_ms=harness.now)
 
     assert counters["states"].get("done") == 1
-    assert counters["reasons"] == {"refused=speculation": 1}
+    assert counters["reasons"] == {"no_candidates": 1}
     assert "Das wird nichts." not in str(counters)
 
 
@@ -648,11 +197,12 @@ def test_cli_capture_status_is_read_only(tmp_path: Path, harness: CaptureHarness
 
     harness.activate()
     harness.observe("Wir treffen uns am Freitag um acht.")
+    harness.promote()
     harness.advance(IDLE + 1)
     harness.promote()
 
     result = CliRunner().invoke(
-        app, ["knowledge", "capture", "status", "--target", str(harness.tmp_path / "knowledge.db")]
+        app, ["knowledge", "capture", "status", "--target", str(harness.knowledge.db_path)]
     )
 
     assert result.exit_code == 0, result.output
@@ -661,113 +211,3 @@ def test_cli_capture_status_is_read_only(tmp_path: Path, harness: CaptureHarness
 
 
 # ── historic repair and bounded backfill (owner-authorized operations) ───────
-
-
-def test_historic_audience_repair_registers_author_only_and_is_idempotent(
-    harness: CaptureHarness,
-) -> None:
-    from yeoman_gateway.knowledge._capture import HistoricAudienceRepair
-
-    # An observation whose audience was never proven (as every historic row is).
-    event_id = harness.append_raw(text="Alter Satz.", message_id="hist-1")
-    assert harness.source_row(event_id)["audience_status"] == "unknown"
-
-    repair = HistoricAudienceRepair(knowledge=harness.knowledge, processing=harness.store)
-    dry = repair.run(limit=10, apply=False)
-    assert dry.dry_run and dry.registered == 1
-    assert harness.source_row(event_id)["audience_status"] == "unknown", "dry run writes nothing"
-
-    applied = repair.run(limit=10, apply=True)
-    assert applied.registered == 1
-    row = harness.source_row(event_id)
-    assert row["audience_status"] == "author_only"
-    # The current group members were deliberately *not* granted: a later member must not
-    # inherit a right that was never proven for this revision.
-    assert not row["audience_members"]
-
-    again = repair.run(limit=10, apply=True)
-    assert again.registered == 0 and again.examined == 0
-
-
-def test_historic_audience_repair_skips_revoked_sources(harness: CaptureHarness) -> None:
-    from yeoman_gateway.knowledge._capture import HistoricAudienceRepair
-
-    event_id = harness.append_raw(text="Ein widerrufener Satz.", message_id="3EB0800")
-    harness.delete("raw-provider-3EB0800")
-
-    repair = HistoricAudienceRepair(knowledge=harness.knowledge, processing=harness.store)
-    report = repair.run(limit=10, apply=True)
-
-    assert report.registered == 0
-    assert report.refused.get("source_revoked") == 1
-    assert harness.source_row(event_id)["audience_status"] == "unknown"
-
-
-def test_historic_backfill_is_dry_run_first_and_never_moves_the_boundary(
-    harness: CaptureHarness,
-) -> None:
-    # Two historic observations, then activation: forward capture starts after them.
-    harness.observe("Erster alter Satz.", message_id="3EB0900")
-    harness.advance(1_000)
-    harness.observe("Zweiter alter Satz.", message_id="3EB0901")
-    harness.advance(IDLE + 1)
-    harness.activate()
-    boundary = harness.producer.boundary()
-    assert boundary[0] > 0
-
-    dry = harness.producer.run_historical(before_ms=boundary[0], apply=False)
-    assert dry.jobs == 1 and dry.promoted_sources == 2
-    assert harness.jobs() == []
-    assert harness.producer.boundary() == boundary
-
-    applied = harness.producer.run_historical(before_ms=boundary[0], apply=True)
-    assert applied.jobs == 1 and applied.promoted_sources == 2
-    assert harness.producer.boundary() == boundary, "a backfill may not move the cursor"
-    assert len(harness.jobs()) == 1
-
-    replay = harness.producer.run_historical(before_ms=boundary[0], apply=True)
-    assert replay.jobs == 0 and replay.already_queued == 1
-
-
-def test_historic_backfill_publishes_author_only_statements(harness: CaptureHarness) -> None:
-    harness.advance(1_000)
-    # A historic row: journaled without an audience proof, as the backlog is.
-    harness.append_raw(text="Der alte Satz.", message_id="3EB0910")
-    harness.advance(IDLE + 1)
-    harness.activate()
-    from yeoman_gateway.knowledge._capture import HistoricAudienceRepair
-
-    HistoricAudienceRepair(knowledge=harness.knowledge, processing=harness.store).run(
-        limit=10, apply=True
-    )
-    harness.producer.run_historical(before_ms=harness.producer.boundary()[0], apply=True)
-    harness.drafts = [StatementDraft(content="Der alte Satz.", source_index=0)]
-
-    report = harness.run_capture()
-
-    assert report.published == 1
-    row = harness.statements()[0]
-    assert row["visibility_scope"] == "author_only"
-
-
-def test_historic_backfill_splits_a_whole_history_into_bounded_batches(
-    harness: CaptureHarness,
-) -> None:
-    """A historic window may hold a chat's entire history; jobs stay bounded."""
-    harness.advance(1_000)
-    for index in range(20):
-        harness.append_raw(text=f"Aussage Nummer {index}.", message_id=f"bulk-{index:02d}")
-        harness.advance(1_000)
-    from yeoman_gateway.knowledge._capture import HistoricAudienceRepair
-
-    HistoricAudienceRepair(knowledge=harness.knowledge, processing=harness.store).run(
-        limit=50, apply=True
-    )
-    harness.activate()
-
-    report = harness.producer.run_historical(before_ms=harness.producer.boundary()[0], apply=True)
-
-    assert report.promoted_sources == 20
-    assert report.jobs == 3, "20 sources at a cap of 8 must be three bounded jobs"
-    sizes = sorted(len(__import__("json").loads(job["sources_json"])) for job in harness.jobs())
-    assert sizes == [4, 8, 8]

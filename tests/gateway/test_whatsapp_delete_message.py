@@ -39,7 +39,7 @@ async def test_whatsapp_channel_routes_delete_without_sending_text() -> None:
             channel="whatsapp",
             chat_id="12345@g.us",
             content="must not be sent",
-            metadata={"delete_message": {"message_id": "BAE5DELETE"}},
+            metadata={"historyMentionsResolved": True, "delete_message": {"message_id": "BAE5DELETE"}},
         )
     )
 
@@ -71,7 +71,7 @@ async def test_whatsapp_channel_rejects_malformed_delete_request() -> None:
                 channel="whatsapp",
                 chat_id="12345@s.whatsapp.net",
                 content="must not be sent",
-                metadata={"delete_message": {}},
+                metadata={"historyMentionsResolved": True, "delete_message": {}},
             )
         )
 

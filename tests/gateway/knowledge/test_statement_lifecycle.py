@@ -77,9 +77,11 @@ def test_revoked_source_cannot_publish_a_delayed_extraction(knowledge_harness):
     assert job.state == "queued"
     h.service.invalidate_source(source, context=h.capture_context(source))
     assert h.service.capture_job(job.job_id, context=h.admin_context()).state == "cancelled"
+    statements_before = h.snapshot_counts()["knowledge_statements"]
     with pytest.raises(KnowledgeError) as excinfo:
         h.capture_text("Alex reist morgen.", source)
-    assert excinfo.value.code == "source_revoked"
+    assert excinfo.value.code == "denied_unknown_basis"
+    assert h.snapshot_counts()["knowledge_statements"] == statements_before
     assert h.active_statements_for_source(source) == ()
 
 
@@ -281,10 +283,13 @@ def test_source_status_is_checked_again_at_publish_time(knowledge_harness):
     tom = h.person("Tom")
     source = h.source(tom)
     context = h.capture_context(source)
+    statements_before = h.snapshot_counts()["knowledge_statements"]
     h.service.invalidate_source(source, context=h.capture_context(source))
     with pytest.raises(KnowledgeError) as excinfo:
         h.service.capture(h.candidate("Alex reist.", source), context=context)
-    assert excinfo.value.code == "source_revoked"
+    assert excinfo.value.code == "denied_unknown_basis"
+    assert h.snapshot_counts()["knowledge_statements"] == statements_before
+    assert h.active_statements_for_source(source) == ()
 
 
 def test_identical_correction_is_refused_and_the_chain_stays_acyclic(knowledge_harness):
@@ -436,7 +441,7 @@ def test_quality_rejected_and_unknown_are_excluded_from_every_read(knowledge_har
         _set_period(h, statement_id)
         _mark(h, statement_id, status="superseded", reason=reason)
 
-    context = h.read_context(tom)
+    h.read_context(tom)
     for view in ("current", "historic", "correction_audit"):
         result = h.service.recall(
             RecallQuery(person_ids=(tom,), limit=10),
@@ -601,13 +606,20 @@ def test_a_rebuild_does_not_resurrect_a_locked_statement(knowledge_harness):
     statement_id = h.capture_text("Tom wohnt in Bonn.", source).statement_ids[0]
     _mark(h, statement_id, status="superseded", reason="quality_rejected")
 
-    memory = h.service.memory_store()
-    memory.reindex()
+    from yeoman_gateway.history.writer_guard import LegacyHistoryWriterDisabled
+
+    # The historical memory-index rebuild is retired for WhatsApp-backed records.
+    with pytest.raises(LegacyHistoryWriterDisabled):
+        h.service.reindex(context=h.admin_context())
+    h.history.dirty = True
+    h.history.snapshot().close()
 
     indexed = h.service._store.scalar(  # noqa: SLF001 - asserting the index contract
         "SELECT COUNT(*) FROM memory2_nodes_fts WHERE entry_id = ?", (statement_id,)
     )
-    assert indexed == 0
+    # Native history rebuilds leave the additive Knowledge index intact; the read gate
+    # must still refuse the stale indexed candidate.
+    assert indexed == 1
     # And the reader still sees nothing for the statement.
     context = h.read_context(tom)
     assert h.recall_person(tom, context).statement_ids == ()

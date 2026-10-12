@@ -52,8 +52,8 @@ class _RecordingTool(Tool):
 def _event() -> InboundEvent:
     return InboundEvent(
         channel="whatsapp",
-        chat_id="chat@s.whatsapp.net",
-        sender_id="sender@s.whatsapp.net",
+        chat_id="10002@s.whatsapp.net",
+        sender_id="10001@s.whatsapp.net",
         content="hello",
     )
 
@@ -85,6 +85,14 @@ async def _run(
     return responder, result
 
 
+
+@pytest.fixture(autouse=True)
+def _project_whatsapp_responder_history(monkeypatch, request, tmp_path):
+    from tests.gateway.history_test_helpers import install_projected_responder_history
+
+    install_projected_responder_history(monkeypatch, request, tmp_path)
+
+
 @pytest.mark.asyncio
 async def test_provider_error_does_not_become_assistant_content(tmp_path: Path) -> None:
     provider = _Provider(
@@ -93,10 +101,13 @@ async def test_provider_error_does_not_become_assistant_content(tmp_path: Path) 
 
     responder, result = await _run(tmp_path, provider, _decision())
     try:
-        session = responder.sessions.get_or_create("whatsapp:chat@s.whatsapp.net")
+        from yeoman_gateway.history.queries import HistoryQueries
+
+        async with responder._test_projected_history.turn() as snapshot:
+            rows = HistoryQueries(snapshot).recent(chat_id="10002@s.whatsapp.net", limit=30)
         assert result is None
-        assert all(message.get("role") != "assistant" for message in session.messages)
-        assert all("provider-key" not in str(message) for message in session.messages)
+        assert all(row["direction"] != "out" for row in rows)
+        assert all("provider-key" not in str(row) for row in rows)
         assert getattr(responder, "_current_session", None) is None
         assert getattr(responder, "_current_trace", None) is None
     finally:

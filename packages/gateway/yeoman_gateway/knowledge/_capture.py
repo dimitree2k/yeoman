@@ -226,10 +226,10 @@ class SourceBatch:
 class ObservedSourceRegistrar:
     """Registers the audience proof of an observed event - turn or no turn.
 
-    The audience comes from the live chat registry (groups) or from the author alone
-    (direct chats).  Nothing is registered when neither is provable: the observation
-    stays durable with an unknown audience, and promotion refuses it later instead of
-    inventing a reader list.
+    Group audience proof comes only from the active WhatsApp history scope; direct
+    chats use the author alone. Nothing is registered when neither is provable: the
+    observation stays durable with an unknown audience, and promotion refuses it later
+    instead of inventing a reader list.
     """
 
     def __init__(
@@ -237,12 +237,10 @@ class ObservedSourceRegistrar:
         *,
         knowledge: Any,
         processing: Any | None = None,
-        chat_registry: Any | None = None,
         clock: Callable[[], int] | None = None,
     ) -> None:
         self._knowledge = knowledge
         self._processing = processing
-        self._chat_registry = chat_registry
         self._clock = clock or (lambda: int(time.time() * 1000))
 
     def __call__(self, event_id: str) -> bool:
@@ -288,11 +286,10 @@ class ObservedSourceRegistrar:
                     author_only=True,
                 )
             )
-        if scope is not None and channel == "whatsapp":
-            audience = scope.queries.members(chat_id=chat_id, at_ms=source.occurred_at_ms)
-            members = frozenset(audience.members) if audience.status == "known" else frozenset()
-        else:
-            members = self._proven_members(channel, chat_id)
+        if scope is None or channel != "whatsapp":
+            return False
+        audience = scope.queries.members(chat_id=chat_id, at_ms=source.occurred_at_ms)
+        members = frozenset(audience.members) if audience.status == "known" else frozenset()
         if not members:
             return False
         return bool(
@@ -302,14 +299,6 @@ class ObservedSourceRegistrar:
                 snapshot_id=f"{channel}:{chat_id}:{len(members)}",
             )
         )
-
-    def _proven_members(self, channel: str, chat_id: str) -> frozenset[str]:
-        if self._chat_registry is None:
-            return frozenset()
-        from yeoman_gateway.knowledge._memory.read_gate import registry_members
-
-        proven = registry_members(self._chat_registry, channel=channel, chat_id=chat_id)
-        return frozenset(str(item) for item in proven if item)
 
 
 @dataclass(slots=True)

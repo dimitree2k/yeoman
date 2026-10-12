@@ -51,7 +51,7 @@ def test_policy_epoch_change_invalidates_prepared_context(knowledge_harness):
     h = knowledge_harness
     tom, alex, source, sid, context = _prepare(h, "tom")
     prepared = h.recall_person(alex, context)
-    h.policy.revision += 1
+    h.policy.policy_revision += 1
     stale_context = h.read_context(
         tom,
         recipients={h.principal_for(tom), h.principal_for(alex)},
@@ -68,17 +68,22 @@ def test_acl_epoch_change_is_detected_even_without_membership_change(knowledge_h
     prepared = h.recall_person(alex, context)
     assert prepared.acl_epoch == h.acl_epoch()
     # A revocation anywhere bumps the epoch; the prepared context records the old one.
-    other = h.source(tom, chat="group-a")
+    other = h.source(tom, chat="group-a", audience={h.principal_for(tom), h.principal_for(alex)})
     h.capture_text("another claim", other)
     h.service.invalidate_source(other, context=h.capture_context(other))
     assert h.acl_epoch() > prepared.acl_epoch
     checked = h.service.revalidate(prepared, context=context)
-    # The unrelated revocation must not silently drop a still-valid statement.
-    assert checked.statement_ids == (sid,)
+    # Native contexts fence the complete prepared draft against the ACL epoch.
+    assert checked.statement_ids == ()
+    assert checked.reason == "stale_context"
     assert checked.acl_epoch == h.acl_epoch()
+    fresh_context = h.read_context(
+        tom, recipients={h.principal_for(tom), h.principal_for(alex)}
+    )
+    assert h.recall_person(alex, fresh_context).statement_ids == (sid,)
 
 
-def test_revalidate_returns_only_currently_allowed_text(knowledge_harness):
+def test_native_revalidation_discards_changed_draft_and_fresh_recall_keeps_allowed_text(knowledge_harness):
     h = knowledge_harness
     tom, alex = h.person("Tom"), h.person("Alex")
     audience = {h.principal_for(tom), h.principal_for(alex)}
@@ -91,9 +96,13 @@ def test_revalidate_returns_only_currently_allowed_text(knowledge_harness):
     assert set(prepared.statement_ids) == {keep, drop}
     h.service.invalidate_source(second, context=h.capture_context(second))
     checked = h.service.revalidate(prepared, context=context)
-    assert checked.statement_ids == (keep,)
-    assert "drop-token" not in checked.text
-    assert "keep-token" in checked.text
+    assert checked.statement_ids == ()
+    assert checked.reason == "stale_context"
+    assert checked.text == ""
+    fresh = h.service.recall(RecallQuery(text="token"), context=context)
+    assert fresh.statement_ids == (keep,)
+    assert "drop-token" not in fresh.text
+    assert "keep-token" in fresh.text
 
 
 def test_revalidate_without_statement_ids_is_empty_not_an_error(knowledge_harness):
@@ -129,23 +138,22 @@ def test_owner_only_diagnostics_do_not_change_user_visible_behaviour(knowledge_h
     tom, alex = h.person("Tom"), h.person("Alex")
     owner = h.person_for("whatsapp:4910000000001", "Owner")
     audience = {h.principal_for(tom), h.principal_for(alex), h.principal_for(owner)}
-    source = h.source(tom, audience=audience)
-    h.capture_text("private-itinerary reist.", source, subjects=(alex,))
-
-    # A statement released only to Tom and Alex, while the owner is in the chat.
+    # Seed the narrower historical roster before the current owner-visible roster.
     narrow = h.source(tom, audience={h.principal_for(tom), h.principal_for(alex)})
     h.capture_text("hidden-claim", narrow, subjects=(alex,))
+    source = h.source(tom, audience=audience)
+    visible = h.capture_text("private-itinerary reist.", source, subjects=(alex,)).statement_ids[0]
 
     normal = h.read_context(tom, recipients=audience)
     assert h.recall_person(alex, normal).denied_count == 0
-
-    as_owner = h.read_context(tom, recipients=audience, owner=True)
+    as_owner = h.read_context(owner, recipients=audience, owner=True)
     owner_result = h.service.recall(RecallQuery(person_ids=(alex,)), context=as_owner)
-    assert owner_result.denied_count >= 1
+    assert owner_result.denied_count >= 1, owner_result
 
     # A non-owner context never receives the diagnostic number, and no context
     # exposes the denied statements themselves.
-    assert h.recall_person(alex, normal).statement_ids == (owner_result.statement_ids[0],)
+    assert owner_result.statement_ids == (visible,)
+    assert h.recall_person(alex, normal).statement_ids == (visible,)
     assert "hidden-claim" not in owner_result.text
 
 

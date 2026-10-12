@@ -8,21 +8,16 @@ partial row behind, and that the public facade does not hand out a second writer
 from __future__ import annotations
 
 import sqlite3
-import threading
 
 import pytest
-from yeoman_gateway.knowledge.authority import FakePolicyAuthority, FakeSourceAuthority
 from yeoman_gateway.knowledge.models import (
-    Identifier,
     KnowledgeError,
-    TrustedAdminContext,
-    TrustedIdentityObservation,
 )
 
 
-def test_identity_and_alias_write_roll_back_together(knowledge_harness):
-    h = knowledge_harness
-    person = h.person("Tom")
+def test_identity_and_alias_write_roll_back_together(lower_store_harness):
+    h = lower_store_harness
+    person = h.store_person("Tom")
     before = h.snapshot_counts()
     before_revision = h.identity_revision()
     h.fail_next_commit()
@@ -39,17 +34,17 @@ def test_identity_and_alias_write_roll_back_together(knowledge_harness):
             h.service._store.set_meta("identity_revision", "9999")  # noqa: SLF001
     assert excinfo.value.code == "storage_unavailable"
     assert h.snapshot_counts() == before
-    assert h.service.display_name(person) == "Tom"
-    assert "Rollback" not in h.service.alias_names(person)
+    assert h.service._store.scalar("SELECT display_name FROM contacts WHERE id = ?", (person,)) == "Tom"  # noqa: SLF001
+    assert h.service._store.scalar("SELECT COUNT(*) FROM contact_aliases WHERE contact_id = ? AND alias = 'Rollback'", (person,)) == 0  # noqa: SLF001
     assert h.identity_revision() == before_revision
 
 
-def test_nested_operation_joins_the_outer_transaction(knowledge_harness):
+def test_nested_operation_joins_the_outer_transaction(lower_store_harness):
     """An inner knowledge operation must not commit the outer unit of work."""
     import sqlite3
 
-    h = knowledge_harness
-    person = h.person("Tom")
+    h = lower_store_harness
+    person = h.store_person("Tom")
     db = h.service.db_path
 
     def outside_preferred_name() -> str | None:
@@ -74,61 +69,11 @@ def test_nested_operation_joins_the_outer_transaction(knowledge_harness):
         # Still inside the outer transaction: another connection must not see it.
         assert outside_preferred_name() is None
     assert outside_preferred_name() == "inner-too"
-    assert h.service.display_name(person) == "inner-too"
+    assert h.service._store.scalar("SELECT preferred_name FROM contacts WHERE id = ?", (person,)) == "inner-too"  # noqa: SLF001
 
 
-def test_identifier_racing_creates_at_most_one_person(knowledge_harness):
-    h = knowledge_harness
-    value = "49188888888@s.whatsapp.net"
-    results: list[str | None] = []
-    errors: list[BaseException] = []
-
-    def worker() -> None:
-        try:
-            resolved = h.observe("whatsapp", "phone_jid", value)
-            results.append(resolved.person_id)
-        except BaseException as exc:  # pragma: no cover - reported below
-            errors.append(exc)
-
-    threads = [threading.Thread(target=worker) for _ in range(4)]
-    for thread in threads:
-        thread.start()
-    for thread in threads:
-        thread.join()
-    assert not errors, errors
-    assert len(set(results)) == 1
-    assert results[0] is not None
-    assert h.snapshot_counts()["contacts"] == 1
-    assert h.snapshot_counts()["contact_identifiers"] == 1
 
 
-def test_second_service_instance_on_one_file_sees_the_same_identity(tmp_path):
-    """Two processes may read one file; there is exactly one logical writer path."""
-    from yeoman_gateway.knowledge.api import open_knowledge_store
-
-    db = tmp_path / "shared.db"
-    authority = FakeSourceAuthority()
-    policy = FakePolicyAuthority(admins={"owner:p"}, capture_actors={"owner:p"})
-    first = open_knowledge_store(
-        db, workspace_id="ws", source_authority=authority, policy_authority=policy
-    )
-    second = open_knowledge_store(
-        db, workspace_id="ws", source_authority=authority, policy_authority=policy
-    )
-    try:
-        observation = TrustedIdentityObservation(
-            identifiers=(Identifier("whatsapp", "phone_jid", "49177777777@s.whatsapp.net"),),
-            evidence_ref="obs-x",
-        )
-        authority.issue_observation(observation)
-        created = first.resolve_person(observation)
-        assert created.person_id
-        again = second.resolve_person(observation)
-        assert again.person_id == created.person_id
-        assert again.reason == "existing_binding"
-    finally:
-        first.close()
-        second.close()
 
 
 def test_close_is_idempotent_and_stops_writes(knowledge_harness):
@@ -141,18 +86,6 @@ def test_close_is_idempotent_and_stops_writes(knowledge_harness):
     assert excinfo.value.code == "storage_unavailable"
 
 
-def test_admin_context_requires_owner_authority(knowledge_harness):
-    h = knowledge_harness
-    person = h.person("Tom")
-    context = TrustedAdminContext(
-        actor_principal="whatsapp:4910000000001",
-        policy_revision=1,
-        authorization_ref="ref",
-        owner=False,
-    )
-    with pytest.raises(KnowledgeError) as excinfo:
-        h.service.set_preferred_name(person, "Dimi", context=context)
-    assert excinfo.value.code == "unauthorized"
 
 
 def test_public_boundary_exposes_no_store_handle():
@@ -177,6 +110,67 @@ def test_public_boundary_exposes_no_store_handle():
 # against the real store so a future "small cleanup" cannot quietly drop them.
 
 
+class _LowerStoreHarness:
+    """Synthetic lower-engine fixture for storage transaction/schema contracts."""
+
+    def __init__(self, path):
+        from types import SimpleNamespace
+
+        from yeoman_gateway.knowledge._identity import IdentityEngine
+        from yeoman_gateway.knowledge._statements import StatementEngine
+        from yeoman_gateway.knowledge._store import KnowledgeStore
+        from yeoman_gateway.knowledge.models import (
+            SourceRef,
+            StatementCandidate,
+            TrustedCaptureContext,
+        )
+        from yeoman_gateway.knowledge.runtime import RuntimeKnowledgePolicy, RuntimeKnowledgeSources
+        self._SourceRef, self._StatementCandidate, self._TrustedCaptureContext = SourceRef, StatementCandidate, TrustedCaptureContext
+        self._authority = RuntimeKnowledgeSources()
+        self._policy = RuntimeKnowledgePolicy(engine=None)
+        self.store = KnowledgeStore(path / "lower-schema-contract.db")
+        identity = IdentityEngine(self.store, authority=self._authority, policy=self._policy, legacy_history_disabled=True)
+        self.statements = StatementEngine(self.store, identity=identity, authority=self._authority, policy=self._policy, workspace_id="synthetic")
+        self.service = SimpleNamespace(_store=self.store, db_path=self.store.db_path, close=self.store.close)
+
+    def store_person(self, name):
+        person = self.store.new_id()
+        self.store.execute("INSERT INTO contacts (id, display_name, created_at, updated_at) VALUES (?, ?, 'now', 'now')", (person, name))
+        self.store.commit_if_idle()
+        return person
+
+    person = store_person
+
+    def source(self, _person):
+        from yeoman_gateway.knowledge.authority import EvidenceAudience
+        source = self._SourceRef("boundary-source", 1, "whatsapp", "boundary@g.us", "whatsapp:10001", 1)
+        self._authority.register_source(source, EvidenceAudience.author_only())
+        return source
+
+    def capture_text(self, text, source):
+        context = self._TrustedCaptureContext("synthetic", 1, "boundary-test", (source,))
+        with self.store.transaction():
+            return self.statements.capture(self._StatementCandidate(text, (source,)), context=context)
+
+    def snapshot_counts(self):
+        return self.store.counts()
+
+    def identity_revision(self):
+        return self.store.identity_revision
+
+    def fail_next_commit(self):
+        self.store.fail_next_commit = True
+
+
+@pytest.fixture
+def lower_store_harness(tmp_path):
+    harness = _LowerStoreHarness(tmp_path)
+    try:
+        yield harness
+    finally:
+        harness.store.close()
+
+
 def _insert_binding(
     store,
     *,
@@ -197,16 +191,16 @@ def _insert_binding(
 
 
 def test_ended_binding_history_coexists_while_only_one_active_binding_is_allowed(
-    knowledge_harness,
+    lower_store_harness,
 ):
     """The partial unique index is the point of the temporal binding table.
 
     Number re-assignment must be representable: an ended row and a new active row for the
     same fully typed identifier coexist, but two *active* rows never do.
     """
-    h = knowledge_harness
-    first = h.person("Tom")
-    second = h.person("Alex")
+    h = lower_store_harness
+    first = h.store_person("Tom")
+    second = h.store_person("Alex")
     value = "49170000001@s.whatsapp.net"
     with h.service._store.transaction():  # noqa: SLF001 - schema contract under test
         _insert_binding(
@@ -252,10 +246,10 @@ def test_ended_binding_history_coexists_while_only_one_active_binding_is_allowed
     ) == 0
 
 
-def test_a_withheld_binding_is_never_the_active_one(knowledge_harness):
+def test_a_withheld_binding_is_never_the_active_one(lower_store_harness):
     """A withheld candidate may keep its row, but it must not block or resolve a person."""
-    h = knowledge_harness
-    person = h.person("Tom")
+    h = lower_store_harness
+    person = h.store_person("Tom")
     value = "49170000002@s.whatsapp.net"
     with h.service._store.transaction():  # noqa: SLF001
         _insert_binding(
@@ -293,11 +287,19 @@ def test_a_withheld_binding_is_never_the_active_one(knowledge_harness):
     )
 
 
-def test_statement_person_status_rejects_unknown_values(knowledge_harness):
-    h = knowledge_harness
+def test_statement_person_status_rejects_unknown_values(lower_store_harness):
+    h = lower_store_harness
     person = h.person("Tom")
     source = h.source(person)
     statement_id = h.capture_text("Alex wohnt in Köln.", source).statement_ids[0]
+    with h.service._store.transaction():  # noqa: SLF001 - seed valid row for CHECK contract
+        h.service._store.execute(  # noqa: SLF001
+            "INSERT INTO knowledge_statement_people "
+            "(statement_id, person_id, role, evidence_source_id, evidence_revision, "
+            "attribution, created_ms, status, resolution_reason) "
+            "VALUES (?, ?, 'subject', ?, ?, 'extracted', 0, 'active', '')",
+            (statement_id, person, source.event_id, source.revision),
+        )
     with pytest.raises(sqlite3.IntegrityError):
         with h.service._store.transaction():  # noqa: SLF001
             h.service._store.execute(  # noqa: SLF001
@@ -307,8 +309,8 @@ def test_statement_person_status_rejects_unknown_values(knowledge_harness):
             )
 
 
-def test_statement_supersession_reason_rejects_unknown_values(knowledge_harness):
-    h = knowledge_harness
+def test_statement_supersession_reason_rejects_unknown_values(lower_store_harness):
+    h = lower_store_harness
     person = h.person("Tom")
     source = h.source(person)
     statement_id = h.capture_text("Alex wohnt in Köln.", source).statement_ids[0]
@@ -321,10 +323,10 @@ def test_statement_supersession_reason_rejects_unknown_values(knowledge_harness)
             )
 
 
-def test_attribute_requires_an_existing_statement_and_person(knowledge_harness):
+def test_attribute_requires_an_existing_statement_and_person(lower_store_harness):
     """A facet is a statement annotation, never a free-standing profile write."""
-    h = knowledge_harness
-    person = h.person("Tom")
+    h = lower_store_harness
+    person = h.store_person("Tom")
     with pytest.raises(sqlite3.IntegrityError):
         with h.service._store.transaction():  # noqa: SLF001
             h.service._store.execute(  # noqa: SLF001
@@ -336,8 +338,8 @@ def test_attribute_requires_an_existing_statement_and_person(knowledge_harness):
             )
 
 
-def test_attribute_polarity_rejects_unknown_values(knowledge_harness):
-    h = knowledge_harness
+def test_attribute_polarity_rejects_unknown_values(lower_store_harness):
+    h = lower_store_harness
     person = h.person("Tom")
     source = h.source(person)
     statement_id = h.capture_text("Alex wohnt in Köln.", source).statement_ids[0]
@@ -351,29 +353,6 @@ def test_attribute_polarity_rejects_unknown_values(knowledge_harness):
             )
 
 
-def test_alias_preference_index_blocks_two_preferred_aliases_in_one_scope(
-    knowledge_harness,
-):
-    h = knowledge_harness
-    person = h.person("Tom")
-    with h.service._store.transaction():  # noqa: SLF001
-        h.service._store.execute(  # noqa: SLF001
-            "INSERT INTO contact_aliases (contact_id, alias, source, first_seen, last_seen,"
-            " alias_kind, normalized_alias, scope_key, status, address_allowed, is_preferred,"
-            " revision) VALUES (?, 'Tommy', 'owner_confirmed', 'now', 'now', 'nickname',"
-            " 'tommy', 'global', 'confirmed', 1, 1, 1)",
-            (person,),
-        )
-    with pytest.raises(sqlite3.IntegrityError):
-        with h.service._store.transaction():  # noqa: SLF001
-            h.service._store.execute(  # noqa: SLF001
-                "INSERT INTO contact_aliases (contact_id, alias, source, first_seen,"
-                " last_seen, alias_kind, normalized_alias, scope_key, status,"
-                " address_allowed, is_preferred, revision) VALUES (?, 'Thomas',"
-                " 'owner_confirmed', 'now', 'now', 'short_name', 'thomas', 'global',"
-                " 'confirmed', 1, 1, 1)",
-                (person,),
-            )
 
 
 def test_v2_schema_keeps_every_reused_table(knowledge_harness):

@@ -55,13 +55,7 @@ def _normalize_choice(raw: str, *, choices: set[str], option: str) -> str:
 
 @contextmanager
 def _memory_service_context():
-    from yeoman_shared.config.loader import load_config
-
-    service = make_memory_service(load_config())
-    try:
-        yield service
-    finally:
-        service.close()
+    _refuse_selected_legacy_maintenance()
 
 
 def _memory_scope_keys(
@@ -305,54 +299,12 @@ def memory_search(
 ) -> None:
     """Search long-term memory with scope filters."""
     scope_value = _normalize_choice(scope, choices=MEMORY_SCOPES, option="--scope")
-    from yeoman_shared.config.loader import load_config
-    history = load_config().history
-    if history.live_projection_enabled and history.readers.secondary:
-        from yeoman_gateway.history.export import cli_secondary_request
-        if channel != 'whatsapp' or not chat_id or scope_value != 'chat':
-            raise typer.BadParameter('explicit WhatsApp chat scope required')
-        result = cli_secondary_request('knowledge_read', dict(chat_id=chat_id, query=query, limit=limit))
-        console.print('\n'.join(result['statements']) or 'No memory hits.')
-        return
-    if history.legacy_writers_disabled and channel == 'whatsapp':
-        raise typer.BadParameter('secondary reader unselected')
-    with _memory_service_context() as service:
-        hits = service.search(
-            query=query,
-            channel=channel,
-            chat_id=chat_id,
-            sender_id=sender_id,
-            scope=scope_value,
-            limit=limit,
-        )
-
-    if not hits:
-        console.print("No memory hits.")
-        return
-
-    table = Table(title="Memory Search Results")
-    table.add_column("Score", justify="right")
-    table.add_column("Kind", min_width=10, no_wrap=True)
-    table.add_column("Scope")
-    table.add_column("Sensitivity", min_width=11, no_wrap=True)
-    table.add_column("Topics", min_width=14, no_wrap=True)
-    table.add_column("Updated")
-    table.add_column("Content")
-    for hit in hits:
-        content = " ".join(hit.entry.content.split())
-        if len(content) > 120:
-            content = content[:117] + "..."
-        sensitivity, topics = _metadata_display(hit.entry.meta_json)
-        table.add_row(
-            f"{hit.final_score:.2f}",
-            hit.entry.kind,
-            hit.entry.scope_type,
-            sensitivity,
-            topics,
-            hit.entry.updated_at[:19],
-            content,
-        )
-    console.print(table)
+    from yeoman_gateway.history.export import cli_secondary_request
+    if channel != 'whatsapp' or not chat_id or scope_value != 'chat':
+        raise typer.BadParameter('explicit WhatsApp chat scope required')
+    result = cli_secondary_request('knowledge_read', dict(chat_id=chat_id, query=query, limit=limit))
+    console.print('\n'.join(result['statements']) or 'No memory hits.')
+    return
 
 
 @memory_app.command("trace")
@@ -758,15 +710,12 @@ def memory_lineage_inventory(
     provider or model call, and never a PDF parse or OCR.  Derived model work is only
     scheduled with --allow-model-jobs, whose eligible count is always reported first.
     """
-    from yeoman_shared.config.loader import load_config
 
     from yeoman_gateway.history.export import require_isolated_paths
     from yeoman_gateway.knowledge.api import import_lineage, inspect_lineage_sources
-    history = load_config().history
-    if history.legacy_writers_disabled or (history.live_projection_enabled and history.readers.secondary):
-        if not all((inbound_dir, processing_db, session_state_dir, knowledge_db, media_root)):
-            raise typer.BadParameter('explicit isolated inventory paths required')
-        require_isolated_paths(*(Path(p) for p in (inbound_dir, processing_db, session_state_dir, knowledge_db, media_root)))
+    if not all((inbound_dir, processing_db, session_state_dir, knowledge_db, media_root)):
+        raise typer.BadParameter('explicit isolated inventory paths required')
+    require_isolated_paths(*(Path(p) for p in (inbound_dir, processing_db, session_state_dir, knowledge_db, media_root)))
     inventory = inspect_lineage_sources(
         inbound_dir=inbound_dir,
         processing_db=processing_db,
@@ -1123,10 +1072,7 @@ def memory_media_growth(
 
 
 def _refuse_selected_legacy_maintenance() -> None:
-    from yeoman_shared.config.loader import load_config
-    history = load_config().history
-    if history.legacy_writers_disabled or (history.live_projection_enabled and history.readers.secondary):
-        raise typer.BadParameter('legacy maintenance is offline only; supply an isolated snapshot runtime')
+    raise typer.BadParameter('legacy maintenance is offline only; supply an isolated snapshot runtime')
 
 
 statements_app = typer.Typer(help='Live owner Knowledge statement inspection and curation')

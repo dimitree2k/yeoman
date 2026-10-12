@@ -16,6 +16,13 @@ from yeoman_gateway.processing.models import (
 from yeoman_gateway.processing.policy import SnapshotEffectAuthorizer
 from yeoman_gateway.processing.store import SCHEMA_VERSION, ProcessingStore
 
+
+@pytest.fixture(autouse=True)
+def _projected_effect_history(monkeypatch, request, tmp_path):
+    from tests.gateway.history_test_helpers import install_projected_effect_history
+    install_projected_effect_history(monkeypatch, request, tmp_path)
+
+
 CHAT = "chat@g.us"
 T0 = 1_700_000_000_000
 

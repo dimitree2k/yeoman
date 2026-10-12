@@ -16,27 +16,19 @@ from pathlib import Path
 from typing import Iterator
 
 import pytest
-from yeoman_gateway.knowledge.api import KnowledgeService, open_knowledge_store
-from yeoman_gateway.knowledge.authority import (
-    EvidenceAudience,
-    FakeClock,
-    FakePolicyAuthority,
-    FakeSourceAuthority,
-)
 from yeoman_gateway.knowledge.models import (
     PersonLinkCandidate,
     RecallQuery,
     SourceRef,
     StatementCandidate,
-    TrustedCaptureContext,
     TrustedReadContext,
 )
 
-WORKSPACE_ID = "hybrid-workspace"
-OWNER = "whatsapp:4910000000001"
+from tests.gateway.knowledge.conftest import ProjectedKnowledgeHarness
+
+WORKSPACE_ID = "test-workspace"
 TOM = "whatsapp:4910000000002"
-ALEX = "whatsapp:4910000000003"
-CHAT = "group-a"
+CHAT = "120363000000001@g.us"
 SCOPE = f"channel:whatsapp:chat:{CHAT}"
 
 
@@ -54,153 +46,92 @@ class SpyEmbedder:
         return [0.5] * self.dims
 
 
-@dataclass
-class HybridHarness:
-    tmp_path: Path
-
-    def __post_init__(self) -> None:
-        self.clock = FakeClock()
-        self.authority = FakeSourceAuthority()
-        self.policy = FakePolicyAuthority(admins={OWNER}, capture_actors={OWNER})
-        self.service: KnowledgeService = open_knowledge_store(
-            self.tmp_path / "knowledge.db",
-            workspace_id=WORKSPACE_ID,
-            source_authority=self.authority,
-            policy_authority=self.policy,
-            clock=self.clock,
-        )
+class HybridHarness(ProjectedKnowledgeHarness):
+    def __init__(self, tmp_path: Path) -> None:
+        super().__init__(tmp_path)
         self.embedder = SpyEmbedder()
-        self._counter = 0
-
-    def close(self) -> None:
-        self.service.close()
 
     def source(self, *, author: str = TOM, audience: set[str] | None = None) -> SourceRef:
-        self._counter += 1
-        source = SourceRef(
-            event_id=f"event-{self._counter}",
-            revision=1,
-            channel="whatsapp",
-            chat_id=CHAT,
-            author_principal=author,
-            occurred_at_ms=self.clock.now_ms(),
-        )
-        self.authority.issue_source(
-            source,
-            EvidenceAudience.known(
-                set(audience) if audience is not None else {author},
-                snapshot_id=f"snap-{source.event_id}",
-            ),
-        )
-        return source
-
-    def capture_context(self, *sources: SourceRef) -> TrustedCaptureContext:
-        request_id = f"cap-{'/'.join(item.event_id for item in sources)}"
-        self.policy.issue_capture(request_id)
-        return TrustedCaptureContext(
-            request_id=request_id,
-            policy_revision=self.policy.revision,
-            capture_basis="user_message",
-            authorized_sources=tuple(sources),
-            actor_principal=OWNER,
-            authorized=True,
-        )
+        person = self.person_for(author, author)
+        return super().source(person, chat=CHAT, audience=audience)
 
     def capture(self, text: str, *, author: str = TOM) -> tuple[str, SourceRef]:
         source = self.source(author=author)
+        person = self.person_for(author, author)
         result = self.service.capture(
             StatementCandidate(
-                content=text,
-                sources=(source,),
-                people=(
-                    PersonLinkCandidate(
-                        person_id=self.person_for(author),
-                        role="speaker",
-                        source=source,
-                        attribution="transport",
-                    ),
-                ),
-                extractor_version="hybrid-extractor-1",
-                confidence=0.6,
-            ),
-            context=self.capture_context(source),
+                content=text, sources=(source,),
+                people=(PersonLinkCandidate(person_id=person, role="speaker", source=source,
+                                            attribution="transport"),),
+                extractor_version="hybrid-extractor-1", confidence=0.6,
+            ), context=self.capture_context(source),
         )
         assert result.statement_ids, result.rejected
         return result.statement_ids[0], source
 
-    def person_for(self, principal: str) -> str:
-        """Resolve a synthetic person through a proven observation."""
-        from yeoman_gateway.knowledge.models import Identifier, TrustedIdentityObservation
-
-        number = principal.split(":", 1)[-1]
-        observation = TrustedIdentityObservation(
-            identifiers=(
-                Identifier(channel="whatsapp", kind="phone_jid", value=f"{number}@s.whatsapp.net"),
-            ),
-            evidence_ref=f"obs-{number}",
-            observed_at_ms=self.clock.now_ms(),
-        )
-        self.authority.issue_observation(observation)
-        resolved = self.service.resolve_person(observation)
-        assert resolved.person_id, resolved.reason
-        return resolved.person_id
-
     def publish_vector(self, statement_id: str, *, dims: int | None = None) -> None:
-        """Publish one embedding section for a statement node, as the worker would."""
-        from yeoman_gateway.knowledge._memory.store import MemoryStore
+        """Seed an already-published vector row for the retrieval integration test.
 
-        memory = MemoryStore(owner=self.service._store)  # noqa: SLF001 - same file, one owner
-        children = dims if dims is not None else self.embedder.dims
-        text = self.service._store.scalar(  # noqa: SLF001 - test fixture only
-            "SELECT content FROM memory2_nodes WHERE id = ?", (statement_id,)
+        WhatsApp embedding publication is retired at this call site. This fixture seeds
+        the additive retrieval index directly while retaining its real schema and source
+        identity, so the guarded vector search and final Knowledge gate remain under test.
+        """
+        from yeoman_gateway.knowledge._memory.store import (
+            _EMBEDDING_INDEX_SCHEMA,
+            MemoryStore,
         )
-        memory.publish_embedding_section(
-            document_id=f"emb:{statement_id}:s0",
-            content_hash=hashlib.sha256(str(text).encode("utf-8")).hexdigest()[:32],
-            source_revision_hash="rev-hash-1",
-            model_id=self.embedder.model,
-            dimension=children,
-            preprocessing_version="memory-text-v1",
-            workspace_id=WORKSPACE_ID,
-            scope_key=SCOPE,
-            channel="whatsapp",
-            chat_id=CHAT,
-            source_event_id="event-1",
-            source_revision=1,
-            node_id=statement_id,
-            section_index=0,
-            section_start=0,
-            section_end=len(str(text)),
-            vector=[0.5] * children,
-            now_ms=self.clock.now_ms(),
+
+        store = self._raw_service._store
+        for statement in _EMBEDDING_INDEX_SCHEMA:
+            store.execute(statement)
+        store.commit_if_idle()
+        dimension = self.embedder.dims if dims is None else dims
+        text = store.scalar("SELECT content FROM memory2_nodes WHERE id = ?", (statement_id,))
+        source = store.query_one(
+            "SELECT event_id, revision FROM knowledge_statement_sources WHERE statement_id = ?",
+            (statement_id,),
         )
+        content_hash = hashlib.sha256(str(text).encode("utf-8")).hexdigest()[:32]
+        store.execute(
+            """
+            INSERT INTO memory2_embedding_index (
+                document_id, content_hash, source_revision_hash, model_id, dimension,
+                preprocessing_version, workspace_id, scope_key, channel, chat_id,
+                source_event_id, source_revision, node_id, section_index, section_start,
+                section_end, page_number, conversation_ids_json, vector, status,
+                created_ms, retired_ms
+            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, NULL, '[]', ?,
+                      'active', ?, NULL)
+            """,
+            (
+                f"emb:{statement_id}:s0",
+                content_hash,
+                "rev-hash-1",
+                self.embedder.model,
+                dimension,
+                "memory-text-v1",
+                "test-workspace",
+                SCOPE,
+                "whatsapp",
+                CHAT,
+                str(source["event_id"]),
+                int(source["revision"]),
+                statement_id,
+                0,
+                0,
+                len(str(text)),
+                MemoryStore._serialize_vector([0.5] * dimension),
+                self.clock.now_ms(),
+            ),
+        )
+        store.commit_if_idle()
+
+    def vector_candidates(self, query, *, context, embedder):
+        with self.history_scope():
+            return self._raw_service._retrieval._vector_candidates(query, context=context, embedder=embedder)
 
     def read_context(self, reader: str = TOM, *, chat: str = CHAT) -> TrustedReadContext:
-        members = {reader}
-        self.policy.set_members(
-            TrustedReadContext(
-                principal_id=reader,
-                channel="whatsapp",
-                chat_id=chat,
-                recipient_principals=frozenset(members),
-                membership_revision=f"mem-{chat}",
-                policy_revision=self.policy.revision,
-                purpose="reply",
-                now_ms=self.clock.now_ms(),
-            ),
-            members,
-            revision=f"mem-{chat}",
-        )
-        return TrustedReadContext(
-            principal_id=reader,
-            channel="whatsapp",
-            chat_id=chat,
-            recipient_principals=frozenset(members),
-            membership_revision=f"mem-{chat}",
-            policy_revision=self.policy.revision,
-            purpose="reply",
-            now_ms=self.clock.now_ms(),
-        )
+        return super().read_context(reader, chat=chat, recipients={reader})
 
 
 @pytest.fixture
@@ -264,7 +195,7 @@ def test_vector_candidates_never_widen_the_read_gate(h: HybridHarness) -> None:
     h.publish_vector(statement_id)
     query = RecallQuery(text="delta echo foxtrot", limit=10)
 
-    assert h.service._retrieval._vector_candidates(  # noqa: SLF001 - vector path check
+    assert h.vector_candidates(  # noqa: SLF001 - vector path check
         query,
         context=h.read_context(),
         embedder=h.embedder,
@@ -277,7 +208,7 @@ def test_vector_candidates_never_widen_the_read_gate(h: HybridHarness) -> None:
     ).statement_ids == (statement_id,)
 
     other = h.read_context(chat="group-b")
-    assert h.service._retrieval._vector_candidates(  # noqa: SLF001
+    assert h.vector_candidates(  # noqa: SLF001
         query, context=other, embedder=h.embedder
     ) == ()
     result = h.service.recall_hybrid(
@@ -320,7 +251,7 @@ def test_vector_candidates_are_scored_and_dimension_bound(h: HybridHarness) -> N
     h.publish_vector(statement_id)
     query = RecallQuery(text="delta echo foxtrot", limit=10)
 
-    matched = h.service._retrieval._vector_candidates(  # noqa: SLF001 - vector path check
+    matched = h.vector_candidates(  # noqa: SLF001 - vector path check
         query, context=h.read_context(), embedder=h.embedder
     )
     assert matched == (statement_id,)
@@ -328,7 +259,7 @@ def test_vector_candidates_are_scored_and_dimension_bound(h: HybridHarness) -> N
     # A row of another width must not be scored against this query vector at all.
     other, _source2 = h.capture("second statement with its own vector")
     h.publish_vector(other, dims=16)
-    still = h.service._retrieval._vector_candidates(  # noqa: SLF001
+    still = h.vector_candidates(  # noqa: SLF001
         query, context=h.read_context(), embedder=h.embedder
     )
     assert still == (statement_id,)

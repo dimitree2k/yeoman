@@ -7,10 +7,14 @@ from collections.abc import Mapping
 from types import SimpleNamespace
 
 from yeoman_gateway.knowledge._capture import ObservedEvent
-from yeoman_gateway.knowledge._capture_worker import StatementDraft, StatementExtractor
+from yeoman_gateway.knowledge._capture_worker import (
+    StatementCaptureWorker,
+    StatementDraft,
+    StatementExtractor,
+)
 from yeoman_shared.config.schema import Config
 
-from tests.gateway.capture_harness import AUTHOR, OTHER, CaptureHarness, Registry
+from tests.gateway.capture_harness import AUTHOR, OTHER
 
 
 class RecordedProvider:
@@ -101,54 +105,34 @@ def diagnose_draft(row: Mapping[str, object], draft: StatementDraft) -> tuple[st
     )
 
 
-def test_capture_harness_still_refuses_unknown_audience(tmp_path) -> None:
-    harness = CaptureHarness(tmp_path, registry=Registry({}))
-    try:
-        harness.activate()
-        harness.observe("Synthetic tuning source.")
-        harness.advance(60_001)
+def test_eligible_people_offer_only_the_source_author() -> None:
+    people = {AUTHOR: "person-author", OTHER: "person-subject"}
+    worker = StatementCaptureWorker(
+        knowledge=SimpleNamespace(person_for_principal=lambda principal: people.get(principal)),
+        processing=None,
+    )
+    source = ObservedEvent(
+        event_id="author-source",
+        revision=1,
+        channel="whatsapp",
+        chat_id="synthetic@g.us",
+        principal=AUTHOR,
+        occurred_ms=1,
+        created_ms=1,
+        text="Synthetic tuning source.",
+    )
+    subject = ObservedEvent(
+        event_id="subject-source",
+        revision=1,
+        channel="whatsapp",
+        chat_id="synthetic@g.us",
+        principal=OTHER,
+        occurred_ms=2,
+        created_ms=2,
+        text="Synthetic subject source.",
+    )
 
-        report = harness.build_worker().run_due(now_ms=harness.now)
+    eligible = worker._eligible_people((source, subject), source)
 
-        assert report.refusals.get("unknown_audience") == 1
-        assert harness.statements() == []
-    finally:
-        harness.close()
-
-
-def test_eligible_people_offer_only_the_source_author(tmp_path, monkeypatch) -> None:
-    harness = CaptureHarness(tmp_path)
-    try:
-        people = {AUTHOR: "person-author", OTHER: "person-subject"}
-        monkeypatch.setattr(
-            harness.knowledge,
-            "person_for_principal",
-            lambda principal: people.get(principal),
-        )
-        source = ObservedEvent(
-            event_id="author-source",
-            revision=1,
-            channel="whatsapp",
-            chat_id="synthetic@g.us",
-            principal=AUTHOR,
-            occurred_ms=1,
-            created_ms=1,
-            text="Synthetic tuning source.",
-        )
-        subject = ObservedEvent(
-            event_id="subject-source",
-            revision=1,
-            channel="whatsapp",
-            chat_id="synthetic@g.us",
-            principal=OTHER,
-            occurred_ms=2,
-            created_ms=2,
-            text="Synthetic subject source.",
-        )
-
-        eligible = harness.build_worker()._eligible_people((source, subject), source)
-
-        assert eligible == ("person-author",)
-        assert "person-subject" not in eligible
-    finally:
-        harness.close()
+    assert eligible == ("person-author",)
+    assert "person-subject" not in eligible

@@ -23,8 +23,6 @@ class ToolContext:
     memory_db: Path | None = None       # used by prune_memory
     runbook_name: str = ""              # current runbook name for audit
     domain: str = ""                    # current runbook domain for audit
-    history_selected: bool = False
-    legacy_history_disabled: bool = False
     gateway_socket_path: Path | None = None
     git: object | None = None           # InternalGit for write_file/edit_file commits
 
@@ -54,7 +52,7 @@ TOOL_DEFINITIONS: list[dict[str, Any]] = [
     },
     {
         "name": "query_memory",
-        "description": "Authorized Knowledge search via Gateway when history is selected; explicit chat scope required.",
+        "description": "Authorized Knowledge search via Gateway; explicit chat scope required.",
         "input_schema": {
             "type": "object",
             "properties": {
@@ -128,7 +126,7 @@ TOOL_DEFINITIONS: list[dict[str, Any]] = [
     },
     {
         "name": "prune_memory",
-        "description": "Delete memory.db entries matching age/salience/domain criteria. Always takes a snapshot first.",
+        "description": "Legacy memory pruning is retired; use authorized Knowledge maintenance.",
         "input_schema": {
             "type": "object",
             "properties": {

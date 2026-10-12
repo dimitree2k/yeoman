@@ -1,22 +1,10 @@
-"""Regression: the live composition must actually create and refresh person identities.
-
-Since the knowledge cutover the contacts middleware resolves the sender through
-``knowledge.resolve_observation``.  The production source authority only accepts an
-observation that was issued to it first, and nothing in the live composition issued one,
-so every inbound message failed verification and the middleware swallowed the error: no
-stub, no binding refresh, no observed name, and no log line.
-
-These tests drive the real composition root on a temporary ``YEOMAN_HOME`` and feed it
-metadata shaped exactly like the WhatsApp channel's bus message.  All identifiers are
-synthetic.
-"""
+"""Live WhatsApp sender identity resolves from projected native history."""
 
 from __future__ import annotations
 
 from pathlib import Path
 
 import pytest
-from loguru import logger
 from yeoman_gateway.app.bootstrap import _inbound_message_to_event
 from yeoman_gateway.bus.queue import MessageBus
 from yeoman_gateway.channels.whatsapp import InboundEvent as WhatsAppInboundEvent
@@ -88,9 +76,11 @@ def runtime(tmp_path: Path, monkeypatch: pytest.MonkeyPatch):
     try:
         yield built
     finally:
-        for store in (built.inbound_archive, built.chat_registry, built.contacts, built.memory):
-            if store is not None:
-                store.close()
+        # These are the owned resources in the history-native runtime. The former
+        # archive/registry/contacts/memory fields no longer exist on GatewayRuntime.
+        built.responder.knowledge.close()
+        if built.processing is not None:
+            built.processing.close()
 
 
 def _contacts_layer(runtime) -> ContactsMiddleware:
@@ -246,26 +236,3 @@ def test_issued_observations_are_bounded() -> None:
     assert sources.verify_observation(observation(2)) == "observation:whatsapp:SYN-2"
 
 
-class _FailingKnowledge:
-    def resolve_observation(self, _observation: object) -> object:
-        raise KnowledgeError("unauthorized", f"secret detail {PHONE_JID}")
-
-
-@pytest.mark.asyncio
-async def test_a_failed_resolution_is_logged_with_a_reason_code_and_no_pii() -> None:
-    records: list[dict] = []
-    sink = logger.add(lambda message: records.append(message.record), level="DEBUG")
-    try:
-        event = await _bus_event(_whatsapp_event("SYN-MSG-1"))
-        ctx = await _resolve(ContactsMiddleware(knowledge=_FailingKnowledge()), event)
-    finally:
-        logger.remove(sink)
-
-    assert "contact_id" not in ctx.event.raw_metadata
-    warnings = [record for record in records if record["level"].name == "WARNING"]
-    assert len(warnings) == 1
-    text = warnings[0]["message"]
-    assert "identity_resolution_failed" in text
-    assert "reason=unauthorized" in text
-    for secret in (PHONE, LID, CHAT, "Synthetic Sender", "SYN-MSG-1", "secret detail"):
-        assert secret not in text

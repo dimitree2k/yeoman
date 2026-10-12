@@ -18,7 +18,7 @@ from yeoman_gateway.policy.engine import PolicyEngine
 from yeoman_gateway.policy.schema import PolicyConfig
 from yeoman_gateway.processing.responder import ThreadActorResponder
 from yeoman_gateway.providers.base import LLMProvider, LLMResponse
-from yeoman_gateway.session.manager import SessionManager
+from yeoman_gateway.session.manager import Session, SessionManager
 from yeoman_shared.utils.helpers import get_operational_store_path, get_sessions_path
 
 
@@ -39,9 +39,7 @@ def case(tmp_path):
     snapshot = HistorySnapshot(1, (), db)
     path = get_operational_store_path("session_metadata", data_dir=tmp_path, create=False)
     ops = OperationalSessions(path)
-    sessions = SessionManager(tmp_path, sessions_dir=tmp_path / "sessions",
-                              operational_store=ops, history_selected=True,
-                              legacy_history_disabled=True)
+    sessions = SessionManager(tmp_path, sessions_dir=tmp_path / "sessions", operational_store=ops)
     yield SimpleNamespace(ops=ops, sessions=sessions, snapshot=snapshot, path=path,
                           root=tmp_path)
     snapshot.close()
@@ -66,8 +64,7 @@ def test_new_boundary_survives_restart_without_conversation_text(case, monkeypat
     case.ops.close()
     case.ops = OperationalSessions(case.path)
     case.sessions = SessionManager(case.root, sessions_dir=case.root / "sessions",
-                                  operational_store=case.ops, history_selected=True,
-                                  legacy_history_disabled=True)
+                                  operational_store=case.ops)
     session = case.sessions.get_or_create("opaque:thread:key", channel="whatsapp",
                                          chat_id=ctx.chat_id, thread_id="t:1",
                                          history_snapshot=case.snapshot)
@@ -149,7 +146,7 @@ def test_boundary_import_is_explicit_and_preserves_last_marker(case):
     assert import_session_boundaries(source, case.ops) == {"whatsapp:dm": 1767225600000}
 
 
-def test_retired_session_routing_keeps_legacy_non_whatsapp_callers(case):
+def test_whatsapp_routes_to_operational_store_and_telegram_keeps_jsonl(case, monkeypatch):
     telegram = case.sessions.get_or_create("telegram:42")
     telegram.add_message("user", "telegram legacy caller")
     case.sessions.save(telegram)
@@ -157,17 +154,39 @@ def test_retired_session_routing_keeps_legacy_non_whatsapp_callers(case):
         {"role": "user", "content": "telegram legacy caller", "timestamp": telegram.messages[0]["timestamp"]}]
     with pytest.raises(ValueError):
         case.sessions.get_or_create("whatsapp:dm:synthetic:thread:1")
+    routed = case.sessions.get_or_create("opaque:wa", channel="whatsapp", chat_id="dm:synthetic",
+                                         history_snapshot=case.snapshot)
+    assert routed.operational_store is case.ops
+    with sqlite3.connect(case.path) as db:
+        assert db.execute("SELECT channel,chat_id,thread_id FROM routes WHERE session_key='opaque:wa'").fetchone() == (
+            "whatsapp", "dm:synthetic", None)
+    with monkeypatch.context() as guard:
+        guard.setattr(case.sessions, "_get_session_path", lambda key: (_ for _ in ()).throw(AssertionError(key)))
+        with pytest.raises(HistoryPaused, match="jsonl_retired"):
+            case.sessions._load("whatsapp:dm:synthetic")
+        with pytest.raises(HistoryPaused, match="jsonl_retired"):
+            case.sessions.delete("whatsapp:dm:synthetic")
+        with pytest.raises(HistoryPaused, match="jsonl_retired"):
+            case.sessions.save(Session("whatsapp:dm:synthetic"))
 
 
-def test_defaults_create_only_legacy_session_files(tmp_path):
+
+def test_whatsapp_jsonl_is_refused_and_telegram_persistence_remains(tmp_path, monkeypatch):
     sessions = SessionManager(tmp_path, sessions_dir=tmp_path / "sessions")
-    session = sessions.get_or_create("whatsapp:synthetic")
-    session.add_message("user", "default legacy text")
-    session.add_boundary()
-    session.add_message("assistant", "after boundary")
-    sessions.save(session)
-    assert sessions._load(session.key).get_history()[0]["content"] == "after boundary"
-    assert not (tmp_path / "ops").exists()
+    with monkeypatch.context() as guard:
+        guard.setattr(sessions, "_get_session_path", lambda key: (_ for _ in ()).throw(AssertionError(key)))
+        with pytest.raises(HistoryPaused, match="jsonl_retired"):
+            sessions._load("whatsapp:synthetic")
+        with pytest.raises(HistoryPaused, match="jsonl_retired"):
+            sessions.save(Session("whatsapp:synthetic"))
+        with pytest.raises(HistoryPaused, match="jsonl_retired"):
+            sessions.delete("whatsapp:synthetic")
+    with pytest.raises(ValueError, match="explicit channel/chat"):
+        sessions.get_or_create("whatsapp:synthetic")
+    telegram = sessions.get_or_create("telegram:synthetic")
+    telegram.add_message("user", "telegram text")
+    sessions.save(telegram)
+    assert sessions._load("telegram:synthetic").get_history()[0]["content"] == "telegram text"
 
 
 def test_import_validation_leaves_boundaries_unchanged(case, monkeypatch):
@@ -245,3 +264,17 @@ def test_sessions_path_can_resolve_without_creating_directories():
     assert set(root.rglob("*")) == before
     assert get_sessions_path() == root / "data" / "inbound"
     assert (root / "data" / "inbound").is_dir()
+
+
+def test_operational_manager_does_not_recreate_retired_directory(tmp_path):
+    directory = tmp_path / "sessions"
+    SessionManager(tmp_path, sessions_dir=directory)
+    assert not directory.exists()
+
+
+def test_explicit_whatsapp_channel_cannot_save_under_opaque_key(tmp_path):
+    directory = tmp_path / "sessions"
+    manager = SessionManager(tmp_path, sessions_dir=directory)
+    with pytest.raises(HistoryPaused, match="jsonl_retired"):
+        manager.save(Session("opaque", channel="whatsapp"))
+    assert not directory.exists()

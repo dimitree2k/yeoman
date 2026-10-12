@@ -46,6 +46,7 @@ PRIVATE_MODULES = (
 ALLOWED_IMPORTERS: dict[str, str] = {
     "knowledge": "the owning module",
     "cli/knowledge_commands.py": "migration CLI (offline operator path)",
+    "cli/history_commands.py": "history CLI (offline owner-attestation path)",
 }
 #: The composition root may build the private adapters.
 ALLOWED_FILES = {"app/bootstrap.py"}

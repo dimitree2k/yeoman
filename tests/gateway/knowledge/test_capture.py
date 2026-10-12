@@ -21,7 +21,7 @@ def test_replay_is_idempotent_but_other_audience_is_independent(knowledge_harnes
     h = knowledge_harness
     tom = h.person("Tom")
     a = h.source(tom, chat="group-a", audience={h.principal_for(tom)})
-    b = h.source(tom, chat="private-b", audience={h.principal_for(tom)})
+    b = h.source(tom, chat="group-b", audience={h.principal_for(tom)})
     first = h.capture_text("Alex reist morgen.", a)
     replay = h.capture_text("Alex reist morgen.", a)
     independent = h.capture_text("Alex reist morgen.", b)
@@ -42,8 +42,12 @@ def test_same_text_different_audience_in_one_chat_stays_separate(knowledge_harne
 def test_replay_of_a_new_source_revision_is_a_new_statement(knowledge_harness):
     h = knowledge_harness
     tom = h.person("Tom")
-    first = h.capture_text("Alex reist morgen.", h.source(tom, revision=1))
-    second = h.capture_text("Alex reist morgen.", h.source(tom, revision=2))
+    original_source = h.source(tom, revision=1)
+    first = h.capture_text("Alex reist morgen.", original_source)
+    revised_source = h.revise_source(original_source)
+    assert revised_source.event_id == original_source.event_id
+    assert revised_source.revision > original_source.revision
+    second = h.capture_text("Alex reist morgen.", revised_source)
     assert first.statement_ids != second.statement_ids
 
 
@@ -126,23 +130,36 @@ def test_source_outside_the_authorized_set_is_refused(knowledge_harness):
     tom = h.person("Tom")
     allowed = h.source(tom)
     other = h.source(tom)
+    statements_before = h.snapshot_counts()["knowledge_statements"]
     context = h.capture_context(allowed)
     with pytest.raises(KnowledgeError) as excinfo:
         h.service.capture(h.candidate("Alex reist.", other), context=context)
     assert excinfo.value.code == "unauthorized"
-    assert h.snapshot_counts()["knowledge_statements"] == 0
+    assert h.snapshot_counts()["knowledge_statements"] == statements_before
 
 
 def test_revoked_source_cannot_be_captured(knowledge_harness):
     h = knowledge_harness
     tom = h.person("Tom")
     source = h.source(tom)
-    h.authority.revoke_source(source)  # noqa: SLF001 - trusted adapter state
+    from yeoman_gateway.knowledge._history_identity import current_history_scope
+
+    with h.history_scope():
+        scope = current_history_scope(h._raw_service._store)  # noqa: SLF001
+        assert scope is not None
+        assert scope.sources.verify_source(source)
+    statements_before = h.snapshot_counts()["knowledge_statements"]
+    h.service.invalidate_source(source, context=h.capture_context(source))
+    with h.history_scope():
+        scope = current_history_scope(h._raw_service._store)  # noqa: SLF001
+        assert scope is not None
+        assert not scope.sources.verify_source(source)
     with pytest.raises(KnowledgeError) as excinfo:
         h.service.capture(
             h.candidate("Alex reist.", source), context=h.capture_context(source)
         )
-    assert excinfo.value.code == "source_revoked"
+    assert excinfo.value.code == "denied_unknown_basis"
+    assert h.snapshot_counts()["knowledge_statements"] == statements_before
 
 
 def test_caller_supplied_audience_is_not_part_of_the_contract():
@@ -194,10 +211,11 @@ def test_fabricated_source_revision_is_rejected(knowledge_harness):
         extractor_version="test-extractor-1",
         confidence=0.5,
     )
+    statements_before = h.snapshot_counts()["knowledge_statements"]
     with pytest.raises(KnowledgeError) as excinfo:
         h.service.capture(candidate, context=h.capture_context(source))
     assert excinfo.value.code == "denied_unknown_basis"
-    assert h.snapshot_counts()["knowledge_statements"] == 0
+    assert h.snapshot_counts()["knowledge_statements"] == statements_before
 
 
 def test_forged_source_metadata_is_rejected(knowledge_harness):
@@ -223,8 +241,9 @@ def test_forged_source_metadata_is_rejected(knowledge_harness):
 def test_ambiguous_name_stays_unresolved_instead_of_picking_a_person(knowledge_harness):
     h = knowledge_harness
     tom = h.person("Tom")
-    h.person("Alex")
-    h.person_for("whatsapp:4910000000099", "Alex Two")
+    first_alex = h.person("Alex")
+    second_alex = h.person_for("whatsapp:4910000000099", "Alex")
+    assert first_alex != second_alex
     source = h.source(tom)
     result = h.service.capture(
         h.candidate("Alex reist.", source, unresolved=("Alex",)),
@@ -232,7 +251,6 @@ def test_ambiguous_name_stays_unresolved_instead_of_picking_a_person(knowledge_h
     )
     sid = result.statement_ids[0]
     assert {link.role for link in h.links(sid)} == {"speaker"}
-    assert h.snapshot_counts()["contacts"] == 3
 
 
 def test_capture_result_reports_rejected_entries(knowledge_harness):

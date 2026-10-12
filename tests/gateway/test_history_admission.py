@@ -76,21 +76,39 @@ async def test_admission_and_final_reply_do_not_share_pre_enrichment_snapshot():
     p.close()
 
 
-def test_reply_anchor_cannot_leak_other_chat_or_deleted_payload():
-    from yeoman_gateway.adapters.reply_archive_history import HistoryReplyArchiveAdapter
-    p = Projector()
-    p.add('same', chat='other@g.us', text='private text')
-    snapshot = __import__('yeoman_gateway.history.reader', fromlist=['HistorySnapshot']).HistorySnapshot(1, (), p.db)
-    adapter = HistoryReplyArchiveAdapter(HistoryQueries(snapshot))
-    assert adapter.lookup_message('whatsapp', 'a@g.us', 'same') is None
-    assert adapter.lookup_message_any_chat('whatsapp', 'same', preferred_chat_id='a@g.us') is None
-    p.add('deleted', text='old quoted payload')
-    p.db.execute("INSERT INTO message_events(event_id,channel,chat_id,target_message_id,kind,payload_json,provenance,time_certainty,actor_basis,source_refs) VALUES ('delete','whatsapp','a@g.us','deleted','delete','{}','native','unknown','unknown','[]')")
-    assert adapter.lookup_message('whatsapp', 'a@g.us', 'deleted') is None
+
+@pytest.mark.asyncio
+async def test_reply_anchor_cannot_leak_other_chat_or_deleted_payload(tmp_path):
     from yeoman_gateway.core.models import InboundEvent
+    from yeoman_gateway.history.queries import HistoryQueries
     from yeoman_gateway.pipeline.reply_context import ReplyContextMiddleware
-    event = InboundEvent(channel='whatsapp', chat_id='a@g.us', sender_id='synthetic', content='reply', reply_to_message_id='deleted', reply_to_text='old quoted payload')
-    resolved, _, _ = ReplyContextMiddleware(archive=adapter)._resolve_reply_context(event)
-    assert resolved.reply_to_text is None
-    assert 'old quoted payload' not in str(resolved.raw_metadata)
-    snapshot.close()
+
+    from tests.gateway.history_test_helpers import ProjectedHistory
+
+    projected = ProjectedHistory(
+        tmp_path / "reply-history",
+        messages=[
+            dict(channel="whatsapp", chat_id="other@g.us", message_id="same",
+                 text="private text", timestamp=1_700_000_000, sender_id="sender"),
+            dict(channel="whatsapp", chat_id="a@g.us", message_id="deleted",
+                 text="old quoted payload", timestamp=1_700_000_001, sender_id="sender"),
+        ],
+    )
+    projected.append("delete", chat_id="a@g.us", timestamp=1_700_000_002,
+                     messageId="deleted")
+    event = InboundEvent(
+        channel="whatsapp", chat_id="a@g.us", sender_id="synthetic", content="reply",
+        reply_to_message_id="deleted", reply_to_text="old quoted payload",
+    )
+    try:
+        async with projected.turn() as snapshot:
+            queries = HistoryQueries(snapshot)
+            from yeoman_gateway.adapters.reply_archive_history import HistoryReplyArchiveAdapter
+            adapter = HistoryReplyArchiveAdapter(queries)
+            assert adapter.lookup_message("whatsapp", "a@g.us", "same") is None
+            assert adapter.lookup_message("whatsapp", "a@g.us", "deleted") is None
+            resolved, _, _ = ReplyContextMiddleware()._resolve_reply_context(event)
+            assert resolved.reply_to_text is None
+            assert "old quoted payload" not in str(resolved.raw_metadata)
+    finally:
+        projected.close()

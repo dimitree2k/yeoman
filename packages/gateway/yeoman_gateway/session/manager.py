@@ -15,10 +15,6 @@ from yeoman_shared.utils.helpers import get_operational_store_path, get_sessions
 from yeoman_gateway.history.live import HistoryPaused
 from yeoman_gateway.history.queries import HistoryQueries
 from yeoman_gateway.history.reader import HistorySnapshot
-from yeoman_gateway.history.writer_guard import (
-    legacy_history_writers_disabled,
-    require_legacy_history_writer,
-)
 
 if TYPE_CHECKING:
     from .operational import OperationalSessions
@@ -235,31 +231,11 @@ class SessionManager:
     """
 
     def __init__(self, workspace: Path, sessions_dir: Path | None = None, *,
-                 operational_store: "OperationalSessions | None" = None,
-                 history_selected: bool = False, legacy_history_disabled: bool = False):
+                 operational_store: "OperationalSessions | None" = None):
         self.workspace = workspace
         self.operational_store = operational_store
-        self.history_selected = history_selected is True
-        self.legacy_history_disabled = legacy_history_writers_disabled(legacy_history_disabled)
-        history_selected = self.history_selected
-        legacy_history_disabled = self.legacy_history_disabled
-        if (history_selected or legacy_history_disabled) and operational_store is None:
-            from .operational import OperationalSessions
-            self.operational_store = OperationalSessions(get_operational_store_path("session_metadata"))
-        if history_selected or legacy_history_disabled:
-            # Resolve legacy location without creating a retired inbound directory.
-            self.sessions_dir = sessions_dir if sessions_dir is not None else get_sessions_path(create=False)
-        else:
-            self.sessions_dir = sessions_dir if sessions_dir is not None else get_sessions_path()
-            self.sessions_dir.mkdir(parents=True, exist_ok=True)
+        self.sessions_dir = sessions_dir if sessions_dir is not None else get_sessions_path(create=False)
         self._cache: dict[str, Session] = {}
-
-    def uses_history(self, channel: str) -> bool:
-        if channel != "whatsapp":
-            return False
-        if self.legacy_history_disabled and not self.history_selected:
-            raise HistoryPaused("session_reader_unselected")
-        return self.history_selected
 
     def recent_history(self, *, channel: str, chat_id: str, snapshot: HistorySnapshot,
                        limit: int) -> list[dict[str, Any]]:
@@ -284,21 +260,18 @@ class SessionManager:
         Returns:
             The session.
         """
-        if self.history_selected or self.legacy_history_disabled:
-            if channel is None and key.startswith("whatsapp:"):
-                raise ValueError("selected session routing requires explicit channel/chat")
-            # Legacy non-WhatsApp keys retain their callers; never decode a new-store route.
-            if channel is not None and self.uses_history(channel):
-                if chat_id is None:
-                    raise ValueError("selected session routing requires explicit channel/chat")
-                assert self.operational_store is not None
-                self.operational_store.set_route(session_key=key, channel=channel, chat_id=chat_id,
-                                                 thread_id=thread_id)
-                return Session(key=key, operational_store=self.operational_store,
-                               channel=channel, chat_id=chat_id, thread_id=thread_id,
-                               history_snapshot=history_snapshot, current_message_id=current_message_id,
-                               turn_id=turn_id or uuid.uuid4().hex)
-        require_legacy_history_writer(disabled=self.legacy_history_disabled, channel=channel or key.split(":", 1)[0])
+        if channel == "whatsapp" or (channel is None and key.startswith("whatsapp:")):
+            if channel != "whatsapp" or not chat_id:
+                raise ValueError("WhatsApp session routing requires explicit channel/chat")
+            if self.operational_store is None:
+                from .operational import OperationalSessions
+                self.operational_store = OperationalSessions(get_operational_store_path("session_metadata"))
+            self.operational_store.set_route(session_key=key, channel=channel, chat_id=chat_id,
+                                             thread_id=thread_id)
+            return Session(key=key, operational_store=self.operational_store,
+                           channel=channel, chat_id=chat_id, thread_id=thread_id,
+                           history_snapshot=history_snapshot, current_message_id=current_message_id,
+                           turn_id=turn_id or uuid.uuid4().hex)
         # Check cache
         if key in self._cache:
             return self._cache[key]
@@ -313,7 +286,8 @@ class SessionManager:
 
     def _load(self, key: str) -> Session | None:
         """Load a session from disk."""
-        require_legacy_history_writer(disabled=self.legacy_history_disabled, channel=key.split(":", 1)[0])
+        if key.split(":", 1)[0] == "whatsapp":
+            raise HistoryPaused("whatsapp_session_jsonl_retired")
         path = self._get_session_path(key)
 
         if not path.exists():
@@ -352,7 +326,8 @@ class SessionManager:
         """Save a session to disk."""
         if session.operational_store is not None:
             return
-        require_legacy_history_writer(disabled=self.legacy_history_disabled, channel=session.key.split(":", 1)[0])
+        if session.channel == "whatsapp" or session.key.split(":", 1)[0] == "whatsapp":
+            raise HistoryPaused("whatsapp_session_jsonl_retired")
         path = self._get_session_path(session.key)
         path.parent.mkdir(parents=True, exist_ok=True)
         temporary = path.with_name(f".{path.name}.{uuid.uuid4().hex}.tmp")
@@ -392,7 +367,8 @@ class SessionManager:
         Returns:
             True if deleted, False if not found.
         """
-        require_legacy_history_writer(disabled=self.legacy_history_disabled, channel=key.split(":", 1)[0])
+        if key.split(":", 1)[0] == "whatsapp":
+            raise HistoryPaused("whatsapp_session_jsonl_retired")
         # Remove from cache
         self._cache.pop(key, None)
 
@@ -416,6 +392,8 @@ class SessionManager:
         sessions = []
 
         for path in self.sessions_dir.glob("*.jsonl"):
+            if path.name.startswith("whatsapp_"):
+                continue
             try:
                 # Read just the metadata line
                 with open(path) as f:

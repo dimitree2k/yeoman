@@ -15,10 +15,7 @@ from collections.abc import Iterator
 from contextlib import contextmanager
 from typing import TYPE_CHECKING
 
-from yeoman_gateway.history.writer_guard import (
-    legacy_history_writers_disabled,
-    require_legacy_history_writer,
-)
+from yeoman_gateway.history.writer_guard import require_legacy_history_writer
 
 if TYPE_CHECKING:
     from yeoman_gateway.history.queries import HistoryQueries
@@ -35,7 +32,6 @@ from typing import Any, Iterable
 
 from yeoman_gateway.knowledge._conversations import ConversationEngine
 from yeoman_gateway.knowledge._episodes import EpisodeConsolidator
-from yeoman_gateway.knowledge._identity import IdentityEngine
 from yeoman_gateway.knowledge._identity_candidates import IdentityCandidateEngine
 from yeoman_gateway.knowledge._migration import (
     LegacyCanonicalApplyReport,
@@ -55,7 +51,7 @@ from yeoman_gateway.knowledge._migration import (
 )
 from yeoman_gateway.knowledge._retrieval import RetrievalEngine
 from yeoman_gateway.knowledge._statements import StatementEngine, token_re
-from yeoman_gateway.knowledge._store import SCHEMA_VERSION, KnowledgeStore
+from yeoman_gateway.knowledge._store import KnowledgeStore
 from yeoman_gateway.knowledge.authority import (
     PolicyAuthority,
     SourceAuthority,
@@ -203,32 +199,22 @@ def open_knowledge_store(
     create: bool = True,
     retention_ms: int | None = None,
     legacy_sources: Iterable[Path] = (),
-    history_mode: bool = False,
-    legacy_history_disabled: bool = False,
 ) -> "KnowledgeService":
-    """Open (or create) the knowledge store and return the public service.
+    """Open an existing verified schema-3 knowledge store and return the public service.
 
     Raises :class:`KnowledgeStartupError` with ``migration_required`` when legacy data
     exists but no verified knowledge store was published, and ``schema_incompatible``
     when the file carries a different schema version.  Both are explicit states, never
     a silent fallback to an older store.
 
-    The order matters: the existing file is probed *read-only* before anything opens it
-    for writing.  A v1 store is therefore refused byte-for-byte unchanged - no tables, no
-    meta rows, no WAL side file.  Only a file that does not exist at all is created as a
-    fresh v2 store; the normal start never migrates, and it never upgrades in place.
+    The existing file is probed read-only and must already carry the verified schema-3
+    history upgrade. Startup never creates, migrates, or upgrades a knowledge store.
     """
-    legacy_history_disabled = legacy_history_writers_disabled(legacy_history_disabled)
-    if legacy_history_disabled and history_mode is not True:
-        from yeoman_gateway.history.live import HistoryPaused
-        raise HistoryPaused("retired_knowledge_requires_history_schema")
     path = Path(db_path).expanduser()
     legacy = [Path(item).expanduser() for item in legacy_sources]
     probe = _probe_schema(path)
     fresh = not probe.exists
-    expected_schema = 3 if history_mode else SCHEMA_VERSION
-    if history_mode and fresh:
-        raise KnowledgeStartupError("migration_required", "history mode requires an offline schema-3 copy")
+    expected_schema = 3
     if fresh and any(item.exists() for item in legacy):
         # The consolidated store is missing while legacy data exists.  Migrate
         # explicitly, never write an empty store next to the old data.
@@ -236,6 +222,8 @@ def open_knowledge_store(
             "migration_required",
             "legacy memory/contacts data exists but no verified knowledge store was built",
         )
+    if fresh:
+        raise KnowledgeStartupError("migration_required", "knowledge requires a verified schema-3 offline copy")
     if not fresh:
         if not probe.is_knowledge_store:
             # An occupied path without a knowledge schema is not a knowledge store: for
@@ -266,15 +254,9 @@ def open_knowledge_store(
                 " an explicit snapshot upgrade is required",
             )
     try:
-        store = KnowledgeStore(path, create=create and not history_mode)
+        store = KnowledgeStore(path, create=False)
     except sqlite3.Error as exc:  # pragma: no cover - defensive
         raise KnowledgeStartupError("storage_unavailable", str(exc)) from exc
-    if fresh and create:
-        # A brand-new installation with no legacy data is complete by construction.
-        store.set_meta("migration_complete", "1")
-        store.set_meta("migration_id", "fresh-install")
-        store.set_meta("semantic_digest", "")
-        store.commit_if_idle()
     return KnowledgeService(
         store=store,
         workspace_id=workspace_id,
@@ -282,8 +264,6 @@ def open_knowledge_store(
         policy_authority=policy_authority,
         clock=clock,
         retention_ms=retention_ms,
-        history_mode=history_mode,
-        legacy_history_disabled=legacy_history_disabled,
     )
 
 
@@ -377,26 +357,22 @@ class KnowledgeService:
         policy_authority: PolicyAuthority,
         clock: Any | None = None,
         retention_ms: int | None = None,
-        history_mode: bool = False,
-        legacy_history_disabled: bool = False,
     ) -> None:
-        self.legacy_history_disabled = legacy_history_writers_disabled(legacy_history_disabled)
-        if self.legacy_history_disabled is True and store.schema_version != 3:
+        # S4 identity/memory/contact mutation delegates remain guarded as retired.
+        self.legacy_history_disabled = True
+        if store.schema_version != 3:
             from yeoman_gateway.history.live import HistoryPaused
             raise HistoryPaused("retired_knowledge_requires_history_schema")
         self._store = store
         # One wrapper so administrative sources registered later are visible to the
         # statement engine through the very same object.
         from yeoman_gateway.knowledge._history_identity import ScopedKnowledgeAdapter
-        self._history_mode = history_mode
         self._legacy_authority = _RecordingSourceAuthority(source_authority)
-        self._authority = ScopedKnowledgeAdapter(store, self._legacy_authority, 'sources', selected=history_mode)
+        self._authority = ScopedKnowledgeAdapter(store, 'sources')
         self._policy = policy_authority
         self.workspace_id = str(workspace_id)
         self._clock = clock
-        self._identity = ScopedKnowledgeAdapter(store,
-            IdentityEngine(store, authority=self._authority, policy=policy_authority, legacy_history_disabled=self.legacy_history_disabled),
-            'identity', selected=history_mode)
+        self._identity = ScopedKnowledgeAdapter(store, 'identity')
         self._identity_candidates = IdentityCandidateEngine(store, identity=self._identity)
         self._statements = StatementEngine(
             store,
@@ -444,9 +420,9 @@ class KnowledgeService:
             _scopes.reset(token)
 
     def _require_legacy_identity(self) -> None:
-        require_legacy_history_writer(disabled=self.legacy_history_disabled, channel="whatsapp")
+        require_legacy_history_writer(disabled=True, channel="whatsapp")
         from yeoman_gateway.knowledge._history_identity import current_history_scope
-        if self._history_mode or current_history_scope(self._store) is not None:
+        if current_history_scope(self._store) is not None:
             raise KnowledgeError('history_identity_read_only', 'use the local owner-attestation CLI')
 
     @property
@@ -483,7 +459,7 @@ class KnowledgeService:
         """Server-side refresh of the trusted read context (never from a model)."""
         if not isinstance(context, TrustedReadContext):
             raise ValidationError("read context must be a TrustedReadContext")
-        if self._history_mode and context.channel == 'whatsapp':
+        if context.channel == 'whatsapp':
             from yeoman_gateway.history.live import HistoryPaused
             from yeoman_gateway.knowledge._history_identity import current_history_scope
             if current_history_scope(self._store) is None:
@@ -1587,13 +1563,13 @@ class KnowledgeService:
         """The session/notes adapter's view of the shared store.  Internal use only."""
         from yeoman_gateway.knowledge._memory.store import MemoryStore
 
-        return MemoryStore(owner=self._store, legacy_history_disabled=self.legacy_history_disabled)
+        return MemoryStore(owner=self._store, legacy_history_disabled=True)
 
     def contacts_store(self) -> Any:
         """The contacts cache adapter's view of the shared store.  Internal use only."""
         from yeoman_gateway.knowledge._contacts.store import ContactsStore
 
-        return ContactsStore(owner=self._store, legacy_history_disabled=self.legacy_history_disabled)
+        return ContactsStore(owner=self._store, legacy_history_disabled=True)
 
     # ── internal helpers used by the runtime adapters ────────────────────────
 
@@ -1962,7 +1938,7 @@ class KnowledgeService:
             return None
         from yeoman_gateway.knowledge._history_identity import current_history_scope
         scope = current_history_scope(self._store)
-        if self._history_mode and scope is None:
+        if channel == 'whatsapp' and scope is None:
             from yeoman_gateway.history.live import HistoryPaused
             raise HistoryPaused('knowledge_history_scope_required')
         if scope is not None:
@@ -2340,18 +2316,12 @@ class KnowledgeService:
         """
         from yeoman_gateway.knowledge._history_identity import current_history_scope
         scope = current_history_scope(self._store)
-        if self._history_mode and scope is None:
+        if scope is None:
             from yeoman_gateway.history.live import HistoryPaused
             raise HistoryPaused('knowledge_history_scope_required')
-        if scope is not None:
-            rows = scope.queries._rows("SELECT DISTINCT value FROM identifier_history"
-                                       " WHERE channel='whatsapp' AND strength='strong' AND valid_until_ms IS NULL ORDER BY value")
-            return tuple(row['value'] for row in rows if scope.identity.owners_of_identifier_value(row['value']))
-        rows = self._store.query(
-            "SELECT value FROM knowledge_identifier_bindings WHERE status = 'active'"
-            " ORDER BY 1"
-        )
-        return tuple(str(row[0]) for row in rows)
+        rows = scope.queries._rows("SELECT DISTINCT value FROM identifier_history"
+                                   " WHERE channel='whatsapp' AND strength='strong' AND valid_until_ms IS NULL ORDER BY value")
+        return tuple(row['value'] for row in rows if scope.identity.owners_of_identifier_value(row['value']))
 
     def roster(
         self, *, context: TrustedReadContext, participant_ids: tuple[str, ...]

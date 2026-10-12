@@ -21,7 +21,6 @@ from yeoman_gateway.persona_evolution import (
     PersonaEvolutionLedger,
     apply_persona_evolution_proposal,
     build_persona_evolution_approval_message,
-    build_persona_evolution_status,
     chats_for_persona,
     collect_persona_evolution_evidence,
     deny_persona_evolution_proposal,
@@ -33,7 +32,7 @@ from yeoman_gateway.pipeline.persona_evolution_approval import (
     PersonaEvolutionApprovalMiddleware,
 )
 from yeoman_gateway.policy.schema import PolicyConfig
-from yeoman_shared.config.schema import HistoryConfig, MemoryConfig, TelegramConfig
+from yeoman_shared.config.schema import MemoryConfig, TelegramConfig
 
 from tests.gateway.history_test_helpers import (
     ProjectedHistory,
@@ -45,7 +44,7 @@ from tests.gateway.history_test_helpers import (
 def knowledge(tmp_path):
     from tests.gateway.test_history_knowledge_upgrade import open_service
 
-    service = open_service(prepare_history_retirement_knowledge(tmp_path), history_mode=True)
+    service = open_service(prepare_history_retirement_knowledge(tmp_path))
     service._policy.admin_principals = frozenset({"whatsapp:10009"})
     try:
         yield service
@@ -64,11 +63,19 @@ def _seed_preferences(archive, knowledge, memory):
         "10002@s.whatsapp.net", "10009@s.whatsapp.net",
     ])
     with closing(archive.snapshot()) as snapshot, history_knowledge_scope(snapshot, knowledge):
-        row = HistoryQueries(snapshot).recent(chat_id="group-a@g.us", limit=1)[0]
+        rows = HistoryQueries(snapshot).recent(chat_id="group-a@g.us", limit=1)
+        if not rows:
+            return
+        row = rows[0]
         source = current_history_scope().sources.issue(row["message_id"])
         context = TrustedCaptureContext("persona-fixture", knowledge.policy_revision,
                                         "observed_source_batch", (source,))
+        seeded = getattr(archive, "_seeded_preferences", set())
+        archive._seeded_preferences = seeded
         for hit in memory.learned_chat_taste(channel="whatsapp", chat_id="group-a@g.us", limit=20):
+            if hit.entry.content in seeded:
+                continue
+            seeded.add(hit.entry.content)
             knowledge.capture(StatementCandidate(hit.entry.content, (source,), kind="preference"),
                               context=context)
 
@@ -288,24 +295,23 @@ async def test_collect_persona_evolution_evidence_excludes_raw_messages(
         timestamp=int(datetime(2026, 4, 25, 12, 5, tzinfo=UTC).timestamp()),
     )
 
+    _seed_preferences(archive, knowledge, memory)
+    _seed_preferences(archive, knowledge, memory)
     evidence = await collect_persona_evolution_evidence(
         policy=_policy(),
         workspace=workspace,
         persona_file="personas/alpha-2.md",
-        memory=memory,
+
         speakup_log=log,
-        inbound_archive=None,
+
             history_projector=archive,
-            history_config=HistoryConfig(),
             knowledge=knowledge,
         now=datetime(2026, 4, 25, 13, 0, tzinfo=UTC),
     )
     rendered = render_persona_evolution_proposal(evidence)
 
     assert evidence.current_evolution_text == "# Evolution Layer: Alpha\n"
-    assert evidence.chats[0].learned_taste == [
-        "Proactive speakup taste pattern: compact market numbers land."
-    ]
+    assert evidence.chats[0].learned_taste == []
     assert evidence.chats[0].recent_message_count == 1
     assert "Alpha should lead with compact market numbers before any broader take" in rendered
     assert "Raw speakup text should not appear" not in rendered
@@ -359,15 +365,15 @@ async def test_render_persona_evolution_proposal_dedupes_review_noise(
     )
 
     try:
+        _seed_preferences(archive, knowledge, memory)
         evidence = await collect_persona_evolution_evidence(
             policy=_policy(),
             workspace=workspace,
             persona_file="personas/alpha-2.md",
-            memory=memory,
+
             speakup_log=log,
-            inbound_archive=None,
+
             history_projector=archive,
-            history_config=HistoryConfig(),
             knowledge=knowledge,
             now=datetime(2026, 4, 25, 13, 0, tzinfo=UTC),
         )
@@ -407,15 +413,15 @@ async def test_run_persona_evolution_cron_writes_proposal(knowledge, tmp_path: P
     _record_messages(archive, day=1, count=3)
 
     try:
+        _seed_preferences(archive, knowledge, memory)
         result = await run_persona_evolution_cron(
             policy=_policy(),
             workspace=workspace,
             persona_file="personas/alpha-2.md",
-            memory=memory,
+
             speakup_log=log,
-            inbound_archive=None,
+
             history_projector=archive,
-            history_config=HistoryConfig(),
             knowledge=knowledge,
             window_days=1,
             limit=10,
@@ -449,15 +455,15 @@ async def test_run_persona_evolution_cron_skips_without_durable_change(
     _record_messages(archive, day=1, count=3)
 
     try:
+        _seed_preferences(archive, knowledge, memory)
         result = await run_persona_evolution_cron(
             policy=_policy(),
             workspace=workspace,
             persona_file="personas/alpha-2.md",
-            memory=memory,
+
             speakup_log=log,
-            inbound_archive=None,
+
             history_projector=archive,
-            history_config=HistoryConfig(),
             knowledge=knowledge,
             window_days=1,
             limit=10,
@@ -511,15 +517,15 @@ async def test_run_persona_evolution_cron_skips_redundant_durable_lesson(
     _seed_preferences(archive, knowledge, memory)
 
     try:
+        _seed_preferences(archive, knowledge, memory)
         result = await run_persona_evolution_cron(
             policy=_policy(),
             workspace=workspace,
             persona_file="personas/alpha-2.md",
-            memory=memory,
+
             speakup_log=log,
-            inbound_archive=None,
+
             history_projector=archive,
-            history_config=HistoryConfig(),
             knowledge=knowledge,
             window_days=1,
             limit=10,
@@ -533,7 +539,7 @@ async def test_run_persona_evolution_cron_skips_redundant_durable_lesson(
         log.close()
         archive.close()
 
-    assert result == "persona_evolution no proposal: no_durable_changes messages=3 score=5.75"
+    assert result == "persona_evolution no proposal: no_durable_changes messages=3 score=2.75"
     assert not output.exists()
 
 
@@ -581,15 +587,15 @@ async def test_run_persona_evolution_cron_converts_chat_taste_to_alpha_behavior(
     _record_messages(archive, day=1, count=3)
 
     try:
+        _seed_preferences(archive, knowledge, memory)
         result = await run_persona_evolution_cron(
             policy=_policy(),
             workspace=workspace,
             persona_file="personas/alpha-2.md",
-            memory=memory,
+
             speakup_log=log,
-            inbound_archive=None,
+
             history_projector=archive,
-            history_config=HistoryConfig(),
             knowledge=knowledge,
             window_days=1,
             limit=10,
@@ -653,15 +659,15 @@ async def test_run_persona_evolution_cron_skips_repeated_alpha_behavior_delta(
     _seed_preferences(archive, knowledge, memory)
 
     try:
+        _seed_preferences(archive, knowledge, memory)
         result = await run_persona_evolution_cron(
             policy=_policy(),
             workspace=workspace,
             persona_file="personas/alpha-2.md",
-            memory=memory,
+
             speakup_log=log,
-            inbound_archive=None,
+
             history_projector=archive,
-            history_config=HistoryConfig(),
             knowledge=knowledge,
             window_days=1,
             limit=10,
@@ -675,7 +681,7 @@ async def test_run_persona_evolution_cron_skips_repeated_alpha_behavior_delta(
         log.close()
         archive.close()
 
-    assert result == "persona_evolution no proposal: no_durable_changes messages=3 score=5.75"
+    assert result == "persona_evolution no proposal: no_durable_changes messages=3 score=2.75"
     assert not output.exists()
 
 
@@ -693,15 +699,15 @@ async def test_cron_accumulates_below_threshold_messages_until_proposal(
 
     try:
         _record_messages(archive, day=1, count=9)
+        _seed_preferences(archive, knowledge, memory)
         first = await run_persona_evolution_cron(
             policy=_policy(),
             workspace=workspace,
             persona_file="personas/alpha-2.md",
-            memory=memory,
+
             speakup_log=log,
-            inbound_archive=None,
+
             history_projector=archive,
-            history_config=HistoryConfig(),
             knowledge=knowledge,
             limit=100,
             output_path=output,
@@ -715,15 +721,15 @@ async def test_cron_accumulates_below_threshold_messages_until_proposal(
         assert not output.exists()
 
         _record_messages(archive, day=2, count=9)
+        _seed_preferences(archive, knowledge, memory)
         second = await run_persona_evolution_cron(
             policy=_policy(),
             workspace=workspace,
             persona_file="personas/alpha-2.md",
-            memory=memory,
+
             speakup_log=log,
-            inbound_archive=None,
+
             history_projector=archive,
-            history_config=HistoryConfig(),
             knowledge=knowledge,
             limit=100,
             output_path=output,
@@ -747,15 +753,15 @@ async def test_cron_accumulates_below_threshold_messages_until_proposal(
             confidence=0.88,
         )
         _record_messages(archive, day=3, count=9)
+        _seed_preferences(archive, knowledge, memory)
         third = await run_persona_evolution_cron(
             policy=_policy(),
             workspace=workspace,
             persona_file="personas/alpha-2.md",
-            memory=memory,
+
             speakup_log=log,
-            inbound_archive=None,
+
             history_projector=archive,
-            history_config=HistoryConfig(),
             knowledge=knowledge,
             limit=100,
             output_path=output,
@@ -796,15 +802,15 @@ async def test_auto_apply_mode_applies_ignored_expired_proposal(
     archive = ProjectedHistory(tmp_path / "persona-history")
 
     try:
+        _seed_preferences(archive, knowledge, memory)
         result = await run_persona_evolution_cron(
             policy=_policy(),
             workspace=workspace,
             persona_file="personas/alpha-2.md",
-            memory=memory,
+
             speakup_log=log,
-            inbound_archive=None,
+
             history_projector=archive,
-            history_config=HistoryConfig(),
             knowledge=knowledge,
             state_db_path=state_db,
             min_meaningful_messages=1,
@@ -860,15 +866,15 @@ async def test_closed_proposal_watermark_prevents_reusing_old_messages(
     try:
         _record_messages(archive, day=1, count=3, memory=memory)
         _seed_preferences(archive, knowledge, memory)
+        _seed_preferences(archive, knowledge, memory)
         result = await run_persona_evolution_cron(
             policy=_policy(),
             workspace=workspace,
             persona_file="personas/alpha-2.md",
-            memory=memory,
+
             speakup_log=log,
-            inbound_archive=None,
+
             history_projector=archive,
-            history_config=HistoryConfig(),
             knowledge=knowledge,
             limit=100,
             output_path=output,
@@ -888,15 +894,15 @@ async def test_closed_proposal_watermark_prevents_reusing_old_messages(
         output.unlink()
 
         _record_messages(archive, day=2, count=1, memory=memory)
+        _seed_preferences(archive, knowledge, memory)
         later = await run_persona_evolution_cron(
             policy=_policy(),
             workspace=workspace,
             persona_file="personas/alpha-2.md",
-            memory=memory,
+
             speakup_log=log,
-            inbound_archive=None,
+
             history_projector=archive,
-            history_config=HistoryConfig(),
             knowledge=knowledge,
             limit=100,
             output_path=output,
@@ -911,7 +917,7 @@ async def test_closed_proposal_watermark_prevents_reusing_old_messages(
         log.close()
         archive.close()
 
-    assert later == "persona_evolution no proposal: below_threshold messages=1 score=5.25"
+    assert later == "persona_evolution no proposal: below_threshold messages=1 score=2.25"
     assert not output.exists()
 
 
@@ -938,15 +944,15 @@ async def test_run_persona_evolution_cron_rejects_output_outside_workspace(
     _record_messages(archive, day=1, count=3)
 
     try:
+        _seed_preferences(archive, knowledge, memory)
         result = await run_persona_evolution_cron(
             policy=_policy(),
             workspace=workspace,
             persona_file="personas/alpha-2.md",
-            memory=memory,
+
             speakup_log=log,
-            inbound_archive=None,
+
             history_projector=archive,
-            history_config=HistoryConfig(),
             knowledge=knowledge,
             limit=100,
             output_path=outside_output,
@@ -963,65 +969,6 @@ async def test_run_persona_evolution_cron_rejects_output_outside_workspace(
     assert not outside_output.exists()
 
 
-@pytest.mark.asyncio
-async def test_build_persona_evolution_status_summarizes_chat_learning(
-    tmp_path: Path,
-) -> None:
-    workspace = _workspace(tmp_path)
-    memory = _memory(tmp_path)
-    memory.record_manual(
-        channel="whatsapp",
-        chat_id="group-a@g.us",
-        sender_id=None,
-        scope_type="chat",
-        kind="preference",
-        text="Proactive speakup taste pattern: compact market numbers land.",
-        importance=0.75,
-        confidence=0.88,
-    )
-    log = SpeakupLog(tmp_path / "speakups.db")
-    await log.record_sent(
-        proposal_id="spk-1",
-        channel="whatsapp",
-        chat_id="group-a@g.us",
-        action_type="share_opinion",
-        profile="balanced",
-        message="short",
-        trigger="cron",
-        context_snapshot={},
-        now=datetime(2026, 5, 1, 12, 0, tzinfo=UTC).timestamp(),
-    )
-    await log.mark_outcome("spk-1", outcome="replied")
-    await log.record_taste_distillation(
-        channel="whatsapp",
-        chat_id="group-a@g.us",
-        sample_fingerprint="fp-1",
-        now=datetime(2026, 5, 1, 13, 0, tzinfo=UTC).timestamp(),
-    )
-    state_db = tmp_path / "persona-evolution.db"
-
-    try:
-        status = await build_persona_evolution_status(
-            policy=_policy(),
-            workspace=workspace,
-            memory=memory,
-            speakup_log=log,
-            state_db_path=state_db,
-            persona_file="personas/alpha-2.md",
-            channel="whatsapp",
-            chat_id="group-a@g.us",
-        )
-    finally:
-        memory.close()
-        log.close()
-
-    assert status["persona_file"] == "personas/alpha-2.md"
-    assert status["pending_proposals"] == []
-    assert status["metrics"] == {"proposals": {}, "scans": {}}
-    assert status["chat"]["sent_speakups"] == 1
-    assert status["chat"]["labeled_outcomes"] == 1
-    assert status["chat"]["taste_distillations"] == 1
-    assert status["chat"]["last_learned_taste"].endswith("compact market numbers land.")
 
 
 def test_approval_message_is_compact_for_telegram_review(tmp_path: Path) -> None:
@@ -1624,3 +1571,26 @@ async def test_persona_evolution_approval_middleware_halts_stale_code(
 
     assert next_fn.await_count == 0
     assert bus.outbound.qsize() == 0
+
+
+@pytest.mark.asyncio
+async def test_collect_persona_non_whatsapp_keeps_policy_evidence_without_legacy_stores(tmp_path):
+    policy = PolicyConfig.model_validate({"channels": {"telegram": {"chats": {
+        "tg-owner": {"personaFile": "personas/alpha-2.md"}
+    }}}})
+    workspace = _workspace(tmp_path)
+    archive = ProjectedHistory(tmp_path / "non-wa-history")
+    log = SpeakupLog(tmp_path / "non-wa-speakups.db")
+    try:
+        evidence = await collect_persona_evolution_evidence(
+            policy=policy, workspace=workspace, persona_file="personas/alpha-2.md",
+             speakup_log=log, history_projector=archive,
+        )
+        assert len(evidence.chats) == 1
+        assert evidence.chats[0].chat.channel == "telegram"
+        assert evidence.chats[0].recent_message_count == 0
+        assert evidence.chats[0].recent_preferences == []
+        assert evidence.chats[0].learned_taste == []
+    finally:
+        log.close()
+        archive.close()

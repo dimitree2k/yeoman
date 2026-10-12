@@ -23,6 +23,24 @@ CHAT = "group@g.us"
 WINDOW_MS = 120 * 60_000
 
 
+@pytest.fixture(autouse=True)
+def projected_history_for_maintenance(tmp_path: Path, monkeypatch: pytest.MonkeyPatch):
+    from tests.gateway.history_test_helpers import ProjectedHistory
+
+    history = ProjectedHistory(tmp_path / "maintenance-history")
+    initialize = ParticipationMaintenance.__init__
+
+    def initialize_projected(self, *args, **kwargs):
+        initialize(self, *args, **kwargs)
+        history.wire(self)
+
+    monkeypatch.setattr(ParticipationMaintenance, "__init__", initialize_projected)
+    try:
+        yield history
+    finally:
+        history.close()
+
+
 def test_observation_window_boundary_arithmetic() -> None:
     assert (
         eligible_for_outcome(delivered_at_ms=0, now_ms=30 * 60_000, window_ms=WINDOW_MS)

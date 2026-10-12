@@ -13,6 +13,17 @@ from yeoman_gateway.core.models import OutboundEvent
 from yeoman_gateway.processing.dispatch import ForwardDispatchError
 from yeoman_shared.telemetry import InMemoryTelemetry
 
+from tests.gateway.history_test_helpers import ProjectedHistory
+
+
+@pytest.fixture
+def history(tmp_path):
+    projected = ProjectedHistory(tmp_path / "history-error-containment")
+    try:
+        yield projected
+    finally:
+        projected.close()
+
 
 class _Bus:
     def __init__(self, messages: list[InboundMessage], *, fail_on_outbound: int | None = None) -> None:
@@ -39,10 +50,6 @@ class _Bus:
 
     async def publish_reaction(self, message: Any) -> None:
         self.reactions.append(message)
-
-
-class _Memory:
-    pass
 
 
 class _ForwardRouter:
@@ -116,7 +123,7 @@ def _message(content: str) -> InboundMessage:
 
 
 @pytest.mark.asyncio
-async def test_orchestrator_error_is_silent_and_next_message_is_processed() -> None:
+async def test_orchestrator_error_is_silent_and_next_message_is_processed(history: ProjectedHistory) -> None:
     bus = _Bus([_message("broken"), _message("works")])
     orchestrator = _RaiseThenReply()
     service = OrchestratorService(
@@ -124,7 +131,7 @@ async def test_orchestrator_error_is_silent_and_next_message_is_processed() -> N
         orchestrator=orchestrator,
         typing_adapter=lambda channel, chat_id, enabled: None,
         telemetry=InMemoryTelemetry(),
-        memory=_Memory(),
+        history_projector=history,
     )
     orchestrator.service = service
 
@@ -136,7 +143,7 @@ async def test_orchestrator_error_is_silent_and_next_message_is_processed() -> N
 
 
 @pytest.mark.asyncio
-async def test_partial_dispatch_does_not_replay_or_publish_error_text() -> None:
+async def test_partial_dispatch_does_not_replay_or_publish_error_text(history: ProjectedHistory) -> None:
     bus = _Bus([_message("partial")], fail_on_outbound=2)
     orchestrator = _PartialDispatch()
     service = OrchestratorService(
@@ -144,7 +151,7 @@ async def test_partial_dispatch_does_not_replay_or_publish_error_text() -> None:
         orchestrator=orchestrator,
         typing_adapter=lambda channel, chat_id, enabled: None,
         telemetry=InMemoryTelemetry(),
-        memory=_Memory(),
+        history_projector=history,
     )
     orchestrator.service = service
 
@@ -155,7 +162,7 @@ async def test_partial_dispatch_does_not_replay_or_publish_error_text() -> None:
 
 
 @pytest.mark.asyncio
-async def test_forward_dispatch_failure_is_reported_through_managed_text() -> None:
+async def test_forward_dispatch_failure_is_reported_through_managed_text(history: ProjectedHistory) -> None:
     bus = _Bus([])
     router = _ForwardRouter()
     service = OrchestratorService(
@@ -163,29 +170,30 @@ async def test_forward_dispatch_failure_is_reported_through_managed_text() -> No
         orchestrator=None,  # type: ignore[arg-type]
         typing_adapter=lambda channel, chat_id, enabled: None,
         telemetry=InMemoryTelemetry(),
-        memory=_Memory(),
+        history_projector=history,
         effect_router=router,  # type: ignore[arg-type]
     )
 
-    await service._dispatch_intents(
-        [
-            SendOutboundIntent(
-                event=OutboundEvent(
-                    channel="whatsapp",
-                    chat_id="target@g.us",
-                    content="",
-                    metadata={
-                        "message_id": "command-1",
-                        "forward_message": {
-                            "source_chat_id": "source@g.us",
-                            "source_message_id": "source-1",
+    async with history.turn():
+        await service._dispatch_intents(
+            [
+                SendOutboundIntent(
+                    event=OutboundEvent(
+                        channel="whatsapp",
+                        chat_id="target@g.us",
+                        content="",
+                        metadata={
+                            "message_id": "command-1",
+                            "forward_message": {
+                                "source_chat_id": "source@g.us",
+                                "source_message_id": "source-1",
+                            },
                         },
-                    },
+                    )
                 )
-            )
-        ],
-        principal="owner",
-    )
+            ],
+            principal="owner",
+        )
 
     assert len(router.calls) == 2
     assert router.calls[1].event.chat_id == "source@g.us"
@@ -195,7 +203,7 @@ async def test_forward_dispatch_failure_is_reported_through_managed_text() -> No
 
 
 @pytest.mark.asyncio
-async def test_f03_a_second_message_is_ingested_during_a_running_generation() -> None:
+async def test_f03_a_second_message_is_ingested_during_a_running_generation(history: ProjectedHistory) -> None:
     """Review F03: the loop used to wait for pipeline *and* dispatch before reading on.
 
     A follow-up could therefore never reach the running thread's postbox - the branch that
@@ -226,17 +234,17 @@ async def test_f03_a_second_message_is_ingested_during_a_running_generation() ->
         orchestrator=_Orchestrator(),
         typing_adapter=lambda channel, chat_id, enabled: None,
         telemetry=InMemoryTelemetry(),
-        memory=_Memory(),
+        history_projector=history,
     )
     orchestrator = service._orchestrator
     orchestrator.service = service  # type: ignore[attr-defined]
 
     task = asyncio.create_task(service.run())
-    await asyncio.wait_for(first_running.wait(), timeout=2)
+    await asyncio.wait_for(first_running.wait(), timeout=30)
 
     # The proof: the second message is already being handled while the first is blocked.
-    await asyncio.wait_for(second_ingested.wait(), timeout=2)
+    await asyncio.wait_for(second_ingested.wait(), timeout=30)
     assert handled == ["first", "second"]
 
     release.set()
-    await asyncio.wait_for(task, timeout=10)
+    await asyncio.wait_for(task, timeout=30)

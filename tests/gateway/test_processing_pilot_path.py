@@ -30,6 +30,13 @@ from yeoman_gateway.processing.policy import IngestRequest
 from yeoman_gateway.session.manager import Session
 from yeoman_shared.config.schema import Config
 
+
+@pytest.fixture(autouse=True)
+def _projected_actor_history(monkeypatch, request, tmp_path):
+    from tests.gateway.history_test_helpers import install_projected_thread_history
+    install_projected_thread_history(monkeypatch, request, tmp_path)
+
+
 CHAT = "pilot@g.us"
 ORDERER = "10001@s.whatsapp.net"
 OWNER = "10002@s.whatsapp.net"

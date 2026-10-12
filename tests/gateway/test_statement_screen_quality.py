@@ -20,7 +20,7 @@ from yeoman_gateway.knowledge._memory.extraction_jobs import (
 )
 from yeoman_gateway.knowledge._statements import rescreen_statements
 
-from tests.gateway.capture_harness import AUTHOR, GROUP, CaptureHarness
+from tests.gateway.capture_harness import GROUP, CaptureHarness
 
 IDLE_MS = 60_000
 
@@ -86,38 +86,13 @@ def test_uncertainty_is_still_kept_not_refused() -> None:
     assert screen_statement_content("Timo könnte heiraten.").accepted
 
 
-def test_a_refused_report_never_removes_the_observation(tmp_path: Path) -> None:
-    harness = CaptureHarness(tmp_path, idle_ms=60_000)
-    try:
-        harness.activate()
-        event_id = harness.observe("Es wird gefragt, wie alt die Person war.")
-        harness.advance(60_001)
-        harness.drafts = [
-            StatementDraft(
-                content="Es wird gefragt, wie alt die Person war.",
-                source_index=0,
-                basis="explicit_statement",
-            )
-        ]
-
-        report = harness.run_capture()
-
-        assert report.published == 0
-        assert report.refused.get("conversation_report") == 1
-        assert harness.statements() == []
-        # The observation and its proof stay exactly where they were.
-        assert harness.store.get_event(event_id) is not None
-        assert harness.source_row(event_id)["audience_status"] == "known"
-    finally:
-        harness.close()
-
-
 def _publish_legacy_and_real(harness: CaptureHarness) -> tuple[str, str]:
     """Reproduce one legacy junk statement and one legitimate statement.
 
     The content screens run in the promotion worker, not in ``capture()``, so a row that
     was published before the rule existed is reproduced here exactly as history left it.
     """
+    from yeoman_gateway.knowledge._history_identity import current_history_scope
     from yeoman_gateway.knowledge.models import SourceRef, StatementCandidate, TrustedCaptureContext
 
     harness.activate()
@@ -126,43 +101,38 @@ def _publish_legacy_and_real(harness: CaptureHarness) -> tuple[str, str]:
     harness.observe("Die FDP liegt nur noch 3,9% hinter der CDU.", message_id="3EB0A01")
     harness.advance(60_001)
 
-    sources: list[SourceRef] = []
-    for provider_id in ("3EB0A00", "3EB0A01"):
-        event = harness.store.events_by_provider_identity(
-            channel="whatsapp", chat_id=GROUP, provider_message_id=provider_id
-        )[0]
-        sources.append(
-            SourceRef(
-                event_id=event.event_id,
-                revision=1,
-                channel="whatsapp",
-                chat_id=GROUP,
-                author_principal=AUTHOR,
-                occurred_at_ms=int(event.occurred_ms or harness.now),
-            )
+    with harness._history_scope():
+        scope = current_history_scope(harness.knowledge._store)  # noqa: SLF001
+        assert scope is not None
+        sources: list[SourceRef] = []
+        for provider_id in ("3EB0A00", "3EB0A01"):
+            native = scope.queries.native_message(chat_id=GROUP, native_id=provider_id)
+            assert native is not None
+            source = scope.sources.issue(str(native["message_id"]))
+            assert source.event_id == str(native["message_id"])
+            sources.append(source)
+        context = TrustedCaptureContext(
+            request_id="legacy-rows",
+            policy_revision=1,
+            capture_basis="historic_row",
+            authorized_sources=tuple(sources),
         )
-    context = TrustedCaptureContext(
-        request_id="legacy-rows",
-        policy_revision=1,
-        capture_basis="historic_row",
-        authorized_sources=tuple(sources),
-    )
-    junk = harness.knowledge.capture(
-        StatementCandidate(
-            content="Es wird gefragt, wie alt die Person war.",
-            sources=(sources[0],),
-            extractor_version="statement-capture-v0",
-        ),
-        context=context,
-    )
-    kept = harness.knowledge.capture(
-        StatementCandidate(
-            content="Die FDP liegt nur noch 3,9% hinter der CDU.",
-            sources=(sources[1],),
-            extractor_version="statement-capture-v0",
-        ),
-        context=context,
-    )
+        junk = harness.knowledge.capture(
+            StatementCandidate(
+                content="Es wird gefragt, wie alt die Person war.",
+                sources=(sources[0],),
+                extractor_version="statement-capture-v0",
+            ),
+            context=context,
+        )
+        kept = harness.knowledge.capture(
+            StatementCandidate(
+                content="Die FDP liegt nur noch 3,9% hinter der CDU.",
+                sources=(sources[1],),
+                extractor_version="statement-capture-v0",
+            ),
+            context=context,
+        )
     return junk.statement_ids[0], kept.statement_ids[0]
 
 
@@ -202,10 +172,10 @@ def test_rescreen_apply_hides_only_the_refused_statement(harness: CaptureHarness
         "SELECT content FROM memory2_nodes WHERE id = ?", (junk,)
     )
     assert content
-    authority = harness.store.get_event_source_authority(
+    authority = harness.knowledge.history_source_ledger.lookup(
         str(source["event_id"]), int(source["revision"])
     )
-    assert authority is not None and authority["revoked_at_ms"] is None
+    assert authority is not None and not authority.revoked
     audit = harness.knowledge._store.query_one(  # noqa: SLF001
         "SELECT reason FROM knowledge_statement_audit"
         " WHERE statement_id = ? AND operation = 'rescreen'",

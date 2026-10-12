@@ -24,12 +24,17 @@ from yeoman_shared.whatsapp_protocol import (
     REPLAYABLE_EVENT_TYPES,
 )
 
+from tests.gateway.history_test_helpers import ProjectedHistory
+
 CHAT = "chat@g.us"
 T0 = 1_700_000_000_000
 
 
 def _channel(store: ProcessingStore) -> WhatsAppChannel:
     channel = WhatsAppChannel(WhatsAppConfig(), MessageBus())
+    channel._history_projector = ProjectedHistory(
+        Path(store.path).parent / f"history-{id(channel)}"
+    )
     channel.set_processing_signals(SignalJournalSink(store, clock=lambda: T0))
     return channel
 
@@ -487,12 +492,6 @@ def test_the_inbound_metadata_carries_the_identity_inputs(tmp_path: Path) -> Non
 
 
 def test_opaque_encrypted_edit_is_canonical_but_never_projected_as_a_message() -> None:
-    class Memory:
-        indexed: list[object] = []
-
-        def index_canonical_event(self, event: object, **kwargs: object) -> None:
-            self.indexed.append(event)
-
     class Sources:
         registered: list[str] = []
 
@@ -501,9 +500,8 @@ def test_opaque_encrypted_edit_is_canonical_but_never_projected_as_a_message() -
             return True
 
     store = ProcessingStore(":memory:")
-    memory = Memory()
     sources = Sources()
-    sink = SignalJournalSink(store, clock=lambda: T0, memory=memory, sources=sources)
+    sink = SignalJournalSink(store, clock=lambda: T0, sources=sources)
     payload = {
         "chatJid": CHAT,
         "messageId": "edit-envelope-1",
@@ -539,7 +537,6 @@ def test_opaque_encrypted_edit_is_canonical_but_never_projected_as_a_message() -
     assert event.payload["target_message_id"] == "target-1"
     assert event.payload["encrypted_edit"]["encPayload"] == "AQID"
     assert event.payload["sender_name"] == "Synthetic sender"
-    assert memory.indexed == []
     assert sources.registered == []
 
     channel = WhatsAppChannel(WhatsAppConfig(), MessageBus())
@@ -549,13 +546,6 @@ def test_opaque_encrypted_edit_is_canonical_but_never_projected_as_a_message() -
 
 
 def test_partial_encrypted_edit_fields_are_canonical_but_not_projected() -> None:
-    class Memory:
-        def __init__(self) -> None:
-            self.indexed: list[object] = []
-
-        def index_canonical_event(self, event: object, **kwargs: object) -> None:
-            self.indexed.append(event)
-
     class Sources:
         def __init__(self) -> None:
             self.registered: list[str] = []
@@ -565,9 +555,8 @@ def test_partial_encrypted_edit_fields_are_canonical_but_not_projected() -> None
             return True
 
     store = ProcessingStore(":memory:")
-    memory = Memory()
     sources = Sources()
-    sink = SignalJournalSink(store, clock=lambda: T0, memory=memory, sources=sources)
+    sink = SignalJournalSink(store, clock=lambda: T0, sources=sources)
     id_only = {
         "chatJid": CHAT,
         "messageId": "edit-envelope-id-only",
@@ -621,7 +610,6 @@ def test_partial_encrypted_edit_fields_are_canonical_but_not_projected() -> None
     assert second_edit["encPayload"] == "%%%malformed-but-bounded"
     assert "encIv" not in second_edit
     assert "fromMe" not in second_edit["targetMessageKey"]
-    assert memory.indexed == []
     assert sources.registered == []
 
     channel = WhatsAppChannel(WhatsAppConfig(), MessageBus())
@@ -656,8 +644,7 @@ def test_partial_encrypted_edit_fields_are_canonical_but_not_projected() -> None
     assert projected == [ordinary]
     ordinary_event = store.get_event("ordinary-after-opaque")
     assert ordinary_event is not None
-    assert len(memory.indexed) == 1
-    assert sources.registered == ["ordinary-after-opaque"]
+    assert sources.registered == []
     store.close()
 
 

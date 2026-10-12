@@ -2,20 +2,13 @@
 
 from __future__ import annotations
 
-import asyncio
-import json
 import re
-import threading
 import time
 import uuid
 from collections import defaultdict, deque
 from dataclasses import replace
 from pathlib import Path
 from typing import Any, Callable
-
-import websockets
-from yeoman_shared.config.loader import load_config
-from yeoman_shared.whatsapp_protocol import PROTOCOL_VERSION
 
 from yeoman_gateway.policy.admin.audit import PolicyAuditEntry, PolicyAuditStore
 from yeoman_gateway.policy.admin.contracts import (
@@ -38,6 +31,17 @@ from yeoman_gateway.policy.schema import (
 )
 
 
+def _projected_history_chats() -> list[dict[str, Any]]:
+    from yeoman_gateway.history.context import current_history_snapshot
+    from yeoman_gateway.history.live import HistoryPaused
+    from yeoman_gateway.history.queries import HistoryQueries
+
+    snapshot = current_history_snapshot()
+    if snapshot is None:
+        raise HistoryPaused("secondary_history_scope_required")
+    return HistoryQueries(snapshot).chats()
+
+
 class PolicyAdminService:
     """Executes policy admin commands against policy.json with guardrails."""
 
@@ -49,20 +53,18 @@ class PolicyAdminService:
         known_tools: set[str],
         apply_channels: set[str],
         on_policy_applied: Callable[[PolicyConfig], None] | None = None,
-        group_subject_resolver: Callable[[list[str]], dict[str, str]] | None = None,
         processing_config: object | None = None,
+        history_chats_reader: Callable[[], list[dict[str, Any]]] = _projected_history_chats,
     ) -> None:
-        self._history_config: Any = None
         self._policy_path = policy_path
         self._processing_config = processing_config
+        self._history_chats_reader = history_chats_reader
         self._workspace = workspace
         self._known_tools = set(known_tools)
         self._apply_channels = set(apply_channels)
         self._on_policy_applied = on_policy_applied
         self._registry = PolicyCommandRegistry()
         self._audit = PolicyAuditStore(policy_path)
-        self._group_subject_resolver = group_subject_resolver
-        self._bridge_subject_cache: dict[str, str] = {}
         self._rate_limit_windows: dict[str, deque[float]] = defaultdict(deque)
 
     @property
@@ -455,10 +457,7 @@ class PolicyAdminService:
                     "in_policy": False,
                     "comment": "",
                     "tags": [],
-                    "seen_session": False,
-                    "seen_log": False,
-                    "seen_bridge": False,
-                    "session_mtime": 0.0,
+                    "seen_history": False,
                 }
                 records[chat_id] = rec
             return rec
@@ -481,48 +480,11 @@ class PolicyAdminService:
                 if tags:
                     rec["tags"] = tags
 
-        history = getattr(self, '_history_config', None)
-        if history is not None and (history.live_projection_enabled and history.readers.secondary or history.legacy_writers_disabled):
-            from yeoman_gateway.history.context import current_history_snapshot
-            from yeoman_gateway.history.live import HistoryPaused
-            from yeoman_gateway.history.queries import HistoryQueries
-            snapshot = current_history_snapshot()
-            if snapshot is None or not (history.live_projection_enabled and history.readers.secondary):
-                raise HistoryPaused('secondary_history_scope_required')
-            for row in HistoryQueries(snapshot).chats():
-                if row['chat_id'].endswith('@g.us'):
-                    rec = ensure(row['chat_id'])
-                    rec['comment'] = row['subject'] or rec['comment']
-            return records
-        base_dir = self._policy_path.parent
-        sessions_dir = base_dir / "data" / "inbound"
-        if sessions_dir.exists():
-            for path in sessions_dir.glob("whatsapp_*@g.us.jsonl"):
-                chat_id = path.name[len("whatsapp_") : -len(".jsonl")]
-                if not chat_id.endswith("@g.us"):
-                    continue
-                rec = ensure(chat_id)
-                rec["seen_session"] = True
-                try:
-                    rec["session_mtime"] = max(float(rec["session_mtime"]), path.stat().st_mtime)
-                except OSError:
-                    pass
-
-        for chat_id, subject in self._bridge_subject_cache.items():
-            rec = ensure(chat_id)
-            rec["seen_bridge"] = True
-            if not str(rec.get("comment") or "").strip():
-                rec["comment"] = subject
-
-        resolver = self._group_subject_resolver or self._list_group_subjects_from_bridge
-        bridge_names = resolver(list(records.keys()))
-        for chat_id, subject in bridge_names.items():
-            rec = ensure(chat_id)
-            rec["seen_bridge"] = True
-            self._bridge_subject_cache[chat_id] = subject
-            if not str(rec.get("comment") or "").strip():
-                rec["comment"] = subject
-
+        for row in self._history_chats_reader():
+            if row['chat_id'].endswith('@g.us'):
+                rec = ensure(row['chat_id'])
+                rec['seen_history'] = True
+                rec['comment'] = row['subject'] or rec['comment']
         return records
 
     def _match_group_query(self, query: str, records: dict[str, dict[str, Any]]) -> tuple[str | None, list[str]]:
@@ -580,13 +542,6 @@ class PolicyAdminService:
         if len(ci_tag) > 1:
             return None, ci_tag
 
-        bridge_hits = [
-            chat_id for chat_id, subject in self._bridge_subject_cache.items() if subject.strip().lower() == lowered
-        ]
-        if len(bridge_hits) == 1:
-            return bridge_hits[0], []
-        if len(bridge_hits) > 1:
-            return None, bridge_hits
 
         lowered_compact = re.sub(r"[\W_]+", "", lowered)
         if len(lowered_compact) >= 4:
@@ -606,12 +561,10 @@ class PolicyAdminService:
             for chat_id, rec in records.items():
                 alias = str(rec.get("alias") or "")
                 comment = str(rec.get("comment") or "")
-                subject = str(self._bridge_subject_cache.get(chat_id, "") or "")
                 tags = [str(tag or "") for tag in list(rec.get("tags", []))]
                 if (
                     _matches_value(alias)
                     or _matches_value(comment)
-                    or _matches_value(subject)
                     or any(_matches_value(tag) for tag in tags)
                 ):
                     partial_hits.add(chat_id)
@@ -803,7 +756,6 @@ class PolicyAdminService:
         rows.sort(
             key=lambda r: (
                 0 if bool(r["in_policy"]) else 1,
-                -float(r["session_mtime"]),
                 str(r["chat_id"]),
             )
         )
@@ -815,12 +767,8 @@ class PolicyAdminService:
             sources: list[str] = []
             if rec["in_policy"]:
                 sources.append("policy")
-            if rec["seen_session"]:
-                sources.append("sessions")
-            if rec["seen_log"]:
-                sources.append("log")
-            if rec.get("seen_bridge"):
-                sources.append("bridge")
+            if rec["seen_history"]:
+                sources.append("history")
             source_text = "+".join(sources) if sources else "unknown"
             chat_id = str(rec["chat_id"])
             alias = str(rec["alias"])
@@ -1558,85 +1506,3 @@ class PolicyAdminService:
         if result.outcome == "applied":
             return replace(result, message=f"Rollback applied from change {target_change_id}.")
         return result
-
-    def _list_group_subjects_from_bridge(self, ids: list[str]) -> dict[str, str]:
-        target_ids = [cid for cid in ids if isinstance(cid, str) and cid.endswith("@g.us")]
-        if not target_ids:
-            return {}
-
-        try:
-            config = load_config()
-        except Exception:
-            return {}
-
-        if not bool(getattr(config.channels.whatsapp, "enabled", False)):
-            return {}
-
-        token = str(getattr(config.channels.whatsapp, "bridge_token", "") or "").strip()
-        if not token:
-            return {}
-
-        bridge_url = str(config.channels.whatsapp.resolved_bridge_url).strip()
-        if not bridge_url:
-            return {}
-
-        async def _fetch(url: str, chat_ids: list[str], bridge_token: str) -> dict[str, str]:
-            request_id = uuid.uuid4().hex
-            payload = {
-                "version": PROTOCOL_VERSION,
-                "type": "list_groups",
-                "token": bridge_token,
-                "requestId": request_id,
-                "accountId": "default",
-                "payload": {"ids": chat_ids},
-            }
-            async with websockets.connect(url) as ws:
-                await ws.send(json.dumps(payload))
-                deadline = time.monotonic() + 5.0
-                while True:
-                    timeout = deadline - time.monotonic()
-                    if timeout <= 0:
-                        raise TimeoutError("bridge did not reply in time")
-                    raw = await asyncio.wait_for(ws.recv(), timeout=timeout)
-                    data = json.loads(raw)
-                    if data.get("version") != PROTOCOL_VERSION:
-                        continue
-                    if data.get("type") != "response":
-                        continue
-                    if data.get("requestId") != request_id:
-                        continue
-                    response_payload = data.get("payload")
-                    if not isinstance(response_payload, dict):
-                        raise RuntimeError("bridge response payload malformed")
-                    if not bool(response_payload.get("ok")):
-                        return {}
-                    result = response_payload.get("result")
-                    if not isinstance(result, dict):
-                        return {}
-                    groups = result.get("groups", [])
-                    out: dict[str, str] = {}
-                    if isinstance(groups, list):
-                        for item in groups:
-                            if not isinstance(item, dict):
-                                continue
-                            gid = str(item.get("chatJid", "")).strip()
-                            subj = str(item.get("subject", "")).strip()
-                            if gid and subj:
-                                out[gid] = subj
-                    return out
-
-        result_holder: dict[str, str] = {}
-        error_holder: dict[str, Exception] = {}
-
-        def _runner() -> None:
-            try:
-                result_holder.update(asyncio.run(_fetch(bridge_url, target_ids, token)))
-            except Exception as e:
-                error_holder["error"] = e
-
-        thread = threading.Thread(target=_runner, daemon=True)
-        thread.start()
-        thread.join(timeout=6.0)
-        if thread.is_alive() or error_holder:
-            return {}
-        return result_holder

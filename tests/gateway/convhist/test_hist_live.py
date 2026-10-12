@@ -39,14 +39,14 @@ async def start_ready(projector):
         await projector._startup_task
 
 
-def test_history_defaults_enabled_and_explicit_false_disables_projection(tmp_path, monkeypatch):
+def test_history_projection_is_required_and_false_is_refused(tmp_path, monkeypatch):
     from yeoman_gateway.app.bootstrap import build_history_projector
     monkeypatch.setenv('YEOMAN_HOME', str(tmp_path))
-    assert Config().history.live_projection_enabled is True
-    assert Config().history.legacy_writers_disabled is True
-    assert all(Config().history.readers.model_dump().values())
-    assert build_history_projector(Config(history={'liveProjectionEnabled': False}),
-                                  SimpleNamespace(raw_archive=None)) is None
+    assert not {'liveProjectionEnabled', 'readers', 'legacyWritersDisabled'} & set(Config().model_dump(by_alias=True).get("history", {}))
+    with pytest.raises(ValueError, match='liveProjectionEnabled'):
+        Config(history={'liveProjectionEnabled': False})
+    with pytest.raises(ValueError):
+        build_history_projector(Config(), SimpleNamespace(raw_archive=None))
     assert not (tmp_path / 'data/history').exists()
 
 
@@ -62,14 +62,15 @@ def test_history_environment_cannot_activate_loader_or_bootstrap(tmp_path, monke
     archive = RawArchive(tmp_path / 'raw', spool=tmp_path / 'spool', status_path=tmp_path / 'status.json')
     channels = SimpleNamespace(raw_archive=archive)
     existing_locks = set(tmp_path.rglob("*.lock"))
-    expected = payload is None or payload.get('history', {}).get('liveProjectionEnabled') is not False
+    if payload is not None and payload.get('history', {}).get('liveProjectionEnabled') is False:
+        from yeoman_shared.config.schema import UnsupportedHistoryConfigError
+        with pytest.raises(UnsupportedHistoryConfigError, match='liveProjectionEnabled'):
+            load_config(path)
+        return
     config = load_config(path)
-    assert config.history.live_projection_enabled is expected
+    assert 'liveProjectionEnabled' not in config.model_dump(by_alias=True).get("history", {})
     projector = build_history_projector(config, channels)
-    if expected:
-        assert projector is not None and projector.archive is archive
-    else:
-        assert projector is None
+    assert projector.archive is archive
     assert not (tmp_path / 'data/history').exists()
     assert set(tmp_path.rglob('*.lock')) == existing_locks
     assert not [t for t in threading.enumerate() if t.name.startswith('history-projector')]
@@ -406,14 +407,12 @@ def test_real_bootstrap_keeps_existing_consumers_and_raw_instance(tmp_path, monk
         assert not (tmp_path / 'data/history').exists()
         assert not list(tmp_path.rglob('*writer.lock'))
         assert not list(tmp_path.rglob('.history-projection-owner.lock'))
-        assert runtime.inbound_archive is None
+        assert not hasattr(runtime, "inbound_archive")
         assert not hasattr(runtime.channels, 'inbound_archive')
         assert runtime.speakup_log is None
         assert runtime.opportunity_scheduler is None
     finally:
-        for store in (runtime.inbound_archive, runtime.chat_registry, runtime.contacts, runtime.memory):
-            if store is not None:
-                store.close()
+        pass
 
 
 @pytest.mark.asyncio
@@ -542,8 +541,7 @@ async def test_gateway_history_lifecycle_starts_before_producers_and_stops_last(
         channels=SimpleNamespace(start_all=channels_start, stop_all=lambda: record('channels.stop')),
         cron=SimpleNamespace(start=lambda: record('cron.start'), stop=lambda: events.append('cron.stop')),
         heartbeat=SimpleNamespace(start=lambda: record('heartbeat.start'), stop=lambda: events.append('heartbeat.stop')),
-        inbound_archive=service('inbound'), responder=SimpleNamespace(tools={}, aclose=lambda: record('responder.close')),
-        memory=service('memory'), contacts=service('contacts'), chat_registry=service('registry'),
+        responder=SimpleNamespace(tools={}, aclose=lambda: record('responder.close')),
         reconciliation=reconciliation, processing=service('processing'), history_projector=history or service('history'),
     )
     with pytest.raises(RuntimeError, match='synthetic shutdown'):

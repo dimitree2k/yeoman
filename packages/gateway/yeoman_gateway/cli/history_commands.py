@@ -15,12 +15,14 @@ from yeoman_gateway.knowledge._history_reader import (
     HistorySearchUnsupportedError,
 )
 from yeoman_gateway.knowledge._history_rebuild import rebuild_history, verify_history
+from yeoman_gateway.knowledge.authority import PolicyMembership
 from yeoman_gateway.knowledge.models import (
     KnowledgeError,
     TrustedAdminContext,
     TrustedReadContext,
 )
 from yeoman_gateway.knowledge.runtime import RuntimeKnowledgePolicy
+from yeoman_gateway.policy.identity import registry_member_principals
 
 from .knowledge_commands import knowledge_app
 
@@ -341,21 +343,36 @@ def _authorization_context(
     return context, authority
 
 
-class _SnapshotRegistry:
-    def __init__(self, *, channel: str, account: str, chat_id: str, members: list[str], revision: str) -> None:
-        self.channel = channel
-        self.account = account
-        self.chat_id = chat_id
-        self.members = members
-        self.revision = revision
+class _SnapshotPolicy(RuntimeKnowledgePolicy):
+    """Read authority backed only by the command's validated policy snapshot."""
 
-    def get_chat(self, channel: str, chat_id: str) -> dict[str, Any] | None:
-        if (channel, chat_id) != (self.channel, self.chat_id):
+    def __init__(
+        self,
+        *,
+        channel: str,
+        chat_id: str,
+        members: list[str],
+        membership_revision: str,
+        policy_revision: int,
+    ) -> None:
+        super().__init__(engine=None, policy_revision=policy_revision)
+        self._channel = channel
+        self._chat_id = chat_id
+        self._members = tuple(members)
+        self._membership_revision = membership_revision
+
+    def membership(self, context: TrustedReadContext) -> PolicyMembership | None:
+        if (
+            (context.channel, context.chat_id)
+            != (self._channel, self._chat_id)
+            or context.policy_revision != self.policy_revision
+            or context.membership_revision != self._membership_revision
+        ):
             return None
-        return {
-            "metadata": {"participants": self.members},
-            "last_sync_at": self.revision,
-        }
+        members = registry_member_principals(self._channel, self._members)
+        if not members:
+            return None
+        return PolicyMembership(members=members, revision=self._membership_revision)
 
 
 def _read_authorization_context(
@@ -428,18 +445,14 @@ def _read_authorization_context(
         )
     except (TypeError, ValueError, KnowledgeError) as exc:
         raise KnowledgeError("unauthorized", "trusted read context fields are invalid") from exc
-    registry = _SnapshotRegistry(
+    policy = _SnapshotPolicy(
         channel=channel,
-        account=account,
         chat_id=chat_id,
         members=members,
-        revision=membership_revision,
-    )
-    return context, RuntimeKnowledgePolicy(
-        engine=None,
-        chat_registry=registry,
+        membership_revision=membership_revision,
         policy_revision=revision,
     )
+    return context, policy
 
 
 def _emit_history_receipts(metadata: dict[str, Any], results: Any) -> None:

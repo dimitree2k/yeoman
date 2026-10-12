@@ -139,8 +139,8 @@ class RecallConversationTool(Tool):
                 principal, self._chat_id, now_ms, is_owner=self._is_owner, channel=self._channel
             ):
                 return "Person and cross-chat history lookup is available only in the owner's direct chat."
-        snapshot = tool_history_snapshot(selected=getattr(self, '_history_selected', False))
-        if snapshot is not None and self._channel == 'whatsapp':
+        snapshot = tool_history_snapshot()
+        if self._channel == 'whatsapp':
             from yeoman_gateway.adapters.reply_archive_history import history_text
             from yeoman_gateway.history.queries import HistoryQueries
             queries = HistoryQueries(snapshot)

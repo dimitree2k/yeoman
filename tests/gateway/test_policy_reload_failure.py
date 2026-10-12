@@ -211,7 +211,8 @@ def test_admin_apply_clears_reload_error_state(tmp_path: Path) -> None:
     assert adapter._policy_reload_error is None
 
 
-def test_admin_command_recovers_from_reload_error(tmp_path: Path) -> None:
+@pytest.mark.asyncio
+async def test_admin_command_recovers_from_reload_error(tmp_path: Path) -> None:
     adapter, path, policy = _adapter(tmp_path)
     invalid = policy.model_dump(by_alias=True, exclude_none=True)
     invalid["unknownField"] = "reject me"
@@ -219,16 +220,25 @@ def test_admin_command_recovers_from_reload_error(tmp_path: Path) -> None:
     _force_reload_check(adapter)
     assert adapter.evaluate(_event()).accept_message is False
 
-    result = adapter.route_admin_command(
-        InboundEvent(
-            channel="whatsapp",
-            chat_id="owner@s.whatsapp.net",
-            sender_id="owner@s.whatsapp.net",
-            content="yes",
-            is_group=False,
-            reply_to_text="Group approval: `recovered@g.us`",
-        )
-    )
+    from tests.gateway.history_test_helpers import ProjectedHistory
+
+    history = ProjectedHistory(tmp_path / "approval-history", groups=[dict(
+        chat_id='recovered@g.us', participants=[], timestamp=1_700_000_000_000, name="Projected test group")])
+    try:
+        async with history.turn():
+            result = adapter.route_admin_command(
+                InboundEvent(
+                    channel="whatsapp",
+                    chat_id="owner@s.whatsapp.net",
+                    sender_id="owner@s.whatsapp.net",
+                    content="yes",
+                    is_group=False,
+                    reply_to_text="Group approval: `recovered@g.us`",
+                )
+            )
+
+    finally:
+        history.close()
 
     assert result is not None and result.outcome == "applied"
     assert adapter._policy_reload_error is None
@@ -236,22 +246,32 @@ def test_admin_command_recovers_from_reload_error(tmp_path: Path) -> None:
     assert adapter.evaluate(_event()).accept_message is True
 
 
-def test_first_admin_command_can_recover_from_invalid_policy(tmp_path: Path) -> None:
+@pytest.mark.asyncio
+async def test_first_admin_command_can_recover_from_invalid_policy(tmp_path: Path) -> None:
     adapter, path, policy = _adapter(tmp_path)
     invalid = policy.model_dump(by_alias=True, exclude_none=True)
     invalid["unknownField"] = "reject me"
     _replace_json(path, invalid)
 
-    result = adapter.route_admin_command(
-        InboundEvent(
-            channel="whatsapp",
-            chat_id="owner@s.whatsapp.net",
-            sender_id="owner@s.whatsapp.net",
-            content="ja",
-            is_group=False,
-            reply_to_text="Group approval: `recovered@g.us`",
-        )
-    )
+    from tests.gateway.history_test_helpers import ProjectedHistory
+
+    history = ProjectedHistory(tmp_path / "approval-history", groups=[dict(
+        chat_id='recovered@g.us', participants=[], timestamp=1_700_000_000_000, name="Projected test group")])
+    try:
+        async with history.turn():
+            result = adapter.route_admin_command(
+                InboundEvent(
+                    channel="whatsapp",
+                    chat_id="owner@s.whatsapp.net",
+                    sender_id="owner@s.whatsapp.net",
+                    content="ja",
+                    is_group=False,
+                    reply_to_text="Group approval: `recovered@g.us`",
+                )
+            )
+
+    finally:
+        history.close()
 
     assert result is not None and result.outcome == "applied"
     assert adapter._policy_reload_error is None

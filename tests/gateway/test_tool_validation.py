@@ -138,6 +138,14 @@ async def test_registry_returns_validation_error() -> None:
     assert "Invalid parameters" in result
 
 
+
+@pytest.fixture(autouse=True)
+def _project_whatsapp_responder_history(monkeypatch, request, tmp_path):
+    from tests.gateway.history_test_helpers import install_projected_responder_history
+
+    install_projected_responder_history(monkeypatch, request, tmp_path)
+
+
 @pytest.mark.asyncio
 async def test_message_tool_resolves_whatsapp_group_reference() -> None:
     sent: list[OutboundMessage] = []
@@ -774,7 +782,7 @@ async def test_orchestrator_blocks_input_before_responder() -> None:
     orchestrator = Orchestrator(
         policy=_AllowPolicy(),
         responder=responder,
-        reply_archive=None,
+
         reply_context_window_limit=6,
         reply_context_line_max_chars=256,
         security=security,
@@ -848,31 +856,30 @@ async def test_removed_owner_raw_voice_send_reaches_llm(
     assert bus.outbound_size == 0
 
 
-class _VoiceRegistry:
-    def get_chat(self, channel: str, chat_id: str) -> dict[str, Any] | None:
-        if (channel, chat_id) != ("whatsapp", "friends@g.us"):
-            return None
-        return {
-            "metadata": {
-                "participants": [
-                    {
-                        "id": "friend@lid",
-                        "phoneNumber": "491234@s.whatsapp.net",
-                    }
-                ]
-            }
-        }
-
-
-def test_non_owner_voice_guard_requires_current_chat_member_and_one_per_day(
+def test_non_owner_voice_guard_requires_current_history_member_and_one_per_day(
     tmp_path: Path,
 ) -> None:
+    from tests.gateway.history_test_helpers import ProjectedHistory
+
+    now_ms = time.time_ns() // 1_000_000 - 1000
+    history = ProjectedHistory(tmp_path / "voice-roster")
+    history.add_contact(
+        identifiers=["491234@s.whatsapp.net"], name="Friend", timestamp=now_ms,
+    )
+    history.add_contact(
+        identifiers=["499999@s.whatsapp.net"], name="Outsider", timestamp=now_ms,
+    )
+    history.add_group(
+        chat_id="friends@g.us",
+        participants=["10001@lid", "491234@s.whatsapp.net"],
+        timestamp=now_ms,
+    )
+    snapshot = history.snapshot()
     store = ProcessingStore(tmp_path / "processing.db")
     responder = LLMResponder(
         bus=MessageBus(),
         provider=_CountingProvider(),
         workspace=tmp_path,
-        chat_registry=_VoiceRegistry(),  # type: ignore[arg-type]
         processing_store=store,
     )
     context_token = set_tool_context(
@@ -881,14 +888,16 @@ def test_non_owner_voice_guard_requires_current_chat_member_and_one_per_day(
             chat_id="friends@g.us",
             session_key="whatsapp:friends@g.us",
             is_owner=False,
+            canonical_user_id="whatsapp:10001@lid",
+            history_snapshot=snapshot,
         )
     )
-    principal_token = CURRENT_PRINCIPAL.set("requester@lid")
+    principal_token = CURRENT_PRINCIPAL.set("10001@lid")
     try:
         outsider = responder._voice_send_governance_error(
             VoiceSendRequest(
                 channel="whatsapp",
-                chat_id="outsider@s.whatsapp.net",
+                chat_id="499999@s.whatsapp.net",
                 content="hi",
             )
         )
@@ -909,6 +918,8 @@ def test_non_owner_voice_guard_requires_current_chat_member_and_one_per_day(
     finally:
         CURRENT_PRINCIPAL.reset(principal_token)
         reset_tool_context(context_token)
+        snapshot.close()
+        history.close()
         store.close()
 
     assert "monthly premium" in (outsider or "").lower()

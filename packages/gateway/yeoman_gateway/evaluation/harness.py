@@ -2,11 +2,18 @@
 
 from __future__ import annotations
 
+import asyncio
+import tempfile
 import time
-from datetime import datetime
+from pathlib import Path
 from typing import Any
 
+from yeoman_shared.raw_archive.writer import RawArchive, RawEvent
+
 from yeoman_gateway.evaluation.scenarios import Scenario
+from yeoman_gateway.history.context import history_turn
+from yeoman_gateway.history.live import HistoryProjector
+from yeoman_gateway.history.project import project as project_history
 from yeoman_gateway.policy.schema import DEFAULT_PARTICIPATION_GUIDANCE
 from yeoman_gateway.processing.model_route import RouteReply
 from yeoman_gateway.processing.participation import ParticipationJudge, ParticipationOpportunity
@@ -22,40 +29,34 @@ CONTRIBUTION_TYPES: tuple[str, ...] = (
 )
 
 
-class ScenarioArchive:
-    """Reply archive stand-in over synthetic messages."""
-
-    def __init__(self, scenario: Scenario) -> None:
-        self._rows: list[dict[str, Any]] = [
-            {
-                "message_id": message.id, "channel": "whatsapp",
-                "chat_id": scenario.chats[message.chat].chat_id,
-                "sender_id": scenario.people[message.sender].sender_id,
-                "sender_name": scenario.people[message.sender].name, "text": message.text,
-                "timestamp": message.at_ms // 1000, "reply_to_message_id": message.reply_to,
-            }
-            for message in scenario.messages
-        ]
-
-    def lookup_messages_in_range(
-        self, channel: str, chat_id: str, since: datetime, until: datetime, *,
-        limit: int = 50, latest: bool = True,
-    ) -> list[dict[str, Any]]:
-        low, high = int(since.timestamp()), int(until.timestamp())
-        rows = sorted(
-            (row for row in self._rows if row["channel"] == channel and row["chat_id"] == chat_id
-             and low <= row["timestamp"] <= high),
-            key=lambda row: row["timestamp"],
+def _project_scenario(scenario: Scenario, root: Path) -> tuple[RawArchive, Path]:
+    raw_root = root / "raw"
+    archive = RawArchive(
+        root=raw_root, spool=root / "spool", status_path=root / "raw-status.json",
+        clock=lambda: scenario.now_ms, media_enabled=False,
+    )
+    for message in scenario.messages:
+        chat = scenario.chats[message.chat]
+        person = scenario.people[message.sender]
+        native = {
+            "type": "message",
+            "payload": {
+                "chatJid": chat.chat_id, "timestamp": message.at_ms,
+                "messageId": message.id, "text": message.text,
+                "senderId": person.sender_id, "participantJid": person.sender_id,
+                "senderName": person.name, "replyToMessageId": message.reply_to or None,
+                "fromAssistant": False,
+            },
+        }
+        event = RawEvent(
+            channel="whatsapp", kind="message", direction="in", native=native,
+            native_id=message.id, chat_id=chat.chat_id, received_ms=message.at_ms,
         )
-        limit = max(1, min(int(limit), 300))
-        selected = rows[-limit:] if latest else rows[:limit]
-        return [dict(row) for row in selected]
-
-    def lookup_message(self, channel: str, chat_id: str, message_id: str) -> dict[str, Any] | None:
-        for row in self._rows:
-            if (row["channel"], row["chat_id"], row["message_id"]) == (channel, chat_id, message_id):
-                return dict(row)
-        return None
+        if not archive.append_durable(event):
+            raise RuntimeError(f"could not archive evaluation event {message.id}")
+    db_path = root / "history.db"
+    project_history((raw_root,), db_path, publish_lineage_root=raw_root)
+    return archive, db_path
 
 
 async def build_today_judge_context(
@@ -81,10 +82,28 @@ async def build_today_judge_context(
         current_source_ids=scenario.trigger.source_ids, continuation_candidate=False,
     )
     builder = ParticipationContextBuilder(
-        archive=ScenarioArchive(scenario), policy=None, source_authorizer=lambda _row: True,
+        policy=None, source_authorizer=lambda _row: True,
     )
     started = time.perf_counter()
-    context = await builder.build(opportunity, inputs=inputs, now_ms=scenario.now_ms)
+    cache_dir = Path.home() / ".cache" / "yeoman" / "evaluation"
+    cache_dir.mkdir(parents=True, exist_ok=True)
+    with tempfile.TemporaryDirectory(prefix="history-", dir=cache_dir) as temp:
+        archive, db_path = _project_scenario(scenario, Path(temp))
+        projector = HistoryProjector(archive.root, db_path, archive)
+        await projector.start()
+        try:
+            async with asyncio.timeout(30):
+                while True:
+                    health = projector.health()
+                    if health["status"] in {"ready", "backlog"}:
+                        break
+                    if health["status"] == "failed":
+                        raise RuntimeError(f"evaluation history projection failed: {health['reason']}")
+                    await asyncio.sleep(0.01)
+            async with history_turn(projector):
+                context = await builder.build(opportunity, inputs=inputs, now_ms=scenario.now_ms)
+        finally:
+            await projector.stop()
     return opportunity, context, (time.perf_counter() - started) * 1000
 
 

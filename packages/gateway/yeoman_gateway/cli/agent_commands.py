@@ -3,12 +3,67 @@
 from __future__ import annotations
 
 import asyncio
+import json
+from pathlib import Path
+from typing import Any
 
 import typer
 
 from yeoman_gateway import __logo__
+from yeoman_gateway.history.control import MAX_IPC_REQUEST_BYTES
 
-from .core import app, console, make_memory_service, make_provider
+from .core import app, console
+
+
+async def _request_agent_turn(socket_path: Path, prompt: str, session_key: str) -> str:
+    request = json.dumps({
+        "cmd": "trigger_agent_turn",
+        "args": {
+            "prompt": prompt,
+            "session_key": session_key,
+            "channel": "cli",
+            "chat_id": "direct",
+        },
+    }).encode() + b"\n"
+    if len(request) > MAX_IPC_REQUEST_BYTES:
+        raise typer.BadParameter("Agent request is too large")
+
+    writer = None
+    try:
+        reader, writer = await asyncio.open_unix_connection(
+            str(socket_path), limit=MAX_IPC_REQUEST_BYTES
+        )
+        writer.write(request)
+        await writer.drain()
+        line = await reader.readline()
+    except (OSError, ValueError) as exc:
+        raise typer.BadParameter(
+            "Gateway agent unavailable. If interrupted, the turn may have completed; "
+            "check the session before retrying."
+        ) from exc
+    except asyncio.LimitOverrunError as exc:
+        raise typer.BadParameter("Gateway agent returned an oversized response") from exc
+    finally:
+        if writer is not None:
+            writer.close()
+            try:
+                await writer.wait_closed()
+            except (ConnectionError, OSError):
+                pass
+
+    try:
+        envelope: Any = json.loads(line)
+    except (UnicodeDecodeError, json.JSONDecodeError):
+        raise typer.BadParameter("Gateway agent returned an invalid response") from None
+    if not isinstance(envelope, dict):
+        raise typer.BadParameter("Gateway agent returned an invalid response")
+    if envelope.get("status") != "ok":
+        detail = envelope.get("code", envelope.get("message", envelope.get("status")))
+        raise typer.BadParameter(f"Gateway agent refused the request: {detail}")
+    result = envelope.get("response")
+    if not isinstance(result, dict) or not isinstance(result.get("response"), str):
+        raise typer.BadParameter("Gateway agent returned an invalid response")
+    return result["response"]
 
 
 @app.command()
@@ -18,86 +73,25 @@ def agent(
 ) -> None:
     """Interact with the agent directly."""
     from yeoman_shared.config.loader import load_config
-    from yeoman_shared.telemetry import InMemoryTelemetry
 
-    from yeoman_gateway.a2a.registry import A2AWorkerRegistry
-    from yeoman_gateway.adapters.responder_llm import LLMResponder
-    from yeoman_gateway.agent.tools.file_access import build_file_access_resolver
-    from yeoman_gateway.bus.queue import MessageBus
-    from yeoman_gateway.policy.loader import load_policy
-    from yeoman_gateway.security import NoopSecurity, SecurityEngine
-
-    config = load_config()
-    memory_service = make_memory_service(config)
-    telemetry = InMemoryTelemetry()
-
-    bus = MessageBus(
-        inbound_maxsize=config.bus.inbound_maxsize,
-        outbound_maxsize=config.bus.outbound_maxsize,
-    )
-    provider = make_provider(config)
-    security = SecurityEngine(config.security) if config.security.enabled else NoopSecurity()
-    restrict_to_workspace = bool(config.tools.restrict_to_workspace)
-    exec_config = config.tools.exec.model_copy(deep=True)
-    if config.security.strict_profile:
-        restrict_to_workspace = True
-        exec_config.isolation.enabled = True
-        exec_config.isolation.fail_closed = True
-        exec_config.allow_host_execution = False
-
-    policy = load_policy()
-    file_access_resolver = build_file_access_resolver(
-        workspace=config.workspace_path,
-        policy=policy,
-    )
-    a2a_registry = A2AWorkerRegistry.from_config(config.tools.a2a)
-
-    responder = LLMResponder(
-        bus=bus,
-        provider=provider,
-        workspace=config.workspace_path,
-        model=config.agents.defaults.model,
-        max_iterations=config.agents.defaults.max_tool_iterations,
-        tavily_api_key=config.tools.web.search.tavily_api_key or None,
-        web_config=config.tools.web,
-        exec_config=exec_config,
-        restrict_to_workspace=restrict_to_workspace,
-        memory_service=memory_service,
-        telemetry=telemetry,
-        security=security,
-        file_access_resolver=file_access_resolver,
-        a2a_registry=a2a_registry,
-    )
-
+    socket_path = Path(load_config().ipc.gateway_socket_path).expanduser()
     if message:
+        response = asyncio.run(_request_agent_turn(socket_path, message, session_id))
+        console.print(f"\n{__logo__} {response}")
+        return
 
-        async def run_once() -> None:
-            response = await responder.process_direct(message, session_key=session_id)
-            console.print(f"\n{__logo__} {response}")
+    console.print(f"{__logo__} Interactive mode (Ctrl+C to exit)\n")
 
-        try:
-            asyncio.run(run_once())
-        finally:
-            responder.close()
-            memory_service.close()
-    else:
-        console.print(f"{__logo__} Interactive mode (Ctrl+C to exit)\n")
+    async def run_interactive() -> None:
+        while True:
+            try:
+                user_input = console.input("[bold blue]You:[/bold blue] ")
+                if not user_input.strip():
+                    continue
+                response = await _request_agent_turn(socket_path, user_input, session_id)
+                console.print(f"\n{__logo__} {response}\n")
+            except KeyboardInterrupt:
+                console.print("\nGoodbye!")
+                break
 
-        async def run_interactive() -> None:
-            while True:
-                try:
-                    user_input = console.input("[bold blue]You:[/bold blue] ")
-                    if not user_input.strip():
-                        continue
-
-                    response = await responder.process_direct(user_input, session_key=session_id)
-                    console.print(f"\n{__logo__} {response}\n")
-                except KeyboardInterrupt:
-                    console.print("\nGoodbye!")
-                    break
-
-        try:
-            asyncio.run(run_interactive())
-        finally:
-            responder.close()
-            memory_service.close()
+    asyncio.run(run_interactive())

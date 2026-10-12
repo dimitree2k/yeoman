@@ -565,58 +565,48 @@ def test_assignment_exposes_the_thread_sources(tmp_path: Path) -> None:
     store.close()
 
 
-def test_ambient_window_never_repeats_the_own_thread() -> None:
+@pytest.mark.asyncio
+async def test_ambient_window_never_repeats_the_own_thread(tmp_path) -> None:
     """Spec R03: ambient is background for other threads, not a copy of this one."""
     from datetime import UTC, datetime
 
-    from yeoman_gateway.core.models import ArchivedMessage, InboundEvent
+    from yeoman_gateway.core.models import InboundEvent
     from yeoman_gateway.pipeline.reply_context import ReplyContextMiddleware
 
-    class _Archive:
-        def lookup_messages_before(self, channel, chat_id, message_id, limit):
-            del channel, chat_id, message_id, limit
-            return [
-                ArchivedMessage(
-                    channel="whatsapp",
-                    chat_id="chat@g.us",
-                    message_id="own-1",
-                    participant="p",
-                    sender_id="s",
-                    text="own thread message",
-                    timestamp=None,
-                    created_at="",
-                ),
-                ArchivedMessage(
-                    channel="whatsapp",
-                    chat_id="chat@g.us",
-                    message_id="other-1",
-                    participant="p",
-                    sender_id="s",
-                    text="other thread message",
-                    timestamp=None,
-                    created_at="",
-                ),
-            ]
+    from tests.gateway.history_test_helpers import ProjectedHistory
 
+    chat_id = "chat@g.us"
+    projected = ProjectedHistory(
+        tmp_path / "thread-history",
+        messages=[
+            dict(channel="whatsapp", chat_id=chat_id, message_id="own-1",
+                 participant="10001@lid", sender_id="491000000001@s.whatsapp.net", text="own thread message",
+                 timestamp=1_700_000_000),
+            dict(channel="whatsapp", chat_id=chat_id, message_id="other-1",
+                 participant="10001@lid", sender_id="491000000001@s.whatsapp.net", text="other thread message",
+                 timestamp=1_700_000_001),
+            dict(channel="whatsapp", chat_id=chat_id, message_id="m3",
+                 participant="10001@lid", sender_id="491000000002@s.whatsapp.net", text="current",
+                 timestamp=1_700_000_002),
+        ],
+    )
     middleware = ReplyContextMiddleware(
-        archive=_Archive(), reply_context_window_limit=5, reply_context_line_max_chars=200,
+        reply_context_window_limit=5, reply_context_line_max_chars=200,
         ambient_window_limit=5,
     )
     event = InboundEvent(
-        channel="whatsapp",
-        chat_id="chat@g.us",
-        sender_id="owner@s.whatsapp.net",
-        content="hi",
-        message_id="m3",
-        is_group=True,
+        channel="whatsapp", chat_id=chat_id, sender_id="491000000002@s.whatsapp.net",
+        content="hi", message_id="m3", is_group=True,
         timestamp=datetime(2023, 11, 14, tzinfo=UTC),
         raw_metadata={"thread_source_message_ids": ["own-1"]},
     )
 
-    lines = middleware._build_ambient_window(event)
+    async with projected.turn():
+        lines = middleware._build_ambient_window(event)
 
     assert any("other thread message" in line for line in lines)
     assert not any("own thread message" in line for line in lines)
+    projected.close()
 
 
 def test_tool_context_is_per_turn_not_per_instance() -> None:

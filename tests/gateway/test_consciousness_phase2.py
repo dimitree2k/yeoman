@@ -48,7 +48,7 @@ def _config(**overrides: object) -> Config:
         "maxSpeakupLengthChars": 200,
     }
     payload.update(overrides)
-    return Config(history={"readers": {"secondary": True}}, consciousness=ConsciousnessConfig.model_validate(payload))
+    return Config(consciousness=ConsciousnessConfig.model_validate(payload))
 
 
 def _policy(*, opt_in_group: bool, preview: str | None = None) -> PolicyConfig:
@@ -101,8 +101,8 @@ def _tools(
         policy_engine=PolicyEngine(_policy(opt_in_group=opt_in_group, preview=preview), workspace=tmp_path),
         bus=MessageBus(),
         log=log,
-        inbound_archive=SecondaryArchive(object(), effective_config.history),
-        memory=_FakeMemory(),
+        inbound_archive=SecondaryArchive(),
+
         security=_FakeSecurity(),
         approval_store=approval_store,
         now=lambda: fixed_now,

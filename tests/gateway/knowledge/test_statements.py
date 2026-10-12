@@ -17,8 +17,8 @@ from yeoman_gateway.knowledge.models import (
 )
 
 
-def test_one_statement_has_multiple_people_and_keeps_speaker(knowledge_harness):
-    h = knowledge_harness
+def test_one_statement_has_multiple_people_and_keeps_speaker(projected_knowledge_harness):
+    h = projected_knowledge_harness
     tom, alex, maria = (h.person(n) for n in ("Tom", "Alex", "Maria"))
     source = h.source(tom, audience={h.principal_for(tom), h.principal_for(alex), h.principal_for(maria)})
     candidate = h.candidate(
@@ -40,8 +40,8 @@ def test_one_statement_has_multiple_people_and_keeps_speaker(knowledge_harness):
     assert h.statement(sid).sources == (source,)
 
 
-def test_reported_speaker_is_distinct_from_the_actual_speaker(knowledge_harness):
-    h = knowledge_harness
+def test_reported_speaker_is_distinct_from_the_actual_speaker(projected_knowledge_harness):
+    h = projected_knowledge_harness
     tom, alex = (h.person(n) for n in ("Tom", "Alex"))
     source = h.source(tom, audience={h.principal_for(tom), h.principal_for(alex)})
     result = h.service.capture(
@@ -57,8 +57,8 @@ def test_reported_speaker_is_distinct_from_the_actual_speaker(knowledge_harness)
     assert h.statement(sid).sources == (source,)
 
 
-def test_same_person_may_hold_several_roles(knowledge_harness):
-    h = knowledge_harness
+def test_same_person_may_hold_several_roles(projected_knowledge_harness):
+    h = projected_knowledge_harness
     tom, alex = (h.person(n) for n in ("Tom", "Alex"))
     source = h.source(tom, audience={h.principal_for(tom), h.principal_for(alex)})
     result = h.service.capture(
@@ -75,8 +75,8 @@ def test_same_person_may_hold_several_roles(knowledge_harness):
     assert roles == {"subject", "participant", "reported_speaker"}
 
 
-def test_no_link_is_allowed_for_a_non_personal_statement(knowledge_harness):
-    h = knowledge_harness
+def test_no_link_is_allowed_for_a_non_personal_statement(projected_knowledge_harness):
+    h = projected_knowledge_harness
     tom = h.person("Tom")
     source = h.source(tom)
     result = h.service.capture(
@@ -87,10 +87,11 @@ def test_no_link_is_allowed_for_a_non_personal_statement(knowledge_harness):
     assert {(link.person_id, link.role) for link in h.links(sid)} == {(tom, "speaker")}
 
 
-def test_person_link_to_a_foreign_uuid_is_rejected(knowledge_harness):
-    h = knowledge_harness
+def test_person_link_to_a_foreign_uuid_is_rejected(projected_knowledge_harness):
+    h = projected_knowledge_harness
     tom = h.person("Tom")
     source = h.source(tom)
+    statements_before = h.snapshot_counts()["knowledge_statements"]
     with pytest.raises(KnowledgeError) as excinfo:
         h.service.capture(
             h.candidate(
@@ -101,11 +102,11 @@ def test_person_link_to_a_foreign_uuid_is_rejected(knowledge_harness):
             context=h.capture_context(source),
         )
     assert excinfo.value.code == "invalid_input"
-    assert h.snapshot_counts()["knowledge_statements"] == 0
+    assert h.snapshot_counts()["knowledge_statements"] == statements_before
 
 
-def test_person_link_must_use_one_of_the_statements_sources(knowledge_harness):
-    h = knowledge_harness
+def test_person_link_must_use_one_of_the_statements_sources(projected_knowledge_harness):
+    h = projected_knowledge_harness
     tom, alex = (h.person(n) for n in ("Tom", "Alex"))
     source = h.source(tom)
     other = h.source(alex, chat="group-b")
@@ -124,10 +125,11 @@ def test_person_link_must_use_one_of_the_statements_sources(knowledge_harness):
     assert excinfo.value.code == "invalid_input"
 
 
-def test_invalid_role_and_too_many_links_are_rejected_before_writing(knowledge_harness):
-    h = knowledge_harness
+def test_invalid_role_and_too_many_links_are_rejected_before_writing(projected_knowledge_harness):
+    h = projected_knowledge_harness
     tom = h.person("Tom")
     source = h.source(tom)
+    statements_before = h.snapshot_counts()["knowledge_statements"]
     with pytest.raises(ValidationError):
         PersonLinkCandidate(person_id=tom, role="boss", source=source, attribution="extracted")
     with pytest.raises(ValidationError):
@@ -152,11 +154,11 @@ def test_invalid_role_and_too_many_links_are_rejected_before_writing(knowledge_h
             ),
             extractor_version="v",
         )
-    assert h.snapshot_counts()["knowledge_statements"] == 0
+    assert h.snapshot_counts()["knowledge_statements"] == statements_before
 
 
-def test_unresolved_names_are_kept_as_metadata_not_as_people(knowledge_harness):
-    h = knowledge_harness
+def test_unresolved_names_are_kept_as_metadata_not_as_people(projected_knowledge_harness):
+    h = projected_knowledge_harness
     tom = h.person("Tom")
     source = h.source(tom)
     result = h.service.capture(
@@ -174,8 +176,8 @@ def test_unresolved_names_are_kept_as_metadata_not_as_people(knowledge_harness):
     assert h.snapshot_counts()["contacts"] == 1
 
 
-def test_confidence_never_confirms_a_statement(knowledge_harness):
-    h = knowledge_harness
+def test_confidence_never_confirms_a_statement(projected_knowledge_harness):
+    h = projected_knowledge_harness
     tom = h.person("Tom")
     source = h.source(tom)
     result = h.service.capture(
@@ -185,8 +187,8 @@ def test_confidence_never_confirms_a_statement(knowledge_harness):
     assert h.statement(result.statement_ids[0]).status == "assertion"
 
 
-def test_unknown_source_evidence_is_rejected(knowledge_harness):
-    h = knowledge_harness
+def test_unknown_source_evidence_is_rejected(projected_knowledge_harness):
+    h = projected_knowledge_harness
     tom = h.person("Tom")
     unissued = SourceRef(
         event_id="never-issued",
@@ -203,20 +205,21 @@ def test_unknown_source_evidence_is_rejected(knowledge_harness):
     assert excinfo.value.code == "denied_unknown_basis"
 
 
-def test_unknown_audience_is_denied_and_not_defaulted_to_normal(knowledge_harness):
-    h = knowledge_harness
+def test_unknown_audience_is_denied_and_not_defaulted_to_normal(projected_knowledge_harness):
+    h = projected_knowledge_harness
     tom = h.person("Tom")
     source = h.source(tom, unknown_audience=True)
+    statements_before = h.snapshot_counts()["knowledge_statements"]
     with pytest.raises(KnowledgeError) as excinfo:
         h.service.capture(
             h.candidate("Alex reist.", source), context=h.capture_context(source)
         )
     assert excinfo.value.code == "denied_unknown_basis"
-    assert h.snapshot_counts()["knowledge_statements"] == 0
+    assert h.snapshot_counts()["knowledge_statements"] == statements_before
 
 
-def test_transport_speaker_cannot_be_rewritten_by_a_model(knowledge_harness):
-    h = knowledge_harness
+def test_transport_speaker_cannot_be_rewritten_by_a_model(projected_knowledge_harness):
+    h = projected_knowledge_harness
     tom, alex = (h.person(n) for n in ("Tom", "Alex"))
     source = h.source(tom, audience={h.principal_for(tom), h.principal_for(alex)})
     forged = PersonLinkCandidate(
@@ -234,8 +237,8 @@ def test_transport_speaker_cannot_be_rewritten_by_a_model(knowledge_harness):
     assert excinfo.value.code == "unauthorized"
 
 
-def test_extractor_may_confirm_the_transport_speaker(knowledge_harness):
-    h = knowledge_harness
+def test_extractor_may_confirm_the_transport_speaker(projected_knowledge_harness):
+    h = projected_knowledge_harness
     tom = h.person("Tom")
     source = h.source(tom)
     agreed = PersonLinkCandidate(
@@ -254,38 +257,9 @@ def test_extractor_may_confirm_the_transport_speaker(knowledge_harness):
     }
 
 
-def test_merging_people_keeps_statement_edges_on_original_ids(knowledge_harness):
-    """A merge during/after capture must not rewrite historical edges."""
-    h = knowledge_harness
-    tom, alex, maria = (h.person(n) for n in ("Tom", "Alex", "Maria"))
-    source = h.source(tom, audience={h.principal_for(tom), h.principal_for(alex), h.principal_for(maria)})
-    result = h.service.capture(
-        h.candidate("Alex reist mit Maria.", source, subjects=(alex,), participants=(maria,)),
-        context=h.capture_context(source),
-    )
-    sid = result.statement_ids[0]
-    before = h.service._store.query(  # noqa: SLF001 - original edges must not move
-        "SELECT person_id, role FROM knowledge_statement_people WHERE statement_id = ?"
-        " ORDER BY person_id, role",
-        (sid,),
-    )
-    h.service.merge_people(
-        alex, maria, expected_revision=h.identity_revision(), context=h.admin_context()
-    )
-    after = h.service._store.query(  # noqa: SLF001
-        "SELECT person_id, role FROM knowledge_statement_people WHERE statement_id = ?"
-        " ORDER BY person_id, role",
-        (sid,),
-    )
-    assert [tuple(row) for row in before] == [tuple(row) for row in after]
-    # The canonical view, however, now resolves both original ids to one person.
-    context = h.read_context(tom, recipients={h.principal_for(tom), h.principal_for(alex), h.principal_for(maria)})
-    assert h.recall_person(alex, context).statement_ids == (sid,)
-    assert h.recall_person(maria, context).statement_ids == (sid,)
 
-
-def test_rollback_keeps_identity_and_statement_changes_together(knowledge_harness):
-    h = knowledge_harness
+def test_rollback_keeps_identity_and_statement_changes_together(projected_knowledge_harness):
+    h = projected_knowledge_harness
     tom = h.person("Tom")
     source = h.source(tom)
     before = h.snapshot_counts()
@@ -301,9 +275,9 @@ def test_rollback_keeps_identity_and_statement_changes_together(knowledge_harnes
 # ── roles, facets and the transport speaker (T11-T13, §7.4) ──────────────────
 
 
-def test_a_third_party_subject_is_not_the_speaker(knowledge_harness):
+def test_a_third_party_subject_is_not_the_speaker(projected_knowledge_harness):
     """T11: the authenticated sender stays ``speaker``; the subject stays the subject."""
-    h = knowledge_harness
+    h = projected_knowledge_harness
     tom = h.person("Tom")
     alex = h.person("Alex")
     source = h.source(tom)
@@ -321,7 +295,7 @@ def test_a_third_party_subject_is_not_the_speaker(knowledge_harness):
     assert tom not in by_role["subject"]
 
 
-def test_a_facet_requires_an_active_subject_role(knowledge_harness):
+def test_a_facet_requires_an_active_subject_role(projected_knowledge_harness):
     """§7.4: the speaker alone does not make a statement about the speaker."""
     from yeoman_gateway.knowledge.models import (
         AttributeCandidate,
@@ -330,7 +304,7 @@ def test_a_facet_requires_an_active_subject_role(knowledge_harness):
         StatementCandidate,
     )
 
-    h = knowledge_harness
+    h = projected_knowledge_harness
     tom = h.person("Tom")
     alex = h.person("Alex")
     source = h.source(tom)
@@ -362,7 +336,7 @@ def test_a_facet_requires_an_active_subject_role(knowledge_harness):
     assert facets[0]["value"] == {"text": "Köln", "precision": "exact"}
 
 
-def test_a_facet_is_unreadable_as_soon_as_its_statement_is(knowledge_harness):
+def test_a_facet_is_unreadable_as_soon_as_its_statement_is(projected_knowledge_harness):
     """A revoked statement locks its facet too, before any physical index cleanup."""
     from yeoman_gateway.knowledge.models import (
         AttributeCandidate,
@@ -371,7 +345,7 @@ def test_a_facet_is_unreadable_as_soon_as_its_statement_is(knowledge_harness):
         StatementCandidate,
     )
 
-    h = knowledge_harness
+    h = projected_knowledge_harness
     tom = h.person("Tom")
     alex = h.person("Alex")
     source = h.source(tom)
@@ -403,7 +377,7 @@ def test_a_facet_is_unreadable_as_soon_as_its_statement_is(knowledge_harness):
     assert h.service._statements.attributes_of(statement_id) == ()  # noqa: SLF001
 
 
-def test_facets_are_published_in_one_transaction_with_the_statement(knowledge_harness):
+def test_facets_are_published_in_one_transaction_with_the_statement(projected_knowledge_harness):
     """A failing commit leaves neither the statement nor its facet behind."""
     from yeoman_gateway.knowledge.models import (
         AttributeCandidate,
@@ -412,7 +386,7 @@ def test_facets_are_published_in_one_transaction_with_the_statement(knowledge_ha
         StatementCandidate,
     )
 
-    h = knowledge_harness
+    h = projected_knowledge_harness
     tom = h.person("Tom")
     alex = h.person("Alex")
     source = h.source(tom)

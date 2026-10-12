@@ -7,7 +7,6 @@ from __future__ import annotations
 
 from datetime import UTC, datetime, timedelta
 from pathlib import Path
-from types import SimpleNamespace
 
 import pytest
 from yeoman_gateway.consciousness.delivery import DeliveryAnchorReader
@@ -22,7 +21,6 @@ from yeoman_gateway.processing.participation_context import (
     ParticipationContextBounds,
     ParticipationContextBuilder,
     ParticipationDecisionInputs,
-    _knowledge_query,
 )
 from yeoman_gateway.processing.store import ProcessingStore
 
@@ -104,7 +102,6 @@ async def _builder(tmp_path: Path, *, anchors=None, taste=None):
     engine = PolicyEngine(_policy(), workspace=tmp_path)
     history = _archive(tmp_path)
     builder = ParticipationContextBuilder(
-        archive=object(),
         policy=engine,
         anchors=anchors,
         taste=taste,
@@ -115,7 +112,7 @@ async def _builder(tmp_path: Path, *, anchors=None, taste=None):
 
 def _context_builder(history: ProjectedHistory, tmp_path: Path, *, source_authorizer=None):
     return history.wire(ParticipationContextBuilder(
-        archive=object(), policy=PolicyEngine(_policy(), workspace=tmp_path),
+        policy=PolicyEngine(_policy(), workspace=tmp_path),
         source_authorizer=source_authorizer,
     ))
 
@@ -587,7 +584,6 @@ async def test_delivered_anchor_is_included_and_nothing_else_is(tmp_path: Path) 
     )
     history = _archive(tmp_path)
     builder = history.wire(ParticipationContextBuilder(
-        archive=object(),
         policy=PolicyEngine(_policy(), workspace=tmp_path),
         anchors=DeliveryAnchorReader(log=log, store=store),
     ))
@@ -677,52 +673,6 @@ async def test_advisory_taste_requires_provenance(tmp_path: Path) -> None:
 
 
 @pytest.mark.asyncio
-async def test_context_attaches_only_rendered_selection_with_bounded_source_query(
-    tmp_path: Path,
-) -> None:
-    archive = _archive(tmp_path)
-    _record(archive, message_id="trigger", text="Riverside venue plans", minutes_ago=1)
-    captured: dict[str, object] = {}
-
-    class _Selector:
-        def select(self, *, query, read_context, fact_context):
-            captured.update(query=query, read_context=read_context, fact_context=fact_context)
-            return SimpleNamespace(
-                text="The venue is Riverside.",
-                reason="selected",
-                statements=SimpleNamespace(statement_ids=("private-statement-id",)),
-                facts=SimpleNamespace(used_source_refs={"private-fact-id": ()}),
-            )
-
-        def select_for_readers(self, *, query, readers):
-            reader = readers.readers[0]
-            return self.select(
-                query=query,
-                read_context=reader.read_context,
-                fact_context=reader.fact_context,
-            )
-
-    builder = archive.wire(ParticipationContextBuilder(
-        archive=object(),
-        policy=PolicyEngine(_policy(), workspace=tmp_path),
-        source_authorizer=lambda row: True,
-        knowledge_selector=_Selector(),
-        knowledge_context_supplier=lambda opportunity, context: ("trusted-read", "trusted-facts"),
-    ))
-    context = await _build_context(builder, _opportunity("trigger"))
-
-    assert captured["query"] == "Riverside venue plans"
-    assert captured["read_context"] == "trusted-read"
-    assert captured["fact_context"] == "trusted-facts"
-    assert context["selected_knowledge_text"] == "The venue is Riverside."
-    assert context["_knowledge_selection"].text == "The venue is Riverside."
-    assert context["knowledge_selection_status"] == "selected"
-    assert context["knowledge_selected_count"] == 2
-    assert "private-statement-id" not in str(context["selected_knowledge_text"])
-    assert context["current_source_ids"] == ["trigger"]
-
-
-@pytest.mark.asyncio
 async def test_media_and_forward_summaries_are_preserved(tmp_path: Path) -> None:
     builder = await _builder(tmp_path)
     archive = builder._history_projector
@@ -739,92 +689,6 @@ async def test_media_and_forward_summaries_are_preserved(tmp_path: Path) -> None
     assert rows["img"]["text"] == ""
     assert "formation" in str(rows["q"]["text"])
     assert context["dropped_source_ids"] == []
-
-
-def _query_rows(*entries: tuple[str, str]) -> list[dict[str, str]]:
-    """Rows in the shape the context builder hands to the query builder."""
-    return [{"message_id": message_id, "text": text} for message_id, text in entries]
-
-
-def test_knowledge_query_retains_a_bounded_prefix_of_an_over_budget_trigger() -> None:
-    long_trigger = "topic " * 180  # 1080 characters, normalized to one entry
-    query = _knowledge_query(
-        {
-            "messages": _query_rows(
-                ("long", long_trigger),
-                ("nearby", "unrelated venue chatter"),
-            )
-        },
-        ("long",),
-    )
-    assert query, "a long authorized trigger must still produce a query"
-    assert len(query) <= 600
-    assert query.startswith("topic")
-    assert long_trigger.split()[0] in query
-    # The trigger consumed the whole budget, so it never falls back to nearby text.
-    assert "unrelated" not in query
-
-
-def test_knowledge_query_keeps_an_entry_that_fits_exactly() -> None:
-    exact = "x" * 600
-    query = _knowledge_query(
-        {"messages": _query_rows(("trigger", exact), ("nearby", "later chatter"))},
-        ("trigger",),
-    )
-    assert query == exact
-    assert len(query) == 600
-
-
-def test_knowledge_query_normalizes_whitespace_before_prefixing() -> None:
-    messy = "  alpha\t beta \n gamma " + "y" * 900
-    query = _knowledge_query({"messages": _query_rows(("trigger", messy))}, ("trigger",))
-    assert query.startswith("alpha beta gamma")
-    assert "\n" not in query and "\t" not in query and "  " not in query
-    assert len(query) == 600
-
-
-def test_knowledge_query_counts_unicode_characters_not_bytes() -> None:
-    trigger = "\u00fc" * 900
-    query = _knowledge_query({"messages": _query_rows(("trigger", trigger))}, ("trigger",))
-    assert len(query) == 600
-    assert query == "\u00fc" * 600
-
-
-def test_knowledge_query_orders_triggers_first_even_when_rows_lead_with_nearby() -> None:
-    """Trigger-first ordering must not depend on the order rows arrive in."""
-    query = _knowledge_query(
-        {
-            "messages": _query_rows(
-                ("nearby-1", "older chatter"),
-                ("trigger", "the match moved to Riverside"),
-                ("nearby-2", "newer chatter"),
-            )
-        },
-        ("trigger",),
-    )
-    assert query.startswith("the match moved to Riverside")
-    assert query == "the match moved to Riverside older chatter newer chatter"
-
-
-def test_knowledge_query_is_empty_without_usable_text() -> None:
-    assert _knowledge_query({"messages": _query_rows(("trigger", "   "))}, ("trigger",)) == ""
-    assert _knowledge_query({"messages": _query_rows(("trigger", ""))}, ("trigger",)) == ""
-
-
-def test_knowledge_query_ignores_non_mapping_rows_and_coerces_text() -> None:
-    query = _knowledge_query(
-        {"messages": ["not a row", {"message_id": "num", "text": 12345}]},
-        (),
-    )
-    assert query == "12345"
-
-
-def test_knowledge_query_does_not_mutate_message_bodies() -> None:
-    long_trigger = "topic " * 180
-    rows = _query_rows(("long", long_trigger), ("nearby", "  spaced   text  "))
-    before = [dict(row) for row in rows]
-    _knowledge_query({"messages": rows}, ("long",))
-    assert rows == before
 
 
 @pytest.mark.asyncio

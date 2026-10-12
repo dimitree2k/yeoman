@@ -42,9 +42,6 @@ from yeoman_gateway.channels.base import BaseChannel
 from yeoman_gateway.channels.whatsapp_runtime import WhatsAppRuntimeManager
 from yeoman_gateway.core.models import InboundEvent as CoreInboundEvent
 from yeoman_gateway.history.live import HistoryPaused
-from yeoman_gateway.history.writer_guard import (
-    legacy_history_writers_disabled,
-)
 from yeoman_gateway.implicit_addressing import (
     DEFAULT_BOT_NAME_ALIASES,
     contains_bot_name,
@@ -337,14 +334,10 @@ class WhatsAppChannel(BaseChannel):
         openai_api_key: str | None = None,
         openai_api_base: str | None = None,
         openai_extra_headers: dict[str, str] | None = None,
-        legacy_history_disabled: bool = False,
     ):
-        self.legacy_history_disabled = legacy_history_writers_disabled(legacy_history_disabled)
         super().__init__(config, bus)
         self.config: WhatsAppConfig = config
         self._history_projector: Any = None
-        self._history_selected = False
-        self._history_mentions_selected = False
         self._history_knowledge: Any = None
         self._model_router = model_router
         self._media_storage = media_storage or MediaStorage(
@@ -634,7 +627,7 @@ class WhatsAppChannel(BaseChannel):
         generation = msg.metadata.get('history_generation')
         if generation is None:
             generation = history_effect_metadata().get('history_generation')
-        if getattr(self, '_history_mentions_selected', getattr(self, '_history_selected', False)) and not msg.metadata.get('historyMentionsResolved'):
+        if not msg.metadata.get('historyMentionsResolved'):
             snapshot = current_history_snapshot()
             if snapshot is None:
                 # Bus consumers own no turn; prepare identity before waiting on transport.
@@ -1829,16 +1822,14 @@ class WhatsAppChannel(BaseChannel):
         return "\n".join(part for part in parts if part)
 
     async def _maybe_answer_ambient(self, event: InboundEvent) -> _AmbientOutcome:
-        if self._history_selected:
-            from yeoman_gateway.history.context import history_knowledge_scope, history_turn
-            from yeoman_gateway.history.live import HistoryPaused
-            try:
-                async with history_turn(self._history_projector) as snapshot:
-                    with history_knowledge_scope(snapshot, self._history_knowledge):
-                        return await self._answer_ambient_scoped(event)
-            except HistoryPaused:
-                return _AmbientOutcome()
-        return await self._answer_ambient_scoped(event)
+        from yeoman_gateway.history.context import history_knowledge_scope, history_turn
+        from yeoman_gateway.history.live import HistoryPaused
+        try:
+            async with history_turn(self._history_projector) as snapshot:
+                with history_knowledge_scope(snapshot, self._history_knowledge):
+                    return await self._answer_ambient_scoped(event)
+        except HistoryPaused:
+            return _AmbientOutcome()
 
     async def _answer_ambient_scoped(self, event: InboundEvent) -> _AmbientOutcome:
         """Ask the judge about an unaddressed message.
@@ -2087,15 +2078,12 @@ class WhatsAppChannel(BaseChannel):
 
         from yeoman_gateway.history.context import history_knowledge_scope, history_turn
         from yeoman_gateway.history.live import HistoryPaused
-        if self._history_selected:
-            try:
-                async with history_turn(self._history_projector) as snapshot:
-                    with history_knowledge_scope(snapshot, self._history_knowledge):
-                        event, ambient_candidate, denied = await self._admit_inbound_event(event)
-            except HistoryPaused:
-                return
-        else:
-            event, ambient_candidate, denied = await self._admit_inbound_event(event)
+        try:
+            async with history_turn(self._history_projector) as snapshot:
+                with history_knowledge_scope(snapshot, self._history_knowledge):
+                    event, ambient_candidate, denied = await self._admit_inbound_event(event)
+        except HistoryPaused:
+            return
         if denied:
             return
         await self._enrich_and_publish_inbound(event, ambient_candidate)
@@ -2147,7 +2135,6 @@ class WhatsAppChannel(BaseChannel):
 
     async def _enrich_and_publish_inbound(self, event, ambient_candidate):
         event = await self._enrich_media_event(event)
-        self._index_approved_enrichments(event)
         if ambient_candidate:
             # Only the judge decides whether this becomes an answer. Either way the message
             # is archived and stays context for the chat.
@@ -2466,28 +2453,6 @@ class WhatsAppChannel(BaseChannel):
         event = await self._enrich_quoted_image_event(event)
         event = await self._enrich_quoted_audio_event(event)
         return event
-
-    def _index_approved_enrichments(self, event: InboundEvent) -> None:
-        """Forward existing, bounded media text to the canonical FTS projection."""
-        indexer = getattr(self._processing_signals, "index_enrichments", None)
-        if not callable(indexer):
-            return
-        enrichments: list[dict[str, object]] = []
-        if event.voice_transcript:
-            enrichments.append(
-                {"kind": "voice_transcript", "text": event.voice_transcript, "approved": True}
-            )
-        if event.media_description:
-            kind = {
-                "image": "image_description",
-                "video": "video_description",
-                "sticker": "sticker_description",
-            }.get(event.media_kind or "", "media_description")
-            enrichments.append(
-                {"kind": kind, "text": event.media_description, "approved": True}
-            )
-        if enrichments:
-            indexer(event.message_id, enrichments)
 
     async def _enrich_quoted_audio_event(self, event: InboundEvent) -> InboundEvent:
         if (

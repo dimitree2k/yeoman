@@ -257,15 +257,25 @@ def test_pause_scope_and_duration_rules(tmp_path: Path) -> None:
 
 
 @pytest.mark.parametrize("answer,approved", [("ja", True), ("nein", False)])
-def test_quoted_group_decision_sets_safe_policy(
+@pytest.mark.asyncio
+async def test_quoted_group_decision_sets_safe_policy(
     tmp_path: Path,
     answer: str,
     approved: bool,
 ) -> None:
     adapter, path = _adapter(tmp_path)
-    result = adapter.route_admin_command(
-        _admin_event(answer, reply_to_text="Group approval: `123@g.us`")
-    )
+    from tests.gateway.history_test_helpers import ProjectedHistory
+
+    history = ProjectedHistory(tmp_path / "approval-history", groups=[dict(
+        chat_id='123@g.us', participants=[], timestamp=1_700_000_000_000, name="Projected test group")])
+    try:
+        async with history.turn():
+            result = adapter.route_admin_command(
+                _admin_event(answer, reply_to_text="Group approval: `123@g.us`")
+            )
+
+    finally:
+        history.close()
 
     assert result is not None and result.outcome == "applied"
     override = load_policy(path).channels["whatsapp"].chats["123@g.us"]
@@ -775,9 +785,13 @@ def test_unmanaged_chat_is_not_touched_by_the_new_mode(tmp_path: Path) -> None:
 
 @pytest.mark.asyncio
 async def test_blocked_sender_never_reaches_enrichment_or_the_bus(tmp_path: Path) -> None:
+    from tests.gateway.history_test_helpers import ProjectedHistory
+
     store = ProcessingStore(tmp_path / "p.db")
     bus = MessageBus()
     channel = WhatsAppChannel(_no_debounce_config(), bus)
+    history = ProjectedHistory(tmp_path / "blocked-sender-history")
+    channel._history_projector = history
     channel.set_processing_gate(_gate(store, _deny()))
 
     enriched: list[str] = []
@@ -802,14 +816,19 @@ async def test_blocked_sender_never_reaches_enrichment_or_the_bus(tmp_path: Path
     assert stored is not None
     assert stored.chat_id == "chat@g.us"
     assert stored.principal == "4915111"
+    history.close()
     store.close()
 
 
 @pytest.mark.asyncio
 async def test_allowed_media_still_reaches_enrichment(tmp_path: Path) -> None:
+    from tests.gateway.history_test_helpers import ProjectedHistory
+
     store = ProcessingStore(tmp_path / "p.db")
     bus = MessageBus()
     channel = WhatsAppChannel(_no_debounce_config(), bus)
+    history = ProjectedHistory(tmp_path / "allowed-media-history")
+    channel._history_projector = history
     channel.set_processing_gate(
         _gate(
             store,
@@ -840,6 +859,7 @@ async def test_allowed_media_still_reaches_enrichment(tmp_path: Path) -> None:
     assert enriched == ["m1"]
     assert published == ["m1"]
     assert store.count_events() == 1
+    history.close()
     store.close()
 
 
@@ -906,9 +926,12 @@ def _ambient_gate(store: ProcessingStore, *, action: str = "answer") -> IngestGa
 
 
 def _ambient_channel(
-    store: ProcessingStore, verdict: AmbientVerdict, *, action: str = "answer"
+    store: ProcessingStore, verdict: AmbientVerdict, *, tmp_path: Path, action: str = "answer"
 ) -> tuple[WhatsAppChannel, _Judge, _Reaction, list[WhatsAppInboundEvent]]:
+    from tests.gateway.history_test_helpers import ProjectedHistory
+
     channel = WhatsAppChannel(_no_debounce_config(), MessageBus())
+    channel._history_projector = ProjectedHistory(tmp_path / "ambient-history")
     channel.set_processing_gate(_ambient_gate(store, action=action))
     judge = _Judge(verdict)
     channel.set_ambient_judge(judge)
@@ -936,7 +959,7 @@ async def test_a_judged_reaction_is_the_whole_reply(tmp_path: Path) -> None:
     """
     store = ProcessingStore(tmp_path / "p.db")
     channel, judge, reaction, published = _ambient_channel(
-        store, AmbientVerdict(action="react", emoji="🤙", confidence=1.0)
+        store, AmbientVerdict(action="react", emoji="🤙", confidence=1.0), tmp_path=tmp_path
     )
 
     await channel._ingest_inbound_event(_wa_event(mentioned_bot=False))
@@ -950,6 +973,7 @@ async def test_a_judged_reaction_is_the_whole_reply(tmp_path: Path) -> None:
     assert channel._processing_gate.is_ambient_pending("m1") is True, (
         "a reaction is the reply, so the classic pipeline must not answer as well"
     )
+    channel._history_projector.close()
     store.close()
 
 
@@ -958,7 +982,7 @@ async def test_an_answer_verdict_is_capped_to_a_reaction_in_a_react_chat(tmp_pat
     """A chat on `react` never gets text: the judge's answer becomes the allowed reaction."""
     store = ProcessingStore(tmp_path / "p.db")
     channel, judge, reaction, published = _ambient_channel(
-        store, AmbientVerdict(action="answer", confidence=1.0), action="react"
+        store, AmbientVerdict(action="answer", confidence=1.0), tmp_path=tmp_path, action="react"
     )
 
     await channel._ingest_inbound_event(_wa_event(mentioned_bot=False))
@@ -968,6 +992,7 @@ async def test_an_answer_verdict_is_capped_to_a_reaction_in_a_react_chat(tmp_pat
     assert published[0].processing_reacted is True
     assert published[0].processing_answer_granted is False
     assert published[0].thread_assignment is None, "no text turn in a react chat"
+    channel._history_projector.close()
     store.close()
 
 
@@ -976,7 +1001,7 @@ async def test_an_answer_verdict_still_opens_a_turn_when_text_is_allowed(tmp_pat
     """The cap must not turn a normal chat's granted answer into a reaction."""
     store = ProcessingStore(tmp_path / "p.db")
     channel, judge, reaction, published = _ambient_channel(
-        store, AmbientVerdict(action="answer", confidence=1.0)
+        store, AmbientVerdict(action="answer", confidence=1.0), tmp_path=tmp_path
     )
 
     await channel._ingest_inbound_event(_wa_event(mentioned_bot=False))
@@ -986,6 +1011,7 @@ async def test_an_answer_verdict_still_opens_a_turn_when_text_is_allowed(tmp_pat
     assert published[0].processing_answer_granted is True
     assert published[0].thread_assignment is not None
     assert published[0].thread_assignment["turn_id"]
+    channel._history_projector.close()
     store.close()
 
 
@@ -994,7 +1020,7 @@ async def test_a_silence_chat_never_spends_a_judge_call(tmp_path: Path) -> None:
     """`silence` is a hard veto: no judge call, no reaction, no turn."""
     store = ProcessingStore(tmp_path / "p.db")
     channel, judge, reaction, published = _ambient_channel(
-        store, AmbientVerdict(action="answer", confidence=1.0), action="silence"
+        store, AmbientVerdict(action="answer", confidence=1.0), tmp_path=tmp_path, action="silence"
     )
 
     await channel._ingest_inbound_event(_wa_event(mentioned_bot=False))
@@ -1003,6 +1029,7 @@ async def test_a_silence_chat_never_spends_a_judge_call(tmp_path: Path) -> None:
     assert reaction.sent == []
     assert published[0].processing_answer_granted is False
     assert published[0].thread_assignment is None
+    channel._history_projector.close()
     store.close()
 
 

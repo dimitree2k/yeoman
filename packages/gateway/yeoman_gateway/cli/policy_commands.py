@@ -135,6 +135,8 @@ def policy_cmd(
     from yeoman_gateway.policy.admin.contracts import PolicyActorContext, PolicyExecutionOptions
     from yeoman_gateway.policy.admin.service import PolicyAdminService
 
+    from .chat_commands import _selected_chats
+
     config = load_config()
     policy_engine, policy_path = make_policy_engine(config)
     if policy_path is None:
@@ -151,6 +153,7 @@ def policy_cmd(
         apply_channels=apply_channels,
         on_policy_applied=None,
         processing_config=config.processing,
+        history_chats_reader=_selected_chats,
     )
     result = service.execute_from_text(
         command,

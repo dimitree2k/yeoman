@@ -64,6 +64,17 @@ def test_policy_adapter_known_tools_include_service_capabilities() -> None:
     assert SERVICE_POLICY_CAPABILITIES <= adapter.known_tools
 
 
+def test_policy_adapter_builds_admin_service_with_policy_path(tmp_path: Path) -> None:
+    adapter = EnginePolicyAdapter(
+        engine=None,
+        known_tools={"message"},
+        policy_path=tmp_path / "policy.json",
+        workspace=tmp_path,
+    )
+
+    assert adapter._policy_admin_service is not None
+
+
 def test_cli_and_runtime_policy_vocabularies_include_same_service_capabilities() -> None:
     assert SERVICE_POLICY_CAPABILITIES <= _policy_known_tools()
     assert SERVICE_POLICY_CAPABILITIES <= policy_validation_tools({"message"})

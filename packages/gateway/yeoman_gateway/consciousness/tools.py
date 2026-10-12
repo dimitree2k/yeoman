@@ -162,7 +162,6 @@ class ConsciousnessTools:
         bus: MessageBus,
         log: SpeakupLog,
         inbound_archive: Any,
-        memory: object | None,
         security: object,
         approval_store: SpeakupApprovalStore | None = None,
         service_effects: object | None = None,
@@ -178,7 +177,6 @@ class ConsciousnessTools:
         self._service_effects = service_effects
         self.log = log
         self.inbound_archive: Any = inbound_archive
-        self.memory = memory
         self.security = security
         self.approval_store = approval_store
         self._now = now or (lambda: datetime.now(UTC))
@@ -326,7 +324,7 @@ class ConsciousnessTools:
             return {"status": "rejected", "reason": "ambiguous_chat_id", "hits": []}
         if eligible is None:
             return {"status": "rejected", "reason": "chat_not_eligible", "hits": []}
-        if self.config.history.live_projection_enabled and self.config.history.readers.secondary and eligible.channel == 'whatsapp':
+        if eligible.channel == 'whatsapp':
             from yeoman_gateway.knowledge.models import RecallQuery
             knowledge = getattr(self, 'knowledge', None)
             if knowledge is None:
@@ -335,21 +333,7 @@ class ConsciousnessTools:
             context = knowledge.owner_read_context(channel=eligible.channel, chat_id=eligible.chat_id)
             result = knowledge.recall(RecallQuery(query, limit=max(1, min(int(limit), 10))), context=context)
             return {'status': 'ok', 'hits': [{'content': text} for text in result.entry_texts]}
-        if self.memory is None or not hasattr(self.memory, "search"):
-            return {"status": "ok", "hits": []}
-        hits = self.memory.search(
-            query=query,
-            channel=eligible.channel,
-            chat_id=eligible.chat_id,
-            scope="chat",
-            limit=max(1, min(int(limit), 10)),
-        )
-        rendered: list[dict[str, object]] = []
-        for hit in hits:
-            entry = getattr(hit, "entry", None)
-            content = getattr(entry, "content", str(hit))
-            rendered.append({"content": str(content)})
-        return {"status": "ok", "hits": rendered}
+        return {"status": "ok", "hits": []}
 
     async def read_learned_chat_taste(
         self,
@@ -363,25 +347,7 @@ class ConsciousnessTools:
             return {"status": "rejected", "reason": "ambiguous_chat_id", "patterns": []}
         if eligible is None:
             return {"status": "rejected", "reason": "chat_not_eligible", "patterns": []}
-        if self.memory is None or not hasattr(self.memory, "learned_chat_taste"):
-            return {"status": "ok", "patterns": []}
-        hits = self.memory.learned_chat_taste(
-            channel=eligible.channel,
-            chat_id=eligible.chat_id,
-            limit=max(1, min(int(limit), 10)),
-        )
-        patterns: list[dict[str, object]] = []
-        for hit in hits:
-            entry = getattr(hit, "entry", None)
-            content = getattr(entry, "content", str(hit))
-            patterns.append(
-                {
-                    "content": str(content),
-                    "confidence": getattr(entry, "confidence", None),
-                    "updated_at": getattr(entry, "updated_at", None),
-                }
-            )
-        return {"status": "ok", "patterns": patterns}
+        return {"status": "ok", "patterns": []}
 
     async def read_speakup_history(
         self,

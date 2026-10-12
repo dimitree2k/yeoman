@@ -11,19 +11,10 @@ provider call and no live runtime state.
 
 from __future__ import annotations
 
-import sqlite3
-from dataclasses import dataclass
 from pathlib import Path
 from typing import Iterator
 
 import pytest
-from yeoman_gateway.knowledge.api import KnowledgeService, open_knowledge_store
-from yeoman_gateway.knowledge.authority import (
-    EvidenceAudience,
-    FakeClock,
-    FakePolicyAuthority,
-    FakeSourceAuthority,
-)
 from yeoman_gateway.knowledge.models import (
     CONVERSATION_ORIGINS,
     CONVERSATION_RELATIONS,
@@ -34,169 +25,47 @@ from yeoman_gateway.knowledge.models import (
     ValidationError,
 )
 
-WORKSPACE_ID = "conversation-workspace"
+from tests.gateway.knowledge.conftest import ProjectedKnowledgeHarness
+
 OWNER = "whatsapp:4910000000001"
 TOM = "whatsapp:4910000000002"
 ALEX = "whatsapp:4910000000003"
-GROUP_A = "group-a"
-GROUP_B = "group-b"
+GROUP_A = "120363000000001@g.us"
+GROUP_B = "120363000000002@g.us"
 
 
-@dataclass
-class ConversationHarness:
-    """A fully synthetic knowledge runtime bound to a temporary database."""
-
-    tmp_path: Path
-
-    def __post_init__(self) -> None:
-        self.clock = FakeClock()
-        self.authority = FakeSourceAuthority()
-        self.policy = FakePolicyAuthority(admins={OWNER}, capture_actors={OWNER})
-        self.service: KnowledgeService = open_knowledge_store(
-            self.tmp_path / "knowledge.db",
-            workspace_id=WORKSPACE_ID,
-            source_authority=self.authority,
-            policy_authority=self.policy,
-            clock=self.clock,
+class ConversationHarness(ProjectedKnowledgeHarness):
+    def source(self, *, chat: str = GROUP_A, author: str = TOM,
+               audience: set[str] | None = None, author_only: bool = False,
+               unknown_audience: bool = False, channel: str = "whatsapp") -> SourceRef:
+        person = self.person_for(author, author)
+        source = super().source(
+            person, chat=chat, channel=channel, audience=audience,
+            author_only=author_only, unknown_audience=unknown_audience,
         )
-        self._counter = 0
-
-    # ── lifecycle ────────────────────────────────────────────────────────────
-
-    def close(self) -> None:
-        self.service.close()
-
-    # ── sources ──────────────────────────────────────────────────────────────
-
-    def source(
-        self,
-        *,
-        chat: str = GROUP_A,
-        author: str = TOM,
-        revision: int = 1,
-        audience: set[str] | None = None,
-        author_only: bool = False,
-        unknown_audience: bool = False,
-        channel: str = "whatsapp",
-    ) -> SourceRef:
-        self._counter += 1
-        source = SourceRef(
-            event_id=f"event-{self._counter}",
-            revision=int(revision),
-            channel=channel,
-            chat_id=chat,
-            author_principal=author,
-            occurred_at_ms=self.clock.now_ms(),
-        )
-        if unknown_audience:
-            self.authority.issue_source(source, EvidenceAudience.unknown())
-        elif author_only:
-            self.authority.issue_source(source, EvidenceAudience.author_only())
-        else:
-            members = set(audience) if audience is not None else {author}
-            self.authority.issue_source(
-                source,
-                EvidenceAudience.known(members, snapshot_id=f"snap-{source.event_id}"),
-            )
         return source
 
     def unknown_source(self, *, chat: str = GROUP_A, author: str = TOM) -> SourceRef:
-        """A source shape that was never issued to the authority."""
-        self._counter += 1
-        return SourceRef(
-            event_id=f"forged-{self._counter}",
-            revision=1,
-            channel="whatsapp",
-            chat_id=chat,
-            author_principal=author,
-            occurred_at_ms=self.clock.now_ms(),
-        )
-
-    # ── contexts ─────────────────────────────────────────────────────────────
+        return self.source(chat=chat, author=author, unknown_audience=True)
 
     def capture_context(self, *sources: SourceRef) -> TrustedCaptureContext:
-        request_id = f"cap-{'/'.join(item.event_id for item in sources) or 'empty'}"
-        self.policy.issue_capture(request_id)
-        return TrustedCaptureContext(
-            request_id=request_id,
-            policy_revision=self.policy.revision,
-            capture_basis="user_message",
-            authorized_sources=tuple(sources),
-            actor_principal=OWNER,
-            authorized=True,
-        )
+        return super().capture_context(*sources)
 
-    def read_context(
-        self,
-        reader: str,
-        *,
-        chat: str = GROUP_A,
-        recipients: set[str] | None = None,
-        channel: str = "whatsapp",
-    ) -> TrustedReadContext:
-        members = set(recipients) if recipients is not None else {reader}
-        revision = f"mem-{chat}-{len(members)}"
-        self.policy.set_members(
-            TrustedReadContext(
-                principal_id=reader,
-                channel=channel,
-                chat_id=chat,
-                recipient_principals=frozenset(members),
-                membership_revision=revision,
-                policy_revision=self.policy.revision,
-                purpose="reply",
-                now_ms=self.clock.now_ms(),
-            ),
-            members,
-            revision=revision,
-        )
-        return TrustedReadContext(
-            principal_id=reader,
-            channel=channel,
-            chat_id=chat,
-            recipient_principals=frozenset(members),
-            membership_revision=revision,
-            policy_revision=self.policy.revision,
-            purpose="reply",
-            now_ms=self.clock.now_ms(),
-        )
+    def read_context(self, reader: str, *, chat: str = GROUP_A,
+                     recipients: set[str] | None = None, channel: str = "whatsapp") -> TrustedReadContext:
+        return super().read_context(reader, chat=chat, channel=channel, recipients=recipients)
 
     def non_member_read_context(self, reader: str, *, chat: str = GROUP_A) -> TrustedReadContext:
-        """A context whose chat membership provably excludes the reader."""
-        members = {OWNER}
-        self.policy.set_members(
-            TrustedReadContext(
-                principal_id=reader,
-                channel="whatsapp",
-                chat_id=chat,
-                recipient_principals=frozenset(members),
-                membership_revision=f"mem-{chat}-nonmember",
-                policy_revision=self.policy.revision,
-                purpose="reply",
-                now_ms=self.clock.now_ms(),
-            ),
-            members,
-            revision=f"mem-{chat}-nonmember",
-        )
-        return TrustedReadContext(
-            principal_id=reader,
-            channel="whatsapp",
-            chat_id=chat,
-            recipient_principals=frozenset(members),
-            membership_revision=f"mem-{chat}-nonmember",
-            policy_revision=self.policy.revision,
-            purpose="reply",
-            now_ms=self.clock.now_ms(),
-        )
+        return self.read_context(reader, chat=chat, recipients={OWNER})
 
-    # ── raw inspection (white-box assertions only) ───────────────────────────
-    def raw_rows(self, table: str) -> list[sqlite3.Row]:
-        return self.service._store.query(f"SELECT * FROM {table}")  # noqa: SLF001
+    def revoke_source(self, source: SourceRef) -> None:
+        super().revoke_source(source)
+
+    def raw_rows(self, table: str):
+        return self._raw_service._store.query(f"SELECT * FROM {table}")  # noqa: SLF001
 
     def table_columns(self, table: str) -> tuple[str, ...]:
-        rows = self.service._store.query(  # noqa: SLF001
-            f"PRAGMA table_info({table})"
-        )
+        rows = self._raw_service._store.query(f"PRAGMA table_info({table})")  # noqa: SLF001
         return tuple(str(row["name"]) for row in rows)
 
 
@@ -431,10 +300,10 @@ def test_missing_source_cannot_be_newly_attached(harness: ConversationHarness) -
 def test_revoked_source_cannot_be_newly_attached(harness: ConversationHarness) -> None:
     h = harness
     source = h.source()
-    h.authority.revoke_source(source)
+    h.revoke_source(source)
     with pytest.raises(KnowledgeError) as excinfo:
         h.service.attach_conversation_membership(source, context=h.capture_context(source))
-    assert excinfo.value.code == "source_revoked"
+    assert excinfo.value.code == "denied_unknown_basis"
     assert h.raw_rows("conversation_memberships") == []
 
 
@@ -459,7 +328,7 @@ def test_revoked_source_is_dropped_from_the_read_view(harness: ConversationHarne
     )
     assert len(h.service.conversation(receipt.conversation_id, context=h.read_context(TOM)).memberships) == 2
 
-    h.authority.revoke_source(second)
+    h.revoke_source(second)
 
     view = h.service.conversation(receipt.conversation_id, context=h.read_context(TOM))
     assert [item.source.event_id for item in view.memberships] == [first.event_id]
@@ -515,13 +384,22 @@ def test_reader_outside_the_source_audience_sees_nothing(harness: ConversationHa
 
 def test_unknown_audience_fails_closed(harness: ConversationHarness) -> None:
     h = harness
-    source = h.source(audience={TOM})
-    receipt = h.service.attach_conversation_membership(source, context=h.capture_context(source))
-    # The authority now reports an unproven audience for the very same revision.
-    h.authority.audiences[source.key] = EvidenceAudience.unknown()
-    denied = h.service.conversation(receipt.conversation_id, context=h.read_context(TOM))
-    assert denied.memberships == ()
-    assert denied.withheld_memberships == 1
+    from yeoman_gateway.knowledge._history_identity import current_history_scope
+
+    h.person_for(TOM, "Tom")
+    chat = "120363999999999@g.us"
+    h.history.add_message(chat_id=chat, message_id="unknown-audience",
+                          text="Authentic source with no roster",
+                          timestamp=h.clock.now_ms(), sender_id="4910000000002@s.whatsapp.net")
+    with h.history_scope():
+        scope = current_history_scope(h._raw_service._store)
+        native = scope.queries.native_message(chat_id=chat, native_id="unknown-audience")
+        assert native is not None
+        assert scope.queries.members(chat_id=chat, at_ms=h.clock.now_ms()).status == "unknown"
+        with pytest.raises(KnowledgeError) as excinfo:
+            scope.sources.issue(str(native["message_id"]))
+        assert excinfo.value.code == "denied_unknown_basis"
+    assert h.raw_rows("conversation_memberships") == []
 
 
 # ── relational truth, never writable JSON ────────────────────────────────────
@@ -551,15 +429,16 @@ def test_conversation_view_lists_memberships_for_every_covered_revision(
     harness: ConversationHarness,
 ) -> None:
     h = harness
-    source = h.source(revision=1)
-    replacement = h.source(revision=2)
-    context = h.capture_context(source, replacement)
-    receipt = h.service.attach_conversation_membership(source, context=context)
+    source = h.source()
+    receipt = h.service.attach_conversation_membership(source, context=h.capture_context(source))
+    replacement = h.revise_source(source)
     h.service.attach_conversation_membership(
-        replacement, conversation_id=receipt.conversation_id, context=context
+        replacement, conversation_id=receipt.conversation_id, context=h.capture_context(replacement)
     )
     view = h.service.conversation(receipt.conversation_id, context=h.read_context(TOM))
-    assert [(item.source.revision) for item in view.memberships] == [1, 2]
+    assert [item.source.revision for item in view.memberships] == [2]
+    assert view.withheld_memberships == 1
+    assert {int(row["source_revision"]) for row in h.raw_rows("conversation_memberships")} == {1, 2}
 
 
 def test_origin_enumeration_is_closed(harness: ConversationHarness) -> None:

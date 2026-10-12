@@ -166,3 +166,46 @@ def test_save_failure_before_replace_reports_previous_policy_bytes(
     assert result.meta["disk_state"] == "before"
     assert "policy file remains unchanged" in result.message
     assert "new-chat@g.us" not in path.read_text(encoding="utf-8")
+
+
+def test_list_groups_uses_projected_history_reader(tmp_path: Path) -> None:
+    path = tmp_path / "policy.json"
+    save_policy(_policy(), path)
+    service = PolicyAdminService(
+        policy_path=path,
+        workspace=tmp_path,
+        known_tools={"message"},
+        apply_channels={"whatsapp"},
+        history_chats_reader=lambda: [
+            {"chat_id": "planning@g.us", "subject": "Planning"}
+        ],
+    )
+
+    result = service.execute_from_text(
+        "/policy list-groups", actor=_actor(), options=PolicyExecutionOptions()
+    )
+
+    assert result.outcome == "noop"
+    assert "planning@g.us" in result.message
+    assert "history" in result.message
+    assert "Planning" in result.message
+
+
+def test_non_group_policy_command_does_not_read_history(tmp_path: Path) -> None:
+    path = tmp_path / "policy.json"
+    save_policy(_policy(), path)
+    reads: list[None] = []
+    service = PolicyAdminService(
+        policy_path=path,
+        workspace=tmp_path,
+        known_tools={"message"},
+        apply_channels={"whatsapp"},
+        history_chats_reader=lambda: reads.append(None) or [],
+    )
+
+    result = service.execute_from_text(
+        "/policy help", actor=_actor(), options=PolicyExecutionOptions()
+    )
+
+    assert result.outcome == "noop"
+    assert reads == []

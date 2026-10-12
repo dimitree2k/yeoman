@@ -66,15 +66,39 @@ def test_audience_does_not_backdate_snapshot_or_widen_on_redirect(case, tmp_path
     db.execute("UPDATE contacts SET merged_into='d' WHERE contact_id='a'")
     q = queries(snapshot)
     assert q.audience("early").status == "unknown"
-    from tests.gateway.knowledge.conftest import KnowledgeHarness
-    h = KnowledgeHarness(tmp_path / "synthetic-knowledge")
+    from yeoman_gateway.knowledge._history_identity import current_history_scope
+    from yeoman_gateway.knowledge.models import KnowledgeError
+
+    from tests.gateway.knowledge.conftest import ProjectedKnowledgeHarness
+
+    h = ProjectedKnowledgeHarness(tmp_path / "synthetic-knowledge")
     try:
+        facts_before = h.snapshot_counts()["memory2_facts"]
         author = h.person("Synthetic author")
-        source = h.source(author)
-        h.service.capture(h.candidate("synthetic secret", source), context=h.capture_context(source))
-        h.authority.audiences[source.key] = q.audience("early")
-        denied = h.recall_text("synthetic secret", h.read_context(author, chat="other@g.us"))
-        assert "synthetic secret" not in denied.text
+        phone = h.principal_for(author).split(":", 1)[1] + "@s.whatsapp.net"
+        h.history.add_message(
+            chat_id="other@g.us",
+            message_id="unknown-audience-message",
+            text="synthetic secret",
+            timestamp=h.clock.now_ms(),
+            sender_id=phone,
+            channel="whatsapp",
+        )
+        with h.history_scope():
+            scope = current_history_scope(h._raw_service._store)  # noqa: SLF001
+            assert scope is not None
+            native = scope.queries.native_message(
+                chat_id="other@g.us", native_id="unknown-audience-message"
+            )
+            assert native is not None
+            with pytest.raises(KnowledgeError) as excinfo:
+                scope.sources.issue(str(native["message_id"]))
+        assert excinfo.value.code == "denied_unknown_basis"
+        assert h.snapshot_counts()["memory2_facts"] == facts_before
+        assert h.recall_text(
+            "synthetic secret",
+            h.read_context(author, chat="other@g.us", membership_known=False),
+        ).text == ""
     finally:
         h.close()
     proof = q.audience("known")

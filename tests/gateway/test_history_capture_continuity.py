@@ -121,7 +121,7 @@ def case(tmp_path):
     legacy = RuntimeKnowledgeSources()
     def open_service():
         return open_knowledge_store(path, workspace_id="synthetic", source_authority=legacy,
-                                    policy_authority=policy, history_mode=True)
+                                    policy_authority=policy)
     knowledge = open_service()
     history = History(tmp_path / "history.db")
     yield history, knowledge, policy, open_service

@@ -62,9 +62,7 @@ class BurstObserver:
         chat_id = str(event.chat_id or "").strip()
         if not channel or not chat_id:
             return
-        history = getattr(self._config, 'history', None)
-        selected = bool(channel == 'whatsapp' and history is not None
-                        and history.live_projection_enabled and history.readers.secondary)
+        selected = channel == 'whatsapp'
         if selected and not await self._eligible(channel, chat_id):
             return
         await self._handle_activity(event, eligibility_checked=selected)

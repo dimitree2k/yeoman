@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import asyncio
 import os
 from pathlib import Path
 from typing import Any
@@ -31,6 +32,13 @@ from yeoman_gateway.processing.models import (
 from yeoman_gateway.processing.policy import PolicyCapabilityResolver, SnapshotEffectAuthorizer
 from yeoman_gateway.processing.store import ProcessingStore
 from yeoman_shared.config.schema import Config, WhatsAppConfig
+
+
+@pytest.fixture(autouse=True)
+def _projected_effect_history(monkeypatch, request, tmp_path):
+    from tests.gateway.history_test_helpers import install_projected_effect_history
+    install_projected_effect_history(monkeypatch, request, tmp_path)
+
 
 CHAT = "chat@g.us"
 OTHER_CHAT = "other@g.us"
@@ -581,11 +589,11 @@ async def test_legacy_publish_is_refused_for_managed_chats(tmp_path: Path) -> No
     await bus.publish_outbound(
         OutboundMessage(channel="whatsapp", chat_id="free@g.us", content="legacy")
     )
-    assert (await bus.consume_outbound()).content == "legacy"
+    assert (await asyncio.wait_for(bus.consume_outbound(), timeout=30)).content == "legacy"
 
     # The effect transport carries provenance and passes.
     await router.submit_outbound(_outbound("managed"), principal="owner@s.whatsapp.net")
-    delivered = await bus.consume_outbound()
+    delivered = await asyncio.wait_for(bus.consume_outbound(), timeout=30)
     assert delivered.content == "managed"
     assert delivered.metadata.get(EFFECT_PROVENANCE_KEY)
     store.close()
@@ -1126,7 +1134,7 @@ async def test_effect_delivery_gets_exactly_one_transport_attempt(tmp_path: Path
                 channel="whatsapp",
                 chat_id=CHAT,
                 content="managed",
-                metadata={EFFECT_PROVENANCE_KEY: "fx1"},
+                metadata={EFFECT_PROVENANCE_KEY: "fx1", "historyMentionsResolved": True},
             )
         )
     assert [c for c in calls if c == "send_text"] == ["send_text"]
@@ -1134,7 +1142,10 @@ async def test_effect_delivery_gets_exactly_one_transport_attempt(tmp_path: Path
     # Legacy message: the existing retry behaviour is untouched.
     calls.clear()
     with pytest.raises(TimeoutError):
-        await channel.send(OutboundMessage(channel="whatsapp", chat_id=CHAT, content="legacy"))
+        await channel.send(OutboundMessage(
+            channel="whatsapp", chat_id=CHAT, content="legacy",
+            metadata={"historyMentionsResolved": True},
+        ))
     assert len([c for c in calls if c == "send_text"]) == SEND_MAX_ATTEMPTS
 
 
@@ -1356,7 +1367,6 @@ async def test_typing_stays_ephemeral_presence_without_an_effect(tmp_path: Path)
         orchestrator=None,  # type: ignore[arg-type]
         typing_adapter=_typing,
         telemetry=None,  # type: ignore[arg-type]
-        memory=None,  # type: ignore[arg-type]
         effect_router=router,
     )
     await service._dispatch_intents(

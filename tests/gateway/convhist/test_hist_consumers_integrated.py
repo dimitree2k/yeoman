@@ -11,7 +11,6 @@ from tests.gateway.convhist.consumer_fixtures import (  # noqa: F401
     capture_case,
     consumer_case,
     continuity_case,
-    parity_case,
     refusal_case,
     reply_case,
     statement_case,
@@ -92,20 +91,6 @@ async def test_consumer_family_reopens_after_atomic_replace(consumer_case, famil
     assert second.members == frozenset({c.author, c.later})
     assert first.source_valid and not second.source_valid
     c.assert_no_leases()
-
-
-async def test_reader_parity_same_synthetic_conversation(parity_case):
-    await parity_case.compare()
-    assert set(parity_case.checked) == {
-        'recent', 'ambient', 'reply_before_after', 'dm', 'thread', 'literal_search',
-        'speaker', 'media',
-    }
-    assert set(parity_case.differences) == {
-        'latest_edit', 'delete_purge', 'typed_terminal_identity', 'evidence_audience',
-        'derived_label', 'authorized_cross_chat', 'passive', 'new_boundary',
-        'failed_assistant_and_tools',
-    }
-    parity_case.assert_no_leases()
 
 
 async def test_integrated_capture_continuity_has_exact_promotable_inputs_and_statements(continuity_case):

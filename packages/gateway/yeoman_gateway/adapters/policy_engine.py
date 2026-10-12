@@ -7,15 +7,12 @@ import json
 import re
 import threading
 import time
-import uuid
 from pathlib import Path
 from typing import TYPE_CHECKING, Any, Literal, override
 
-import websockets
 from loguru import logger
 from yeoman_shared.config.loader import load_config
 from yeoman_shared.utils.helpers import get_operational_store_path
-from yeoman_shared.whatsapp_protocol import PROTOCOL_VERSION
 
 from yeoman_gateway.core.admin_commands import (
     AdminCommandContext,
@@ -131,7 +128,6 @@ class EnginePolicyAdapter(PolicyPort):
     ) -> None:
         self._engine = engine
         self._known_tools = policy_known_tools(known_tools)
-        self._history_config: Any = None
         self._policy_path = policy_path
         self._processing_config = processing_config
         self._models_config = models_config
@@ -202,7 +198,6 @@ class EnginePolicyAdapter(PolicyPort):
                 known_tools=self._known_tools,
                 apply_channels=apply_channels,
                 on_policy_applied=self._on_policy_applied,
-                group_subject_resolver=lambda ids: self._list_group_subjects_from_bridge(ids),
                 processing_config=self._processing_config,
             )
 
@@ -1070,25 +1065,14 @@ class EnginePolicyAdapter(PolicyPort):
         return bool(self._owner_policy_for_context(ctx))
 
     def _get_group_name(self, chat_id: str) -> str | None:
-        """Get group name from History or bridge."""
-        history = getattr(self, '_history_config', None)
-        if history is not None and (history.live_projection_enabled and history.readers.secondary or history.legacy_writers_disabled):
-            from yeoman_gateway.history.context import current_history_snapshot
-            from yeoman_gateway.history.live import HistoryPaused
-            from yeoman_gateway.history.queries import HistoryQueries
-            snapshot = current_history_snapshot()
-            if snapshot is None or not (history.live_projection_enabled and history.readers.secondary):
-                raise HistoryPaused('secondary_history_scope_required')
-            return next((row['subject'] for row in HistoryQueries(snapshot).chats() if row['chat_id'] == chat_id), None)
-        # Try bridge lookup
-        try:
-            names = self._list_group_subjects_from_bridge([chat_id])
-            if names.get(chat_id):
-                return names[chat_id]
-        except Exception:
-            pass
-
-        return None
+        """Get group name from the active projected History."""
+        from yeoman_gateway.history.context import current_history_snapshot
+        from yeoman_gateway.history.live import HistoryPaused
+        from yeoman_gateway.history.queries import HistoryQueries
+        snapshot = current_history_snapshot()
+        if snapshot is None:
+            raise HistoryPaused('secondary_history_scope_required')
+        return next((row['subject'] for row in HistoryQueries(snapshot).chats() if row['chat_id'] == chat_id), None)
 
     def _handle_group_approval_reply(self, event: InboundEvent) -> AdminCommandResult | None:
         choice = event.content.strip().casefold()
@@ -1450,7 +1434,7 @@ class EnginePolicyAdapter(PolicyPort):
 
         session_key = f"{ctx.channel}:{ctx.chat_id}"
         try:
-            if self._session_manager.uses_history(ctx.channel):
+            if ctx.channel == "whatsapp":
                 session = self._session_manager.get_or_create(
                     session_key, channel=ctx.channel, chat_id=ctx.chat_id)
                 assert self._session_manager.operational_store is not None
@@ -1731,88 +1715,6 @@ class EnginePolicyAdapter(PolicyPort):
         self._policy_file_was_present = True
         self._last_reload_check = time.monotonic()
         self._policy_reload_error = None
-
-
-    def _list_group_subjects_from_bridge(self, ids: list[str]) -> dict[str, str]:
-        target_ids = [cid for cid in ids if isinstance(cid, str) and cid.endswith("@g.us")]
-        if not target_ids:
-            return {}
-
-        try:
-            config = load_config()
-        except Exception:
-            return {}
-        if not bool(getattr(config.channels.whatsapp, "enabled", False)):
-            return {}
-        token = str(getattr(config.channels.whatsapp, "bridge_token", "") or "").strip()
-        if not token:
-            return {}
-        bridge_url = str(config.channels.whatsapp.resolved_bridge_url).strip()
-        if not bridge_url:
-            return {}
-
-        async def _fetch(url: str, chat_ids: list[str], bridge_token: str) -> dict[str, str]:
-            request_id = uuid.uuid4().hex
-            payload = {
-                "version": PROTOCOL_VERSION,
-                "type": "list_groups",
-                "token": bridge_token,
-                "requestId": request_id,
-                "accountId": "default",
-                "payload": {"ids": chat_ids},
-            }
-            async with websockets.connect(url) as ws:
-                await ws.send(json.dumps(payload))
-                deadline = time.monotonic() + 5.0
-                while True:
-                    timeout = deadline - time.monotonic()
-                    if timeout <= 0:
-                        raise TimeoutError("bridge did not reply in time")
-                    raw = await asyncio.wait_for(ws.recv(), timeout=timeout)
-                    data = json.loads(raw)
-                    if data.get("version") != PROTOCOL_VERSION:
-                        continue
-                    if data.get("type") != "response":
-                        continue
-                    if data.get("requestId") != request_id:
-                        continue
-                    response_payload = data.get("payload")
-                    if not isinstance(response_payload, dict):
-                        raise RuntimeError("bridge response payload malformed")
-                    if not bool(response_payload.get("ok")):
-                        return {}
-                    result = response_payload.get("result")
-                    if not isinstance(result, dict):
-                        return {}
-                    groups = result.get("groups", [])
-                    out: dict[str, str] = {}
-                    if isinstance(groups, list):
-                        for item in groups:
-                            if not isinstance(item, dict):
-                                continue
-                            gid = str(item.get("chatJid", "")).strip()
-                            subj = str(item.get("subject", "")).strip()
-                            if gid and subj:
-                                out[gid] = subj
-                    return out
-
-        result_holder: dict[str, str] = {}
-        error_holder: dict[str, Exception] = {}
-
-        def _runner() -> None:
-            try:
-                result_holder.update(asyncio.run(_fetch(bridge_url, target_ids, token)))
-            except Exception as e:
-                error_holder["error"] = e
-
-        thread = threading.Thread(target=_runner, daemon=True)
-        thread.start()
-        thread.join(timeout=6.0)
-        if thread.is_alive():
-            return {}
-        if error_holder:
-            return {}
-        return result_holder
 
 
 class NewSessionCommandHandler(AdminCommandHandler):

@@ -9,6 +9,13 @@ from yeoman_gateway.knowledge._memory.read_gate import build_read_context, regis
 from yeoman_gateway.processing.reconcile import _effect_meta
 from yeoman_gateway.processing.store import ProcessingStore
 
+
+@pytest.fixture(autouse=True)
+def _projected_actor_history(monkeypatch, request, tmp_path):
+    from tests.gateway.history_test_helpers import install_projected_thread_history
+    install_projected_thread_history(monkeypatch, request, tmp_path)
+
+
 CHAT_A = "chat-a"
 CHAT_B = "chat-b"
 T0 = 1_700_000_000_000
@@ -255,41 +262,6 @@ def test_f05_a_reaction_never_invalidates(tmp_path: Path) -> None:
     store.close()
 
 
-def test_f05_edit_supersedes_facts_instead_of_revoking_them(tmp_path: Path) -> None:
-    """An edit replaces the statement; a delete removes it."""
-    from yeoman_gateway.knowledge._memory.shared_facts import FactSource, SharedFact
-    from yeoman_gateway.processing.invalidation import SignalInvalidator
-
-    store, _thread_id, _turn_id = _store_with_message(tmp_path)
-
-    class _Memory:
-        def __init__(self) -> None:
-            self.calls: list[tuple[list[str], str]] = []
-
-        def invalidate_sources(self, ids, *, now_ms, kind=None):
-            self.calls.append((list(ids), str(kind)))
-
-            class _Report:
-                revoked = ()
-                superseded = ("fact-1",)
-                jobs_cancelled = 2
-
-            return _Report()
-
-    memory = _Memory()
-    invalidator = SignalInvalidator(store=store, memory=memory, clock=lambda: T0 + 100)
-
-    result = invalidator(
-        "edit",
-        {"chatJid": CHAT_A, "messageId": "m1", "senderId": "author-1", "text": "neu"},
-    )
-
-    assert memory.calls == [(["m1"], "edit")]
-    assert result.facts_superseded == ("fact-1",)
-    assert result.jobs_cancelled == 2
-    # A shared-fact path exists and is reachable from here (sanity, not behaviour).
-    assert FactSource and SharedFact
-    store.close()
 
 
 @pytest.mark.asyncio

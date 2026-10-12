@@ -22,12 +22,11 @@ from yeoman_gateway.knowledge.models import (
     TrustedReadContext,
     ValidationError,
 )
-from yeoman_gateway.policy.identity import registry_member_principals
 
 
 @dataclass
 class RuntimeKnowledgePolicy:
-    """Authorization adapter over the live Policy engine and the chat registry.
+    """Authorization adapter over the live Policy engine and projected history.
 
     ``policy_revision`` must change whenever owner rights, tool rights or capture
     permission change; the adapter reads it from the engine so a stale read context is
@@ -35,7 +34,6 @@ class RuntimeKnowledgePolicy:
     """
 
     engine: Any
-    chat_registry: Any | None = None
     policy_revision: int = 1
     admin_principals: frozenset[str] = frozenset()
     capture_actors: frozenset[str] = frozenset()
@@ -153,24 +151,7 @@ class RuntimeKnowledgePolicy:
             if audience.status != 'known':
                 return None
             return PolicyMembership(audience.members, f"history:{scope.queries.snapshot.generation}:{audience.snapshot_id}")
-        if self.chat_registry is None:
-            return None
-        record = self.chat_registry.get_chat(context.channel, context.chat_id)
-        if not isinstance(record, Mapping):
-            return None
-        metadata = record.get("metadata")
-        raw = metadata.get("participants") if isinstance(metadata, Mapping) else None
-        members = registry_member_principals(context.channel, raw)
-        if not members and context.is_direct:
-            return None
-        if not members:
-            return None
-        revision = str(
-            record.get("last_sync_at")
-            or record.get("last_seen_at")
-            or f"{context.channel}:{context.chat_id}:{len(members)}"
-        )
-        return PolicyMembership(members=members, revision=revision)
+        return None
 
 
 def _principal_candidates(principal: str) -> tuple[str, ...]:

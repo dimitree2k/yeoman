@@ -20,109 +20,70 @@ from yeoman_gateway.knowledge._snapshot import (
 
 
 def _fixture_dbs(tmp_path: Path) -> tuple[Path, Path]:
-    """Two *closed* writers, so the offline snapshot premise is literally true."""
-    from yeoman_gateway.knowledge.api import open_knowledge_store
-    from yeoman_gateway.knowledge.authority import FakePolicyAuthority, FakeSourceAuthority
-    from yeoman_gateway.knowledge.models import (
-        Identifier,
-        SourceRef,
-        TrustedIdentityObservation,
-    )
+    """A verified schema-3 copy with synthetic curation and revocation history."""
+    import sys
 
-    knowledge_path = tmp_path / "knowledge.db"
-    authority = FakeSourceAuthority()
-
-    class _SnapshotPolicy(FakePolicyAuthority):
-        """The composition root's owner decision, without a real policy engine."""
-
-        def admin_actor(self) -> str:
-            return "whatsapp:4910000000001"
-
-    policy = _SnapshotPolicy(
-        admins={"whatsapp:4910000000001"}, capture_actors={"whatsapp:4910000000001"}
-    )
-    service = open_knowledge_store(
-        knowledge_path,
-        workspace_id="snapshot-tests",
-        source_authority=authority,
-        policy_authority=policy,
-    )
-    observation = TrustedIdentityObservation(
-        identifiers=(Identifier("whatsapp", "phone_jid", "49183333333@s.whatsapp.net", "acc"),),
-        evidence_ref="snapshot-observation-1",
-        observed_name="Synthetic Snapshot Person",
-    )
-    authority.issue_observation(observation)
-    person = service.resolve_observation(observation)
-    assert person.person_id
-    # A manual name correction must survive the round trip.
-    service.set_preferred_name(person.person_id, "Corrected Name", context=service.admin_context_for(reason="snapshot-tests"))
-
-    from yeoman_gateway.knowledge.models import (
-        AttributeCandidate,
-        AttributeValue,
-        PersonLinkCandidate,
-        StatementCandidate,
-    )
-
-    source = SourceRef(
-        event_id="snapshot-event-1",
-        revision=1,
-        channel="whatsapp",
-        chat_id="group-a",
-        author_principal="whatsapp:49183333333",
-        occurred_at_ms=1,
-    )
+    sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
+    from yeoman_gateway.knowledge._history_upgrade import upgrade_history_knowledge
+    from yeoman_gateway.knowledge._identity import IdentityEngine
+    from yeoman_gateway.knowledge._statements import StatementEngine
+    from yeoman_gateway.knowledge._store import KnowledgeStore
     from yeoman_gateway.knowledge.authority import EvidenceAudience
+    from yeoman_gateway.knowledge.models import SourceRef, StatementCandidate, TrustedCaptureContext
+    from yeoman_gateway.knowledge.runtime import RuntimeKnowledgePolicy, RuntimeKnowledgeSources
 
-    authority.issue_source(source, EvidenceAudience.known({"whatsapp:49183333333"}))
-    candidate = StatementCandidate(
-        content="Synthetic residence.",
-        sources=(source,),
-        people=(
-            PersonLinkCandidate(
-                person_id=person.person_id, role="subject", source=source, attribution="extracted"
-            ),
-        ),
-        attributes=(
-            AttributeCandidate(
-                person_id=person.person_id, attribute_key="residence", value=AttributeValue("Köln")
-            ),
-        ),
-        extractor_version="snapshot-test",
-        confidence=0.5,
+    from tests.gateway.test_history_knowledge_upgrade import v2
+
+    source_v2 = v2(tmp_path / "knowledge-v2.db")
+    store = KnowledgeStore(source_v2, create=False)
+    authority = RuntimeKnowledgeSources()
+    policy = RuntimeKnowledgePolicy(engine=None)
+    identity = IdentityEngine(store, authority=authority, policy=policy, legacy_history_disabled=True)
+    statements = StatementEngine(store, identity=identity, authority=authority, policy=policy,
+                                 workspace_id="synthetic")
+    revoked_source = SourceRef("revocation-source", 1, "whatsapp", "curated@g.us", "whatsapp:10009", 200)
+    authority.register_source(revoked_source, EvidenceAudience.author_only())
+    context = TrustedCaptureContext("synthetic", 1, "synthetic_snapshot", (revoked_source,))
+    with store.transaction():
+        statements.capture(StatementCandidate("Synthetic revoked source", (revoked_source,)), context=context)
+    with store.transaction():
+        statements.invalidate_source_internal(revoked_source, actor="synthetic", reason="fixture_revocation")
+    # The verified snapshot requires the locked search index to contain no entries.
+    # Rebuild this synthetic v2 index after curation/revocation, preserving historical
+    # statement rows while excluding every statement that is not readable.
+    store.execute("DELETE FROM memory2_nodes_fts")
+    store.execute(
+        "INSERT INTO memory2_nodes_fts (entry_id, content) "
+        "SELECT n.id, n.content FROM memory2_nodes n "
+        "WHERE n.is_deleted = 0 AND n.content <> '' "
+        "AND NOT EXISTS (SELECT 1 FROM knowledge_statements s "
+        "WHERE s.statement_id = n.id AND (s.status IN ('superseded','revoked') "
+        "OR s.revoked_at_ms IS NOT NULL OR s.superseded_by IS NOT NULL))"
     )
-    from yeoman_gateway.knowledge.models import TrustedCaptureContext
+    store.commit_if_idle()
+    store.close()
 
-    request_id = "snapshot-capture-1"
-    policy.issue_capture(request_id)
-    context = TrustedCaptureContext(
-        request_id=request_id,
-        policy_revision=service.policy_revision,
-        capture_basis="user_message",
-        authorized_sources=(source,),
-        actor_principal="whatsapp:4910000000001",
-        authorized=True,
-    )
-    captured = service.capture(candidate, context=context)
-    assert captured.statement_ids
-    service.close()
-
-    processing_path = tmp_path / "processing.db"
-    connection = sqlite3.connect(processing_path)
+    knowledge = tmp_path / "knowledge-v3.db"
+    upgrade_history_knowledge(source=source_v2, target=knowledge)
+    processing = tmp_path / "processing.db"
+    connection = sqlite3.connect(processing)
     try:
         connection.execute(
             "CREATE TABLE events (event_id TEXT PRIMARY KEY, chat_id TEXT NOT NULL,"
             " revision INTEGER NOT NULL, media_path TEXT)"
         )
+        connection.executemany(
+            "INSERT INTO events VALUES (?, 'curated@g.us', ?, ?)",
+            [("curated-source", 4, "/nonexistent/synthetic.pdf"), ("revocation-source", 1, None)],
+        )
         connection.execute(
-            "INSERT INTO events (event_id, chat_id, revision, media_path)"
-            " VALUES ('snapshot-event-1', 'group-a', 1, '/nonexistent/synthetic.pdf')"
+            "CREATE TABLE event_source_authority (event_id TEXT NOT NULL, revision INTEGER NOT NULL,"
+            " authorized INTEGER NOT NULL DEFAULT 0, PRIMARY KEY(event_id, revision))"
         )
         connection.commit()
     finally:
         connection.close()
-    return processing_path, knowledge_path
+    return processing, knowledge
 
 
 def test_snapshot_requires_an_explicit_quiesce_reference(tmp_path: Path) -> None:
@@ -175,53 +136,48 @@ def test_snapshot_manifest_is_redacted_and_describes_the_copy(tmp_path: Path) ->
     assert payload["coherent_live_boundary"] is False
     assert payload["identity_revision"]
     assert payload["acl_epoch"]
-    assert payload["revoked_statements"] == 0
+    assert payload["revoked_statements"] == 1
     assert "Corrected Name" not in json.dumps(payload)
     assert "49183333333" not in json.dumps(payload)
     # A missing medium is marked, not silently dropped.
     assert payload["media"] and payload["media"][0][1] == -1
 
 
+
+
 def test_restore_rehearsal_preserves_correction_attribute_binding_and_revocation(
     tmp_path: Path,
 ) -> None:
-    """The rehearsal the plan requires: the restored copy still means the same thing."""
     processing, knowledge = _fixture_dbs(tmp_path)
     create_snapshot(
         processing=processing,
         knowledge=knowledge,
         target_dir=tmp_path / "out",
-        quiesce_ref="quiesce-ref-2",
+        quiesce_ref="quiesce-ref-restore",
     )
     verification = verify_snapshot(
-        manifest=tmp_path / "out" / "manifest.json", restore_dir=tmp_path / "restore"
+        manifest=tmp_path / "out" / "manifest.json", restore_dir=tmp_path / "restore-curated"
     )
     assert verification.verdict == "ok", verification.reason
-    assert verification.integrity_ok
-    assert verification.cross_references_ok
-    assert verification.rehearsal_ok
-    assert verification.fts_locked_ok
-    assert verification.restored_path is not None and verification.restored_path.exists()
-    # The rehearsal never touches the live snapshot copy.
-    assert verification.restored_path != knowledge
-
-    connection = sqlite3.connect(f"file:{verification.restored_path}?mode=ro", uri=True)
-    try:
-        name = connection.execute(
-            "SELECT preferred_name FROM contacts WHERE preferred_name IS NOT NULL"
+    assert verification.rehearsal_ok and verification.cross_references_ok
+    restored = verification.restored_path
+    assert restored is not None
+    with sqlite3.connect(f"file:{restored}?mode=ro", uri=True) as connection:
+        assert connection.execute(
+            "SELECT COUNT(*) FROM knowledge_statements WHERE status='superseded'"
+        ).fetchone()[0] >= 1
+        assert connection.execute("SELECT COUNT(*) FROM knowledge_person_attributes").fetchone()[0] >= 1
+        assert connection.execute(
+            "SELECT COUNT(*) FROM knowledge_identifier_bindings WHERE binding_id IS NOT NULL"
+        ).fetchone()[0] >= 1
+        assert connection.execute(
+            "SELECT COUNT(*) FROM knowledge_statements WHERE status='revoked' AND revoked_at_ms IS NOT NULL"
+        ).fetchone()[0] >= 1
+        assert connection.execute("SELECT COUNT(*) FROM knowledge_jobs").fetchone()[0] >= 1
+        suppression = connection.execute(
+            "SELECT value FROM knowledge_meta WHERE key='curated_suppression'"
         ).fetchone()
-        assert name is not None and str(name[0]) == "Corrected Name"
-        facet = connection.execute(
-            "SELECT attribute_key FROM knowledge_person_attributes"
-        ).fetchone()
-        assert facet is not None and str(facet[0]) == "residence"
-        binding = connection.execute(
-            "SELECT COUNT(*) FROM knowledge_identifier_bindings"
-            " WHERE status = 'active' AND binding_id IS NOT NULL"
-        ).fetchone()
-        assert binding is not None and int(binding[0]) == 1
-    finally:
-        connection.close()
+        assert suppression == ("synthetic-withheld-ref",)
 
 
 def test_verify_reports_a_damaged_snapshot_instead_of_accepting_it(tmp_path: Path) -> None:

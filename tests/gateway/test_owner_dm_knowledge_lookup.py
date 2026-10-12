@@ -18,8 +18,6 @@ OWNER_ENDPOINTS = (
 def responder(monkeypatch):
     responder = object.__new__(LLMResponder)
     responder.knowledge = SimpleNamespace(policy_revision=1, recall=Mock(return_value=SimpleNamespace(text="Alex holds shares")))
-    responder.chat_registry = None
-    responder._history_selected = True
     queries = SimpleNamespace(
         owner_member_chat_ids=Mock(return_value=("stocks@g.us",)),
         is_owner_direct_chat=Mock(side_effect=lambda principal, chat, at_ms, **kwargs:

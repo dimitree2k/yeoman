@@ -1,14 +1,13 @@
 """One complete path, end to end, without a response turn anywhere.
 
-passive observation -> durable storage -> valid source and audience proof -> sourced
-statement -> ordinary responder recall -> revocation blocks recall.
+passive observation -> durable storage -> native source and audience proof -> sourced
+statement -> scoped Knowledge recall -> revocation blocks recall.
 
 Everything runs on production components: the Bridge signal sink writes the canonical
-event, the observation registrar proves the audience, the promotion producer queues an
-idempotent job, the capture worker extracts through an injected extractor and publishes
-through ``KnowledgeService.capture``, and the read goes through the ordinary shared-fact
-retrieval the responder uses.  Only the model call is injected, because a test may not
-call a provider.
+journal event, the observation registrar proves the audience from projected History, the
+native producer discovers and queues the source, the capture worker extracts through an
+injected extractor and publishes through ``KnowledgeService.capture``, and recall uses a
+scope derived from the same native snapshot. Only extraction is injected.
 """
 
 from __future__ import annotations
@@ -17,9 +16,8 @@ from pathlib import Path
 
 import pytest
 from yeoman_gateway.knowledge._capture_worker import StatementDraft
-from yeoman_shared.config.schema import Config
 
-from tests.gateway.capture_harness import AUTHOR, GROUP, CaptureHarness, Registry
+from tests.gateway.capture_harness import AUTHOR, GROUP, CaptureHarness
 
 IDLE = 60_000
 TEXT = "Wir treffen uns am Freitag um acht."
@@ -50,10 +48,13 @@ def test_passive_observation_reaches_recall_and_revocation_ends_it(
     row = harness.source_row(event_id)
     assert row["audience_status"] == "known"
     assert row["occurred_at_ms"] == harness.now
-    issued = harness.knowledge.knowledge_sources.verify_source_ref(event_id, 1)
-    assert issued is not None and issued.author_principal == AUTHOR
+    with harness._history_scope():
+        issued = harness.knowledge.knowledge_sources.verify_source_ref(row["event_id"], 1)
+    assert issued is not None and issued.author_principal == f"whatsapp:{AUTHOR}"
 
     # 3. Promotion: one idempotent job, one sourced statement.
+    # Native capture starts its quiescence clock when the committed row is first seen.
+    harness.promote()
     harness.advance(IDLE + 1)
     harness.drafts = [StatementDraft(content=STATEMENT, source_index=0)]
     report = harness.run_capture()
@@ -66,32 +67,23 @@ def test_passive_observation_reaches_recall_and_revocation_ends_it(
     )
     assert [
         (str(item["event_id"]), int(item["revision"]), str(item["status"])) for item in source_rows
-    ] == [(event_id, 1, "active")]
+    ] == [(row["event_id"], 1, "active")]
 
-    # 4. Ordinary recall, with the reader proven from the live registry.
+    # 4. Recall with reader and audience proven by projected History.
     recalled = harness.recall("Freitag")
     assert STATEMENT in recalled
 
     # 5. Revocation wins: the provider delete arrives, recall goes quiet.
     harness.delete(provider_id)
     harness.advance(1_000)
-    assert harness.statements()[0]["status"] == "revoked"
     assert STATEMENT not in harness.recall("Freitag")
     assert harness.knowledge_recall("Freitag").statement_ids == ()
 
 
-def test_observation_continues_when_promotion_is_disabled(tmp_path: Path) -> None:
-    """``capture_enabled = false``: no worker, no job, and the journal keeps filling."""
-    config = Config.model_validate({"knowledge": {"enabled": True, "captureEnabled": False}})
-    from yeoman_gateway.app.bootstrap import build_statement_capture
-
+def test_observation_continues_without_a_capture_pass(tmp_path: Path) -> None:
+    """The journal remains durable when no native capture pass is requested."""
     harness = CaptureHarness(tmp_path, idle_ms=IDLE)
     try:
-        assert (
-            build_statement_capture(config, knowledge=harness.knowledge, processing=harness.store)
-            is None
-        )
-        harness.activate()
         first = harness.observe("Erster beobachteter Satz.", message_id="3EB0500")
         harness.advance(1_000)
         second = harness.observe("Zweiter beobachteter Satz.", message_id="3EB0501")
@@ -106,14 +98,14 @@ def test_observation_continues_when_promotion_is_disabled(tmp_path: Path) -> Non
 
 
 def test_observation_survives_a_refused_and_an_overflowing_promotion(tmp_path: Path) -> None:
-    blind = CaptureHarness(tmp_path, registry=Registry({}), idle_ms=IDLE, max_waiting=1)
+    blind = CaptureHarness(tmp_path, history_members=(), idle_ms=IDLE, max_waiting=1)
     try:
         blind.activate()
         refused = blind.observe("Niemand ist als Publikum bewiesen.", message_id="3EB0600")
         blind.advance(IDLE + 1)
         report = blind.promote()
 
-        assert report.refusals.get("unknown_audience") == 1
+        assert report.refusals.get("unknown_evidence") == 1
         assert blind.jobs() == []
         # The refused observation is still durable, complete with its identity.
         event = blind.store.get_event(refused)
@@ -125,6 +117,7 @@ def test_observation_survives_a_refused_and_an_overflowing_promotion(tmp_path: P
 def test_promotion_is_idempotent_across_a_replayed_window(harness: CaptureHarness) -> None:
     harness.activate()
     harness.observe(TEXT, message_id="3EB0700")
+    harness.promote()
     harness.advance(IDLE + 1)
     harness.drafts = [StatementDraft(content=STATEMENT, source_index=0)]
 

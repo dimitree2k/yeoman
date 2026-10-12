@@ -15,7 +15,6 @@ import time
 from pathlib import Path
 
 import pytest
-from yeoman_gateway.adapters.reply_archive_history import HistoryReplyArchiveAdapter
 from yeoman_gateway.app.bootstrap import participant_is_allowed
 from yeoman_gateway.bus.events import InboundObservedEvent
 from yeoman_gateway.consciousness.delivery import DeliveryAnchorReader
@@ -158,7 +157,6 @@ def _pilot_runtime(tmp_path: Path, *, decision: dict[str, object], shadow: bool)
     archive = ProjectedHistory(tmp_path, messages=[dict(channel=CHANNEL, chat_id=CHAT,
         message_id="m1", participant="10001@s.whatsapp.net", sender_id="10001@s.whatsapp.net",
         sender_name="anna", text="Wer steht heute im Tor?", timestamp=NOW_MS / 1000)])
-    queries = HistoryQueries(archive.snapshot())
 
     client = _ScriptedClient(decision)
     judge = ParticipationJudge(client=client, allowed_emojis=("👍",))
@@ -218,7 +216,6 @@ def _pilot_runtime(tmp_path: Path, *, decision: dict[str, object], shadow: bool)
         }
 
     builder = archive.wire(ParticipationContextBuilder(
-        archive=HistoryReplyArchiveAdapter(queries),
         policy=engine,
         anchors=DeliveryAnchorReader(log=log, store=store),
         source_authorizer=lambda row: participant_is_allowed(
@@ -260,7 +257,11 @@ def _pilot_runtime(tmp_path: Path, *, decision: dict[str, object], shadow: bool)
     def _material(
         channel: str, chat_id: str, source_ids: tuple[str, ...] | None
     ) -> tuple[tuple[str, ...], int]:
-        rows = queries.recent(chat_id=chat_id, limit=500)
+        snapshot = archive.snapshot()
+        try:
+            rows = HistoryQueries(snapshot).recent(chat_id=chat_id, limit=500)
+        finally:
+            snapshot.close()
         available = {str(row["native_message_id"]) for row in rows}
         resolved_sources = tuple(sorted(set(source_ids or available) & available))
         log.ensure_source_revisions_sync(

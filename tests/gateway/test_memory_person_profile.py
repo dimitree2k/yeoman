@@ -4,6 +4,7 @@ from __future__ import annotations
 from pathlib import Path
 from unittest.mock import MagicMock
 
+import pytest
 from yeoman_gateway.knowledge._contacts.service import ContactsService
 from yeoman_gateway.knowledge._memory.extractor import ExtractedCandidate
 from yeoman_gateway.knowledge._memory.service import MemoryService
@@ -33,6 +34,7 @@ class TestContactScopeKey:
 
 
 class TestLearnedChatTaste:
+    @pytest.mark.skip(reason="dormant legacy MemoryService writer; removed with the memory service in G6 S4")
     def test_learned_chat_taste_returns_recent_proactive_patterns(self, tmp_path: Path) -> None:
         svc = _service(tmp_path)
         svc.record_manual(
@@ -75,6 +77,7 @@ class TestLearnedChatTaste:
 
 
 class TestPersistCandidatePersonProfile:
+    @pytest.mark.skip(reason="dormant legacy MemoryService writer; removed with the memory service in G6 S4")
     def test_person_profile_stored_without_legacy_field_copy(self, tmp_path: Path) -> None:
         jid = "491786@s.whatsapp.net"
         contacts = ContactsService(db_path=tmp_path / "contacts.db")
@@ -109,6 +112,7 @@ class TestPersistCandidatePersonProfile:
         assert any("Frank" in h.entry.content for h in hits)
         assert contacts.store.get_fields(contact_id) == []
 
+    @pytest.mark.skip(reason="dormant legacy MemoryService writer; removed with the memory service in G6 S4")
     def test_person_profile_capture_does_not_write_legacy_field(
         self, tmp_path: Path
     ) -> None:
@@ -133,6 +137,7 @@ class TestPersistCandidatePersonProfile:
 
         svc._contacts.upsert_field.assert_not_called()
 
+    @pytest.mark.skip(reason="dormant legacy MemoryService writer; removed with the memory service in G6 S4")
     def test_person_profile_falls_back_to_user_scope_when_no_contact(self, tmp_path: Path) -> None:
         svc = _service(tmp_path)  # no contacts wired
 
@@ -161,6 +166,7 @@ class TestPersistCandidatePersonProfile:
         )
         assert any("Frank" in h.entry.content for h in hits)
 
+    @pytest.mark.skip(reason="dormant legacy MemoryService writer; removed with the memory service in G6 S4")
     def test_non_person_profile_unaffected(self, tmp_path: Path) -> None:
         jid = "491786@s.whatsapp.net"
         contact_id = "frank-uuid-001"
@@ -215,18 +221,22 @@ class TestResolveContactIdFallback:
         svc.set_contacts(mock)
         return svc
 
+    @pytest.mark.skip(reason="dormant legacy MemoryService writer; removed with the memory service in G6 S4")
     def test_resolves_exact_match(self, tmp_path: Path) -> None:
         svc = self._service_with_jid(tmp_path, "491786@s.whatsapp.net", "c-1")
         assert svc._resolve_contact_id("491786@s.whatsapp.net") == "c-1"
 
+    @pytest.mark.skip(reason="dormant legacy MemoryService writer; removed with the memory service in G6 S4")
     def test_resolves_stripped_user_token_via_whatsapp_suffix(self, tmp_path: Path) -> None:
         svc = self._service_with_jid(tmp_path, "491786@s.whatsapp.net", "c-1")
         assert svc._resolve_contact_id("491786") == "c-1"
 
+    @pytest.mark.skip(reason="dormant legacy MemoryService writer; removed with the memory service in G6 S4")
     def test_resolves_stripped_user_token_via_lid_suffix(self, tmp_path: Path) -> None:
         svc = self._service_with_jid(tmp_path, "263036883452098@lid", "c-lid")
         assert svc._resolve_contact_id("263036883452098") == "c-lid"
 
+    @pytest.mark.skip(reason="dormant legacy MemoryService writer; removed with the memory service in G6 S4")
     def test_returns_none_for_unknown_sender(self, tmp_path: Path) -> None:
         svc = self._service_with_jid(tmp_path, "491786@s.whatsapp.net", "c-1")
         assert svc._resolve_contact_id("999999") is None
@@ -247,6 +257,7 @@ class TestOwnerOnlyPreferenceGate:
         svc.set_contacts(mock_contacts)
         return svc
 
+    @pytest.mark.skip(reason="dormant legacy MemoryService writer; removed with the memory service in G6 S4")
     def test_person_profile_bypasses_owner_only_gate(self, tmp_path: Path) -> None:
         jid = "491786@s.whatsapp.net"
         contact_id = "frank-uuid-001"
@@ -277,6 +288,7 @@ class TestOwnerOnlyPreferenceGate:
         )
         assert any("Frank" in h.entry.content for h in hits)
 
+    @pytest.mark.skip(reason="dormant legacy MemoryService writer; removed with the memory service in G6 S4")
     def test_semantic_preference_still_gated_for_non_owner(self, tmp_path: Path) -> None:
         jid = "491786@s.whatsapp.net"
         svc = self._strict_service_with_contact(tmp_path, jid, "frank-uuid-001")
@@ -300,6 +312,7 @@ class TestOwnerOnlyPreferenceGate:
 
 
 class TestRecallContactScope:
+    @pytest.mark.skip(reason="dormant legacy MemoryService writer; removed with the memory service in G6 S4")
     def test_person_profile_recalled_from_different_group(self, tmp_path: Path) -> None:
         jid = "491786@s.whatsapp.net"
         contact_id = "frank-uuid-001"
@@ -330,6 +343,7 @@ class TestRecallContactScope:
         )
         assert any("Frank" in h.entry.content for h in hits)
 
+    @pytest.mark.skip(reason="dormant legacy MemoryService writer; removed with the memory service in G6 S4")
     def test_recall_includes_reply_to_contact_scope(self, tmp_path: Path) -> None:
         frank_jid = "491786@s.whatsapp.net"
         contact_id = "frank-uuid-001"
@@ -361,6 +375,7 @@ class TestRecallContactScope:
         )
         assert any("Frank" in h.entry.content for h in hits)
 
+    @pytest.mark.skip(reason="dormant legacy MemoryService writer; removed with the memory service in G6 S4")
     def test_recall_no_crash_when_sender_and_reply_same_contact(self, tmp_path: Path) -> None:
         jid = "491786@s.whatsapp.net"
         contact_id = "frank-uuid-001"

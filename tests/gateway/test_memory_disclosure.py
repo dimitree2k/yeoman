@@ -2,19 +2,13 @@ from __future__ import annotations
 
 import asyncio
 import json
-import re
 import uuid
 from pathlib import Path
 from typing import Any
 from unittest.mock import patch
 
-import pytest
 from test_memory_cli import isolated_memory_cli_config  # noqa: F401 - shared autouse fixture
 from typer.testing import CliRunner
-from yeoman_gateway.adapters.responder_llm import LLMResponder
-from yeoman_gateway.bus.queue import MessageBus
-from yeoman_gateway.cli.commands import app
-from yeoman_gateway.core.models import InboundEvent, PolicyDecision
 from yeoman_gateway.knowledge._memory.disclosure import (
     classify_disclosure_for_content,
     render_disclosed_hits,
@@ -29,7 +23,6 @@ from yeoman_gateway.knowledge._memory.extractor import _SYSTEM_PROMPT
 from yeoman_gateway.knowledge._memory.models import MemoryEntry, MemoryHit
 from yeoman_gateway.knowledge._memory.service import MemoryService
 from yeoman_gateway.providers.base import LLMProvider, LLMResponse
-from yeoman_shared.config.loader import save_config
 from yeoman_shared.config.schema import Config
 
 runner = CliRunner()
@@ -637,219 +630,7 @@ def test_multi_query_recall_reserves_slot_for_narrow_query_hit(tmp_path: Path) -
     assert hits[0].trace["quota"] == "reserved"
 
 
-def test_memory_trace_reports_query_origin_and_disclosure(tmp_path: Path, monkeypatch) -> None:
-    home = tmp_path / "home"
-    home.mkdir()
-    monkeypatch.setenv("HOME", str(home))
-    cfg = Config()
-    cfg.memory.embedding.enabled = False
-    cfg.history.legacy_writers_disabled = False  # Retained S3 service unit; no gateway startup.
-    cfg.history.live_projection_enabled = False
-    cfg.history.readers.secondary = False
-    save_config(cfg)
-
-    add = runner.invoke(
-        app,
-        [
-            "memory",
-            "add",
-            "--text",
-            "Natasha is the user's wife.",
-            "--kind",
-            "fact",
-            "--scope",
-            "chat",
-            "--channel",
-            "whatsapp",
-            "--chat-id",
-            "group@g.us",
-            "--sender-id",
-            "owner@s.whatsapp.net",
-            "--topics",
-            "relationship,natasha",
-        ],
-    )
-    assert add.exit_code == 0, add.output
-
-    trace = runner.invoke(
-        app,
-        [
-            "memory",
-            "trace",
-            "--query",
-            "What about Natasha?",
-            "--channel",
-            "whatsapp",
-            "--chat-id",
-            "group@g.us",
-            "--sender-id",
-            "owner@s.whatsapp.net",
-        ],
-    )
-
-    assert trace.exit_code == 0, trace.output
-    assert "Memory Trace" in trace.output
-    assert "query_origin" in trace.output
-    assert "disclosure" in trace.output
-    assert "render_raw" in trace.output
 
 
-@pytest.mark.asyncio
-async def test_responder_does_not_inject_taboo_memory_raw(tmp_path: Path) -> None:
-    workspace = tmp_path / "ws"
-    workspace.mkdir()
-
-    cfg = Config()
-    cfg.memory.db_path = str(tmp_path / "longterm.db")
-    cfg.memory.embedding.enabled = False
-    memory_service = MemoryService(workspace=workspace, config=cfg.memory)
-
-    memory_service.record_manual(
-        channel="whatsapp",
-        chat_id="group@g.us",
-        sender_id="owner@s.whatsapp.net",
-        scope_type="chat",
-        kind="fact",
-        text="Timo is quiet because his father died last year.",
-        importance=0.9,
-        topics=["funeral"],
-        sensitivity="taboo",
-        disclosure_mode="never_initiate",
-    )
-
-    provider = CaptureProvider()
-    responder = LLMResponder(
-        bus=MessageBus(),
-        provider=provider,
-        workspace=workspace,
-        memory_service=memory_service,
-    )
-    event = InboundEvent(
-        channel="whatsapp",
-        chat_id="group@g.us",
-        sender_id="not-owner@s.whatsapp.net",
-        content="Why is Timo quiet?",
-        is_group=True,
-        mentioned_bot=True,
-    )
-    decision = PolicyDecision(
-        accept_message=True,
-        should_respond=True,
-        allowed_tools=frozenset(),
-        reason="test",
-        is_owner=False,
-    )
-
-    try:
-        out = await responder.generate_reply(event, decision)
-    finally:
-        await responder.aclose()
-        memory_service.close()
-
-    assert out == "ok"
-    sent_payload = json.dumps(provider.messages_seen[-1])
-    assert "father died" not in sent_payload
-    assert "funeral" not in sent_payload
-    assert "Private Context Guardrails" in sent_payload
 
 
-def test_memory_cli_add_search_and_tag_disclosure_metadata(
-    tmp_path: Path,
-    monkeypatch: pytest.MonkeyPatch,
-) -> None:
-    home = tmp_path / "home"
-    home.mkdir()
-    monkeypatch.setenv("HOME", str(home))
-
-    cfg = Config()
-    cfg.history.legacy_writers_disabled = False  # Retained S3 service unit; no gateway startup.
-    cfg.history.live_projection_enabled = False
-    cfg.history.readers.secondary = False
-    save_config(cfg)
-
-    add = runner.invoke(
-        app,
-        [
-            "memory",
-            "add",
-            "--text",
-            "Private family funeral context",
-            "--kind",
-            "fact",
-            "--scope",
-            "chat",
-            "--channel",
-            "whatsapp",
-            "--chat-id",
-            "group@g.us",
-            "--topics",
-            "funeral,family",
-            "--sensitivity",
-            "taboo",
-            "--disclosure",
-            "never_initiate",
-            "--subjects",
-            "timo",
-        ],
-    )
-    assert add.exit_code == 0, add.output
-    match = re.search(r"memory entry: ([a-f0-9-]+)", add.output)
-    assert match is not None, add.output
-    entry_id = match.group(1)
-
-    search = runner.invoke(
-        app,
-        [
-            "memory",
-            "search",
-            "--query",
-            "family funeral",
-            "--channel",
-            "whatsapp",
-            "--chat-id",
-            "group@g.us",
-            "--scope",
-            "chat",
-        ],
-    )
-    assert search.exit_code == 0, search.output
-    assert "taboo" in search.output
-    assert "funeral,family" in search.output
-
-    tag = runner.invoke(
-        app,
-        [
-            "memory",
-            "tag",
-            entry_id,
-            "--topics",
-            "family",
-            "--sensitivity",
-            "private",
-            "--disclosure",
-            "owner_only",
-            "--subjects",
-            "timo",
-        ],
-    )
-    assert tag.exit_code == 0, tag.output
-    assert "Updated memory metadata" in tag.output
-
-    updated_search = runner.invoke(
-        app,
-        [
-            "memory",
-            "search",
-            "--query",
-            "family funeral",
-            "--channel",
-            "whatsapp",
-            "--chat-id",
-            "group@g.us",
-            "--scope",
-            "chat",
-        ],
-    )
-    assert updated_search.exit_code == 0, updated_search.output
-    assert "private" in updated_search.output
-    assert "family" in updated_search.output

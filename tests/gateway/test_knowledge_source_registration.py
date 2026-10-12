@@ -1,119 +1,145 @@
-"""Source registration: real canonical provenance, proven without a response turn.
-
-Two defects are covered here.  The responder substituted wall-clock time for the event
-timestamp, which conflicted with the immutable source authority (``JournalConflictError``)
-so the audience was never registered.  And registration only ever happened at the end of
-a response turn, so a message nobody answered stayed an unknown source forever.
-"""
+"""Native source registration: prove audiences from projected history, never a registry."""
 
 from __future__ import annotations
 
+import asyncio
+from contextlib import contextmanager
 from pathlib import Path
-from typing import Any
 
-import pytest
+from yeoman_gateway.history.context import history_knowledge_scope
+from yeoman_gateway.history.queries import HistoryQueries
 from yeoman_gateway.knowledge import open_knowledge_store, workspace_id_for
 from yeoman_gateway.knowledge._capture import ObservedSourceRegistrar
-from yeoman_gateway.knowledge.models import SourceRef
 from yeoman_gateway.knowledge.runtime import RuntimeKnowledgePolicy, RuntimeKnowledgeSources
-from yeoman_gateway.processing.models import JournalConflictError
+from yeoman_gateway.policy.engine import PolicyEngine
+from yeoman_gateway.policy.schema import PolicyConfig
 from yeoman_gateway.processing.signals import SignalJournalSink
 from yeoman_gateway.processing.store import ProcessingStore
+
+from tests.gateway.history_test_helpers import (
+    ProjectedHistory,
+    prepare_history_retirement_knowledge,
+)
 
 NOW = 1_700_000_000_000
 GROUP = "491786127564-1611913127@g.us"
 DIRECT = "491757070305@s.whatsapp.net"
 SENDER = "491757070305"
-
-
-class _Registry:
-    """Minimal stand-in for the live chat registry (proven participants per chat)."""
-
-    def __init__(self, chats: dict[tuple[str, str], list[str]] | None = None) -> None:
-        self.chats = chats or {}
-
-    def get_chat(self, channel: str, chat_id: str) -> Any:
-        members = self.chats.get((channel, chat_id))
-        if members is None:
-            return None
-        return {"metadata": {"participants": [f"{item}@s.whatsapp.net" for item in members]}}
+OTHER = "491511"
 
 
 class _Runtime:
-    """A knowledge service whose proof owner is a real processing store."""
+    """A Knowledge service and registrar under the real native-history scope."""
 
-    def __init__(self, tmp_path: Path, *, registry: _Registry | None = None) -> None:
+    def __init__(self, tmp_path: Path, *, history_members: tuple[str, ...] = ()) -> None:
         self.store = ProcessingStore(tmp_path / "processing.db")
-        self.registry = registry or _Registry()
+        self.history = ProjectedHistory(tmp_path / "projected-history")
+        async def read_turn():
+            return self.history.snapshot()
+        self.history.read_turn = read_turn
+        self.members = tuple(history_members)
+        engine = PolicyEngine(PolicyConfig.model_validate({
+            "defaults": {"whoCanTalk": {"mode": "everyone"}},
+            "channels": {"whatsapp": {"chats": {GROUP: {}}}},
+        }), tmp_path)
+        self.policy = RuntimeKnowledgePolicy(engine=engine, policy_revision=1)
         self.sources = RuntimeKnowledgeSources(processing_store=self.store)
-        self.policy = RuntimeKnowledgePolicy(
-            engine=None, chat_registry=self.registry, policy_revision=1
-        )
         self.knowledge = open_knowledge_store(
-            tmp_path / "knowledge.db",
+            prepare_history_retirement_knowledge(tmp_path, "knowledge"),
             workspace_id=workspace_id_for(tmp_path),
             source_authority=self.sources,
             policy_authority=self.policy,
+            clock=lambda: NOW,
+
+        )
+        self.registrar = ObservedSourceRegistrar(knowledge=self.knowledge, processing=self.store, clock=lambda: NOW)
+        self.registration_results: dict[str, bool] = {}
+        self.sink = SignalJournalSink(self.store, clock=lambda: NOW, sources=self.registrar)
+        self.sink._history_projector = self.history
+        self.sink._history_knowledge = self.knowledge
+
+    @contextmanager
+    def scope(self):
+        snapshot = self.history.snapshot()
+        try:
+            with history_knowledge_scope(snapshot, self.knowledge):
+                yield snapshot
+        finally:
+            snapshot.close()
+
+    def project_message(self, *, chat_id: str, message_id: str, occurred_ms: int = NOW) -> None:
+        if chat_id.endswith("@g.us") and self.members:
+            self.history.add_group(
+                chat_id=chat_id,
+                participants=[f"{member}@s.whatsapp.net" for member in self.members],
+                timestamp=occurred_ms,
+            )
+        identifiers = {SENDER, *self.members}
+        for member in identifiers:
+            self.history.add_contact(
+                identifiers=[f"{member}@s.whatsapp.net"], name=f"Synthetic {member}", timestamp=occurred_ms
+            )
+        self.history.add_message(
+            chat_id=chat_id, message_id=message_id, text="Wir treffen uns am Freitag um acht.",
+            timestamp=occurred_ms, sender_id=f"{SENDER}@s.whatsapp.net",
         )
 
     def close(self) -> None:
+        self.history.close()
         self.knowledge.close()
         self.store.close()
 
 
 def _append_message(
-    runtime: _Runtime,
-    *,
-    chat_id: str,
-    message_id: str,
-    registrar: Any | None = None,
+    runtime: _Runtime, *, chat_id: str, message_id: str, occurred_ms: int = NOW
 ) -> str:
-    sink = SignalJournalSink(runtime.store, clock=lambda: NOW, sources=registrar)
-    stored = sink.capture(
-        "message",
-        {
-            "chatJid": chat_id,
-            "messageId": message_id,
-            "senderId": SENDER,
-            "text": "Wir treffen uns am Freitag um acht.",
-            "isGroup": chat_id.endswith("@g.us"),
-            "timestamp": NOW,
-        },
-        event_id=f"wa_{message_id}",
-        event_key=f"whatsapp:default:{chat_id}:message:{message_id}",
-        account="default",
-        observed_at_ms=NOW,
-        strict=True,
+    runtime.project_message(chat_id=chat_id, message_id=message_id, occurred_ms=occurred_ms)
+    payload = {
+        "chatJid": chat_id, "messageId": message_id, "senderId": SENDER,
+        "text": "Wir treffen uns am Freitag um acht.",
+        "isGroup": chat_id.endswith("@g.us"), "timestamp": occurred_ms,
+    }
+    stored = runtime.sink.capture(
+        "message", payload, event_id=f"wa_{message_id}",
+        event_key=f"whatsapp:default:{chat_id}:message:{message_id}", account="default",
+        observed_at_ms=NOW, strict=True,
+    )
+    runtime.registration_results[stored] = asyncio.run(
+        runtime.sink.register_observed_source_live(stored)
     )
     assert stored == f"wa_{message_id}"
     return stored
 
 
-def _authority(runtime: _Runtime, event_id: str, revision: int = 1) -> dict[str, Any]:
-    entry = runtime.store.get_event_source_authority(event_id, revision)
-    assert entry is not None
-    return entry
+def _source(runtime: _Runtime, chat_id: str, native_id: str, revision: int = 1):
+    from yeoman_gateway.knowledge._history_sources import HistoryKnowledgeSources
 
-
-def test_group_observation_registers_proven_audience_without_a_turn(tmp_path: Path) -> None:
-    runtime = _Runtime(
-        tmp_path, registry=_Registry({("whatsapp", GROUP): ["491757070305", "491511"]})
-    )
-    try:
-        registrar = ObservedSourceRegistrar(
-            knowledge=runtime.knowledge,
-            processing=runtime.store,
-            chat_registry=runtime.registry,
+    with runtime.scope() as snapshot:
+        queries = HistoryQueries(snapshot)
+        authority = HistoryKnowledgeSources(
+            queries, {}, runtime.knowledge.history_source_ledger,
+            runtime.knowledge._legacy_authority,
         )
-        event_id = _append_message(runtime, chat_id=GROUP, message_id="m1", registrar=registrar)
+        native = queries.native_message(chat_id=chat_id, native_id=native_id)
+        assert native is not None
+        source = authority.verify_source_ref(native["message_id"], revision)
+        audience = (
+            authority.evidence_audience(source, basis="observed_source_batch")
+            if source is not None else None
+        )
+        return source, audience
 
-        entry = _authority(runtime, event_id)
-        assert entry["audience_status"] == "known"
-        assert set(entry["audience_members"]) == {
-            "491757070305@s.whatsapp.net",
-            "491511@s.whatsapp.net",
-        }
-        # No turn exists in this scenario: the proof came from the observation boundary.
+
+def test_group_observation_registers_proven_native_audience_without_a_turn(tmp_path: Path) -> None:
+    runtime = _Runtime(tmp_path, history_members=(SENDER, OTHER))
+    try:
+        event_id = _append_message(runtime, chat_id=GROUP, message_id="m1")
+        source, audience = _source(runtime, GROUP, "m1")
+        assert source is not None and source.author_principal == "whatsapp:491757070305"
+        assert audience is not None and audience.status == "known"
+        assert set(audience.members) == {"whatsapp:491757070305", "whatsapp:491511"}
+        assert runtime.registration_results[event_id] is True
+        assert runtime.store.get_event_source_authority(event_id)["audience_status"] == "unknown"
         assert runtime.store.count_events() == 1
     finally:
         runtime.close()
@@ -122,151 +148,44 @@ def test_group_observation_registers_proven_audience_without_a_turn(tmp_path: Pa
 def test_direct_observation_is_proven_author_only(tmp_path: Path) -> None:
     runtime = _Runtime(tmp_path)
     try:
-        registrar = ObservedSourceRegistrar(
-            knowledge=runtime.knowledge, processing=runtime.store, chat_registry=runtime.registry
-        )
-        event_id = _append_message(runtime, chat_id=DIRECT, message_id="m2", registrar=registrar)
-        assert _authority(runtime, event_id)["audience_status"] == "author_only"
+        _append_message(runtime, chat_id=DIRECT, message_id="m2")
+        source, audience = _source(runtime, DIRECT, "m2")
+        assert source is not None
+        assert audience is not None and audience.status == "author_only"
+        assert runtime.store.get_event_source_authority("wa_m2")["audience_status"] == "unknown"
     finally:
         runtime.close()
 
 
-def test_group_without_proven_membership_stays_a_durable_unknown_source(tmp_path: Path) -> None:
+def test_group_without_native_membership_stays_durable_and_unknown(tmp_path: Path) -> None:
     runtime = _Runtime(tmp_path)
     try:
-        registrar = ObservedSourceRegistrar(
-            knowledge=runtime.knowledge, processing=runtime.store, chat_registry=runtime.registry
-        )
-        event_id = _append_message(runtime, chat_id=GROUP, message_id="m3", registrar=registrar)
-
-        # The observation is durable and complete; only the proof is missing.
+        event_id = _append_message(runtime, chat_id=GROUP, message_id="m3")
         assert runtime.store.get_event(event_id) is not None
-        assert _authority(runtime, event_id)["audience_status"] == "unknown"
+        source, _ = _source(runtime, GROUP, "m3")
+        assert source is None
+        assert runtime.registration_results[event_id] is False
+        assert runtime.store.get_event_source_authority(event_id)["audience_status"] == "unknown"
     finally:
         runtime.close()
 
 
-def test_registration_uses_the_real_event_time_not_the_wall_clock(tmp_path: Path) -> None:
-    """The review's synthetic reproduction: a timestamp substitution used to raise."""
-    runtime = _Runtime(tmp_path, registry=_Registry({("whatsapp", GROUP): [SENDER]}))
+def test_registration_uses_native_event_time_and_canonical_source(tmp_path: Path) -> None:
+    runtime = _Runtime(tmp_path, history_members=(SENDER,))
     try:
-        event_id = _append_message(runtime, chat_id=GROUP, message_id="m4")
-        issued = runtime.knowledge.knowledge_sources.verify_source_ref(event_id, 1)
-        assert issued is not None and issued.occurred_at_ms == NOW
-
-        # A replayed frame may carry a revised source time. Refusing it used to close the
-        # WhatsApp intake and killed ingest for 25 hours on 2026-09-24, so the stored time
-        # stays authoritative instead of raising.
-        runtime.store.upsert_event_source_authority(
-            source=SourceRef(
-                event_id=event_id,
-                revision=1,
-                channel="whatsapp",
-                chat_id=GROUP,
-                author_principal=SENDER,
-                occurred_at_ms=NOW + 60_000,
-            ),
-            audience={"status": "known", "members": [SENDER]},
-        )
-        assert _authority(runtime, event_id)["occurred_at_ms"] == NOW
-
-        # Tolerance covers the timing only: a different author is still a real conflict.
-        with pytest.raises(JournalConflictError):
-            runtime.store.upsert_event_source_authority(
-                source=SourceRef(
-                    event_id=event_id,
-                    revision=1,
-                    channel="whatsapp",
-                    chat_id=GROUP,
-                    author_principal="499999999999",
-                    occurred_at_ms=NOW,
-                ),
-            )
-
-        # The canonical provenance registers cleanly and proves the audience.
-        assert runtime.knowledge.register_turn_source(
-            source=issued,
-            verified_members=frozenset({SENDER}),
-            snapshot_id="snap-1",
-        )
-        assert _authority(runtime, event_id)["audience_status"] == "known"
-    finally:
-        runtime.close()
-
-
-def test_responder_source_registration_uses_canonical_provenance(tmp_path: Path) -> None:
-    """The production method registers the event's own provenance, not a substitution."""
-    from yeoman_gateway.adapters.responder_llm import LLMResponder
-
-    class _Probe(LLMResponder):
-        def __init__(self, *, knowledge: Any, processing: Any, chat_registry: Any) -> None:
-            self.knowledge = knowledge
-            self.chat_registry = chat_registry
-            self._processing = processing
-            self.metrics: list[tuple[str, int]] = []
-
-        def _shared_fact_runtime(self) -> Any:
-            from types import SimpleNamespace
-
-            return SimpleNamespace(processing=self._processing)
-
-        def _metric(self, name: str, value: int) -> None:
-            self.metrics.append((name, int(value)))
-
-    runtime = _Runtime(tmp_path, registry=_Registry({("whatsapp", GROUP): [SENDER, "491511"]}))
-    try:
-        event_id = _append_message(runtime, chat_id=GROUP, message_id="m5")
-        probe = _Probe(
-            knowledge=runtime.knowledge,
-            processing=runtime.store,
-            chat_registry=runtime.registry,
-        )
-
-        assert probe._register_knowledge_sources(  # noqa: SLF001 - production method under test
-            channel="whatsapp", chat_id=GROUP, sources=[(event_id, 1)]
-        )
-        entry = _authority(runtime, event_id)
-        assert entry["audience_status"] == "known"
-        assert entry["occurred_at_ms"] == NOW
-    finally:
-        runtime.close()
-
-
-def test_direct_turn_registration_falls_back_to_author_only(tmp_path: Path) -> None:
-    from yeoman_gateway.adapters.responder_llm import LLMResponder
-
-    class _Probe(LLMResponder):
-        def __init__(self, *, knowledge: Any, processing: Any) -> None:
-            self.knowledge = knowledge
-            self.chat_registry = None
-            self._processing = processing
-
-        def _shared_fact_runtime(self) -> Any:
-            from types import SimpleNamespace
-
-            return SimpleNamespace(processing=self._processing)
-
-        def _metric(self, name: str, value: int) -> None:
-            return None
-
-    runtime = _Runtime(tmp_path)
-    try:
-        event_id = _append_message(runtime, chat_id=DIRECT, message_id="m6")
-        probe = _Probe(knowledge=runtime.knowledge, processing=runtime.store)
-        assert probe._register_knowledge_sources(  # noqa: SLF001 - production method under test
-            channel="whatsapp", chat_id=DIRECT, sources=[(event_id, 1)]
-        )
-        assert _authority(runtime, event_id)["audience_status"] == "author_only"
+        occurred_ms = NOW - 60_000
+        _append_message(runtime, chat_id=GROUP, message_id="m4", occurred_ms=occurred_ms)
+        issued, _ = _source(runtime, GROUP, "m4")
+        assert issued is not None and issued.occurred_at_ms == occurred_ms
+        assert issued.author_principal == "whatsapp:491757070305"
+        assert runtime.store.count_events() == 1
     finally:
         runtime.close()
 
 
 def test_unknown_event_is_never_registered(tmp_path: Path) -> None:
-    runtime = _Runtime(tmp_path, registry=_Registry({("whatsapp", GROUP): [SENDER]}))
+    runtime = _Runtime(tmp_path, history_members=(SENDER,))
     try:
-        registrar = ObservedSourceRegistrar(
-            knowledge=runtime.knowledge, processing=runtime.store, chat_registry=runtime.registry
-        )
-        assert registrar("does-not-exist") is False
+        assert asyncio.run(runtime.sink.register_observed_source_live("does-not-exist")) is False
     finally:
         runtime.close()

@@ -84,6 +84,7 @@ def test_classify_outbound_uses_forward_capability_before_media() -> None:
             content="",
             media=["should-not-be-loaded"],
             metadata={
+                "historyMentionsResolved": True,
                 "forward_message": {
                     "source_chat_id": "source@g.us",
                     "source_message_id": "SRC-1",
@@ -132,6 +133,7 @@ async def test_whatsapp_channel_sends_native_forward_before_media() -> None:
             content="",
             media=["must-not-be-loaded"],
             metadata={
+                "historyMentionsResolved": True,
                 "forward_message": {
                     "source_chat_id": "source@g.us",
                     "source_message_id": "SRC-1",

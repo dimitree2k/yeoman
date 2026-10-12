@@ -42,7 +42,8 @@ def test_same_audience_group_read_is_allowed(knowledge_harness):
 def test_direct_message_claim_stays_hidden_in_the_group(knowledge_harness):
     h = knowledge_harness
     tom, alex = (h.person(n) for n in ("Tom", "Alex"))
-    dm = h.source(tom, chat="dm-tom-alex", audience={h.principal_for(tom), h.principal_for(alex)})
+    dm_chat = "4910000000002@s.whatsapp.net"
+    dm = h.source(tom, chat=dm_chat, author_only=True)
     sid = h.capture_text("Nur im Direktchat.", dm, subjects=(alex,)).statement_ids[0]
     group = h.read_context(
         tom,
@@ -52,8 +53,8 @@ def test_direct_message_claim_stays_hidden_in_the_group(knowledge_harness):
     assert h.recall_person(alex, group).text == ""
     direct = h.read_context(
         tom,
-        chat="dm-tom-alex",
-        recipients={h.principal_for(tom), h.principal_for(alex)},
+        chat=dm_chat,
+        recipients={h.principal_for(tom)},
         is_direct=True,
     )
     assert h.recall_person(alex, direct).statement_ids == (sid,)
@@ -62,13 +63,31 @@ def test_direct_message_claim_stays_hidden_in_the_group(knowledge_harness):
 def test_membership_must_be_proven(knowledge_harness):
     h = knowledge_harness
     tom, alex = (h.person(n) for n in ("Tom", "Alex"))
-    source = h.source(tom, audience={h.principal_for(tom), h.principal_for(alex)})
-    h.capture_text("Alex reist.", source, subjects=(alex,))
-    unknown = h.read_context(
+    dm_chat = "4910000000002@s.whatsapp.net"
+    source = h.source(tom, chat=dm_chat, author_only=True)
+    sid = h.capture_text("Alex reist.", source, subjects=(alex,)).statement_ids[0]
+    direct = h.read_context(
         tom,
-        recipients={h.principal_for(tom), h.principal_for(alex)},
-        membership_known=False,
+        chat=dm_chat,
+        recipients={h.principal_for(tom)},
+        is_direct=True,
     )
+    assert h.recall_person(alex, direct).statement_ids == (sid,)
+    from yeoman_gateway.knowledge.models import TrustedReadContext
+
+    unknown = TrustedReadContext(
+        principal_id=h.principal_for(tom),
+        channel="whatsapp",
+        chat_id="120363000000000001@g.us",
+        recipient_principals=frozenset({h.principal_for(tom), h.principal_for(alex)}),
+        membership_revision=None,
+        policy_revision=h.policy.revision,
+        purpose="reply",
+        now_ms=h.clock.now_ms(),
+        is_direct=False,
+        owner=False,
+    )
+    # This fixture has no native roster snapshot for the requested group.
     result = h.recall_person(alex, unknown)
     assert result.statement_ids == ()
     assert result.reason == "membership_unknown"
@@ -228,15 +247,15 @@ def test_recall_only_ranks_permitted_candidates(knowledge_harness):
     tom, alex, maria = (h.person(n) for n in ("Tom", "Alex", "Maria"))
     wide = {h.principal_for(tom), h.principal_for(alex), h.principal_for(maria)}
     narrow = {h.principal_for(tom), h.principal_for(alex)}
-    shared = h.source(tom, audience=wide)
     restricted = h.source(tom, audience=narrow)
+    shared = h.source(tom, audience=wide)
     allowed = h.capture_text("alpha-beta-gamma", shared).statement_ids[0]
     h.capture_text("alpha-beta-gamma forbidden extra", restricted)
 
     # Marie reads with a three-member audience: only the wide statement qualifies.
     context = h.read_context(tom, recipients=wide)
-    result = h.recall_text("alpha beta gamma", context)
-    assert result.statement_ids == (allowed,)
+    result = h.recall_text("alpha-beta-gamma", context)
+    assert result.statement_ids == (allowed,), result
     assert "forbidden" not in result.text
 
 

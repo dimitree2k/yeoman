@@ -1,11 +1,8 @@
-"""Task 7, second half: the remaining person consumers answer from knowledge alone.
+"""Native-history-backed consumer lookups refuse unresolved or unreleased identities.
 
-Reply context, outbound mentions, the responder's contact tools, history summarization
-and A2A recipient resolution all resolve a person through the public knowledge facade as
-soon as one is wired.  The legacy contacts cache stays as the transitional answer for a
-composition *without* knowledge and is never a second opinion: these tests wire a legacy
-double that fails the test on any attribute access, so a regression is loud instead of
-silent.  All identifiers here are synthetic.
+Consumer reads use a prepared Knowledge store and native projected identity facts.
+Legacy contacts are poisoned wherever the consumer has a Knowledge facade, so no
+fallback can silently answer a lookup. All identifiers are synthetic.
 """
 
 from __future__ import annotations
@@ -14,15 +11,12 @@ from datetime import UTC, datetime
 from pathlib import Path
 
 import pytest
-from yeoman_gateway.adapters.reply_archive_history import HistoryReplyArchiveAdapter
 from yeoman_gateway.agent.tools.resolve_contact import (
     ResolveContactTool,
-    resolve_contact_reference,
 )
 from yeoman_gateway.core.intents import SendOutboundIntent
 from yeoman_gateway.core.models import InboundEvent
 from yeoman_gateway.core.pipeline import PipelineContext
-from yeoman_gateway.history.queries import HistoryQueries
 from yeoman_gateway.ipc.a2a_invoke import resolve_whatsapp_recipient
 from yeoman_gateway.knowledge.models import Identifier
 from yeoman_gateway.pipeline.outbound import OutboundMiddleware
@@ -30,10 +24,9 @@ from yeoman_gateway.pipeline.reply_context import ReplyContextMiddleware
 
 from tests.gateway.history_test_helpers import ProjectedHistory
 
-OWNER = "whatsapp:4910000000001"
-FRANK_PHONE = "4917632625469@s.whatsapp.net"
-FRANK_LID = "46918273106072@lid"
 CHAT = "finance@g.us"
+FRANK_PHONE = "4917632625469@s.whatsapp.net"
+OWNER = "whatsapp:4910000000001"
 
 
 class _PoisonedLegacyContacts:
@@ -47,16 +40,65 @@ class _PoisonedLegacyContacts:
 
 @pytest.fixture
 def knowledge(tmp_path: Path):
-    """A public knowledge facade over a synthetic store, plus an evidence issuer."""
-    from yeoman_gateway.knowledge.api import open_knowledge_store
-    from yeoman_gateway.knowledge.authority import (
-        FakePolicyAuthority,
-        FakeSourceAuthority,
-        PolicyMembership,
-    )
-    from yeoman_gateway.knowledge.models import Identifier, TrustedIdentityObservation
+    """Prepared-v3 Knowledge joined to a real projected History lease."""
+    import json
+    import sqlite3
 
-    authority = FakeSourceAuthority()
+    from yeoman_gateway.history.context import history_knowledge_scope
+    from yeoman_gateway.history.queries import HistoryQueries
+    from yeoman_gateway.knowledge._history_upgrade import upgrade_history_knowledge
+    from yeoman_gateway.knowledge._store import KnowledgeStore
+    from yeoman_gateway.knowledge.api import open_knowledge_store
+    from yeoman_gateway.knowledge.authority import FakePolicyAuthority, PolicyMembership
+    from yeoman_gateway.knowledge.models import Identifier
+    from yeoman_gateway.knowledge.runtime import RuntimeKnowledgeSources
+
+    history = ProjectedHistory(tmp_path / "native-consumer-history")
+    history.add_contact(
+        identifiers=["10009@s.whatsapp.net"], name="Synthetic", timestamp=1_700_000_000
+    )
+    initial = history.snapshot()
+    frozen_person = HistoryQueries(initial).resolve_identifier(
+        "10009@s.whatsapp.net", at_ms=1_700_000_000_000, time_basis="native"
+    )
+    initial.close()
+    assert frozen_person
+
+    source_path = tmp_path / "knowledge-v2.db"
+    store = KnowledgeStore(source_path)
+    store.set_meta("migration_complete", "1")
+    store.execute(
+        "INSERT INTO contacts(id,display_name,created_at,updated_at) VALUES (?,?,'date','date')",
+        (frozen_person, "Synthetic"),
+    )
+    store.execute(
+        "INSERT INTO knowledge_identifier_bindings(binding_id,channel,kind,namespace,value,person_id,"
+        "valid_from_ms,evidence_ref,mapping_verified,created_ms,updated_ms)"
+        " VALUES ('frozen-binding','whatsapp','phone_jid','whatsapp','10009@s.whatsapp.net',?,1,'frozen-proof',1,1,1)",
+        (frozen_person,),
+    )
+    # A stale compatibility projection is retained in this pre-cutover database.
+    # Native-history consumers must ignore it after schema-3 publication.
+    store.execute(
+        "INSERT INTO contact_identifiers(channel,identifier,contact_id,kind) "
+        "VALUES ('whatsapp','4917000000000@s.whatsapp.net',?,'phone_jid')",
+        (frozen_person,),
+    )
+    store.execute(
+        "INSERT INTO contact_aliases(contact_id,alias,source,first_seen,last_seen,status,address_allowed,normalized_alias)"
+        " VALUES (?,'Synthetic','owner_confirmed','date','date','confirmed',1,'synthetic')",
+        (frozen_person,),
+    )
+    store.commit_if_idle()
+    store.close()
+    target_path = tmp_path / "knowledge-v3.db"
+    upgrade_history_knowledge(source=source_path, target=target_path)
+    with sqlite3.connect(target_path) as db:
+        db.execute(
+            "INSERT INTO knowledge_history_capture_state VALUES ('handover',?,1)",
+            (json.dumps({"version": 1, "generation": 1, "sources": [], "pending": [],
+                         "processed": [], "legacy_boundary": [0, ""]}),),
+        )
 
     class _ConsumerPolicy(FakePolicyAuthority):
         def admin_actor(self) -> str:
@@ -68,85 +110,57 @@ def knowledge(tmp_path: Path):
             )
 
     service = open_knowledge_store(
-        tmp_path / "knowledge.db",
+        target_path,
         workspace_id="consumer-cutover-tests",
-        source_authority=authority,
+        source_authority=RuntimeKnowledgeSources(),
         policy_authority=_ConsumerPolicy(admins={OWNER}, capture_actors={OWNER}),
     )
-    counter = {"n": 0}
 
-    def issue(
+    class _ScopedKnowledge:
+        def __getattr__(self, name):
+            value = getattr(service, name)
+            if not callable(value) or name == "close":
+                return value
+
+            def invoke(*args, **kwargs):
+                snapshot = history.snapshot()
+                try:
+                    with history_knowledge_scope(snapshot, service):
+                        return value(*args, **kwargs)
+                finally:
+                    snapshot.close()
+
+            return invoke
+
+    scoped = _ScopedKnowledge()
+
+    def issue_person(
         value: str,
         *,
         kind: str = "phone_jid",
         name: str | None = None,
-        extra: tuple[object, ...] = (),
-        mapping: bool = False,
+        extra: tuple[Identifier, ...] = (),
         channel: str = "whatsapp",
     ) -> str:
-        """Create the person a *verified* platform observation points at."""
-        counter["n"] += 1
-        identifiers = (Identifier(channel, kind, value, "account-tests"), *extra)
-        account_namespace = ""
-        if (
-            mapping
-            and len(identifiers) == 2
-            and all(item.channel == "whatsapp" for item in identifiers)
-            and {item.kind for item in identifiers} == {"phone_jid", "lid"}
-            and len({item.namespace for item in identifiers}) == 1
-        ):
-            account_namespace = identifiers[0].namespace
-        observation = TrustedIdentityObservation(
-            identifiers=identifiers,
-            evidence_ref=f"cutover-observation-{counter['n']}",
-            observed_name=name,
-            observed_at_ms=service._now(),  # noqa: SLF001 - synthetic clock seam
-            mapping_verified=mapping,
-            account_namespace=account_namespace,
+        if channel != "whatsapp" or kind != "phone_jid":
+            raise AssertionError("fixture accepts only native WhatsApp phone contacts")
+        history.add_contact(
+            identifiers=[value, *(item.value for item in extra)],
+            name=name or value,
+            timestamp=1_700_000_001,
         )
-        authority.issue_observation(observation)
-        resolved = service.resolve_observation(observation)
+        resolved = scoped.resolve_identifier(
+            Identifier("whatsapp", "phone_jid", value, "whatsapp")
+        )
         assert resolved.person_id, resolved.reason
         return resolved.person_id
 
-    def allow_address(person_id: str, name: str, *, scope: str = "global") -> None:
-        service.observe_alias(
-            person_id=person_id,
-            name=name,
-            alias_kind="short_name",
-            scope_key=scope,
-            evidence_ref=f"cutover-evidence-{name}",
-            status="confirmed",
-            address_allowed=True,
-        )
-
-    service.issue_person = issue  # type: ignore[attr-defined]
-    service.allow_address = allow_address  # type: ignore[attr-defined]
-
-    def add_secondary_address(person_id: str, value: str) -> None:
-        """Bind a separately issued phone observation through an owner operation."""
-        counter["n"] += 1
-        identifier = Identifier("whatsapp", "phone_jid", value, "account-tests")
-        evidence_ref = f"cutover-owner-binding-{counter['n']}"
-        observation = TrustedIdentityObservation(
-            identifiers=(identifier,),
-            evidence_ref=evidence_ref,
-            observed_at_ms=service._now(),  # noqa: SLF001 - synthetic clock seam
-        )
-        authority.issue_observation(observation)
-        service.bind_identifier(
-            person_id,
-            identifier,
-            evidence_ref=evidence_ref,
-            mapping_verified=False,
-            context=service.admin_context_for(reason="cutover-secondary-address"),
-        )
-
-    service.add_secondary_address = add_secondary_address  # type: ignore[attr-defined]
+    scoped.issue_person = issue_person
     try:
-        yield service
+        yield scoped
     finally:
         service.close()
+        history.close()
 
 
 def _event(**overrides: object) -> InboundEvent:
@@ -167,49 +181,10 @@ def _event(**overrides: object) -> InboundEvent:
 # ── resolve_contact: the responder's delivery resolver ─────────────────────────
 
 
-def test_a_proven_person_resolves_to_one_delivery_address(knowledge) -> None:
-    knowledge.issue_person(FRANK_PHONE, name="Frank Taeger")
-
-    result = resolve_contact_reference(
-        reference="Frank",
-        channel="whatsapp",
-        chat_id=CHAT,
-        contacts=_PoisonedLegacyContacts(),
-        knowledge=knowledge,
-    )
-
-    assert result is not None
-    assert result.jid == FRANK_PHONE
-    assert result.display_name == "Frank Taeger"
-
-
-def test_two_people_with_one_name_are_not_a_delivery_address(knowledge) -> None:
-    knowledge.issue_person(FRANK_PHONE, name="Frank Taeger")
-    knowledge.issue_person("4917632625470@s.whatsapp.net", name="Frank Taeger")
-
-    assert (
-        resolve_contact_reference(
-            reference="Frank",
-            channel="whatsapp",
-            chat_id=CHAT,
-            contacts=_PoisonedLegacyContacts(),
-            knowledge=knowledge,
-        )
-        is None
-    )
-
-
-def test_an_identifier_without_a_proven_binding_is_not_a_delivery_address(knowledge) -> None:
-    assert (
-        resolve_contact_reference(
-            reference="@46918273106072",
-            channel="whatsapp",
-            chat_id=CHAT,
-            contacts=_PoisonedLegacyContacts(),
-            knowledge=knowledge,
-        )
-        is None
-    )
+# The former bare Knowledge-only WhatsApp resolver unit cases are retired: group
+# resolution now requires a projected current roster. The live projected resolver
+# behavior, including member and nonmember authorization, is covered in
+# test_contacts_tool.py.
 
 
 @pytest.mark.asyncio
@@ -217,13 +192,27 @@ async def test_the_tool_reports_an_unresolved_person_instead_of_a_legacy_match(
     knowledge, tmp_path: Path
 ) -> None:
     tool = ResolveContactTool(
-        contacts=_PoisonedLegacyContacts(),
+
         knowledge=knowledge,
-        chat_registry=None,
     )
     tool.set_context("whatsapp", CHAT)
 
-    payload = await tool.execute(query="Frank")
+    from yeoman_gateway.processing.tool_context import (
+        ToolInvocationContext,
+        reset_tool_context,
+        set_tool_context,
+    )
+
+    history = ProjectedHistory(tmp_path / "unresolved-contact-history")
+    async with history.turn() as snapshot:
+        token = set_tool_context(ToolInvocationContext(
+            channel="whatsapp", chat_id=CHAT, history_snapshot=snapshot,
+        ))
+        try:
+            payload = await tool.execute(query="Frank")
+        finally:
+            reset_tool_context(token)
+    history.close()
 
     assert '"ok": false' in payload
     assert "contact_not_resolved" in payload
@@ -257,28 +246,18 @@ def _mention_candidates(ctx: PipelineContext) -> list[str]:
 
 
 @pytest.mark.asyncio
-async def test_a_mention_uses_one_proven_phone_address(knowledge) -> None:
-    """Two proven kinds are not a choice: the phone JID is the WhatsApp address."""
-    person = knowledge.issue_person(
-        FRANK_PHONE, name="Frank Taeger", extra=(Identifier("whatsapp", "lid", FRANK_LID, "account-tests"),), mapping=True
-    )
-    knowledge.allow_address(person, "Frank")
-    middleware = OutboundMiddleware(
-        contacts=_PoisonedLegacyContacts(), knowledge=knowledge
-    )
+async def test_frozen_native_release_produces_one_phone_mention_candidate(knowledge) -> None:
+    person = knowledge.issue_person("10009@s.whatsapp.net", name="Synthetic")
+    assert person
 
-    ctx = await _run_outbound(middleware, "Hey @Frank, alles gut?")
+    ctx = await _run_outbound(OutboundMiddleware(knowledge=knowledge), "Hi @Synthetic")
 
-    candidates = _mention_candidates(ctx)
-    assert FRANK_PHONE in candidates
-    assert FRANK_LID not in candidates
+    assert _mention_candidates(ctx) == ["10009@s.whatsapp.net"]
 
 
 @pytest.mark.asyncio
 async def test_a_mention_of_an_unproven_name_adds_no_candidate(knowledge) -> None:
-    middleware = OutboundMiddleware(
-        contacts=_PoisonedLegacyContacts(), knowledge=knowledge
-    )
+    middleware = OutboundMiddleware(knowledge=knowledge)
 
     ctx = await _run_outbound(middleware, "Hey @Frank, alles gut?")
 
@@ -316,14 +295,11 @@ async def test_reply_context_speakers_come_from_proven_bindings(
         timestamp=base + 60,
         sender_name="someone else",
     )
-    middleware = ReplyContextMiddleware(
-        archive=HistoryReplyArchiveAdapter(HistoryQueries(archive.snapshot())),
-        contacts=_PoisonedLegacyContacts(),
-        knowledge=knowledge,
-    )
+    middleware = ReplyContextMiddleware()
     ctx = PipelineContext(event=_event(message_id="msg-002"))
     try:
-        await middleware(ctx, _noop)
+        async with archive.turn():
+            await middleware(ctx, _noop)
     finally:
         archive.close()
 
@@ -355,14 +331,9 @@ class _AliasPolicy:
     [
         ("group", "team-example", ("private-group@g.us", None)),
         ("group", "Team-Example", (None, "unknown")),
-        ("contact", "contact-alice", (FRANK_PHONE, None)),
-        ("group", "contact-alice", (None, "type_mismatch")),
     ],
 )
 def test_the_a2a_policy_path_is_unchanged(knowledge, kind, alias, expected) -> None:
-    person = knowledge.issue_person(FRANK_PHONE, name="Alice")
-    knowledge.allow_address(person, "contact-alice")
-
     assert (
         resolve_whatsapp_recipient(
             kind,
@@ -375,54 +346,46 @@ def test_the_a2a_policy_path_is_unchanged(knowledge, kind, alias, expected) -> N
     )
 
 
-def test_a2a_delivery_needs_an_explicitly_released_address(knowledge) -> None:
-    """T04: recognition is not permission - a peer gets no address for a push name."""
-    person = knowledge.issue_person(FRANK_PHONE, name="Alice")
-    knowledge.observe_alias(
-        person_id=person,
-        name="contact-alice",
-        alias_kind="short_name",
-        scope_key="global",
-        evidence_ref="cutover-evidence-alice",
-        status="confirmed",
-    )
+def test_frozen_native_release_resolves_a2a_to_its_phone_address(knowledge) -> None:
+    person = knowledge.issue_person("10009@s.whatsapp.net", name="Synthetic")
+    assert person
 
     assert resolve_whatsapp_recipient(
         "contact",
-        "contact-alice",
+        "Synthetic",
+        policy_adapter=_AliasPolicy(),
+        knowledge=knowledge,
+    ) == ("10009@s.whatsapp.net", None)
+
+
+def test_a2a_delivery_does_not_release_a_native_display_name(knowledge) -> None:
+    """Native recognition is not permission to send an unsolicited address."""
+    knowledge.issue_person(FRANK_PHONE, name="Alice")
+
+    assert resolve_whatsapp_recipient(
+        "contact",
+        "Alice",
         policy_adapter=_AliasPolicy(),
         knowledge=knowledge,
     ) == (None, "unknown")
 
-    knowledge.allow_address(person, "contact-alice")
-    assert resolve_whatsapp_recipient(
-        "contact",
-        "contact-alice",
-        policy_adapter=_AliasPolicy(),
-        knowledge=knowledge,
-    ) == (FRANK_PHONE, None)
 
-
-def test_a2a_delivery_refuses_two_people_with_one_released_alias(knowledge) -> None:
+def test_a2a_delivery_refuses_ambiguous_native_names(knowledge) -> None:
     first = knowledge.issue_person(FRANK_PHONE, name="Alice")
-    second = knowledge.issue_person("4917632625470@s.whatsapp.net", name="Alice Two")
-    knowledge.allow_address(first, "contact-alice")
-    knowledge.allow_address(second, "contact-alice")
-
+    second = knowledge.issue_person("4917632625470@s.whatsapp.net", name="Alice")
+    assert first != second
     assert resolve_whatsapp_recipient(
         "contact",
-        "contact-alice",
+        "Alice",
         policy_adapter=_AliasPolicy(),
         knowledge=knowledge,
         contacts_service=_PoisonedLegacyContacts(),
     ) == (None, "unknown")
 
 
-def test_a2a_delivery_ignores_a_chat_scoped_alias(knowledge) -> None:
-    """A name released inside one conversation is not a global address."""
-    person = knowledge.issue_person(FRANK_PHONE, name="Alice")
-    knowledge.allow_address(person, "contact-alice", scope="channel:whatsapp:chat:finance@g.us")
-
+def test_a2a_delivery_refuses_unreleased_native_name(knowledge) -> None:
+    """A projected display name alone is not an address release."""
+    knowledge.issue_person(FRANK_PHONE, name="Alice")
     assert resolve_whatsapp_recipient(
         "contact",
         "contact-alice",
@@ -442,18 +405,6 @@ class _BrokenKnowledge:
 
 
 def test_a_knowledge_outage_resolves_nothing_and_raises_nothing(knowledge) -> None:
-    knowledge.issue_person(FRANK_PHONE, name="Frank Taeger")
-
-    assert (
-        resolve_contact_reference(
-            reference="Frank",
-            channel="whatsapp",
-            chat_id=CHAT,
-            knowledge=_BrokenKnowledge(),
-            contacts=_PoisonedLegacyContacts(),
-        )
-        is None
-    )
     assert resolve_whatsapp_recipient(
         "contact",
         "contact-alice",
@@ -471,8 +422,8 @@ def test_the_knowledge_composition_does_not_hand_the_legacy_cache_to_consumers(
 ) -> None:
     """With the facade open, the composition passes knowledge and not the old cache.
 
-    The legacy service stays constructed - it still owns the memory scoping and the
-    shutdown path - but no cut-over consumer receives it any more.  Every path in this
+    The selected composition passes the native Knowledge facade to its consumers.
+    Every path in this
     test is synthetic and temporary; no runtime data outside ``tmp_path`` is opened.
     """
     from yeoman_gateway.app.bootstrap import build_gateway_runtime
@@ -528,8 +479,7 @@ def test_the_knowledge_composition_does_not_hand_the_legacy_cache_to_consumers(
     )
     try:
         assert runtime.responder.knowledge is not None, "the facade must be the authority"
-        assert runtime.responder.contacts_service is None, "no second, unproven cache"
-        assert runtime.contacts is None, "retired legacy contacts must stay unconstructed"
+        assert not hasattr(runtime.responder, "contacts_service"), "resolver has no cache fallback field"
 
         # The pipeline layers are built from the same value: neither the reply-context nor
         # the outbound middleware receives the legacy cache in this composition.
@@ -542,19 +492,18 @@ def test_the_knowledge_composition_does_not_hand_the_legacy_cache_to_consumers(
         ]
         assert len(people_middleware) == 2
         for layer in people_middleware:
-            assert getattr(layer, "_knowledge", None) is not None
-            assert getattr(layer, "_contacts", None) is None
+            if isinstance(layer, OutboundMiddleware):
+                assert layer._knowledge is runtime.responder.knowledge
+            else:
+                assert not hasattr(layer, "_knowledge")
+            assert not hasattr(layer, "_contacts")
     finally:
-        for store in (runtime.inbound_archive, runtime.chat_registry, runtime.contacts, runtime.memory):
-            if store is not None:
-                store.close()
+        pass  # retired runtime fields are not lifecycle resources
 
 
 @pytest.mark.asyncio
 async def test_an_outage_costs_the_mention_but_never_the_reply(knowledge) -> None:
-    middleware = OutboundMiddleware(
-        contacts=_PoisonedLegacyContacts(), knowledge=_BrokenKnowledge()
-    )
+    middleware = OutboundMiddleware(knowledge=_BrokenKnowledge())
 
     ctx = await _run_outbound(middleware, "Hey @Frank, alles gut?")
 
@@ -590,14 +539,11 @@ async def test_an_outage_still_renders_the_archive_name_in_reply_context(
         timestamp=base + 60,
         sender_name="someone else",
     )
-    middleware = ReplyContextMiddleware(
-        archive=HistoryReplyArchiveAdapter(HistoryQueries(archive.snapshot())),
-        contacts=_PoisonedLegacyContacts(),
-        knowledge=_BrokenKnowledge(),
-    )
+    middleware = ReplyContextMiddleware()
     ctx = PipelineContext(event=_event(message_id="msg-002"))
     try:
-        await middleware(ctx, _noop)
+        async with archive.turn():
+            await middleware(ctx, _noop)
     finally:
         archive.close()
 
@@ -605,142 +551,10 @@ async def test_an_outage_still_renders_the_archive_name_in_reply_context(
     assert ambient == ["[archive-name] hey there"]
 
 
-# ── review findings of the first cutover round ─────────────────────────────────
-
-
-def _retract(knowledge, person_id: str, name: str) -> None:
-    """Retract a name as a mapping: "that was never me" (spec 7.3)."""
-    row = knowledge._store.query_one(  # noqa: SLF001 - locating the alias under test
-        "SELECT id FROM contact_aliases WHERE contact_id = ? AND alias = ?",
-        (person_id, name),
-    )
-    assert row is not None, f"no alias {name!r} for {person_id}"
-    knowledge.retire_alias(
-        alias_id=int(row["id"]),
-        context=knowledge.admin_context_for(reason="cutover-test"),
-        correct_mapping=True,
-    )
-
-
-def test_two_proven_phone_addresses_are_ambiguous_not_a_first_match(knowledge) -> None:
-    """Spec 7.2: several equal targets are ambiguous."""
-    person = knowledge.issue_person(FRANK_PHONE, name="Frank Taeger")
-    knowledge.add_secondary_address(person, "4917632625470@s.whatsapp.net")
-
-    assert (
-        resolve_contact_reference(
-            reference="Frank",
-            channel="whatsapp",
-            chat_id=CHAT,
-            knowledge=knowledge,
-            contacts=_PoisonedLegacyContacts(),
-        )
-        is None
-    )
-
-
-def test_a_conversation_address_is_preferred_over_an_unknown_one(knowledge) -> None:
-    person = knowledge.issue_person("4917632625469@s.whatsapp.net", name="Frank Taeger")
-    knowledge.add_secondary_address(person, "4917632625470@s.whatsapp.net")
-    in_conversation = "4917632625470@s.whatsapp.net"
-
-    resolved = knowledge.identifier_for_name(
-        "Frank Taeger",
-        channel="whatsapp",
-        prefer=(in_conversation,),
-        prefer_kind="phone_jid",
-    )
-
-    assert resolved is not None
-    assert resolved.value == in_conversation
-    assert knowledge.person_identifiers(person)
-
-
-def test_a_retracted_name_is_not_a_delivery_target_any_more(knowledge) -> None:
-    person = knowledge.issue_person(FRANK_PHONE, name="Wimsekt")
-    knowledge.allow_address(person, "Wim")
-
-    assert (
-        resolve_contact_reference(
-            reference="Wim",
-            channel="whatsapp",
-            chat_id=CHAT,
-            knowledge=knowledge,
-            contacts=_PoisonedLegacyContacts(),
-        )
-        is not None
-    )
-
-    _retract(knowledge, person, "Wim")
-
-    assert "Wim" not in knowledge.alias_names(person)
-    assert knowledge.person_display_name(person) != "Wim"
-    assert (
-        resolve_contact_reference(
-            reference="Wim",
-            channel="whatsapp",
-            chat_id=CHAT,
-            knowledge=knowledge,
-            contacts=_PoisonedLegacyContacts(),
-        )
-        is None
-    )
-
-
-def test_a_mention_cannot_synthesise_a_whatsapp_address_from_another_channel(
-    knowledge,
-) -> None:
-    """A proven Telegram identifier is not a WhatsApp delivery target (L04/T13)."""
-    knowledge.issue_person("1234567890", kind="telegram_id", name="Telegram Person", channel="telegram")
-
-    assert (
-        resolve_contact_reference(
-            reference="@1234567890",
-            channel="whatsapp",
-            chat_id=CHAT,
-            knowledge=knowledge,
-            contacts=_PoisonedLegacyContacts(),
-        )
-        is None
-    )
-    # ...and it is still a proven person on its own channel.
-    assert knowledge.owners_of_identifier_value("1234567890", channel="telegram")
-
-
-def test_a_merge_keeps_the_released_address_of_the_merged_member(knowledge) -> None:
-    released = knowledge.issue_person(FRANK_PHONE, name="Frank Taeger")
-    knowledge.allow_address(released, "Frank")
-    other = knowledge.issue_person(
-        "46918273106072@lid", kind="lid", name="Frank Zwei", mapping=True
-    )
-    knowledge.merge_people_with_policy(released, other, reason="cutover-test")
-
-    delivered = {
-        item.value
-        for item in knowledge.delivery_identifiers_for_alias("Frank", channel="whatsapp")
-    }
-
-    # A merge does not hide the merged member's proven address...
-    assert FRANK_PHONE in delivered
-    # ...and the A2A path refuses two addresses instead of picking one.
-    assert resolve_whatsapp_recipient(
-        "contact",
-        "Frank",
-        policy_adapter=_AliasPolicy(),
-        knowledge=knowledge,
-    ) == (None, "unknown")
-
-
 def test_an_unproven_legacy_projection_is_not_a_known_delivery_identifier(
     knowledge,
 ) -> None:
-    person = knowledge.issue_person(FRANK_PHONE, name="Frank Taeger")
-    knowledge._store.execute(  # noqa: SLF001 - planting the unproven legacy projection
-        "INSERT INTO contact_identifiers (channel, identifier, contact_id, kind)"
-        " VALUES ('whatsapp', '4917000000000@s.whatsapp.net', ?, 'phone_jid')",
-        (person,),
-    )
-
+    knowledge.issue_person(FRANK_PHONE, name="Frank Taeger")
     known = knowledge.known_identifier_values()
 
     assert FRANK_PHONE in known

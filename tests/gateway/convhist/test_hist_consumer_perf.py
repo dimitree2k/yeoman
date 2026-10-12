@@ -360,8 +360,8 @@ class PerfCase(ConsumerCase):
         from yeoman_gateway.session.manager import SessionManager
         from yeoman_gateway.session.operational import OperationalSessions
 
-        sessions = SessionManager(self.root, sessions_dir=self.root / 'sessions', history_selected=True,
-            legacy_history_disabled=True, operational_store=OperationalSessions(self.root / 'sessions.db'))
+        sessions = SessionManager(self.root, sessions_dir=self.root / 'sessions',
+            operational_store=OperationalSessions(self.root / 'sessions.db'))
         tool = RecallConversationTool(sessions)
         class Provider(LLMProvider):
             async def chat(self, **kwargs):
@@ -606,7 +606,7 @@ async def prepare_case(inputs, monkeypatch, *, synthetic=False):
     elif version != '3':
         raise ValueError('verified Knowledge schema 2 or 3 required')
     knowledge = open_knowledge_store(target, workspace_id='synthetic-perf', source_authority=RuntimeKnowledgeSources(),
-        policy_authority=policy, history_mode=True)
+        policy_authority=policy)
     case = PerfCase(inputs.destination, inputs.raw, inputs.destination / 'history.db', knowledge, policy,
                     chat=chat, sender=sender, now=now)
     case.synthetic = synthetic

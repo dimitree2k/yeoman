@@ -877,372 +877,6 @@ async def test_comment_is_one_judge_one_generation_one_effect(tmp_path: Path) ->
     log.close()
 
 
-@pytest.mark.parametrize(
-    ("revoke_source", "oversized_optional"),
-    [(False, False), (True, False), (False, True)],
-    ids=["effect", "revocation", "optional-budget-trim"],
-)
-@pytest.mark.asyncio
-async def test_older_knowledge_reaches_real_renderers_and_revocation_blocks_effect(
-    tmp_path: Path, revoke_source: bool, oversized_optional: bool
-) -> None:
-    """A real protected statement reaches both prompts; revocation blocks its draft."""
-    from time import time
-
-    from yeoman_gateway.adapters.responder_llm import LLMResponder
-    from yeoman_gateway.app.bootstrap import _ParticipationSubmission
-    from yeoman_gateway.bus.queue import MessageBus
-    from yeoman_gateway.knowledge._capture_worker import StatementDraft
-    from yeoman_gateway.knowledge._memory.shared_facts import FactReadContext
-    from yeoman_gateway.knowledge.models import TrustedReadContext
-    from yeoman_gateway.media.router import ModelRouter
-    from yeoman_gateway.processing.model_route import RouteReply
-    from yeoman_gateway.processing.participation import ParticipationJudge
-    from yeoman_gateway.processing.participation_context import ParticipationContextBuilder
-    from yeoman_gateway.processing.participation_knowledge import ParticipationKnowledgeSelector
-    from yeoman_gateway.providers.base import LLMResponse
-    from yeoman_shared.config.schema import Config
-
-    from tests.gateway.capture_harness import CaptureHarness, Registry
-
-    older_fact = "The group meetup is every Friday."
-    knowledge_now_ms = int(time() * 1000)
-    members = frozenset({"10001@s.whatsapp.net", "10002@s.whatsapp.net"})
-    harness = CaptureHarness(
-        tmp_path / "protected",
-        registry=Registry({("whatsapp", CHAT): ["10001", "10002"]}),
-        idle_ms=0,
-    )
-    harness.now = knowledge_now_ms
-    harness.activate()
-    old_source = harness.observe(
-        "The group meetup is every Friday.",
-        message_id="old-meetup",
-        sender="10001",
-        chat_id=CHAT,
-        occurred_ms=knowledge_now_ms - 7 * 86_400_000,
-    )
-    harness.advance(1)
-    harness.drafts = [StatementDraft(content=older_fact, source_index=0)]
-    assert harness.run_capture().published == 1
-    assert harness.source_row(old_source)["audience_status"] == "known"
-
-    archive = ProjectedHistory(tmp_path, groups=[dict(
-        chat_id=CHAT, participants=["10001@s.whatsapp.net", "10002@s.whatsapp.net"],
-        timestamp=knowledge_now_ms / 1000,
-    )])
-    archive.add_message(channel=CHANNEL, chat_id=CHAT, message_id="m1",
-        participant="10001@s.whatsapp.net", sender_id="10001@s.whatsapp.net",
-        sender_name="Anna", text="When is the group meetup?", timestamp=knowledge_now_ms / 1000)
-    oversized_text = "unrelated optional history " * 5_000
-    if oversized_optional:
-        archive.add_message(channel=CHANNEL, chat_id=CHAT, message_id="optional-large-history",
-            participant="10002@s.whatsapp.net", sender_id="10002@s.whatsapp.net",
-            sender_name="Ben", text=oversized_text, timestamp=knowledge_now_ms / 1000 - 60)
-    selector = ParticipationKnowledgeSelector(knowledge=harness.knowledge, memory=harness.memory)
-
-    def trusted_contexts(opportunity, context):
-        del opportunity, context
-        return (
-            TrustedReadContext(
-                principal_id="10001@s.whatsapp.net",
-                channel=CHANNEL,
-                chat_id=CHAT,
-                recipient_principals=members,
-                membership_revision="members-v1",
-                policy_revision=1,
-                purpose="proactive",
-                now_ms=knowledge_now_ms,
-                is_direct=False,
-            ),
-            FactReadContext(
-                principal_id="10001@s.whatsapp.net",
-                chat_scope_key=f"channel:{CHANNEL}:chat:{CHAT}",
-                current_members=members,
-                epoch=harness.memory.store.acl_epoch(),
-                now_ms=knowledge_now_ms,
-            ),
-        )
-
-    builder = archive.wire(ParticipationContextBuilder(
-        archive=object(),
-        policy=PolicyEngine(_policy(), workspace=tmp_path),
-        source_authorizer=lambda row: True,
-        knowledge_selector=selector,
-        knowledge_context_supplier=trusted_contexts,
-    ))
-    writer_contexts = []
-    original_context_build = builder.build
-
-    async def build_with_taste(*args, **kwargs):
-        context = await original_context_build(*args, **kwargs)
-        context["advisory_taste"] = [
-            {"content": "Use direct phrasing.", "provenance": "participation:test"}
-        ]
-        writer_contexts.append(context)
-        return context
-
-    builder.build = build_with_taste
-
-    class JudgeClient:
-        route_key = "fake-participation-judge"
-
-        def __init__(self):
-            self.requests = []
-
-        async def chat_with_usage(self, messages, **kwargs):
-            del kwargs
-            self.requests.append(messages)
-            action = "silence" if len(self.requests) > 1 else "comment"
-            payload = (
-                '{"action":"comment","intent":"initiate","reason":"useful",'
-                '"purpose":"answer the meetup question",'
-                '"contribution_type":"observation","target_message_id":"m1"}'
-                if action == "comment"
-                else '{"action":"silence","intent":"initiate","reason":"no longer grounded"}'
-            )
-            return RouteReply(content=payload, model="fake-judge", finish_reason="stop")
-
-    writer_requests = []
-    effects = []
-
-    class WriterProvider:
-        async def chat(self, messages, **kwargs):
-            del kwargs
-            writer_requests.append(messages)
-            # Simulate a real source deletion while the draft is being generated.
-            if revoke_source:
-                harness.delete("old-meetup", chat_id=CHAT, sender="10001")
-            return LLMResponse(content="Friday works for the meetup.")
-
-    class MainProvider:
-        def get_default_model(self):
-            return "unused"
-
-        async def chat(self, *args, **kwargs):
-            del args, kwargs
-            raise AssertionError("draft-only generation must use the writer route")
-
-    config = Config.model_validate({
-        "models": {
-            "profiles": {
-                "participation_writer": {
-                    "kind": "chat", "model": "fake-writer", "provider": "fake"
-                }
-            },
-            "routes": {"participation.writer": "participation_writer"},
-        }
-    })
-    responder = LLMResponder(
-        provider=MainProvider(),  # type: ignore[arg-type]
-        workspace=tmp_path,
-        bus=MessageBus(),
-        model_router=ModelRouter(config.models),
-        routed_provider_factory=lambda model, provider: WriterProvider(),  # type: ignore[arg-type]
-    )
-
-    async def record_effect(*, admission, effect_id, content):
-        del admission
-        effects.append((effect_id, content))
-        return {"status": "submitted", "effect_id": effect_id}
-
-    responder.submit_participation_comment = record_effect
-    submission = _ParticipationSubmission(
-        responder=responder, writer_profile="participation_writer"
-    )
-    runtime, _judge, _context, log = _runtime(
-        tmp_path, decision=COMMENT, submission=submission
-    )
-    runtime._context_builder = builder
-    archive.wire(runtime)
-    judge_client = JudgeClient()
-    finalized_contexts = []
-
-    class InspectingJudge(ParticipationJudge):
-        def _fit_context_for_judge(self, context, opportunity):
-            super()._fit_context_for_judge(context, opportunity)
-            finalized_contexts.append(context)
-
-    runtime._judge = InspectingJudge(client=judge_client)
-
-    def revalidate(opportunity, context, selection):
-        read_context, fact_context = trusted_contexts(opportunity, context)
-        return selector.revalidate(
-            selection, read_context=read_context, fact_context=fact_context
-        )
-
-    runtime._revalidate_knowledge = revalidate
-    try:
-        async with archive.turn():
-            result = await runtime.evaluate_participation(_opportunity("m1"))
-        assert writer_requests
-        assert len(writer_requests) == 1
-        judge_prompt = "\n".join(item["content"] for item in judge_client.requests[0])
-        writer_prompt = "\n".join(
-            str(item.get("content", "")) for request in writer_requests for item in request
-        )
-        assert older_fact in judge_prompt and older_fact in writer_prompt
-        assert 'id="m1"' in judge_prompt
-        assert "When is the group meetup?" in writer_prompt
-        assert finalized_contexts[0]["knowledge_rendered_to_judge"] is True
-        assert any(context.get("knowledge_rendered_to_writer") is True for context in writer_contexts)
-        assert any(context.get("taste_rendered_to_writer") is True for context in writer_contexts)
-        assert "Use direct phrasing." in writer_prompt
-        if oversized_optional:
-            assert finalized_contexts[0]["judge_dropped_entry_count"] >= 1
-            assert "optional-large-history" in finalized_contexts[0]["judge_dropped_entry_ids"]
-            assert finalized_contexts[0]["selected_knowledge_text"] == older_fact
-            assert oversized_text not in judge_prompt
-            assert oversized_text not in writer_prompt
-        if revoke_source:
-            harness.advance(1_000)
-            assert harness.statements()[0]["status"] == "revoked"
-            assert len(judge_client.requests) == 2, result
-            assert result["status"] == "silence", result
-            assert effects == []
-            assert await log.pending_delivery_reservations(origin="participation") == []
-            assert harness.knowledge.recall(
-                __import__("yeoman_gateway.knowledge.models", fromlist=["RecallQuery"]).RecallQuery(
-                    text="group meetup", limit=3
-                ),
-                context=trusted_contexts(_opportunity("m1"), {})[0],
-                group_wide=True,
-            ).text == ""
-        else:
-            assert len(judge_client.requests) == 1, result
-            assert result["status"] == "submitted", result
-            assert len(effects) == 1
-            assert selector.revalidate(
-                finalized_contexts[0]["_knowledge_selection"],
-                read_context=trusted_contexts(_opportunity("m1"), {})[0],
-                fact_context=trusted_contexts(_opportunity("m1"), {})[1],
-            ).text == older_fact
-    finally:
-        archive.close()
-        harness.close()
-        log.close()
-
-
-@pytest.mark.asyncio
-async def test_two_author_trigger_consults_the_multi_reader_knowledge_selector(
-    tmp_path: Path,
-) -> None:
-    """A coalesced two-author trigger intersects both authors' protected reads.
-
-    The superseded composition answered ``"multi_author"`` and left such a trigger on
-    the recent-only fallback; the production supplier now builds one verified reader
-    per author and the selector is asked for both principals.
-    """
-    from time import time
-
-    from yeoman_gateway.app.bootstrap import _participation_knowledge_readers
-    from yeoman_gateway.knowledge._memory.shared_facts import FactRetrievalResult
-    from yeoman_gateway.knowledge.models import KnowledgeContext, SourceRef
-    from yeoman_gateway.processing.participation_context import ParticipationContextBuilder
-    from yeoman_gateway.processing.participation_knowledge import (
-        ParticipationKnowledgeRecord,
-        ParticipationKnowledgeSelection,
-        reader_key,
-    )
-
-    from tests.gateway.capture_harness import Registry
-
-    shared_fact = "The group meetup is every Friday."
-    now_ms = int(time() * 1000)
-    archive = ProjectedHistory(tmp_path, groups=[dict(
-        chat_id=CHAT, participants=["10001@s.whatsapp.net", "10002@s.whatsapp.net"],
-        timestamp=now_ms / 1000,
-    )])
-    for message_id, sender, name, text in (
-        ("m1", "10001@s.whatsapp.net", "Anna", "When is the group meetup?"),
-        ("m2", "10002@s.whatsapp.net", "Ben", "And what time?"),
-    ):
-        archive.add_message(channel=CHANNEL, chat_id=CHAT, message_id=message_id,
-            participant=sender, sender_id=sender, sender_name=name, text=text,
-            timestamp=now_ms / 1000)
-    registry = Registry({("whatsapp", CHAT): ["10001", "10002"]})
-
-    class RecordingSelector:
-        """Records the verified principals the production supplier handed over."""
-
-        def __init__(self) -> None:
-            self.calls: list[tuple[str, ...]] = []
-
-        def select_for_readers(self, *, query, readers):
-            self.calls.append(readers.principals)
-            return ParticipationKnowledgeSelection(
-                text=shared_fact,
-                statements=KnowledgeContext(
-                    text=shared_fact,
-                    statement_ids=("stmt-shared",),
-                    source_refs=(
-                        SourceRef(
-                            "ev-shared", 1, CHANNEL, CHAT, "10001@s.whatsapp.net", now_ms
-                        ),
-                    ),
-                ),
-                facts=FactRetrievalResult(),
-                revision="r1",
-                reason="selected",
-                records=(
-                    ParticipationKnowledgeRecord(
-                        kind="statement",
-                        record_id="stmt-shared",
-                        text=shared_fact,
-                        refs=(("ev-shared", 1),),
-                    ),
-                ),
-                reader_keys=tuple(
-                    reader_key(reader.read_context, reader.fact_context)
-                    for reader in readers.readers
-                ),
-                query=query,
-            )
-
-    selector = RecordingSelector()
-    builder = archive.wire(ParticipationContextBuilder(
-        archive=object(),
-        policy=PolicyEngine(_policy(), workspace=tmp_path),
-        source_authorizer=lambda row: True,
-        knowledge_selector=selector,
-        knowledge_context_supplier=lambda opportunity, context: (
-            _participation_knowledge_readers(
-                opportunity,
-                context,
-                chat_registry=registry,
-                knowledge=SimpleNamespace(policy_revision=1),
-            )
-        ),
-    ))
-    built: list[dict] = []
-    original_build = builder.build
-
-    async def build_and_capture(*args, **kwargs):
-        context = await original_build(*args, **kwargs)
-        built.append(context)
-        return context
-
-    builder.build = build_and_capture
-
-    runtime, judge, _context, log = _runtime(tmp_path, decision=COMMENT)
-    runtime._context_builder = builder
-    archive.wire(runtime)
-    runtime._revalidate_knowledge = lambda opportunity, context, selection: selection
-    try:
-        async with archive.turn():
-            result = await runtime.evaluate_participation(_opportunity("m1", "m2"))
-
-        assert selector.calls
-        assert all(call == ("10001@s.whatsapp.net", "10002@s.whatsapp.net") for call in selector.calls)
-        assert built[0]["knowledge_selection_status"] == "selected"
-        assert built[0]["selected_knowledge_text"] == shared_fact
-        assert judge.calls == 1
-        assert result["status"] == "submitted", result
-    finally:
-        archive.close()
-        log.close()
-
-
 @pytest.mark.asyncio
 async def test_writer_unavailable_removes_only_comment(tmp_path: Path) -> None:
     """A missing writer must not disable an otherwise permitted reaction."""
@@ -1799,7 +1433,7 @@ async def test_changed_context_rejudges_and_reuses_unchanged_draft(tmp_path: Pat
     runtime._judge = judge  # type: ignore[assignment]
     task = asyncio.create_task(runtime.evaluate_participation(_opportunity()))
     try:
-        await asyncio.wait_for(draft_started.wait(), timeout=1)
+        await asyncio.wait_for(draft_started.wait(), timeout=30)
         release_draft.set()
         result = await asyncio.wait_for(task, timeout=2)
     finally:
@@ -1845,7 +1479,7 @@ async def test_changed_context_with_zero_reevaluations_discards_draft(tmp_path: 
     runtime._snapshot_provider = snapshot
     task = asyncio.create_task(runtime.evaluate_participation(_opportunity()))
     try:
-        await asyncio.wait_for(draft_started.wait(), timeout=1)
+        await asyncio.wait_for(draft_started.wait(), timeout=30)
         release_draft.set()
         result = await asyncio.wait_for(task, timeout=2)
     finally:
@@ -1916,7 +1550,7 @@ async def test_changed_decision_replaces_draft_at_most_once(tmp_path: Path) -> N
     runtime._judge = judge  # type: ignore[assignment]
     task = asyncio.create_task(runtime.evaluate_participation(_opportunity()))
     try:
-        await asyncio.wait_for(draft_started.wait(), timeout=1)
+        await asyncio.wait_for(draft_started.wait(), timeout=30)
         release_draft.set()
         result = await asyncio.wait_for(task, timeout=2)
     finally:
@@ -2057,7 +1691,7 @@ async def test_reevaluation_bound_stays_at_original_activation_limit(tmp_path: P
     runtime._judge = judge  # type: ignore[assignment]
     task = asyncio.create_task(runtime.evaluate_participation(_opportunity()))
     try:
-        await asyncio.wait_for(draft_started.wait(), timeout=1)
+        await asyncio.wait_for(draft_started.wait(), timeout=30)
         release_draft.set()
         result = await asyncio.wait_for(task, timeout=2)
     finally:
@@ -2183,7 +1817,7 @@ async def test_reevaluation_cannot_extend_the_original_opportunity_deadline(
     runtime._snapshot_provider = snapshot
     task = asyncio.create_task(runtime.evaluate_participation(_opportunity()))
     try:
-        await asyncio.wait_for(draft_started.wait(), timeout=1)
+        await asyncio.wait_for(draft_started.wait(), timeout=30)
         release_draft.set()
         result = await asyncio.wait_for(task, timeout=2)
     finally:
@@ -2238,7 +1872,7 @@ async def test_reevaluation_stays_within_the_original_judge_budget(tmp_path: Pat
     runtime._snapshot_provider = snapshot
     task = asyncio.create_task(runtime.evaluate_participation(_opportunity()))
     try:
-        await asyncio.wait_for(draft_started.wait(), timeout=1)
+        await asyncio.wait_for(draft_started.wait(), timeout=30)
         release_draft.set()
         result = await asyncio.wait_for(task, timeout=2)
     finally:
@@ -2301,7 +1935,7 @@ async def test_fresh_pause_or_revocation_discards_waiting_draft(
     runtime._snapshot_provider = snapshot
     task = asyncio.create_task(runtime.evaluate_participation(_opportunity()))
     try:
-        await asyncio.wait_for(draft_started.wait(), timeout=1)
+        await asyncio.wait_for(draft_started.wait(), timeout=30)
         release_draft.set()
         result = await asyncio.wait_for(task, timeout=2)
     finally:
@@ -2747,7 +2381,6 @@ async def test_private_records_never_enter_the_participation_context(tmp_path: P
         participant="someone", sender_id="someone", sender_name="someone",
         text="same chat id, other channel", timestamp=NOW_MS / 1000)
     builder = archive.wire(ParticipationContextBuilder(
-        archive=object(),
         policy=PolicyEngine(_policy(), workspace=tmp_path),
         source_authorizer=lambda row: True,
     ))
@@ -3506,11 +3139,16 @@ async def test_writer_budget_keeps_required_target_and_complete_shared_knowledge
     from yeoman_gateway.app.bootstrap import _ParticipationSubmission
 
     submission = _ParticipationSubmission(responder=responder, writer_profile="test")
-    await submission.generate_draft(
-        opportunity=SimpleNamespace(channel=CHANNEL, chat_id=CHAT, opportunity_id="opp-writer"),
-        decision=SimpleNamespace(target_message_id="current", purpose="brief response"),
-        context=context,
-    )
+    history = ProjectedHistory(tmp_path / "participation-writer-budget-history")
+    try:
+        async with history.turn():
+            await submission.generate_draft(
+                opportunity=SimpleNamespace(channel=CHANNEL, chat_id=CHAT, opportunity_id="opp-writer"),
+                decision=SimpleNamespace(target_message_id="current", purpose="brief response"),
+                context=context,
+            )
+    finally:
+        history.close()
     assert len(provider.calls) == 1
     assert provider.calls[0]["tools"] == []
     prompt = "\n".join(

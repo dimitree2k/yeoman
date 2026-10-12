@@ -1011,24 +1011,36 @@ class RawArchiveConfig(BaseModel):
     media: RawArchiveMediaConfig = Field(default_factory=RawArchiveMediaConfig)
 
 
-class HistoryReaderConfig(BaseModel):
-    """File-only selectors; effective selection also requires live projection."""
-
-    participation: bool = True
-    whatsapp: bool = True
-    responder: bool = True
-    tools: bool = True
-    secondary: bool = True
-    knowledge: bool = True
+class UnsupportedHistoryConfigError(ValueError):
+    """A retired history selector explicitly disables required behavior."""
 
 
-class HistoryConfig(BaseModel):
-    """Live projection defaults, with optional readers requiring the projection."""
+def _reject_disabled_history_selectors(history: Any) -> None:
+    if not isinstance(history, dict):
+        return
+    leaves = (
+        (("liveProjectionEnabled", "live_projection_enabled"), "liveProjectionEnabled"),
+        (("legacyWritersDisabled", "legacy_writers_disabled"), "legacyWritersDisabled"),
+    )
+    for keys, path in leaves:
+        if any(history.get(key) is False for key in keys):
+            raise UnsupportedHistoryConfigError(f"history.{path}=false is unsupported")
+    readers = history.get("readers")
+    if isinstance(readers, dict):
+        for family in ("participation", "whatsapp", "responder", "tools", "secondary", "knowledge"):
+            if readers.get(family) is False:
+                raise UnsupportedHistoryConfigError(f"history.readers.{family}=false is unsupported")
 
-    model_config = ConfigDict(populate_by_name=True)
-    live_projection_enabled: bool = Field(default=True, alias="liveProjectionEnabled")
-    readers: HistoryReaderConfig = Field(default_factory=HistoryReaderConfig)
-    legacy_writers_disabled: bool = Field(default=True, alias="legacyWritersDisabled")
+
+class _HistoryCompatibility:
+    __slots__ = ()
+
+    @property
+    def legacy_writers_disabled(self) -> bool:
+        return True
+
+
+_HISTORY_COMPATIBILITY = _HistoryCompatibility()
 
 
 class Config(BaseSettings):
@@ -1037,6 +1049,13 @@ class Config(BaseSettings):
     model_config = ConfigDict(
         extra="ignore", populate_by_name=True, env_prefix="YEOMAN_", env_nested_delimiter="__"
     )
+
+    @model_validator(mode="before")
+    @classmethod
+    def _reject_retired_history_selectors(cls, values: Any) -> Any:
+        if isinstance(values, dict):
+            _reject_disabled_history_selectors(values.get("history"))
+        return values
 
     @classmethod
     def settings_customise_sources(
@@ -1051,8 +1070,7 @@ class Config(BaseSettings):
                                    and not key.casefold().startswith("yeoman_history__")}
         return init_settings, env_settings, dotenv_settings, file_secret_settings
 
-    history: HistoryConfig = Field(default_factory=HistoryConfig)
-    config_version: int = 2
+    config_version: int = 3
     models: ModelRoutingConfig = Field(default_factory=ModelRoutingConfig)
     agents: AgentsConfig = Field(default_factory=AgentsConfig)
     channels: ChannelsConfig = Field(default_factory=ChannelsConfig)
@@ -1072,6 +1090,10 @@ class Config(BaseSettings):
     )
     processing: ProcessingConfig = Field(default_factory=ProcessingConfig)
     raw: RawArchiveConfig = Field(default_factory=RawArchiveConfig)
+
+    @property
+    def history(self) -> _HistoryCompatibility:
+        return _HISTORY_COMPATIBILITY
 
     @property
     def workspace_path(self) -> Path:

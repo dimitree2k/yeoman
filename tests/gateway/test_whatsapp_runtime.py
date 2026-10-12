@@ -226,11 +226,8 @@ def test_gateway_cleanup_closes_processing_when_retention_stop_fails(monkeypatch
         channels=Channels(),
         cron=Lifecycle(),
         heartbeat=Lifecycle(),
-        inbound_archive=Closing(),
+        history_projector=AsyncNoop(),
         responder=AsyncNoop(),
-        memory=Closing(),
-        contacts=Closing(),
-        chat_registry=Closing(),
         processing=Processing(),
         retention=FailingRetention(),
     )

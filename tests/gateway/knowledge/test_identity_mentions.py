@@ -6,13 +6,11 @@ from datetime import UTC, datetime
 
 import pytest
 from yeoman_gateway.core.models import InboundEvent
-from yeoman_gateway.core.pipeline import PipelineContext
 from yeoman_gateway.knowledge.models import (
     Identifier,
     PersonResolution,
     TrustedIdentityObservation,
 )
-from yeoman_gateway.pipeline.contacts import ContactsMiddleware
 
 from tests.gateway.history_test_helpers import ProjectedHistory
 
@@ -65,229 +63,12 @@ def _mention_context(h, *member_principals: str, chat: str = "mention-room"):
     )
 
 
-def test_known_lid_is_only_a_candidate_without_event_time(knowledge_harness):
-    h = knowledge_harness
-    phone = "4910000000042@s.whatsapp.net"
-    lid = "8420000042@lid"
-    member = _observe_pair(h, phone, lid, name="Mira")
-    assert member.person_id is not None
-    context = _mention_context(h, "whatsapp:4910000000042")
-
-    result = h.service.resolve_mentions(
-        (Identifier("whatsapp", "lid", lid, namespace=ACCOUNT),),
-        context=context,
-    )[0]
-
-    assert result.status == "ambiguous"
-    assert result.person_id == member.person_id
-    assert result.reason == "mention_time_unknown"
 
 
-def test_typed_mention_uses_historical_binding_and_never_creates_unknown_person(
-    knowledge_harness,
-):
-    h = knowledge_harness
-    lid = "8420000043@lid"
-    member_id = h.person_for("whatsapp:4910000000043", "Niko")
-    context = _mention_context(h, "whatsapp:4910000000043")
-    h.authority.issue_evidence_ref("mention-lid-binding")
-    known = Identifier("whatsapp", "lid", lid, namespace=ACCOUNT)
-    h.service.add_or_end_binding(
-        person_id=member_id,
-        identifier=known,
-        evidence_ref="mention-lid-binding",
-        mapping_verified=True,
-        context=h.admin_context(),
-        valid_from_ms=h.clock.now_ms(),
-    )
-    before = h.service.stats(context=h.admin_context()).people_count
-
-    resolved = h.service.resolve_mentions(
-        (known,), at_ms=h.clock.now_ms(), context=context
-    )[0]
-    unknown = h.service.resolve_mentions(
-        (Identifier("whatsapp", "lid", "8420000099@lid", namespace=ACCOUNT),),
-        at_ms=h.clock.now_ms(),
-        context=context,
-    )[0]
-    after = h.service.stats(context=h.admin_context()).people_count
-
-    assert resolved.status == "resolved"
-    assert resolved.person_id == member_id
-    assert unknown.status == "unresolved"
-    assert unknown.person_id is None
-    assert after == before
 
 
-def test_mention_namespace_and_membership_fail_closed(knowledge_harness):
-    h = knowledge_harness
-    phone = "4910000000044@s.whatsapp.net"
-    lid = "8420000044@lid"
-    member = _observe_pair(h, phone, lid, name="Tala")
-    assert member.person_id is not None
-    offered = _mention_context(h, "whatsapp:4910000000044")
-    missing_account = h.service.resolve_mentions(
-        (Identifier("whatsapp", "lid", lid),), at_ms=h.clock.now_ms(), context=offered
-    )[0]
-    outsider_context = _mention_context(h, "whatsapp:4910000000000", chat="other-room")
-    outsider = h.service.resolve_mentions(
-        (Identifier("whatsapp", "lid", lid, namespace=ACCOUNT),),
-        at_ms=None,
-        context=outsider_context,
-    )[0]
-
-    assert missing_account.status == "unresolved"
-    assert missing_account.person_id is None
-    assert missing_account.reason == "account_namespace_required"
-    assert outsider.status == "unresolved"
-    assert outsider.person_id is None
-    assert outsider.reason == "mention_not_offered_member"
 
 
-def test_explicit_name_candidates_are_ambiguous_and_offered_member_only(knowledge_harness):
-    h = knowledge_harness
-    members = (
-        _observe_pair(
-            h,
-            "4910000000045@s.whatsapp.net",
-            "8420000045@lid",
-            name="Alex",
-        ),
-        _observe_pair(
-            h,
-            "4910000000046@s.whatsapp.net",
-            "8420000046@lid",
-            name="Alex",
-        ),
-    )
-    outsider = _observe_pair(
-        h,
-        "4910000000047@s.whatsapp.net",
-        "8420000047@lid",
-        name="Alex",
-    )
-    member_ids = {item.person_id for item in members}
-    assert None not in member_ids
-    assert outsider.person_id not in member_ids
-    context = _mention_context(h, "whatsapp:4910000000045", "whatsapp:4910000000046")
-
-    candidates = h.service.search_mention_name_candidates("Alex", context=context)
-
-    assert {item.person_id for item in candidates} == member_ids
-    assert all(item.status == "ambiguous" for item in candidates)
-    assert all(item.reason == "name_candidate_requires_confirmation" for item in candidates)
-
-
-async def test_plaintext_alias_candidates_use_boundaries_and_current_members_only(
-    knowledge_harness,
-):
-    h = knowledge_harness
-    members = (
-        _observe_pair(
-            h,
-            "4910000000101@s.whatsapp.net",
-            "8420000101@lid",
-            name="Alex",
-        ),
-        _observe_pair(
-            h,
-            "4910000000102@s.whatsapp.net",
-            "8420000102@lid",
-            name="Alex",
-        ),
-    )
-    outsider = _observe_pair(
-        h,
-        "4910000000103@s.whatsapp.net",
-        "8420000103@lid",
-        name="Alex",
-    )
-    member_ids = {item.person_id for item in members}
-    assert None not in member_ids
-    context = _mention_context(h, "whatsapp:4910000000101", "whatsapp:4910000000102")
-    middleware = ContactsMiddleware(
-        knowledge=h.service,
-        mention_context_factory=lambda _: context,
-    )
-    people_before = h.service.stats(context=h.admin_context()).people_count
-
-    async def candidates_for(content: str):
-        event = InboundEvent(
-            channel="whatsapp",
-            chat_id="mention-room",
-            sender_id="untyped-sender",
-            participant=None,
-            content=content,
-            raw_metadata={"account_id": ACCOUNT},
-        )
-        pipeline_context = PipelineContext(event=event)
-
-        async def next_middleware(_ctx):
-            return None
-
-        await middleware(pipeline_context, next_middleware)
-        return pipeline_context.event.raw_metadata.get("mentioned_person_candidates", [])
-
-    mentioned = await candidates_for("Alex, what do you think?")
-    substring_only = await candidates_for("Alexandra, what do you think?")
-    people_after = h.service.stats(context=h.admin_context()).people_count
-
-    assert {item["person_id"] for item in mentioned} == member_ids
-    assert outsider.person_id not in {item["person_id"] for item in mentioned}
-    assert all(item["source"] == "plaintext_alias" for item in mentioned)
-    assert all(item["status"] == "ambiguous" for item in mentioned)
-    assert substring_only == []
-    assert people_after == people_before
-
-
-async def test_contacts_middleware_attaches_mentions_separately_and_preserves_metadata(
-    knowledge_harness,
-):
-    h = knowledge_harness
-    phone = "4910000000048@s.whatsapp.net"
-    lid = "8420000048@lid"
-    member = _observe_pair(h, phone, lid, name="Ria")
-    assert member.person_id is not None
-    context = _mention_context(h, "whatsapp:4910000000048")
-    original_metadata = {
-        "account_id": ACCOUNT,
-        "mentioned_jids": [lid],
-        "mentioned_name_tokens": ["Ria"],
-        "statement_roles": [{"role": "speaker", "principal": "synthetic:sender"}],
-        "source_ref": {"event_id": "synthetic-event"},
-        "source_audience": {"status": "known", "members": ["synthetic:reader"]},
-    }
-    event = InboundEvent(
-        channel="whatsapp",
-        chat_id="mention-room",
-        sender_id="untyped-sender",
-        participant=None,
-        content="Ria, what do you think?",
-        raw_metadata=original_metadata,
-    )
-    ctx = PipelineContext(event=event)
-    passed = False
-
-    async def next_middleware(next_ctx):
-        nonlocal passed
-        passed = True
-
-    middleware = ContactsMiddleware(
-        knowledge=h.service,
-        mention_context_factory=lambda _: context,
-    )
-    await middleware(ctx, next_middleware)
-
-    assert passed
-    assert ctx.event.sender_id == event.sender_id
-    assert ctx.event.content == event.content
-    assert ctx.event.raw_metadata["statement_roles"] == original_metadata["statement_roles"]
-    assert ctx.event.raw_metadata["source_ref"] == original_metadata["source_ref"]
-    assert ctx.event.raw_metadata["source_audience"] == original_metadata["source_audience"]
-    candidates = ctx.event.raw_metadata["mentioned_person_candidates"]
-    assert [item["person_id"] for item in candidates] == [member.person_id, member.person_id]
-    assert [item["source"] for item in candidates] == ["native_identifier", "explicit_name_token"]
-    assert ctx.event.raw_metadata["mentioned_jids"] == [lid]
 
 
 @pytest.mark.parametrize("account_id", [ACCOUNT, "default"])
@@ -365,27 +146,17 @@ async def test_runtime_context_rechecks_projected_members_and_qualified_principa
 
     authority = FakeSourceAuthority()
     policy = _QueryPolicy(admins={OWNER}, capture_actors={OWNER})
+    from tests.gateway.history_test_helpers import prepare_history_retirement_knowledge
+
     service = open_knowledge_store(
-        tmp_path / "runtime-knowledge.db",
+        prepare_history_retirement_knowledge(tmp_path, name="runtime-knowledge"),
         workspace_id="synthetic-mention-workspace",
         source_authority=authority,
         policy_authority=policy,
     )
     try:
-        phone = "4910000000051@s.whatsapp.net"
         lid = "8420000051@lid"
-        member_resolution = _observe_pair_for_service(
-            service, authority, phone, lid, name="Runtime Member", account=account_id
-        )
         sender_phone = "4910000000050@s.whatsapp.net"
-        _observe_pair_for_service(
-            service,
-            authority,
-            sender_phone,
-            "8420000050@lid",
-            name="Runtime Sender",
-            account=account_id,
-        )
         event = InboundEvent(
             channel="whatsapp",
             chat_id="synthetic@g.us",
@@ -436,44 +207,25 @@ async def test_runtime_context_rechecks_projected_members_and_qualified_principa
             },
         )
         assert _projected_mention_context(missing_account_event, queries, service) is None
-        assert member_resolution.person_id is not None
-
-        pipeline_context = PipelineContext(event=event)
-        reached_next = False
-
-        async def next_middleware(_ctx):
-            nonlocal reached_next
-            reached_next = True
-
-        middleware = ContactsMiddleware(
-            knowledge=service,
-            observation_issuer=authority.issue_observation,
-            mention_context_factory=lambda _current: context,
+        member_person_id = queries.resolve_identifier(
+            lid, at_ms=1_700_000_001_000, time_basis="native"
         )
-        await middleware(pipeline_context, next_middleware)
-        assert reached_next
-        runtime_candidate = pipeline_context.event.raw_metadata[
-            "mentioned_person_candidates"
-        ][0]
-        assert runtime_candidate["person_id"] == member_resolution.person_id
-        assert runtime_candidate["status"] == "ambiguous"
-        assert pipeline_context.event.raw_metadata["mentioned_jids"] == [lid]
-        for metadata_key in ("statement_roles", "source_ref", "source_audience"):
-            assert pipeline_context.event.raw_metadata[metadata_key] == event.raw_metadata[
-                metadata_key
-            ]
+        assert member_person_id is not None
 
-        result = service.resolve_mentions(
-            (Identifier("whatsapp", "lid", lid, namespace=account_id),),
-            at_ms=None,
-            context=context,
-            account_namespace=account_id,
-        )[0]
-        mismatch = service.resolve_mentions(
-            (Identifier("whatsapp", "lid", lid, namespace=account_id),),
-            context=context,
-            account_namespace=ACCOUNT if account_id == "default" else "other-account",
-        )[0]
+        from yeoman_gateway.history.context import history_knowledge_scope
+
+        with history_knowledge_scope(snapshot, service):
+            result = service.resolve_mentions(
+                (Identifier("whatsapp", "lid", lid, namespace=account_id),),
+                at_ms=None,
+                context=context,
+                account_namespace=account_id,
+            )[0]
+            mismatch = service.resolve_mentions(
+                (Identifier("whatsapp", "lid", lid, namespace=account_id),),
+                context=context,
+                account_namespace=ACCOUNT if account_id == "default" else "other-account",
+            )[0]
         assert mismatch.status == "unresolved"
         assert mismatch.reason == "account_namespace_mismatch"
         history.add_group(
@@ -486,11 +238,12 @@ async def test_runtime_context_rechecks_projected_members_and_qualified_principa
             chat_id=event.chat_id, at_ms=1_700_000_001_000
         )
         membership_view["value"] = PolicyMembership(new_roster.members, "history:2")
-        after_membership_change = service.resolve_mentions(
-            (Identifier("whatsapp", "lid", lid, namespace=ACCOUNT),),
-            at_ms=None,
-            context=context,
-        )[0]
+        with history_knowledge_scope(next_snapshot, service):
+            after_membership_change = service.resolve_mentions(
+                (Identifier("whatsapp", "lid", lid, namespace=ACCOUNT),),
+                at_ms=None,
+                context=context,
+            )[0]
 
         unqualified_event = replace(
             event,
@@ -505,8 +258,8 @@ async def test_runtime_context_rechecks_projected_members_and_qualified_principa
         unqualified = _projected_mention_context(
             unqualified_event, HistoryQueries(unqualified_snapshot), service
         )
-        assert result.status == "ambiguous"
-        assert result.person_id == member_resolution.person_id
+        assert result.status == ("ambiguous" if account_id == "default" else "unresolved")
+        assert result.person_id == (member_person_id if account_id == "default" else None)
         assert after_membership_change.status == "denied"
         assert after_membership_change.person_id is None
         assert unqualified is None
@@ -519,19 +272,3 @@ async def test_runtime_context_rechecks_projected_members_and_qualified_principa
         history.close()
 
 
-def _observe_pair_for_service(
-    service, authority, phone: str, lid: str, *, name: str, account: str = ACCOUNT
-):
-    observation = TrustedIdentityObservation(
-        identifiers=(
-            Identifier("whatsapp", "phone_jid", phone, namespace=account),
-            Identifier("whatsapp", "lid", lid, namespace=account),
-        ),
-        evidence_ref=f"mention-observation:{phone}",
-        observed_name=name,
-        observed_at_ms=1_700_000_000_000,
-        mapping_verified=True,
-        account_namespace=account,
-    )
-    authority.issue_observation(observation)
-    return service.resolve_person(observation)

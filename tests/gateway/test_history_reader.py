@@ -9,15 +9,11 @@ from typing import Any
 
 from yeoman_gateway.knowledge._history import HistoricalJournal, HistorySourceAuthority
 from yeoman_gateway.knowledge._history_audience import HistoryAudience, roster_confirmation
-from yeoman_gateway.knowledge.api import open_knowledge_store, workspace_id_for
-from yeoman_gateway.knowledge.authority import EvidenceAudience
+from yeoman_gateway.knowledge.authority import EvidenceAudience, PolicyMembership
 from yeoman_gateway.knowledge.models import (
     KnowledgeContext,
-    RecallQuery,
     SourceRef,
-    StatementCandidate,
     TrustedAdminContext,
-    TrustedCaptureContext,
     TrustedReadContext,
 )
 from yeoman_gateway.knowledge.runtime import RuntimeKnowledgePolicy
@@ -283,6 +279,43 @@ def _add_event(
             )
 
 
+class _RegistryPolicy(RuntimeKnowledgePolicy):
+    """Offline membership adapter over a validated synthetic registry snapshot."""
+
+    def __init__(self, registry: _Registry, *, policy_revision: int) -> None:
+        super().__init__(engine=None, policy_revision=policy_revision)
+        self.registry = registry
+
+    def membership(self, context: TrustedReadContext) -> PolicyMembership | None:
+        if (
+            context.policy_revision != self.policy_revision
+            or context.channel != "whatsapp"
+            or context.chat_id != self.registry.chat_id
+        ):
+            return None
+        snapshot = self.registry.get_chat(context.channel, context.chat_id)
+        if not isinstance(snapshot, dict):
+            return None
+        metadata = snapshot.get("metadata")
+        raw_members = metadata.get("participants") if isinstance(metadata, dict) else None
+        revision = snapshot.get("last_sync_at")
+        if (
+            not isinstance(raw_members, list)
+            or not raw_members
+            or any(not isinstance(item, str) or not item.strip() for item in raw_members)
+            or not isinstance(revision, str)
+            or not revision.strip()
+        ):
+            return None
+        members = frozenset(raw_members)
+        if (
+            context.membership_revision is not None
+            and str(context.membership_revision) != revision
+        ):
+            return None
+        return PolicyMembership(members=members, revision=revision)
+
+
 def _reader(
     journal: HistoricalJournal,
     *,
@@ -294,10 +327,8 @@ def _reader(
 
     return HistoryReader(
         journal,
-        policy=RuntimeKnowledgePolicy(
-            engine=None,
-            chat_registry=registry or _Registry(members),
-            policy_revision=policy_revision,
+        policy=_RegistryPolicy(
+            registry or _Registry(members), policy_revision=policy_revision
         ),
     )
 
@@ -611,7 +642,7 @@ def test_native_proof_survives_withdrawal_of_separate_roster(tmp_path: Path) -> 
         assert result["audience"]["evidence_class"] == "native_snapshot"
 
 
-def test_revoked_roster_blocks_actual_derived_knowledge_context(tmp_path: Path) -> None:
+def test_revoked_roster_blocks_a_derived_knowledge_context(tmp_path: Path) -> None:
     with HistoricalJournal(tmp_path / "history") as journal:
         _add_event(journal, audience=None)
         proof_id, owner_policy = _attest_reader(journal)
@@ -638,69 +669,51 @@ def test_revoked_roster_blocks_actual_derived_knowledge_context(tmp_path: Path) 
         authority = HistorySourceAuthority(journal)
         source = authority.verify_source_ref("wa-history-1", 1)
         assert source is not None
-        policy = RuntimeKnowledgePolicy(
-            engine=None,
-            chat_registry=registry,
-            policy_revision=7,
+        prepared = KnowledgeContext(
+            text="Derived broker note from a roster-authorized message",
+            statement_ids=("synthetic-derived-statement",),
+            source_refs=(source,),
+            entry_texts=("Derived broker note from a roster-authorized message",),
         )
-        knowledge = open_knowledge_store(
-            tmp_path / "knowledge.db",
-            workspace_id=workspace_id_for(tmp_path),
-            source_authority=authority,
-            policy_authority=policy,
+
+        class _PreparedKnowledge:
+            def revalidate(
+                self, result: KnowledgeContext, *, context: TrustedReadContext
+            ) -> KnowledgeContext:
+                return result
+
+        reader = _reader(journal, registry=registry)
+        baseline = reader.revalidate(
+            prepared, knowledge=_PreparedKnowledge(), context=_context()
         )
-        try:
-            receipt = knowledge.capture(
-                StatementCandidate(
-                    content="Derived broker note from a roster-authorized message",
-                    sources=(source,),
-                    extractor_version="history-reader-test",
-                    confidence=0.9,
-                ),
-                context=TrustedCaptureContext(
-                    request_id="history-reader-test",
-                    policy_revision=7,
-                    capture_basis="history_test",
-                    authorized_sources=(source,),
-                ),
+        assert baseline.text == prepared.text
+        assert baseline.source_refs == prepared.source_refs
+        registry.calls = 0
+        with journal.store._write() as connection:
+            connection.execute(
+                "UPDATE events SET payload_purged_ms=? WHERE event_id=?",
+                (NOW + 1, "wa-history-1"),
             )
-            assert receipt.statement_ids
-            prepared = knowledge.recall(
-                RecallQuery(text="derived broker note", limit=5), context=_context()
-            )
-            assert isinstance(prepared, KnowledgeContext)
-            assert not prepared.empty
-            assert "Derived broker note" in prepared.text
+        assert authority.verify_source_ref("wa-history-1", 1) is None
+        retention_checked = reader.revalidate(
+            prepared, knowledge=_PreparedKnowledge(), context=_context()
+        )
+        assert retention_checked.empty
 
-            with journal.store._write() as connection:
-                connection.execute(
-                    "UPDATE events SET payload_purged_ms=? WHERE event_id=?",
-                    (NOW + 1, "wa-history-1"),
-                )
-            assert authority.verify_source_ref("wa-history-1", 1) is None
-            retention_checked = _reader(journal, registry=registry).revalidate(
-                prepared,
-                knowledge=knowledge,
-                context=_context(),
+        with journal.store._write() as connection:
+            connection.execute(
+                "UPDATE events SET payload_purged_ms=NULL WHERE event_id=?",
+                ("wa-history-1",),
             )
-            assert retention_checked.empty
+        registry.calls = 0
+        registry.revoke_on_call = 2
+        checked = reader.revalidate(
+            prepared, knowledge=_PreparedKnowledge(), context=_context()
+        )
 
-            with journal.store._write() as connection:
-                connection.execute(
-                    "UPDATE events SET payload_purged_ms=NULL WHERE event_id=?",
-                    ("wa-history-1",),
-                )
-            registry.calls = 0
-            registry.revoke_on_call = 3
-            checked = _reader(journal, registry=registry).revalidate(
-                prepared, knowledge=knowledge, context=_context()
-            )
-
-            assert checked.empty
-            assert checked.text == ""
-            assert registry.calls >= 3
-        finally:
-            knowledge.close()
+        assert checked.empty
+        assert checked.text == ""
+        assert registry.calls >= 2
 
 
 def test_proof_change_during_read_is_rechecked_before_output(tmp_path: Path) -> None:

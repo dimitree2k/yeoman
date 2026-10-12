@@ -17,7 +17,8 @@ def configure(monkeypatch, tmp_path, disabled):
     root = tmp_path / 'synthetic-home'
     root.mkdir(exist_ok=True)
     monkeypatch.setenv('YEOMAN_HOME', str(root))
-    (root / 'config.json').write_text(json.dumps({'configVersion': 2, 'history': {'legacyWritersDisabled': disabled}}))
+    if disabled:
+        (root / 'config.json').write_text(json.dumps({'configVersion': 3}))
     return root
 
 
@@ -76,7 +77,7 @@ def mutation(kind, obj):
     return obj.start()
 
 
-@pytest.mark.parametrize('kind', (*KINDS, 'session', 'identity'))
+@pytest.mark.parametrize('kind', (*KINDS, 'identity'))
 @pytest.mark.parametrize('transition', ['instance', 'explicit-after-file-change'])
 def test_retired_writer_call_fails_on_existing_instance(tmp_path, monkeypatch, kind, transition):
     from yeoman_gateway.history.writer_guard import LegacyHistoryWriterDisabled
@@ -94,7 +95,7 @@ def test_retired_writer_call_fails_on_existing_instance(tmp_path, monkeypatch, k
     if transition == 'instance':
         obj.legacy_history_disabled = True
     else:
-        (root / 'config.json').write_text(json.dumps({'history': {'legacyWritersDisabled': True}}))
+        (root / 'config.json').write_text(json.dumps({'configVersion': 3}))
         obj.legacy_history_disabled = True
     try:
         with pytest.raises(LegacyHistoryWriterDisabled):
@@ -111,8 +112,8 @@ def test_retired_writer_call_fails_on_existing_instance(tmp_path, monkeypatch, k
             obj._store.close()
 
 
-@pytest.mark.parametrize('missing', ['projection', 'adapter', 'knowledge', 'handover'])
-def test_writer_off_requires_replacements_and_handover(tmp_path, monkeypatch, missing):
+@pytest.mark.parametrize('missing', ['adapter', 'knowledge', 'handover'])
+def test_startup_requires_knowledge_adapter_and_handover(tmp_path, monkeypatch, missing):
     from yeoman_gateway.app import bootstrap
     from yeoman_gateway.bus.queue import MessageBus
     from yeoman_gateway.history.live import HistoryPaused
@@ -126,8 +127,7 @@ def test_writer_off_requires_replacements_and_handover(tmp_path, monkeypatch, mi
         if missing != 'handover':
             db.execute("INSERT INTO knowledge_history_capture_state VALUES ('handover',?,1)",
                        (json.dumps({'version': 1, 'generation': 1, 'sources': [], 'pending': [], 'processed': [], 'legacy_boundary': [0, '']}),))
-    config = Config(history={'liveProjectionEnabled': missing != 'projection', 'legacyWritersDisabled': True},
-                    knowledge={'enabled': missing != 'knowledge', 'db_path': str(target)})
+    config = Config(knowledge={'enabled': missing != 'knowledge', 'db_path': str(target)})
     if missing == 'adapter':
         import yeoman_gateway.adapters.reply_archive_history as adapters
         monkeypatch.setattr(adapters, 'HistoryReplyArchiveAdapter', None)
@@ -172,34 +172,32 @@ def test_statement_writes_continue_while_identity_tables_are_frozen(case):  # no
     assert service._store.scalar('PRAGMA query_only') == 0
 
 
-def test_retirement_default_false_preserves_legacy_and_telegram(tmp_path, monkeypatch):
-    from yeoman_gateway.history.writer_guard import require_legacy_history_writer
+def test_session_whatsapp_files_are_refused_and_telegram_persists(tmp_path, monkeypatch):
     from yeoman_gateway.session.manager import Session, SessionManager
     root = configure(monkeypatch, tmp_path, False)
-    legacy = SessionManager(tmp_path, sessions_dir=tmp_path / 'sessions')
-    legacy.save(Session('whatsapp:synthetic'))
-    assert len(list(legacy.sessions_dir.glob('*.jsonl'))) == 1
-    require_legacy_history_writer(disabled=MagicMock(), channel='whatsapp')
-    retired = SessionManager(tmp_path, sessions_dir=tmp_path / 'retired', legacy_history_disabled=True)
+    manager = SessionManager(tmp_path, sessions_dir=tmp_path / 'sessions')
+    monkeypatch.setattr(manager, '_get_session_path', lambda key: (_ for _ in ()).throw(AssertionError(key)))
     from yeoman_gateway.history.live import HistoryPaused
-    with pytest.raises(HistoryPaused):
-        retired.get_or_create('whatsapp:synthetic', channel='whatsapp', chat_id='synthetic')
-    assert not retired.sessions_dir.exists()
-    retired.save(retired.get_or_create('telegram:synthetic'))
-    assert len(list(retired.sessions_dir.glob('*.jsonl'))) == 1
+    with pytest.raises(HistoryPaused, match='jsonl_retired'):
+        manager._load('whatsapp:synthetic')
+    with pytest.raises(HistoryPaused, match='jsonl_retired'):
+        manager.save(Session('whatsapp:synthetic'))
+    with pytest.raises(HistoryPaused, match='jsonl_retired'):
+        manager.delete('whatsapp:synthetic')
+    telegram = SessionManager(tmp_path, sessions_dir=tmp_path / 'telegram-sessions')
+    telegram.save(Session('telegram:synthetic'))
+    assert len(list(telegram.sessions_dir.glob('*.jsonl'))) == 1
     assert not (root / 'data' / 'operational' / 'history').exists()
     assert not list(root.rglob('knowledge.db'))
 
 
-def test_whatsapp_and_fact_bootstrap_skip_private_legacy_constructors(tmp_path, monkeypatch):
-    from yeoman_gateway.app.bootstrap import build_shared_fact_runtime
+def test_whatsapp_bootstrap_builds_raw_archive(tmp_path, monkeypatch):
     from yeoman_gateway.bus.queue import MessageBus
     from yeoman_gateway.channels.manager import ChannelManager
     configure(monkeypatch, tmp_path, False)
-    config = Config(history={'legacyWritersDisabled': True}, channels={'whatsapp': {'enabled': True}})
+    config = Config(channels={'whatsapp': {'enabled': True}})
     channels = ChannelManager(config, MessageBus())
     assert channels.raw_archive is not None
-    assert build_shared_fact_runtime(config, store=MagicMock(), memory=MagicMock()) is None
 
 
 @pytest.mark.parametrize('retired', [True])
@@ -216,9 +214,7 @@ def test_bootstrap_writer_routes_and_operational_exceptions(tmp_path, monkeypatc
         with sqlite3.connect(target) as db:
             db.execute("INSERT INTO knowledge_history_capture_state VALUES ('handover',?,1)",
                        (json.dumps({'version': 1, 'generation': 1, 'sources': [], 'pending': [], 'processed': [], 'legacy_boundary': [0, '']}),))
-    config = Config(history={'liveProjectionEnabled': retired, 'legacyWritersDisabled': retired,
-                             'readers': {k: retired for k in ('participation', 'whatsapp', 'responder', 'tools', 'secondary', 'knowledge')}},
-                    knowledge={'enabled': retired, 'db_path': str(target), 'capture_enabled': retired},
+    config = Config(knowledge={'enabled': retired, 'db_path': str(target), 'capture_enabled': retired},
                     processing={'enabled': True}, security={'enabled': False},
                     memory={'db_path': str(tmp_path / 'memory.db')},
                     personaEvolution={'enabled': False})
@@ -231,49 +227,34 @@ def test_bootstrap_writer_routes_and_operational_exceptions(tmp_path, monkeypatc
     try:
         assert runtime.channels.raw_archive is not None
         assert runtime.processing is not None
-        if retired:
-            assert runtime.inbound_archive is None
-            assert runtime.chat_registry is None
-            assert runtime.contacts is None
-            assert runtime.memory is None
-            assert runtime.shared_facts is None
-            from yeoman_gateway.knowledge._history_capture import HistoryCaptureWorker
-            assert isinstance(runtime.statement_capture, HistoryCaptureWorker)
-            assert not (root / 'data' / 'operational' / 'inbound' / 'reply_context.db').exists()
-            assert not (root / 'data' / 'operational' / 'inbound' / 'chat_registry.db').exists()
-            assert not (root / 'data' / 'operational' / 'contacts').exists()
-            assert not (tmp_path / 'memory.db').exists()
-        else:
-            assert runtime.inbound_archive is not None
-            assert runtime.chat_registry is not None
-            assert runtime.contacts is not None
-            assert runtime.memory is not None
-            assert runtime.history_projector is None
-            assert not target.exists()
-            assert not (root / 'data' / 'operational' / 'history').exists()
+        from yeoman_gateway.knowledge._history_capture import HistoryCaptureWorker
+        assert isinstance(runtime.statement_capture, HistoryCaptureWorker)
+        assert not (root / 'data' / 'operational' / 'inbound' / 'reply_context.db').exists()
+        assert not (root / 'data' / 'operational' / 'inbound' / 'chat_registry.db').exists()
+        assert not (root / 'data' / 'operational' / 'contacts').exists()
+        assert not (tmp_path / 'memory.db').exists()
         # The responder always receives the shared channel-aware session manager.
         manager = runtime.responder.sessions
         manager.save(manager.get_or_create('telegram:synthetic'))
         assert list(manager.sessions_dir.glob('telegram*.jsonl'))
         assert runtime.channels.document_cache is not None
     finally:
-        for obj in (runtime.inbound_archive, runtime.chat_registry, runtime.contacts, runtime.memory,
-                    runtime.processing, runtime.responder.knowledge):
+        for obj in (runtime.processing, runtime.responder.knowledge):
             if obj is not None:
                 obj.close()
 
 
-def test_retired_canonical_fts_is_unreachable_but_journal_keeps_writing(tmp_path):
+def test_signal_sink_only_journals_canonical_event(tmp_path):
     from yeoman_gateway.processing.signals import SignalJournalSink
     from yeoman_gateway.processing.store import ProcessingStore
     store = ProcessingStore(tmp_path / 'processing.db')
-    memory = MagicMock()
-    sink = SignalJournalSink(store, memory=memory, legacy_history_disabled=True)
+    sink = SignalJournalSink(store)
     try:
         sink.capture('message', {'chatJid': 'synthetic@g.us', 'messageId': 'm', 'text': 'Synthetic'})
         assert store.count_events() == 1
-        assert sink.index_enrichments('m', ({'text': 'Synthetic enrichment'},)) == ()
-        memory.index_canonical_event.assert_not_called()
+        assert not hasattr(sink, 'legacy_history_disabled')
+        assert not hasattr(sink, 'index_enrichments')
+        assert not hasattr(sink, '_memory')
     finally:
         store.close()
 
@@ -281,7 +262,7 @@ def test_retired_canonical_fts_is_unreachable_but_journal_keeps_writing(tmp_path
 def test_memory_factory_uses_root_retirement_before_any_worker_or_file(tmp_path):
     from yeoman_gateway.history.writer_guard import LegacyHistoryWriterDisabled
     from yeoman_gateway.knowledge._memory.service import MemoryService
-    config = Config(history={'legacyWritersDisabled': True}, memory={'db_path': str(tmp_path / 'uncreated' / 'legacy.db')})
+    config = Config(memory={'db_path': str(tmp_path / 'uncreated' / 'legacy.db')})
     threads = set(threading.enumerate())
     with pytest.raises(LegacyHistoryWriterDisabled):
         MemoryService(workspace=tmp_path, config=config.memory, root_config=config)
@@ -316,32 +297,11 @@ def test_guarded_calls_do_not_read_config_after_construction(tmp_path, monkeypat
             obj._store.close()
 
 
-@pytest.mark.parametrize('retired', [False, True])
-def test_signal_guard_uses_cached_flag(tmp_path, monkeypatch, retired):
+def test_signal_sink_has_no_retired_memory_cache_or_guard():
     from yeoman_gateway.processing.signals import SignalJournalSink
-    sink = SignalJournalSink(MagicMock(), memory=MagicMock(), legacy_history_disabled=retired)
-    reads = MagicMock(side_effect=AssertionError('hot path must not read config'))
-    monkeypatch.setattr(Path, 'read_text', reads)
-    for _ in range(20):
-        sink.index_enrichments('m', ())
-    reads.assert_not_called()
-
-
-def test_knowledge_composition_passes_resolved_flag_to_identity(case, tmp_path, monkeypatch):  # noqa: F811 - fixture
-    from yeoman_gateway.history.writer_guard import LegacyHistoryWriterDisabled
-    from yeoman_gateway.knowledge.api import KnowledgeService
-    from yeoman_gateway.knowledge.models import TrustedAdminContext
-    service, _, _, _ = case
-    configure(monkeypatch, tmp_path, True)
-    resolved = KnowledgeService(store=service._store, workspace_id='synthetic',
-                                source_authority=service._legacy_authority, policy_authority=service._policy,
-                                history_mode=True)
-    assert resolved.legacy_history_disabled is True
-    assert resolved._identity.legacy.legacy_history_disabled is True
-    reads = MagicMock(side_effect=AssertionError('identity must use the resolved flag'))
-    monkeypatch.setattr(Path, 'read_text', reads)
-    with pytest.raises(LegacyHistoryWriterDisabled):
-        resolved._identity.legacy.set_preferred_name('synthetic', 'Changed', context=TrustedAdminContext('synthetic', 1, 'test', True))
-    reads.assert_not_called()
+    sink = SignalJournalSink(MagicMock())
+    assert not hasattr(sink, 'legacy_history_disabled')
+    assert not hasattr(sink, 'index_enrichments')
+    assert not hasattr(sink, '_memory')
 
 

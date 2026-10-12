@@ -554,7 +554,8 @@ async def test_whatsapp_staged_artifacts_preserve_safe_suffix_mime(
     channel._send_command_with_retry = send  # type: ignore[method-assign]
     await channel.send(
         OutboundMessage(
-            channel="whatsapp", chat_id="private-group@g.us", content="", media=[str(path)]
+            channel="whatsapp", chat_id="private-group@g.us", content="", media=[str(path)],
+            metadata={"historyMentionsResolved": True},
         )
     )
 

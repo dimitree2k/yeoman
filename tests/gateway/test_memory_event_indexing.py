@@ -119,10 +119,9 @@ def test_tombstoned_canonical_content_follows_existing_search_semantics(tmp_path
     store.close()
 
 
-def test_strict_delete_tombstones_the_canonical_fts_projection(tmp_path: Path) -> None:
+def test_strict_delete_remains_in_canonical_processing_journal(tmp_path: Path) -> None:
     processing = ProcessingStore(tmp_path / "processing.db")
-    memory = MemoryStore(tmp_path / "memory.db")
-    sink = SignalJournalSink(processing, memory=memory, clock=lambda: 1_700_000_000_000)
+    sink = SignalJournalSink(processing, clock=lambda: 1_700_000_000_000)
     sink.capture(
         "message",
         {
@@ -137,12 +136,6 @@ def test_strict_delete_tombstones_the_canonical_fts_projection(tmp_path: Path) -
         observed_at_ms=1_700_000_000_000,
         strict=True,
     )
-    assert memory.search_lexical(
-        workspace_id="canonical",
-        query="tombstoned text",
-        scope_keys=["channel:whatsapp:chat:chat@g.us"],
-    )
-
     sink.capture(
         "delete",
         {
@@ -155,10 +148,6 @@ def test_strict_delete_tombstones_the_canonical_fts_projection(tmp_path: Path) -
         observed_at_ms=1_700_000_000_001,
         strict=True,
     )
-    assert memory.search_lexical(
-        workspace_id="canonical",
-        query="tombstoned text",
-        scope_keys=["channel:whatsapp:chat:chat@g.us"],
-    ) == []
+    assert processing.count_events() == 2
+    assert processing.get_event("delete-1") is not None
     processing.close()
-    memory.close()

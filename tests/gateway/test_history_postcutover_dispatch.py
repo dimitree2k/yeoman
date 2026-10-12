@@ -1,4 +1,5 @@
 """Synthetic retired-mode capture and intent isolation witnesses."""
+from contextlib import asynccontextmanager
 from unittest.mock import AsyncMock
 
 import pytest
@@ -10,13 +11,24 @@ from yeoman_gateway.core.intents import (
 )
 from yeoman_gateway.core.models import InboundEvent, OutboundEvent, PolicyDecision
 from yeoman_gateway.core.orchestrator import Orchestrator
-from yeoman_shared.config.schema import HistoryConfig
 from yeoman_shared.telemetry import InMemoryTelemetry
+
+from tests.gateway.history_test_helpers import ProjectedHistory
+
+
+@asynccontextmanager
+async def _history_scope(tmp_path):
+    history = ProjectedHistory(tmp_path / "history-dispatch")
+    try:
+        async with history.turn():
+            yield
+    finally:
+        history.close()
 
 
 def service(bus):
     return OrchestratorService(bus=bus, orchestrator=None, typing_adapter=AsyncMock(),
-                               telemetry=InMemoryTelemetry(), memory=None)
+                               telemetry=InMemoryTelemetry())
 
 
 def notes():
@@ -26,10 +38,11 @@ def notes():
 
 
 @pytest.mark.asyncio
-async def test_retired_capture_does_not_lose_following_reply():
+async def test_retired_capture_does_not_lose_following_reply(tmp_path):
     bus = AsyncMock()
-    await service(bus)._dispatch_intents([notes(), SendOutboundIntent(
-        event=OutboundEvent(channel='whatsapp', chat_id='group@g.us', content='reply'))])
+    async with _history_scope(tmp_path):
+        await service(bus)._dispatch_intents([notes(), SendOutboundIntent(
+            event=OutboundEvent(channel='whatsapp', chat_id='group@g.us', content='reply'))])
     assert bus.publish_outbound.call_args.args[0].content == 'reply'
 
 
@@ -44,41 +57,46 @@ async def test_failed_intent_does_not_abort_remaining_intents():
 
 @pytest.mark.asyncio
 @pytest.mark.parametrize('kind', ['idea', 'backlog'])
-async def test_stale_manual_intent_refuses_explicitly_without_crashing(kind):
+async def test_stale_manual_intent_refuses_explicitly_without_crashing(kind, tmp_path):
     bus = AsyncMock()
-    await service(bus)._dispatch_intents([RecordManualMemoryIntent(channel='whatsapp',
-        chat_id='synthetic', sender_id='10001', content='synthetic', entry_kind=kind)])
+    async with _history_scope(tmp_path):
+        await service(bus)._dispatch_intents([RecordManualMemoryIntent(channel='whatsapp',
+            chat_id='synthetic', sender_id='10001', content='synthetic', entry_kind=kind)])
     assert 'not available after the history migration' in bus.publish_outbound.call_args.args[0].content
 
 
 @pytest.mark.asyncio
 @pytest.mark.parametrize('accepted', [False, True])
-async def test_retired_orchestrator_never_emits_notes(accepted):
+async def test_retired_orchestrator_never_emits_notes(accepted, tmp_path):
     class Policy:
         def evaluate(self, event):
             return PolicyDecision(accept_message=accepted, should_respond=False,
                 allowed_tools=frozenset(), reason='synthetic', notes_enabled=True,
                 notes_allow_blocked_senders=True)
     orchestrator = Orchestrator(policy=Policy(), responder=AsyncMock(),
-        reply_context_window_limit=0, reply_context_line_max_chars=100,
-        history_secondary_config=HistoryConfig(legacyWritersDisabled=True))
-    intents = await orchestrator.handle(InboundEvent(channel='whatsapp', chat_id='group@g.us',
-        sender_id='10001', content='synthetic', message_id='m', is_group=True))
+        reply_context_window_limit=0, reply_context_line_max_chars=100)
+    history = ProjectedHistory(tmp_path / "history-postcutover-notes")
+    async with history.turn():
+        intents = await orchestrator.handle(InboundEvent(channel='whatsapp', chat_id='group@g.us',
+            sender_id='10001', content='synthetic', message_id='m', is_group=True))
+    history.close()
     assert not any(isinstance(i, QueueMemoryNotesCaptureIntent) for i in intents)
 
 
 @pytest.mark.asyncio
 @pytest.mark.parametrize('text', ['[idea] synthetic', '[backlog] synthetic'])
-async def test_retired_idea_command_refuses_without_success_reaction(text):
+async def test_retired_idea_command_refuses_without_success_reaction(text, tmp_path):
     class Policy:
         def evaluate(self, event):
             return PolicyDecision(accept_message=True, should_respond=True,
                 allowed_tools=frozenset(), reason='synthetic')
     orchestrator = Orchestrator(policy=Policy(), responder=AsyncMock(),
-        reply_context_window_limit=0, reply_context_line_max_chars=100,
-        history_secondary_config=HistoryConfig(legacyWritersDisabled=True))
-    intents = await orchestrator.handle(InboundEvent(channel='whatsapp', chat_id='synthetic',
-        sender_id='10001', content=text, message_id='m'))
+        reply_context_window_limit=0, reply_context_line_max_chars=100)
+    history = ProjectedHistory(tmp_path / "history-postcutover-idea")
+    async with history.turn():
+        intents = await orchestrator.handle(InboundEvent(channel='whatsapp', chat_id='synthetic',
+            sender_id='10001', content=text, message_id='m'))
+    history.close()
     assert not any(isinstance(i, RecordManualMemoryIntent) for i in intents)
     outbound = [i for i in intents if isinstance(i, SendOutboundIntent)]
     assert len(outbound) == 1
@@ -111,9 +129,7 @@ async def test_bootstrap_retired_runtime_completes_six_synthetic_turns(tmp_path,
         db.execute("INSERT INTO knowledge_history_capture_state VALUES ('handover',?,1)",
             (json.dumps({'version': 1, 'generation': 1, 'sources': [], 'pending': [],
                          'processed': [], 'legacy_boundary': [0, '']}),))
-    config = Config(history={'liveProjectionEnabled': True, 'legacyWritersDisabled': True,
-        'readers': {k: True for k in ('participation', 'whatsapp', 'responder', 'tools', 'secondary', 'knowledge')}},
-        knowledge={'enabled': True, 'db_path': str(target), 'capture_enabled': True},
+    config = Config(knowledge={'enabled': True, 'db_path': str(target), 'capture_enabled': True},
         processing={'enabled': False}, security={'enabled': False}, personaEvolution={'enabled': False})
     workspace = root / 'workspace'
     workspace.mkdir()
@@ -139,7 +155,6 @@ async def test_bootstrap_retired_runtime_completes_six_synthetic_turns(tmp_path,
     failures = []
     log_id = logger.add(lambda msg: failures.append(str(msg)), level='ERROR')
     try:
-        assert runtime.memory is runtime.contacts is runtime.chat_registry is runtime.inbound_archive is None
         projector = runtime.history_projector
         from yeoman_gateway.history.project import project
         project([runtime.channels.raw_archive.root], projector.db_path,

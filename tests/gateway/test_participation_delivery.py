@@ -43,6 +43,13 @@ from yeoman_gateway.processing.models import (
 from yeoman_gateway.processing.policy import SnapshotEffectAuthorizer
 from yeoman_gateway.processing.store import ProcessingStore
 
+
+@pytest.fixture(autouse=True)
+def _projected_effect_history(monkeypatch, request, tmp_path):
+    from tests.gateway.history_test_helpers import install_projected_effect_history
+    install_projected_effect_history(monkeypatch, request, tmp_path)
+
+
 CHAT = "synthetic@g.us"
 CHANNEL = "whatsapp"
 DAY_MS = 86_400_000
@@ -1915,8 +1922,8 @@ def _build_tools(tmp_path: Path, *, security: object | None = None, policy: obje
         policy_engine=PolicyEngine(policy or _group_policy(), workspace=tmp_path),
         bus=MessageBus(),
         log=log,
-        inbound_archive=SecondaryArchive(archive, config.history),
-        memory=_FakeMemory(),
+        inbound_archive=SecondaryArchive(),
+
         security=security or _AllowSecurity(),
         approval_store=store,
         now=lambda: _FIXED_NOW,

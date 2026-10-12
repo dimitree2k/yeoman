@@ -14,50 +14,52 @@ from yeoman_gateway.history.context import (
 )
 from yeoman_gateway.history.live import HistoryPaused
 
+from tests.gateway.history_test_helpers import ProjectedHistory
 
-async def test_selected_contacts_resolve_terminal_string_once():
+
+async def test_selected_contacts_resolve_terminal_string_once(tmp_path):
     from yeoman_gateway.core.models import InboundEvent
     from yeoman_gateway.core.pipeline import Pipeline
     from yeoman_gateway.pipeline.contacts import ContactsMiddleware
 
-    p = Projector()
-    p.db.execute("INSERT INTO contacts VALUES ('person','person',NULL,'synthetic','confirmed',NULL,'[]')")
-    p.db.execute("INSERT INTO identifier_history(contact_id,channel,kind,value,strength,evidence,source_refs) VALUES ('person','whatsapp','pn_jid','491000000001@s.whatsapp.net','strong','owner_attested','[]')")
-    p.db.commit()
+    p = ProjectedHistory(
+        tmp_path / "history-review-fixes",
+        contacts=[dict(identifiers=["491000000001@s.whatsapp.net"], name="synthetic", timestamp=1700000000000)],
+    )
     downstream = AsyncMock()
     event = InboundEvent(channel='whatsapp', chat_id='a@g.us', sender_id='491000000001@s.whatsapp.net', content='synthetic', timestamp=datetime.fromtimestamp(1700000000, UTC))
     try:
-        async with history_turn(p):
-            await Pipeline([ContactsMiddleware(history_selected=True), downstream]).run(event)
+        async with p.turn() as snapshot:
+            from yeoman_gateway.history.queries import HistoryQueries
+
+            expected = HistoryQueries(snapshot).resolve_identifier(event.sender_id, at_ms=1700000000000, time_basis='native')
+            assert expected is not None
+            await Pipeline([ContactsMiddleware(), downstream]).run(event)
         downstream.assert_awaited_once()
-        assert downstream.call_args.args[0].event.raw_metadata['contact_id'] == 'person'
+        assert downstream.call_args.args[0].event.raw_metadata['contact_id'] == expected
     finally:
         p.close()
 
 
-@pytest.mark.parametrize('paused', [False, True])
-async def test_spawned_send_reacquires_after_parent_closed(paused):
+async def test_spawned_send_reacquires_with_projected_roster_after_parent_closed(tmp_path):
     from yeoman_gateway.bus.events import OutboundMessage
     from yeoman_gateway.bus.queue import MessageBus
     from yeoman_gateway.channels.whatsapp import WhatsAppChannel
     from yeoman_shared.config.schema import WhatsAppConfig
 
-    p = Projector()
     phone, lid = '491000000001@s.whatsapp.net', '100000000001@lid'
-    p.db.execute("INSERT INTO contacts VALUES ('person','person',NULL,'synthetic','confirmed',NULL,'[]')")
-    for kind, value in (('pn_jid', phone), ('lid', lid)):
-        p.db.execute("INSERT INTO identifier_history(contact_id,channel,kind,value,strength,evidence,source_refs) VALUES ('person','whatsapp',?,?,'strong','owner_attested','[]')", (kind, value))
-    p.db.execute("INSERT INTO message_events(event_id,channel,chat_id,kind,occurred_ms,time_certainty,payload_json,provenance,actor_basis,source_refs) VALUES ('roster','whatsapp','a@g.us','member_snapshot',1700000000000,'native',?,'native','unknown','[]')", (json.dumps({'complete': True, 'participants': [[phone, lid]]}),))
-    p.db.commit()
+    projected = ProjectedHistory(
+        tmp_path / 'spawned-send-history',
+        groups=[dict(chat_id='a@g.us', participants=[{'phoneJid': phone, 'lid': lid}], timestamp=1700000000000)],
+    )
     channel = WhatsAppChannel(WhatsAppConfig(bridge_token='synthetic-token'), MessageBus())
-    channel._history_projector = p
-    channel._history_mentions_selected = True
+    channel._history_projector = projected
     channel._connected = True
     channel._stop_typing = AsyncMock()
     channel._raw_archive_outbound = AsyncMock()
     sent = []
     async def ws_send(encoded):
-        assert current_history_snapshot() is None and p.live_snapshot_count == 0
+        assert current_history_snapshot() is None
         frame = json.loads(encoded)
         sent.append(frame['payload'])
         channel._pending[frame['requestId']].set_result({'providerMessageId': 'synthetic-sent'})
@@ -69,21 +71,52 @@ async def test_spawned_send_reacquires_after_parent_closed(paused):
         assert history_effect_metadata() == {}
         await channel.send(OutboundMessage(channel='whatsapp', chat_id='a@g.us', content='synthetic @100000000001@lid'))
     try:
+        async with history_turn(projected) as parent:
+            task = asyncio.create_task(child())
+        assert parent._closed
+        release.set()
+        await asyncio.wait_for(task, 30)
+        assert sent[0]['mentions'] == [phone]
+        assert sent[0]['text'] == 'synthetic @491000000001'
+        assert len(projected.snapshots) == 2
+        assert all(snapshot._closed for snapshot in projected.snapshots)
+    finally:
+        projected.close()
+
+
+async def test_spawned_send_fails_when_reader_pauses_before_child_acquires():
+    from yeoman_gateway.bus.events import OutboundMessage
+    from yeoman_gateway.bus.queue import MessageBus
+    from yeoman_gateway.channels.whatsapp import WhatsAppChannel
+    from yeoman_shared.config.schema import WhatsAppConfig
+
+    p = Projector()
+    channel = WhatsAppChannel(WhatsAppConfig(bridge_token='synthetic-token'), MessageBus())
+    channel._history_projector = p
+    channel._connected = True
+    channel._stop_typing = AsyncMock()
+    channel._raw_archive_outbound = AsyncMock()
+    sent = []
+
+    async def ws_send(encoded):
+        sent.append(json.loads(encoded)['payload'])
+
+    channel._ws = SimpleNamespace(send=ws_send)
+    release = asyncio.Event()
+
+    async def child():
+        await asyncio.wait_for(release.wait(), 30)
+        await channel.send(OutboundMessage(channel='whatsapp', chat_id='a@g.us', content='plain text'))
+
+    try:
         async with history_turn(p) as parent:
             task = asyncio.create_task(child())
         assert parent._closed
-        if paused:
-            p.status = 'rebuilding'
+        p.status = 'rebuilding'
         release.set()
-        if paused:
-            with pytest.raises(HistoryPaused):
-                await asyncio.wait_for(task, 30)
-            assert sent == [] and p.acquisitions == 1
-        else:
+        with pytest.raises(HistoryPaused):
             await asyncio.wait_for(task, 30)
-            assert sent[0]['mentions'] == [phone]
-            assert sent[0]['text'] == 'synthetic @491000000001'
-            assert p.acquisitions == 2
+        assert sent == [] and p.acquisitions == 1
         assert p.live_snapshot_count == 0
     finally:
         p.close()
@@ -110,8 +143,6 @@ async def test_observer_scopes_only_eligible_inbound(tmp_path, kind, case):
     from yeoman_shared.config.schema import Config
 
     config = Config()
-    config.history.live_projection_enabled = True
-    config.history.readers.secondary = True
     config.consciousness.enabled = case != 'disabled'
     config.consciousness.burst_enabled = True
     config.consciousness.lull_enabled = True

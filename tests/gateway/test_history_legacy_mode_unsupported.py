@@ -1,27 +1,13 @@
-"""Dormant legacy mode must fail before gateway startup touches storage."""
-
-from unittest.mock import Mock
+"""Explicitly disabling retired history behavior is refused at config validation."""
 
 import pytest
-from yeoman_gateway.app.bootstrap import build_gateway_runtime
+from pydantic import ValidationError
 from yeoman_shared.config.schema import Config
 
 
-def test_legacy_mode_is_refused_before_storage_is_constructed(tmp_path, monkeypatch):
-    import yeoman_gateway.app.bootstrap as bootstrap
+def test_legacy_mode_false_is_refused_by_direct_config_validation():
+    with pytest.raises(ValidationError, match=r"history\.legacyWritersDisabled=false is unsupported"):
+        Config(history={"legacyWritersDisabled": False})
 
-    storage = Mock(side_effect=AssertionError("startup reached storage"))
-    monkeypatch.setattr(bootstrap, "build_processing_store", storage)
-    config = Config(history={"legacyWritersDisabled": False})
-
-    with pytest.raises(ValueError, match=r"history\.legacyWritersDisabled=false is unsupported"):
-        build_gateway_runtime(
-            config=config,
-            provider=Mock(),
-            policy_engine=None,
-            policy_path=None,
-            workspace=tmp_path,
-            bus=Mock(),
-        )
-
-    storage.assert_not_called()
+    with pytest.raises(ValidationError, match=r"history\.legacyWritersDisabled=false is unsupported"):
+        Config.model_validate({"history": {"legacy_writers_disabled": False}})

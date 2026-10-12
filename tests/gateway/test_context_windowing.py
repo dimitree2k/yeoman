@@ -4,13 +4,14 @@ from __future__ import annotations
 
 import base64
 import os
-from unittest.mock import MagicMock
 
 import pytest
 from yeoman_gateway.agent.tools.recall_conversation import RecallConversationTool
 from yeoman_gateway.core.models import InboundEvent
 from yeoman_gateway.pipeline.reply_context import ReplyContextMiddleware
 from yeoman_gateway.session.manager import Session, SessionManager
+
+from tests.gateway.history_test_helpers import ProjectedHistory
 
 _PNG_BYTES = b"\x89PNG\r\n\x1a\n\x00\x00\x00\rIHDR"
 _JPEG_BYTES = b"\xff\xd8\xff\xe0\x00\x10JFIF\x00"
@@ -37,26 +38,40 @@ def _make_event(
 class TestAmbientWindowSkipDM:
     """Ambient window should be empty for DM chats, populated for groups."""
 
-    def test_dm_returns_empty_ambient(self):
-        archive = MagicMock()
-        archive.lookup_messages_before = MagicMock(return_value=[])
-        mw = ReplyContextMiddleware(archive=archive, ambient_window_limit=8)
-
+    @pytest.mark.asyncio
+    async def test_dm_returns_empty_ambient(self, tmp_path):
+        projected = ProjectedHistory(tmp_path / "dm-history")
+        mw = ReplyContextMiddleware(ambient_window_limit=8)
         event = _make_event(chat_id="owner@s.whatsapp.net", is_group=False)
-        result = mw._build_ambient_window(event)
+
+        async with projected.turn():
+            result = mw._build_ambient_window(event)
 
         assert result == []
-        archive.lookup_messages_before.assert_not_called()
+        projected.close()
 
-    def test_group_calls_archive(self):
-        archive = MagicMock()
-        archive.lookup_messages_before = MagicMock(return_value=[])
-        mw = ReplyContextMiddleware(archive=archive, ambient_window_limit=8)
+    @pytest.mark.asyncio
+    async def test_group_reads_projected_ambient_rows(self, tmp_path):
+        chat_id = "123456@g.us"
+        projected = ProjectedHistory(
+            tmp_path / "group-history",
+            messages=[
+                dict(channel="whatsapp", chat_id=chat_id, message_id="prior",
+                     text="earlier group message", timestamp=1_700_000_000,
+                     sender_id="491000000001@s.whatsapp.net"),
+                dict(channel="whatsapp", chat_id=chat_id, message_id="msg-1",
+                     text="current message", timestamp=1_700_000_060,
+                     sender_id="491000000002@s.whatsapp.net"),
+            ],
+        )
+        mw = ReplyContextMiddleware(ambient_window_limit=8)
+        event = _make_event(chat_id=chat_id, message_id="msg-1", is_group=True)
 
-        event = _make_event(chat_id="123456@g.us", is_group=True)
-        mw._build_ambient_window(event)
+        async with projected.turn():
+            result = mw._build_ambient_window(event)
 
-        archive.lookup_messages_before.assert_called_once()
+        assert result == ["[491000000001@s.whatsapp.net] earlier group message"]
+        projected.close()
 
 
 class TestSessionBoundary:
@@ -153,24 +168,30 @@ class TestSessionBoundary:
         ]
 
     def test_new_closes_processing_work_without_deleting_history(self, tmp_path):
-        import asyncio
-
         from yeoman_gateway.adapters.policy_engine import EnginePolicyAdapter
-        from yeoman_gateway.agent.tools.recall_conversation import RecallConversationTool
+        from yeoman_gateway.history.queries import HistoryQueries
         from yeoman_gateway.policy.engine import PolicyEngine
         from yeoman_gateway.policy.loader import save_policy
         from yeoman_gateway.policy.schema import PolicyConfig
         from yeoman_gateway.processing.models import CanonicalEvent
         from yeoman_gateway.processing.store import ProcessingStore
         from yeoman_gateway.processing.threads import ThreadRegistry
+        from yeoman_gateway.session.operational import OperationalSessions
         from yeoman_shared.config.schema import ProcessingConfig
 
         workspace = tmp_path / "workspace"
         workspace.mkdir()
-        sessions = SessionManager(workspace, sessions_dir=tmp_path / "sessions")
-        session = sessions.get_or_create("whatsapp:owner@s.whatsapp.net")
-        session.add_message("user", "old foreground context")
-        sessions.save(session)
+        chat_id = "10001@s.whatsapp.net"
+        projected = ProjectedHistory(tmp_path / "history", messages=[dict(
+            channel="whatsapp", chat_id=chat_id, message_id="old", text="old foreground context",
+            timestamp=1_791_000_000_000, sender_id=chat_id, participant=chat_id,
+        )])
+        snapshot = projected.snapshot()
+        operational = OperationalSessions(tmp_path / "sessions.db")
+        sessions = SessionManager(workspace, sessions_dir=tmp_path / "sessions", operational_store=operational)
+        session = sessions.get_or_create("whatsapp:owner@s.whatsapp.net", channel="whatsapp",
+                                         chat_id=chat_id, history_snapshot=snapshot)
+        assert session.get_history()[0]["content"] == "old foreground context"
 
         store = ProcessingStore(tmp_path / "processing.db")
         config = ProcessingConfig.model_validate({"enabled": True})
@@ -183,7 +204,7 @@ class TestSessionBoundary:
                 origin="whatsapp",
                 principal="owner@s.whatsapp.net",
                 channel="whatsapp",
-                chat_id="owner@s.whatsapp.net",
+                chat_id=chat_id,
                 occurred_ms=1_700_000_000_000,
                 source_message_id="m1",
                 payload={"text": "old foreground context", "is_group": False},
@@ -204,22 +225,16 @@ class TestSessionBoundary:
             workspace=workspace,
         )
 
-        result = adapter.route_admin_command(_make_event(content="/new", message_id="new-1"))
+        result = adapter.route_admin_command(_make_event(chat_id=chat_id, content="/new", message_id="new-1"))
 
         assert result is not None and result.status == "handled"
         assert result.reaction_emoji == "👍"
         assert session.get_history() == []
-        assert [row["role"] for row in session.get_full_history()] == [
-            "user",
-            "session_boundary",
-        ]
+        assert HistoryQueries(snapshot).search(chat_ids=(chat_id,), query="old foreground", limit=5)
         assert store.get_thread(assigned.thread_id).state == "closed"
         assert store.get_turn(assigned.turn_id).state == "superseded"
-        recall = RecallConversationTool(sessions)
-        recall.set_context("whatsapp", "owner@s.whatsapp.net")
-        assert "old foreground context" in asyncio.run(
-            recall.execute(query="old foreground context")
-        )
+        operational.close()
+        projected.close()
         store.close()
 
 
@@ -680,40 +695,54 @@ class TestDeliveryRepairGate:
             def get_default_model(self) -> str:
                 return "dummy/model"
 
+        chat_id = "group@g.us"
+        projected = ProjectedHistory(tmp_path / "history", contacts=[dict(identifiers=["203075365150770@lid"], name="Carschten", timestamp=1_790_999_999_000)], messages=[dict(
+            channel="whatsapp", chat_id=chat_id, message_id="carschten-1", text="Ich BIN Carschten",
+            timestamp=1_791_000_000_000, sender_id="4915253696948", participant="203075365150770@lid",
+            sender_name="Carschten",
+            reply_to_message_id="bot-1",
+        )])
         responder = LLMResponder(bus=MessageBus(), provider=_Provider(), workspace=tmp_path)
+        responder._history_selected = True
+        projected.wire(responder)
 
-        out = await responder.generate_reply(
-            InboundEvent(
-                channel="whatsapp",
-                chat_id="group@g.us",
-                sender_id="4915253696948",
-                content="Ich BIN Carschten",
-                message_id="carschten-1",
-                is_group=True,
-                reply_to_bot=True,
-                reply_to_message_id="bot-1",
-                reply_to_participant="203075365150770@lid",
-                reply_to_text="Carschten, 50+ oder nicht...",
-                raw_metadata={"sender_name": "Carschten"},
-            ),
-            PolicyDecision(
-                accept_message=True,
-                should_respond=True,
-                allowed_tools=frozenset(),
-                reason="test",
-            ),
-        )
-
-        history = responder.sessions.get_or_create("whatsapp:group@g.us").get_history()
+        async with projected.turn() as snapshot:
+            from yeoman_gateway.adapters.reply_archive_history import HistoryReplyArchiveAdapter
+            from yeoman_gateway.history.queries import HistoryQueries
+            projected_row = HistoryReplyArchiveAdapter(HistoryQueries(snapshot)).row("whatsapp", chat_id, "carschten-1")
+            out = await responder.generate_reply(
+                InboundEvent(
+                    channel="whatsapp",
+                    chat_id=chat_id,
+                    sender_id="4915253696948",
+                    content="Ich BIN Carschten",
+                    message_id="carschten-1",
+                    is_group=True,
+                    reply_to_bot=True,
+                    reply_to_message_id="bot-1",
+                    reply_to_participant="203075365150770@lid",
+                    reply_to_text="Carschten, 50+ oder nicht...",
+                    raw_metadata={"sender_name": "Carschten"},
+                ),
+                PolicyDecision(
+                    accept_message=True,
+                    should_respond=True,
+                    allowed_tools=frozenset(),
+                    reason="test",
+                ),
+            )
+            history = responder.sessions.get_or_create(
+                "observed", channel="whatsapp", chat_id=chat_id, history_snapshot=snapshot
+            ).get_history()
         await responder.aclose()
 
         assert out == "verstanden"
-        assert history[0]["sender_id"] == "4915253696948"
-        assert history[0]["sender_name"] == "Carschten"
+        assert history[0]["sender_id"] == "203075365150770@lid"
         assert history[0]["message_id"] == "carschten-1"
-        assert history[0]["reply_to_message_id"] == "bot-1"
-        assert history[0]["reply_to_participant"] == "203075365150770@lid"
-        assert history[0]["reply_to_text"] == "Carschten, 50+ oder nicht..."
+        assert projected_row is not None
+        assert projected_row["sender_name"] == "Carschten"
+        assert projected_row["reply_to_message_id"] == "bot-1"
+        projected.close()
 
     @pytest.mark.asyncio
     async def test_side_effecting_tool_without_explicit_target_gets_repair_result(
@@ -768,25 +797,30 @@ class TestDeliveryRepairGate:
             workspace=tmp_path,
             max_iterations=2,
         )
+        projected = ProjectedHistory(tmp_path / "history")
+        responder._history_selected = True
+        projected.wire(responder)
 
-        out = await responder.generate_reply(
-            InboundEvent(
-                channel="whatsapp",
-                chat_id="491234567890-123456789@g.us",
-                sender_id="user@s.whatsapp.net",
-                content="Arvid schick eine Sprachnachricht an Martin: Kommst du?",
-                is_group=True,
-                mentioned_bot=True,
-            ),
-            PolicyDecision(
-                accept_message=True,
-                should_respond=True,
-                allowed_tools=frozenset({"send_voice"}),
-                reason="test",
-            ),
-        )
+        async with projected.turn():
+            out = await responder.generate_reply(
+                InboundEvent(
+                    channel="whatsapp",
+                    chat_id="491234567890-123456789@g.us",
+                    sender_id="10001@s.whatsapp.net",
+                    content="Arvid schick eine Sprachnachricht an Martin: Kommst du?",
+                    is_group=True,
+                    mentioned_bot=True,
+                ),
+                PolicyDecision(
+                    accept_message=True,
+                    should_respond=True,
+                    allowed_tools=frozenset({"send_voice"}),
+                    reason="test",
+                ),
+            )
 
         await responder.aclose()
+        projected.close()
 
         assert out == "Welchen Martin meinst du?"
         assert provider.calls == 2
@@ -797,58 +831,94 @@ class TestDeliveryRepairGate:
 
 
 class TestRecallConversationTool:
-    """recall_conversation tool should search session history."""
+    """recall_conversation should search projected WhatsApp history."""
 
     @pytest.fixture
     def session_manager(self, tmp_path):
-        return SessionManager(workspace=tmp_path, sessions_dir=tmp_path / "sessions")
+        from yeoman_gateway.session.operational import OperationalSessions
+
+        operational = OperationalSessions(tmp_path / "sessions.db")
+        manager = SessionManager(workspace=tmp_path, sessions_dir=tmp_path / "sessions",
+                                 operational_store=operational)
+        yield manager
+        operational.close()
+
+    @pytest.fixture
+    def history(self, tmp_path):
+        history = ProjectedHistory(tmp_path / "history")
+        yield history
+        history.close()
 
     @pytest.fixture
     def tool(self, session_manager):
         t = RecallConversationTool(session_manager=session_manager)
-        t.set_context("whatsapp", "owner@s.whatsapp.net")
+        t.set_context("whatsapp", "10001@s.whatsapp.net")
         return t
 
-    @pytest.mark.asyncio
-    async def test_finds_matching_messages(self, tool, session_manager):
-        session = session_manager.get_or_create("whatsapp:owner@s.whatsapp.net")
-        session.add_message("user", "let's use PostgreSQL for the database")
-        session.add_message("assistant", "sure, PostgreSQL is a good choice")
-        session.add_message("user", "what about Redis for caching?")
-        session_manager.save(session)
+    async def _execute(self, tool, history, **kwargs):
+        from yeoman_gateway.processing.tool_context import (
+            ToolInvocationContext,
+            reset_tool_context,
+            set_tool_context,
+        )
 
-        result = await tool.execute(query="PostgreSQL")
+        async with history.turn() as snapshot:
+            token = set_tool_context(ToolInvocationContext(
+                channel="whatsapp", chat_id="10001@s.whatsapp.net", history_snapshot=snapshot,
+            ))
+            try:
+                return await tool.execute(**kwargs)
+            finally:
+                reset_tool_context(token)
+
+    @pytest.mark.asyncio
+    async def test_finds_matching_messages(self, tool, history):
+        history.add_message(chat_id="10001@s.whatsapp.net", message_id="m1",
+                            text="let's use PostgreSQL for the database", timestamp=1_791_000_000_000,
+                            sender_id="10001@s.whatsapp.net", participant="10001@s.whatsapp.net")
+        history.add_message(chat_id="10001@s.whatsapp.net", message_id="m2",
+                            text="sure, PostgreSQL is a good choice", timestamp=1_791_000_001_000,
+                            direction="out")
+        history.add_message(chat_id="10001@s.whatsapp.net", message_id="m3",
+                            text="what about Redis for caching?", timestamp=1_791_000_002_000,
+                            sender_id="10001@s.whatsapp.net", participant="10001@s.whatsapp.net")
+
+        result = await self._execute(tool, history, query="PostgreSQL")
         assert "PostgreSQL" in result
         assert "Redis" not in result
 
     @pytest.mark.asyncio
-    async def test_returns_no_matches(self, tool, session_manager):
-        session = session_manager.get_or_create("whatsapp:owner@s.whatsapp.net")
-        session.add_message("user", "hello world")
-        session_manager.save(session)
+    async def test_returns_no_matches(self, tool, history):
+        history.add_message(chat_id="10001@s.whatsapp.net", message_id="m1",
+                            text="hello world", timestamp=1_791_000_000_000,
+                            sender_id="10001@s.whatsapp.net", participant="10001@s.whatsapp.net")
 
-        result = await tool.execute(query="kubernetes")
+        result = await self._execute(tool, history, query="kubernetes")
         assert "No matching" in result or "no match" in result.lower()
 
     @pytest.mark.asyncio
-    async def test_searches_across_boundaries(self, tool, session_manager):
-        session = session_manager.get_or_create("whatsapp:owner@s.whatsapp.net")
-        session.add_message("user", "use PostgreSQL")
-        session.add_boundary()
-        session.add_message("user", "hello")
-        session_manager.save(session)
+    async def test_searches_across_boundaries(self, tool, history, session_manager):
+        history.add_message(chat_id="10001@s.whatsapp.net", message_id="m1",
+                            text="use PostgreSQL", timestamp=1_791_000_000_000,
+                            sender_id="10001@s.whatsapp.net", participant="10001@s.whatsapp.net")
+        history.add_message(chat_id="10001@s.whatsapp.net", message_id="m2",
+                            text="hello", timestamp=1_791_000_001_000,
+                            sender_id="10001@s.whatsapp.net", participant="10001@s.whatsapp.net")
+        session_manager.operational_store.set_boundary(
+            channel="whatsapp", chat_id="10001@s.whatsapp.net", at_ms=1_791_000_000_500,
+        )
 
-        result = await tool.execute(query="PostgreSQL")
+        result = await self._execute(tool, history, query="PostgreSQL")
         assert "PostgreSQL" in result
 
     @pytest.mark.asyncio
-    async def test_respects_max_messages(self, tool, session_manager):
-        session = session_manager.get_or_create("whatsapp:owner@s.whatsapp.net")
+    async def test_respects_max_messages(self, tool, history):
         for i in range(50):
-            session.add_message("user", f"message about topic {i}")
-        session_manager.save(session)
+            history.add_message(chat_id="10001@s.whatsapp.net", message_id=f"m{i}",
+                                text=f"message about topic {i}", timestamp=1_791_000_000_000 + i,
+                                sender_id="10001@s.whatsapp.net", participant="10001@s.whatsapp.net")
 
-        result = await tool.execute(query="topic", max_messages=5)
+        result = await self._execute(tool, history, query="topic", max_messages=5)
         lines = [line for line in result.strip().split("\n") if line.strip() and not line.startswith("Found")]
         assert len(lines) <= 5
 

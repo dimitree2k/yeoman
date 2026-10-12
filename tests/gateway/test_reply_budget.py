@@ -76,6 +76,14 @@ def test_policy_resolves_reply_budget_block(tmp_path: Path) -> None:
     assert resolved.reply_budget["ambient_window_limit"] == 3
 
 
+
+@pytest.fixture(autouse=True)
+def _project_whatsapp_responder_history(monkeypatch, request, tmp_path):
+    from tests.gateway.history_test_helpers import install_projected_responder_history
+
+    install_projected_responder_history(monkeypatch, request, tmp_path)
+
+
 @pytest.mark.asyncio
 async def test_reply_budget_middleware_derives_turn_budget_and_preserves_reply_context() -> None:
     ctx = PipelineContext(
@@ -187,7 +195,7 @@ def test_reply_budget_prompt_is_trusted_system_context(tmp_path: Path, compact: 
 
 @pytest.mark.asyncio
 @pytest.mark.parametrize("compact", [False, True])
-async def test_responder_persists_budgeted_reply_in_session(tmp_path: Path, compact: bool) -> None:
+async def test_responder_applies_budget_before_return(tmp_path: Path, compact: bool) -> None:
     persona_text = None
     if compact:
         (tmp_path / "prompts").mkdir()
@@ -229,11 +237,10 @@ async def test_responder_persists_budgeted_reply_in_session(tmp_path: Path, comp
         ),
     )
 
-    session = responder.sessions.get_or_create("whatsapp:group@g.us")
-    assistant_rows = [row for row in session.messages if row.get("role") == "assistant"]
-    # Compact personas are no longer exempt: the configured budget clips both branches.
+
+    # WhatsApp reply history is archived by dispatch; generation applies its budget first.
     assert reply == _SHORT_REPLY
-    assert assistant_rows[-1]["content"] == reply
+
 
 
 @pytest.mark.asyncio

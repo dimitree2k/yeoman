@@ -16,7 +16,6 @@ from yeoman_gateway.app.bootstrap import (
     _build_participation_runtime,
     _has_pending_participation_recovery,
     _offer_participation_trigger,
-    _participation_knowledge_readers,
     build_effect_router,
     build_gateway_runtime,
     build_reconciliation_service,
@@ -41,124 +40,12 @@ def _history_knowledge_config(tmp_path: Path, name: str) -> dict[str, object]:
     }
 
 
-def test_participation_knowledge_context_uses_verified_single_source_author() -> None:
-    opportunity = SimpleNamespace(
-        channel="whatsapp", chat_id="group@g.us", source_event_ids=("m1", "m2")
-    )
-    context = {
-        "messages": [
-            {"event_id": "m1", "sender_id": "anna"},
-            {"event_id": "m2", "sender_id": "anna"},
-        ]
-    }
-    registry = SimpleNamespace(
-        get_chat=lambda channel, chat: {
-            "metadata": {"participants": ["anna", "ben"]}
-        }
-    )
-    readers = _participation_knowledge_readers(
-        opportunity, context, chat_registry=registry, knowledge=SimpleNamespace(policy_revision=7)
-    )
-    assert readers.principals == ("anna",)
-    read, facts = readers.readers[0].read_context, readers.readers[0].fact_context
-    assert read.principal_id == facts.principal_id == "anna"
-    assert read.purpose == "proactive" and read.owner is False and facts.owner is False
-    assert read.recipient_principals == facts.current_members == frozenset({"anna", "ben"})
 
 
-def test_participation_knowledge_context_covers_every_trigger_author() -> None:
-    """A coalesced multi-author trigger gets one verified reader per distinct author."""
-    opportunity = SimpleNamespace(
-        channel="whatsapp", chat_id="group@g.us", source_event_ids=("m1", "m2", "m3")
-    )
-    registry = SimpleNamespace(
-        get_chat=lambda channel, chat: {
-            "metadata": {"participants": ["anna", "ben", "carla"]}
-        }
-    )
-    knowledge = SimpleNamespace(policy_revision=7)
-    shared = {"messages": [
-        {"event_id": "m1", "sender_id": "ben"},
-        {"event_id": "m2", "sender_id": "anna"},
-        {"event_id": "m3", "sender_id": "ben"},
-    ]}
-    readers = _participation_knowledge_readers(
-        opportunity, shared, chat_registry=registry, knowledge=knowledge
-    )
-    # Sorted, distinct: a repeated author is not read twice, and order cannot matter.
-    assert readers.principals == ("anna", "ben")
-    for reader in readers.readers:
-        assert reader.read_context.recipient_principals == frozenset({"anna", "ben", "carla"})
-        assert reader.fact_context.current_members == frozenset({"anna", "ben", "carla"})
-
-    # An author who is not a current member fails the whole read closed.
-    departed = {"messages": [
-        {"event_id": "m1", "sender_id": "anna"},
-        {"event_id": "m2", "sender_id": "mallory"},
-        {"event_id": "m3", "sender_id": "ben"},
-    ]}
-    assert _participation_knowledge_readers(
-        opportunity, departed, chat_registry=registry, knowledge=knowledge
-    ) == "denied"
 
 
-def test_participation_knowledge_context_fails_closed_without_members_or_author() -> None:
-    """No proven membership and no proven author both refuse, never one author's read."""
-    knowledge = SimpleNamespace(policy_revision=7)
-    opportunity = SimpleNamespace(
-        channel="whatsapp", chat_id="group@g.us", source_event_ids=("m1",)
-    )
-    context = {"messages": [{"event_id": "m1", "sender_id": "anna"}]}
-
-    def _registry_with(participants):
-        return SimpleNamespace(
-            get_chat=lambda channel, chat: {"metadata": {"participants": participants}}
-        )
-
-    assert _participation_knowledge_readers(
-        opportunity,
-        context,
-        chat_registry=SimpleNamespace(get_chat=lambda channel, chat: None),
-        knowledge=knowledge,
-    ) == "unknown_membership"
-    assert _participation_knowledge_readers(
-        opportunity, context, chat_registry=_registry_with([]), knowledge=knowledge
-    ) == "unknown_membership"
-
-    def _unavailable(channel, chat):
-        raise RuntimeError("registry unavailable")
-
-    assert _participation_knowledge_readers(
-        opportunity,
-        context,
-        chat_registry=SimpleNamespace(get_chat=_unavailable),
-        knowledge=knowledge,
-    ) == "unknown_membership"
-    # A trigger source the archive cannot resolve has no proven author at all.
-    assert _participation_knowledge_readers(
-        opportunity,
-        {"messages": [{"event_id": "other", "sender_id": "anna"}]},
-        chat_registry=_registry_with(["anna", "ben"]),
-        knowledge=knowledge,
-    ) == "source_unavailable"
 
 
-def test_participation_knowledge_context_fails_closed_for_unverified_chat_types() -> None:
-    registry = SimpleNamespace(
-        get_chat=lambda channel, chat: {
-            "metadata": {"participants": ["anna", "ben"]}
-        }
-    )
-    context = {"messages": [{"event_id": "m1", "sender_id": "anna"}]}
-    knowledge = SimpleNamespace(policy_revision=7)
-
-    for channel, chat_id in (("telegram", "-100123"), ("whatsapp", "anna@s.whatsapp.net")):
-        opportunity = SimpleNamespace(
-            channel=channel, chat_id=chat_id, source_event_ids=("m1",)
-        )
-        assert _participation_knowledge_readers(
-            opportunity, context, chat_registry=registry, knowledge=knowledge
-        ) == "unsupported_chat_type"
 
 
 @pytest.mark.asyncio
@@ -222,9 +109,7 @@ def test_legacy_consciousness_flag_does_not_build_a_social_runtime(
         assert runtime.speakup_log is None
         assert not hasattr(runtime, "consciousness")
     finally:
-        for store in (runtime.inbound_archive, runtime.chat_registry, runtime.contacts, runtime.memory):
-            if store is not None:
-                store.close()
+        pass  # retired runtime fields are not lifecycle resources
 
 
 @pytest.mark.asyncio
@@ -301,9 +186,7 @@ async def test_persona_evolution_lazily_reads_historical_speakup_log(
             await captured_logs[0].history("whatsapp", "group@g.us")
     finally:
         await runtime.history_projector.stop()
-        for store in (runtime.inbound_archive, runtime.chat_registry, runtime.contacts, runtime.memory):
-            if store is not None:
-                store.close()
+        pass  # retired runtime fields are not lifecycle resources
 
 
 @pytest.mark.asyncio
@@ -371,17 +254,18 @@ async def test_failed_startup_recovery_blocks_every_ingress() -> None:
         async def stop(self) -> None:
             return None
 
+    class _History(_Idle):
+        async def stop(self) -> None:
+            return None
+
     idle = _Idle()
     runtime = GatewayRuntime(
         orchestrator=idle,  # type: ignore[arg-type]
         channels=idle,  # type: ignore[arg-type]
         cron=idle,  # type: ignore[arg-type]
         heartbeat=idle,  # type: ignore[arg-type]
-        inbound_archive=idle,  # type: ignore[arg-type]
+        history_projector=_History(),  # type: ignore[arg-type]
         responder=idle,  # type: ignore[arg-type]
-        memory=idle,  # type: ignore[arg-type]
-        contacts=idle,  # type: ignore[arg-type]
-        chat_registry=idle,
         gateway_socket=_Socket(),  # type: ignore[arg-type]
         reconciliation=_Recovery(),
     )
@@ -477,9 +361,7 @@ def test_processing_only_pending_data_enables_recovery_without_creating_speakup_
         assert not speakup_path.exists()
     finally:
         runtime.processing.close()
-        for store in (runtime.inbound_archive, runtime.chat_registry, runtime.contacts, runtime.memory):
-            if store is not None:
-                store.close()
+        pass  # retired runtime fields are not lifecycle resources
 
 
 def test_pending_recovery_probe_fails_closed_on_corrupt_existing_ledger(
@@ -710,7 +592,6 @@ async def test_receipts_reconcile_with_learning_and_consciousness_disabled(
         runtime.heartbeat = idle  # type: ignore[assignment]
         runtime.bus = None
         runtime.gateway_socket = _Socket()  # type: ignore[assignment]
-        runtime.shared_facts = None
         runtime.startup_hook = None
         await runtime.run()
         assert runtime.reconciliation.running is False
@@ -785,7 +666,6 @@ async def test_receipts_reconcile_with_learning_and_consciousness_disabled(
     log_only_runtime.heartbeat = idle  # type: ignore[assignment]
     log_only_runtime.bus = None
     log_only_runtime.gateway_socket = None
-    log_only_runtime.shared_facts = None
     log_only_runtime.startup_hook = None
     await log_only_runtime.run()
     assert log_only_processing.exists()
@@ -825,7 +705,6 @@ async def test_receipts_reconcile_with_learning_and_consciousness_disabled(
     empty_runtime.heartbeat = idle  # type: ignore[assignment]
     empty_runtime.bus = None
     empty_runtime.gateway_socket = None
-    empty_runtime.shared_facts = None
     empty_runtime.startup_hook = None
     await empty_runtime.run()
     assert empty_processing.exists()
@@ -844,12 +723,15 @@ async def test_admin_terminal_dispatch_finishes_exact_overlapping_direct_binding
 
     store = ProcessingStore(tmp_path / "processing.db")
     released: list[tuple[str, str]] = []
+    from tests.gateway.history_test_helpers import ProjectedHistory
+
+    archive = ProjectedHistory(tmp_path / "terminal-history")
     service = OrchestratorService(
         bus=MessageBus(),
         orchestrator=_TerminalAdmin(),
         typing_adapter=SimpleNamespace(),
         telemetry=SimpleNamespace(),
-        memory=SimpleNamespace(),
+        history_projector=archive,
         processing_store=store,
         release_participation_chat=lambda channel, chat_id: released.append(
             (channel, chat_id)
@@ -873,6 +755,7 @@ async def test_admin_terminal_dispatch_finishes_exact_overlapping_direct_binding
         assert not store.direct_work_active("whatsapp", "group@g.us")
         assert released == [("whatsapp", "group@g.us")]
     finally:
+        archive.close()
         store.close()
 
 
@@ -1055,7 +938,7 @@ def test_restart_activation_transition_new_offers_use_new_epoch(
             source_owner=SourceOwner(store=log),
             log=log,
             policy_engine=engine,
-            inbound_archive=SecondaryArchive(None, config.history),
+            inbound_archive=SecondaryArchive(),
             processing_store=processing_store,
             responder=UnprovenReactionResponder(),
             policy_adapter=adapter,
@@ -1316,7 +1199,6 @@ async def test_bootstrap_reaction_reaches_transport_with_reserved_effect_id(
         store,
         bus,
         participation_ledger=log,
-        inbound_archive=SecondaryArchive(None, config.history),
     )
     assert router is not None
     reaction_calls: list[object] = []
@@ -1363,7 +1245,7 @@ async def test_bootstrap_reaction_reaches_transport_with_reserved_effect_id(
         source_owner=SourceOwner(store=log),
         log=log,
         policy_engine=engine,
-        inbound_archive=SecondaryArchive(None, config.history),
+        inbound_archive=SecondaryArchive(),
         processing_store=store,
         responder=responder,
         policy_adapter=adapter,
@@ -1489,6 +1371,25 @@ async def test_participation_writer_uses_explicit_route_provider_and_model(
         model_router=ModelRouter(config.models),
         routed_provider_factory=provider_factory,  # type: ignore[arg-type]
     )
+    from tests.gateway.history_test_helpers import ProjectedHistory
+
+    archive = ProjectedHistory(
+        tmp_path / "writer-history",
+        groups=[{
+            "chat_id": "group@g.us",
+            "participants": ["4910000000002@s.whatsapp.net"],
+            "timestamp": 1_791_000_000,
+        }],
+        messages=[{
+            "chat_id": "group@g.us",
+            "message_id": "m1",
+            "text": "question",
+            "timestamp": 1_791_000_000,
+            "sender_id": "4910000000002@s.whatsapp.net",
+            "participant": "4910000000002@s.whatsapp.net",
+        }],
+    )
+    responder._history_projector = archive
     submission = _ParticipationSubmission(
         responder=responder,
         writer_profile="participation_writer",
@@ -1513,37 +1414,39 @@ async def test_participation_writer_uses_explicit_route_provider_and_model(
     )
 
     try:
-        draft = await submission.generate_draft(
-            opportunity=opportunity,
-            decision=decision,
-            context={"messages": [{"event_id": "m1", "sender": "Anna", "text": "question"}]},
-        )
-        assert draft == "explicit writer draft"
-        assert calls == [("writer/model", "openrouter")]
-
-        writer_mode = "timeout"
-        with pytest.raises(ParticipationDraftError, match="timeout"):
-            await submission.generate_draft(
+        async with archive.turn():
+            draft = await submission.generate_draft(
                 opportunity=opportunity,
                 decision=decision,
                 context={"messages": [{"event_id": "m1", "sender": "Anna", "text": "question"}]},
             )
+            assert draft == "explicit writer draft"
+            assert calls == [("writer/model", "openrouter")]
 
-        writer_mode = "empty"
-        assert await submission.generate_draft(
-            opportunity=opportunity,
-            decision=decision,
-            context={"messages": [{"event_id": "m1", "sender": "Anna", "text": "question"}]},
-        ) is None
+            writer_mode = "timeout"
+            with pytest.raises(ParticipationDraftError, match="timeout"):
+                await submission.generate_draft(
+                    opportunity=opportunity,
+                    decision=decision,
+                    context={"messages": [{"event_id": "m1", "sender": "Anna", "text": "question"}]},
+                )
 
-        writer_mode = "unbound"
-        with pytest.raises(ParticipationDraftError, match="provider_error"):
-            await submission.generate_draft(
+            writer_mode = "empty"
+            assert await submission.generate_draft(
                 opportunity=opportunity,
                 decision=decision,
                 context={"messages": [{"event_id": "m1", "sender": "Anna", "text": "question"}]},
-            )
+            ) is None
+
+            writer_mode = "unbound"
+            with pytest.raises(ParticipationDraftError, match="provider_error"):
+                await submission.generate_draft(
+                    opportunity=opportunity,
+                    decision=decision,
+                    context={"messages": [{"event_id": "m1", "sender": "Anna", "text": "question"}]},
+                )
     finally:
+        archive.close()
         await responder.aclose()
 
 
@@ -1702,7 +1605,6 @@ async def test_participation_approval_rechecks_pause_and_submits_once(
         store,
         bus,
         participation_ledger=log,
-        inbound_archive=SecondaryArchive(None, config.history),
     )
     assert router is not None
     target_calls: list[object] = []
@@ -1740,8 +1642,8 @@ async def test_participation_approval_rechecks_pause_and_submits_once(
         policy_engine=engine,
         bus=bus,
         log=log,
-        inbound_archive=SecondaryArchive(None, config.history),
-        memory=None,
+        inbound_archive=SecondaryArchive(),
+
         security=NoopSecurity(),
         approval_store=approval_store,
         service_effects=effects,
@@ -1753,7 +1655,7 @@ async def test_participation_approval_rechecks_pause_and_submits_once(
         source_owner=SourceOwner(store=log),
         log=log,
         policy_engine=engine,
-        inbound_archive=SecondaryArchive(None, config.history),
+        inbound_archive=SecondaryArchive(),
         processing_store=store,
         responder=responder,
         policy_adapter=adapter,
@@ -2016,7 +1918,6 @@ async def test_real_effect_transport_denies_participation_after_pause(
     from yeoman_gateway.adapters.policy_engine import EnginePolicyAdapter
     from yeoman_gateway.consciousness.log import SpeakupLog
     from yeoman_gateway.consciousness.participation_runtime import ActivationEpochTracker
-    from yeoman_gateway.history.export import SecondaryArchive
     from yeoman_gateway.processing.models import (
         EffectEnvelope,
         EffectTarget,
@@ -2144,7 +2045,6 @@ async def test_real_effect_transport_denies_participation_after_pause(
                 store,
                 MessageBus(),
                 participation_ledger=log,
-                inbound_archive=SecondaryArchive(None, config.history),
             )
             assert router is not None
             sent: list[object] = []

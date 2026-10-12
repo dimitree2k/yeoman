@@ -45,6 +45,14 @@ def _decision(*, is_owner: bool = False) -> PolicyDecision:
     )
 
 
+
+@pytest.fixture(autouse=True)
+def _project_whatsapp_responder_history(monkeypatch, request, tmp_path):
+    from tests.gateway.history_test_helpers import install_projected_responder_history
+
+    install_projected_responder_history(monkeypatch, request, tmp_path)
+
+
 @pytest.mark.asyncio
 async def test_group_reply_to_landed_social_line_holds_back(tmp_path: Path) -> None:
     workspace = tmp_path / "ws"
@@ -58,7 +66,7 @@ async def test_group_reply_to_landed_social_line_holds_back(tmp_path: Path) -> N
         InboundEvent(
             channel="whatsapp",
             chat_id="group@g.us",
-            sender_id="u1",
+            sender_id="10001@s.whatsapp.net",
             content="Cringe direkt auf Mutter zu gehen",
             is_group=True,
             reply_to_bot=True,
@@ -69,7 +77,7 @@ async def test_group_reply_to_landed_social_line_holds_back(tmp_path: Path) -> N
         InboundEvent(
             channel="whatsapp",
             chat_id="group@g.us",
-            sender_id="u1",
+            sender_id="10001@s.whatsapp.net",
             content="haha safe",
             is_group=True,
             reply_to_bot=True,
@@ -102,7 +110,7 @@ async def test_group_new_opinion_request_after_social_line_does_not_hold_back(
         InboundEvent(
             channel="whatsapp",
             chat_id="group@g.us",
-            sender_id="u1",
+            sender_id="10001@s.whatsapp.net",
             content="Cringe direkt auf Mutter zu gehen",
             is_group=True,
             reply_to_bot=True,
@@ -113,7 +121,7 @@ async def test_group_new_opinion_request_after_social_line_does_not_hold_back(
         InboundEvent(
             channel="whatsapp",
             chat_id="group@g.us",
-            sender_id="u2",
+            sender_id="10002@s.whatsapp.net",
             content="@203075365150770 wie findest du antigravity? Arbeite ich gerade das erste Mal mit",
             is_group=True,
             mentioned_bot=True,
@@ -146,7 +154,7 @@ async def test_group_trading_exit_question_after_social_line_does_not_hold_back(
         InboundEvent(
             channel="whatsapp",
             chat_id="group@g.us",
-            sender_id="u1",
+            sender_id="10001@s.whatsapp.net",
             content="Cringe direkt auf Mutter zu gehen",
             is_group=True,
             reply_to_bot=True,
@@ -157,7 +165,7 @@ async def test_group_trading_exit_question_after_social_line_does_not_hold_back(
         InboundEvent(
             channel="whatsapp",
             chat_id="group@g.us",
-            sender_id="u2",
+            sender_id="10002@s.whatsapp.net",
             content="@203075365150770 was macht AMD und Intel und so? Wann aussteigen? :)",
             is_group=True,
             mentioned_bot=True,
@@ -190,7 +198,7 @@ async def test_group_voice_retry_refinement_after_social_line_does_not_hold_back
         InboundEvent(
             channel="whatsapp",
             chat_id="group@g.us",
-            sender_id="u1",
+            sender_id="10001@s.whatsapp.net",
             content="Sing die deutsche Nationalhymne kurz in einer Sprachnachricht",
             is_group=True,
             reply_to_bot=True,
@@ -201,7 +209,7 @@ async def test_group_voice_retry_refinement_after_social_line_does_not_hold_back
         InboundEvent(
             channel="whatsapp",
             chat_id="group@g.us",
-            sender_id="u1",
+            sender_id="10001@s.whatsapp.net",
             content="Textsicherheit ist da\nJetzt aber mit Melodie \nDas war nicht gesungen",
             is_group=True,
             reply_to_bot=True,
@@ -231,7 +239,7 @@ async def test_group_social_reply_ends_rhetorical_question_with_full_stop(
         InboundEvent(
             channel="whatsapp",
             chat_id="group@g.us",
-            sender_id="u1",
+            sender_id="10001@s.whatsapp.net",
             content="Cringe direkt auf Mutter zu gehen",
             is_group=True,
             reply_to_bot=True,
@@ -257,7 +265,7 @@ async def test_group_genuine_clarifying_question_is_not_rewritten(
         InboundEvent(
             channel="whatsapp",
             chat_id="group@g.us",
-            sender_id="u1",
+            sender_id="10001@s.whatsapp.net",
             content="Das da",
             is_group=True,
             reply_to_bot=True,
@@ -330,7 +338,7 @@ async def test_group_other_user_picks_up_after_social_reply_does_not_hold_back(
         InboundEvent(
             channel="whatsapp",
             chat_id="group@g.us",
-            sender_id="u1",
+            sender_id="10001@s.whatsapp.net",
             content="Cringe direkt auf Mutter zu gehen",
             is_group=True,
             reply_to_bot=True,
@@ -341,7 +349,7 @@ async def test_group_other_user_picks_up_after_social_reply_does_not_hold_back(
         InboundEvent(
             channel="whatsapp",
             chat_id="group@g.us",
-            sender_id="u2",
+            sender_id="10002@s.whatsapp.net",
             content="@203075365150770 transkribieren pls",
             is_group=True,
             mentioned_bot=True,
@@ -372,7 +380,7 @@ async def test_group_holdback_decays_after_ten_minutes(tmp_path: Path) -> None:
         InboundEvent(
             channel="whatsapp",
             chat_id="group@g.us",
-            sender_id="u1",
+            sender_id="10001@s.whatsapp.net",
             content="Cringe direkt auf Mutter zu gehen",
             is_group=True,
             reply_to_bot=True,
@@ -380,18 +388,18 @@ async def test_group_holdback_decays_after_ten_minutes(tmp_path: Path) -> None:
         _decision(),
     )
 
-    session = responder.sessions.get_or_create("whatsapp:group@g.us")
-    stale = (datetime.now() - timedelta(minutes=15)).isoformat()
-    for message in session.messages:
-        if message.get("role") in {"user", "assistant"}:
-            message["timestamp"] = stale
-    responder.sessions.save(session)
+    history = responder._test_projected_history
+    stale_ms = int((datetime.now() - timedelta(minutes=15)).timestamp() * 1000)
+    for index, record in enumerate(history.records):
+        record["received_ms"] = stale_ms + index
+        record["native"]["payload"]["timestamp"] = stale_ms + index
+    history.dirty = True
 
     second = await responder.generate_reply(
         InboundEvent(
             channel="whatsapp",
             chat_id="group@g.us",
-            sender_id="u1",
+            sender_id="10001@s.whatsapp.net",
             content="haha safe",
             is_group=True,
             reply_to_bot=True,
@@ -416,7 +424,7 @@ async def test_group_talkative_cooldown_sets_blunt_boundary(tmp_path: Path) -> N
         InboundEvent(
             channel="whatsapp",
             chat_id="group@g.us",
-            sender_id="u1",
+            sender_id="10001@s.whatsapp.net",
             content="Arvid check Tesla Aktie bitte",
             is_group=True,
             mentioned_bot=True,
@@ -435,7 +443,7 @@ async def test_group_talkative_cooldown_sets_blunt_boundary(tmp_path: Path) -> N
         InboundEvent(
             channel="whatsapp",
             chat_id="group@g.us",
-            sender_id="u1",
+            sender_id="10001@s.whatsapp.net",
             content="Arvid check Tesla Aktie nochmal",
             is_group=True,
             mentioned_bot=True,

@@ -752,7 +752,7 @@ async def test_live_participation_observer_budget_is_not_legacy_planner_only(
         bus=MessageBus(),
         log=log,
         inbound_archive=archive,
-        memory=None,
+
         security=None,
     )
     try:
@@ -784,7 +784,7 @@ def test_consciousness_tools_prefers_shared_activation_provider() -> None:
         bus=object(),
         log=object(),
         inbound_archive=object(),
-        memory=None,
+
         security=None,
         activation_provider=lambda channel, chat_id: shared,
     )
@@ -885,7 +885,7 @@ def test_consciousness_planner_skips_an_owned_chat(tmp_path: Path) -> None:
         bus=MessageBus(),
         log=SpeakupLog(tmp_path / "speakups.db"),
         inbound_archive=object(),
-        memory=None,
+
         security=None,
     )
     eligible = {chat.chat_id for chat in tools._eligible_chats()}  # noqa: SLF001

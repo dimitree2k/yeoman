@@ -1286,21 +1286,13 @@ def test_v1_inventory_never_carries_row_content(tmp_path: Path):
 
 
 def test_v1_inventory_refuses_a_v2_snapshot(tmp_path: Path):
-    from yeoman_gateway.knowledge.api import open_knowledge_store
-    from yeoman_gateway.knowledge.authority import FakePolicyAuthority, FakeSourceAuthority
-
     journal = processing_snapshot(tmp_path / "processing.db")
-    v2 = tmp_path / "v2.db"
-    service = open_knowledge_store(
-        v2,
-        workspace_id="ws",
-        source_authority=FakeSourceAuthority(),
-        policy_authority=FakePolicyAuthority(),
-    )
-    service.close()
-    inventory = inspect_v1(source=v2, processing=journal)
+    source = _build_knowledge_snapshot(tmp_path)
+    before = source.read_bytes()
+    inventory = inspect_v1(source=source, processing=journal)
     assert inventory.verdict == "refused"
     assert inventory.knowledge_schema_version == "2"
+    assert source.read_bytes() == before
 
 
 def test_v1_inventory_reports_a_missing_input_as_a_stable_error(tmp_path: Path):
@@ -1315,23 +1307,15 @@ def test_v1_inventory_reports_a_missing_input_as_a_stable_error(tmp_path: Path):
 
 
 def test_v1_upgrade_refuses_a_non_v1_source_without_creating_a_target(tmp_path: Path):
-    from yeoman_gateway.knowledge.api import open_knowledge_store
-    from yeoman_gateway.knowledge.authority import FakePolicyAuthority, FakeSourceAuthority
-
     journal = processing_snapshot(tmp_path / "processing.db")
-    v2 = tmp_path / "v2.db"
-    service = open_knowledge_store(
-        v2,
-        workspace_id="ws",
-        source_authority=FakeSourceAuthority(),
-        policy_authority=FakePolicyAuthority(),
-    )
-    service.close()
+    source = _build_knowledge_snapshot(tmp_path)
+    before = source.read_bytes()
     target = tmp_path / "target.db"
     manifest = tmp_path / "manifest.json"
     with pytest.raises(UpgradeError) as excinfo:
-        upgrade_v1(source=v2, processing=journal, target=target, manifest=manifest)
+        upgrade_v1(source=source, processing=journal, target=target, manifest=manifest)
     assert excinfo.value.code == "unsupported_source_schema"
+    assert source.read_bytes() == before
     assert not target.exists()
     assert not manifest.exists()
 

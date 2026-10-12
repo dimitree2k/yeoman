@@ -1,85 +1,38 @@
-from __future__ import annotations
-
-from pathlib import Path
+"""The memory CLI uses bounded Gateway reads and refuses retired maintenance."""
+from unittest.mock import Mock
 
 import pytest
 from typer.testing import CliRunner
 from yeoman_gateway.cli.commands import app
-from yeoman_shared.config.loader import save_config
-from yeoman_shared.config.schema import Config
-
-runner = CliRunner()
 
 
 @pytest.fixture(autouse=True)
 def isolated_memory_cli_config(tmp_path, monkeypatch):
-    # Retained S3 service units must not change the worker's live-default config.
     monkeypatch.setattr("yeoman_shared.config.loader.get_config_path", lambda: tmp_path / "config.json")
 
 
+def test_memory_search_uses_authorized_gateway(monkeypatch):
+    endpoint = Mock(return_value={"statements": ["synthetic statement"]})
+    monkeypatch.setattr("yeoman_gateway.history.export.cli_secondary_request", endpoint)
+    result = CliRunner().invoke(app, ["memory", "search", "--query", "synthetic",
+        "--channel", "whatsapp", "--chat-id", "g@g.us", "--scope", "chat"])
+    assert result.exit_code == 0, result.output
+    assert "synthetic statement" in result.output
+    endpoint.assert_called_once_with("knowledge_read", {"chat_id": "g@g.us", "query": "synthetic", "limit": 8})
 
-def test_memory_cli_commands_end_to_end(tmp_path: Path, monkeypatch) -> None:
-    home = tmp_path / "home"
-    home.mkdir()
-    monkeypatch.setenv("HOME", str(home))
 
-    cfg = Config()
-    cfg.history.legacy_writers_disabled = False
-    cfg.history.live_projection_enabled = False
-    cfg.history.readers.secondary = False
-    save_config(cfg)
+def test_memory_search_requires_explicit_whatsapp_chat(monkeypatch):
+    endpoint = Mock(side_effect=AssertionError("unscoped read"))
+    monkeypatch.setattr("yeoman_gateway.history.export.cli_secondary_request", endpoint)
+    result = CliRunner().invoke(app, ["memory", "search", "--query", "synthetic"])
+    assert result.exit_code != 0
+    assert "explicit WhatsApp chat scope required" in result.output
+    endpoint.assert_not_called()
 
-    add = runner.invoke(
-        app,
-        [
-            "memory",
-            "add",
-            "--text",
-            "I prefer dark mode",
-            "--kind",
-            "preference",
-            "--scope",
-            "user",
-            "--channel",
-            "cli",
-            "--chat-id",
-            "direct",
-            "--sender-id",
-            "u1",
-        ],
-    )
-    assert add.exit_code == 0, add.output
-    assert "memory entry" in add.output
 
-    search = runner.invoke(
-        app,
-        [
-            "memory",
-            "search",
-            "--query",
-            "dark mode",
-            "--channel",
-            "cli",
-            "--chat-id",
-            "direct",
-            "--sender-id",
-            "u1",
-            "--scope",
-            "user",
-        ],
-    )
-    assert search.exit_code == 0, search.output
-    assert "preference" in search.output.lower()
-
-    status = runner.invoke(app, ["memory", "status"])
-    assert status.exit_code == 0, status.output
-    assert "backend" in status.output
-    assert "total_active" in status.output
-
-    prune = runner.invoke(app, ["memory", "prune", "--older-than-days", "0", "--dry-run"])
-    assert prune.exit_code == 0, prune.output
-    assert "Dry run" in prune.output
-
-    reindex = runner.invoke(app, ["memory", "reindex"])
-    assert reindex.exit_code == 0, reindex.output
-    assert "rebuilt" in reindex.output.lower()
+@pytest.mark.parametrize("args", [["reindex"], ["prune", "--older-than-days", "0", "--dry-run"],
+    ["add", "--text", "synthetic", "--kind", "preference", "--scope", "global"]])
+def test_memory_cli_refuses_retired_maintenance(args):
+    result = CliRunner().invoke(app, ["memory", *args])
+    assert result.exit_code != 0
+    assert "legacy maintenance is offline only" in result.output

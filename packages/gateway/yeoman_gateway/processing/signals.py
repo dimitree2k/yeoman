@@ -28,10 +28,6 @@ from yeoman_shared.whatsapp_protocol import (
     valid_group_metadata,
 )
 
-from yeoman_gateway.history.writer_guard import (
-    legacy_history_writers_disabled,
-)
-from yeoman_gateway.knowledge.models import Identifier, TrustedIdentityObservation
 from yeoman_gateway.processing.models import (
     CANONICAL_WHATSAPP_ORIGIN,
     TransportReceipt,
@@ -704,31 +700,22 @@ class SignalJournalSink:
         mapper: WhatsAppSignalMapper | None = None,
         clock: Any = None,
         invalidator: Any | None = None,
-        memory: Any | None = None,
         sources: Any | None = None,
         statements: Any | None = None,
-        identity_observation_issuer: Any | None = None,
-        legacy_history_disabled: bool = False,
         history_projector: Any | None = None,
         history_knowledge: Any | None = None,
     ) -> None:
-        self.legacy_history_disabled = legacy_history_writers_disabled(legacy_history_disabled)
         self._store = store
         self._mapper = mapper or WhatsAppSignalMapper()
         self._clock = clock
         # Review F05: an edit/delete must not stop at the journal. The invalidator raises
         # the turn revision, cancels stale effects and revokes derived facts.
         self._invalidator = invalidator
-        self._memory = memory
         #: Proven audience registration for a newly observed message.  It runs at the
         #: observation boundary, so a message that never gets a response turn still owns
         #: a proof instead of staying "unknown audience" forever.
         self._sources = sources
-        #: Applies an arrived provider revocation to derived statements.  Without it a
-        #: published statement would outlive the delete that revoked its only source.
         self._statements = statements
-        #: Issues verified provider identity observations before the knowledge projection.
-        self._identity_observation_issuer = identity_observation_issuer
         self._history_projector = history_projector
         self._history_knowledge = history_knowledge
 
@@ -799,161 +786,12 @@ class SignalJournalSink:
                 raise ValueError("strict capture found a conflicting event identity")
         elif strict and stored_event_id != signal.event_id:
             raise ValueError("strict capture found a conflicting event identity")
-        if signal.kind == "membership_snapshot" and self.legacy_history_disabled is not True:
-            self._record_membership_snapshot_pairs(signal, stored_event_id)
-        opaque_edit = (
-            signal.kind == "message"
-            and signal.payload.get("observation_only") is True
-            and signal.payload.get("observation_type") == "encrypted_message_edit_undecoded"
-        )
-        if signal.kind == "message" and self._memory is not None and not opaque_edit and self.legacy_history_disabled is not True:
-            get_event = getattr(self._store, "get_event", None)
-            get_authority = getattr(self._store, "get_event_source_authority", None)
-            index_event = getattr(self._memory, "index_canonical_event", None)
-            if callable(get_event) and callable(index_event):
-                try:
-                    event = get_event(stored_event_id)
-                    if event is not None:
-                        audience = (
-                            get_authority(stored_event_id, signal.revision)
-                            if callable(get_authority)
-                            else None
-                        )
-                        index_event(event, audience=audience)
-                except Exception as exc:  # pragma: no cover - projection must not block ACK
-                    logger.warning(
-                        "canonical message FTS projection failed error_type={}",
-                        type(exc).__name__,
-                    )
-        if (
-            signal.kind == "message"
-            and not opaque_edit
-            and self._history_projector is None
-            and self.legacy_history_disabled is not True
-        ):
-            self.register_observed_source(stored_event_id)
         if str(kind) in ("edit", "delete"):
             revoked_sources = self.project_source_revocation(signal, now_ms=now, strict=strict)
-            if strict and revoked_sources:
-                self._invalidate_memory_projection(
-                    signal, revoked_sources, now_ms=now
-                )
             self.invalidate_statement_sources(revoked_sources, kind=str(kind))
         if not strict:
             self.invalidate(kind, payload)
         return stored_event_id
-
-    def _record_membership_snapshot_pairs(
-        self, signal: JournalSignal, stored_event_id: str
-    ) -> None:
-        """Project only complete snapshot pairs through the issued identity API."""
-        issuer = self._identity_observation_issuer
-        record_pair = getattr(self._statements, "record_provider_pair", None)
-        namespace = signal.account
-        participants = signal.payload.get("participants")
-        observed_at_ms = signal.payload.get("snapshot_at_ms")
-        if (
-            issuer is None
-            or not callable(getattr(issuer, "observe", None))
-            or not callable(record_pair)
-            or signal.payload.get("complete") is not True
-            or not namespace
-            or not isinstance(participants, list)
-            or not isinstance(observed_at_ms, int)
-            or isinstance(observed_at_ms, bool)
-        ):
-            return
-
-        for participant in participants:
-            if not isinstance(participant, Mapping):
-                continue
-            phone_jid = participant.get("phone_jid")
-            lid = participant.get("lid")
-            if not isinstance(phone_jid, str) or not isinstance(lid, str):
-                continue
-            pair_identity = (
-                f"whatsapp\0{namespace}\0phone_jid\0{phone_jid}\0"
-                f"whatsapp\0{namespace}\0lid\0{lid}"
-            )
-            pair_digest = hashlib.sha256(pair_identity.encode("utf-8")).hexdigest()
-            observation = TrustedIdentityObservation(
-                identifiers=(
-                    Identifier("whatsapp", "phone_jid", phone_jid, namespace=namespace),
-                    Identifier("whatsapp", "lid", lid, namespace=namespace),
-                ),
-                evidence_ref=f"whatsapp-membership:{stored_event_id}:{pair_digest}",
-                observed_at_ms=observed_at_ms,
-                mapping_verified=True,
-                account_namespace=namespace,
-            )
-            issuer.observe(observation)
-            record_pair(observation)
-
-    def _invalidate_memory_projection(
-        self, signal: Any, source_event_ids: Iterable[str], *, now_ms: int | None
-    ) -> None:
-        """Apply strict source tombstones to memory without changing turn semantics."""
-        if self._memory is None or self.legacy_history_disabled is True:
-            return
-        invalidate = getattr(self._memory, "invalidate_sources", None)
-        direct_soft_delete = False
-        if not callable(invalidate):
-            invalidate = getattr(self._memory, "soft_delete_sources", None)
-            direct_soft_delete = callable(invalidate)
-        get_event = getattr(self._store, "get_event", None)
-        if not callable(invalidate) or not callable(get_event):
-            return
-        principal = str(getattr(signal, "principal", "") or "")
-        account = str(getattr(signal, "account", "") or "")
-        channel = str(getattr(signal, "channel", "") or "")
-        chat_id = str(getattr(signal, "chat_id", "") or "")
-        provider_message_id = str(
-            getattr(signal, "source_message_id", "")
-            or getattr(signal, "target_message_id", "")
-            or ""
-        )
-        authorized: list[str] = []
-        for event_id in source_event_ids:
-            source = get_event(str(event_id))
-            if (
-                source is not None
-                and str(getattr(source, "kind", "")) == "message"
-                and str(getattr(source, "channel", "")) == channel
-                and str(getattr(source, "chat_id", "")) == chat_id
-                and str(getattr(source, "source_message_id", "")) == provider_message_id
-                and (not account or str(getattr(source, "account", "")) == account)
-                and (not principal or str(getattr(source, "principal", "")) == principal)
-            ):
-                authorized.append(str(event_id))
-        if not authorized:
-            return
-        try:
-            if direct_soft_delete:
-                invalidate(authorized)
-            else:
-                invalidate(
-                    authorized,
-                    now_ms=int(now_ms if now_ms is not None else 0),
-                    kind=str(getattr(signal, "kind", "delete")),
-                )
-        except Exception as exc:  # pragma: no cover - projection must not block ACK
-            logger.warning(
-                "canonical source tombstone failed error_type={}",
-                type(exc).__name__,
-            )
-
-    def register_observed_source(self, event_id: str | None) -> bool:
-        """Prove the audience of a just-observed message, response turn or not."""
-        registrar = self._sources
-        if registrar is None or not event_id:
-            return False
-        try:
-            return bool(registrar(str(event_id)))
-        except Exception as exc:  # projection must never block the ACK boundary
-            logger.warning(
-                "observed source registration failed error_type={}", type(exc).__name__
-            )
-            return False
 
     async def register_observed_source_live(self, event_id: str | None) -> bool:
         """Register an observation under a fresh selected-history reader lease."""
@@ -974,7 +812,7 @@ class SignalJournalSink:
     def invalidate_statement_sources(
         self, revoked_event_ids: Iterable[str], *, kind: str = "delete"
     ) -> tuple[str, ...]:
-        """Let a projected revocation reach the statements that rest on those sources."""
+        """Revoke projected statements that cite an edited or deleted source."""
         invalidator = self._statements
         wanted = tuple(str(item) for item in revoked_event_ids if str(item))
         if invalidator is None or not wanted:
@@ -986,46 +824,7 @@ class SignalJournalSink:
             return tuple(invalidate(wanted, reason=f"source_{kind}"))
         except Exception as exc:  # pragma: no cover - projection must not block ACK
             logger.warning(
-                "statement revocation projection failed error_type={}", type(exc).__name__
-            )
-            return ()
-
-    def index_enrichments(
-        self, source_message_id: str, enrichments: Iterable[Mapping[str, Any] | object]
-    ) -> tuple[Any, ...]:
-        """Index approved text derived from an already-journaled message."""
-        if self._memory is None or self.legacy_history_disabled is True:
-            return ()
-        get_event = getattr(self._store, "get_event", None)
-        events_by_source = getattr(self._store, "events_by_source_message", None)
-        index_event = getattr(self._memory, "index_canonical_event", None)
-        if not callable(index_event):
-            return ()
-        event = get_event(str(source_message_id)) if callable(get_event) else None
-        if event is not None and str(getattr(event, "kind", "")) != "message":
-            event = None
-        if event is None and callable(events_by_source):
-            event = next(
-                (
-                    candidate
-                    for candidate in events_by_source(str(source_message_id))
-                    if str(getattr(candidate, "kind", "")) == "message"
-                ),
-                None,
-            )
-        if event is None:
-            return ()
-        authority_getter = getattr(self._store, "get_event_source_authority", None)
-        audience = (
-            authority_getter(event.event_id, event.revision)
-            if callable(authority_getter)
-            else None
-        )
-        try:
-            return tuple(index_event(event, audience=audience, enrichments=enrichments))
-        except Exception as exc:  # pragma: no cover - projection must not block routing
-            logger.warning(
-                "canonical enrichment FTS projection failed error_type={}",
+                "statement revocation projection failed error_type={}",
                 type(exc).__name__,
             )
             return ()

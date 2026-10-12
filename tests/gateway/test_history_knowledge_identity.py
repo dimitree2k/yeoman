@@ -120,9 +120,10 @@ def test_history_identity_mutations_refused_but_statement_curation_continues(cas
             lambda: service.merge_people('a', 'b', context=admin, expected_revision=1),
             lambda: service.bind_identifier('a', Identifier('whatsapp', 'phone_jid', '10003@s.whatsapp.net'), evidence_ref='proof', mapping_verified=True, context=admin),
         ):
-            with pytest.raises(KnowledgeError) as error:
+            from yeoman_gateway.history.writer_guard import LegacyHistoryWriterDisabled
+
+            with pytest.raises(LegacyHistoryWriterDisabled):
                 call()
-            assert error.value.code == 'history_identity_read_only'
         receipt = service.correct_statement(sid, StatementCandidate('Curated replacement', (source,)),
                                             expected_source=source, context=context)
         assert receipt.changed_ids
@@ -297,11 +298,9 @@ async def test_responder_handoff_uses_frozen_lid_principal_when_sender_canonical
     identifier(db, 'b', '20002@lid', start=1)
     assert canonical_user_id("whatsapp", "20002@lid", {}) == ""
     responder = object.__new__(LLMResponder)
-    responder._history_selected = True
     session = SimpleNamespace(operational_store=None, messages=[])
     session.add_message = Mock()
     responder.sessions = SimpleNamespace(
-        history_selected=True, legacy_history_disabled=False,
         get_or_create=Mock(return_value=session), save=Mock(),
     )
     responder._model_for_profile = lambda profile: "test-model"
@@ -342,7 +341,6 @@ async def test_responder_handoff_uses_frozen_lid_principal_when_sender_canonical
 
     db.execute("UPDATE contacts SET display_name='Alex' WHERE contact_id='a'")
     responder.knowledge = service
-    responder.chat_registry = None
     monkeypatch.setattr("yeoman_gateway.history.context.current_history_snapshot", lambda: q.snapshot)
     with service.history_scope(q, sources):
         sid, _ = capture(service, sources.issue('m'))
@@ -410,8 +408,6 @@ def test_owner_german_person_question_retrieves_real_v3_statement(case, monkeypa
         )
         responder = object.__new__(LLMResponder)
         responder.knowledge = service
-        responder.chat_registry = None
-        responder._history_selected = True
         monkeypatch.setattr(
             "yeoman_gateway.history.context.current_history_snapshot", lambda: q.snapshot
         )
@@ -450,8 +446,6 @@ def test_owner_german_natural_prefix_preserves_display_name_in_real_v3_result(ca
         capture(service, source)
         responder = object.__new__(LLMResponder)
         responder.knowledge = service
-        responder.chat_registry = None
-        responder._history_selected = True
         monkeypatch.setattr(
             "yeoman_gateway.history.context.current_history_snapshot", lambda: q.snapshot
         )
@@ -492,8 +486,6 @@ def test_owner_ambiguous_natural_prefix_has_no_knowledge_person_targets_or_resul
         monkeypatch.setattr(service, 'recall', record_recall)
         responder = object.__new__(LLMResponder)
         responder.knowledge = service
-        responder.chat_registry = None
-        responder._history_selected = True
         monkeypatch.setattr(
             "yeoman_gateway.history.context.current_history_snapshot", lambda: q.snapshot
         )
@@ -529,8 +521,6 @@ def test_owner_lookup_denies_late_joiner_even_when_currently_in_group(case, monk
         )
         responder = object.__new__(LLMResponder)
         responder.knowledge = service
-        responder.chat_registry = None
-        responder._history_selected = True
         monkeypatch.setattr(
             "yeoman_gateway.history.context.current_history_snapshot", lambda: q.snapshot
         )

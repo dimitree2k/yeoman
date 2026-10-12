@@ -21,6 +21,8 @@ from yeoman_shared.raw_archive.records import archive_files, iter_records
 from yeoman_shared.raw_archive.writer import RawArchive, RawArchiveCapacityError
 from yeoman_shared.whatsapp_protocol import PROTOCOL_VERSION
 
+from tests.gateway.history_test_helpers import ProjectedHistory
+
 NOW = 1_790_000_000_000
 CHAT = "chat@g.us"
 
@@ -51,6 +53,7 @@ def _setup(tmp_path: Path) -> tuple[WhatsAppChannel, RawArchive, ProcessingStore
     store = ProcessingStore(tmp_path / "processing.db")
     media = MediaStorage(incoming_dir=tmp_path / "incoming", outgoing_dir=tmp_path / "outgoing")
     channel = WhatsAppChannel(WhatsAppConfig(), MessageBus(), media_storage=media)
+    channel._history_projector = ProjectedHistory(tmp_path / f"history-{id(channel)}")
     channel.set_processing_signals(SignalJournalSink(store, clock=lambda: NOW))
     archive = RawArchive(
         tmp_path / "raw",
@@ -209,27 +212,12 @@ def test_empty_complete_membership_snapshot_is_archived_journaled_and_acked(
 ) -> None:
     channel, archive, store = _setup(tmp_path)
     order: list[str] = []
-    issued: list[object] = []
-    recorded: list[object] = []
     append_raw = archive.append_durable
     append_event = store.append_event
 
-    class Issuer:
-        def observe(self, observation: object) -> None:
-            issued.append(observation)
-
-    class IdentityService:
-        def record_provider_pair(self, observation: object) -> None:
-            recorded.append(observation)
-
-    channel.set_processing_signals(
-        SignalJournalSink(
-            store,
-            clock=lambda: NOW,
-            identity_observation_issuer=Issuer(),
-            statements=IdentityService(),
-        )
-    )
+    sink = SignalJournalSink(store, clock=lambda: NOW)
+    assert not hasattr(sink, "_identity_observation_issuer")
+    channel.set_processing_signals(sink)
     _inline_raw_append(monkeypatch)
 
     def record_raw(event, source=None, *, kind=""):
@@ -278,7 +266,6 @@ def test_empty_complete_membership_snapshot_is_archived_journaled_and_acked(
     assert event.payload["complete"] is True
     assert event.payload["member_count"] == 0
     assert event.payload["participants"] == []
-    assert issued == recorded == []
     store.close()
 
 
@@ -290,8 +277,6 @@ def test_membership_conflict_is_archived_but_not_acked_or_projected(
     channel._connected = True
     acknowledgements: list[str] = []
     order: list[str] = []
-    issued: list[object] = []
-    recorded: list[object] = []
     append_raw = archive.append_durable
     append_event = store.append_event
 
@@ -314,24 +299,11 @@ def test_membership_conflict_is_archived_but_not_acked_or_projected(
         async def close(self):
             self.closed = True
 
-    class Issuer:
-        def observe(self, observation: object) -> None:
-            issued.append(observation)
-
-    class IdentityService:
-        def record_provider_pair(self, observation: object) -> None:
-            recorded.append(observation)
-
     socket = Socket()
     channel._ws = socket
-    channel.set_processing_signals(
-        SignalJournalSink(
-            store,
-            clock=lambda: NOW,
-            identity_observation_issuer=Issuer(),
-            statements=IdentityService(),
-        )
-    )
+    sink = SignalJournalSink(store, clock=lambda: NOW)
+    assert not hasattr(sink, "_identity_observation_issuer")
+    channel.set_processing_signals(sink)
 
     async def ack(command_type: str, payload: dict, timeout_seconds: float, **kwargs):
         del timeout_seconds, kwargs
@@ -385,11 +357,7 @@ def test_membership_conflict_is_archived_but_not_acked_or_projected(
     original = store.get_event("membership-first")
     assert original is not None and original.payload is not None
     assert original.payload["participants"][0].get("lid") == "123@lid"
-    if kind == "membership_snapshot":
-        assert len(issued) == len(recorded) == 1
-        assert issued[0] is recorded[0]
-    else:
-        assert issued == recorded == []
+    assert not hasattr(sink, "_identity_observation_issuer")
     store.close()
 
 

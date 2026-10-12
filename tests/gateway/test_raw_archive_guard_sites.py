@@ -58,7 +58,7 @@ def test_session_delete_refuses_protected_paths(home: Path) -> None:
     raw_file = _old_file(home / "data" / "raw" / "whatsapp" / "2026-02.jsonl")
     manager = SessionManager(workspace=home / "workspace", sessions_dir=home / "sessions")
     manager._get_session_path = lambda key: raw_file  # type: ignore[method-assign]
-    assert manager.delete("whatsapp:x") is False
+    assert manager.delete("telegram:x") is False
     assert raw_file.exists()
 
 

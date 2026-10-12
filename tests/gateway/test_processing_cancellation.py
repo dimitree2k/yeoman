@@ -25,6 +25,12 @@ from yeoman_gateway.processing.threads import (
 )
 
 T0 = 1_700_000_000_000
+@pytest.fixture(autouse=True)
+def _projected_actor_history(monkeypatch, request, tmp_path):
+    from tests.gateway.history_test_helpers import install_projected_thread_history
+    install_projected_thread_history(monkeypatch, request, tmp_path)
+
+
 CHAT = "chat@g.us"
 
 
@@ -406,7 +412,7 @@ async def test_followup_is_accepted_while_the_provider_call_is_in_flight(tmp_pat
         return "first answer"
 
     task = asyncio.create_task(actor.run_generation(snapshot, _provider))
-    await started.wait()
+    await asyncio.wait_for(started.wait(), timeout=30)
 
     admission = actor.accept(event_id="m2", principal="orderer@s.whatsapp.net", authorized=True)
 
@@ -442,7 +448,7 @@ async def test_manual_new_suppresses_an_in_flight_generation(tmp_path: Path) -> 
         return "stale answer"
 
     task = asyncio.create_task(actor.run_generation(snapshot, _provider))
-    await started.wait()
+    await asyncio.wait_for(started.wait(), timeout=30)
     store.close_chat_threads(channel="whatsapp", chat_id=CHAT, now_ms=T0 + 1)
     release.set()
     outcome = await task
@@ -754,7 +760,7 @@ async def test_direct_admission_finishes_when_generation_is_cancelled(tmp_path: 
     )
     task = asyncio.create_task(wrapper.generate_reply(_event_model(message_id="m1"), object()))
     try:
-        await started.wait()
+        await asyncio.wait_for(started.wait(), timeout=30)
         task.cancel()
         with pytest.raises(asyncio.CancelledError):
             await task
@@ -820,7 +826,7 @@ async def test_followup_during_generation_produces_no_second_answer(tmp_path: Pa
         store, event_id="m2", thread_id=str(decision.thread_id), turn_id=str(decision.turn_id)
     )
     task = asyncio.create_task(wrapper.generate_reply(_event_model(message_id="m1"), object()))
-    await started.wait()
+    await asyncio.wait_for(started.wait(), timeout=30)
     followup = await wrapper.generate_reply(_event_model(message_id="m2"), object())
     assert followup is None  # accepted into the postbox, no second answer path
     barrier.set()
@@ -850,7 +856,7 @@ async def test_new_context_restarts_the_generation_once(tmp_path: Path) -> None:
         store, event_id="m2", thread_id=str(decision.thread_id), turn_id=str(decision.turn_id)
     )
     task = asyncio.create_task(wrapper.generate_reply(_event_model(message_id="m1"), object()))
-    await started.wait()
+    await asyncio.wait_for(started.wait(), timeout=30)
     await wrapper.generate_reply(_event_model(message_id="m2"), object())
     barrier.set()
     reply = await task
@@ -884,7 +890,7 @@ async def test_superseded_generation_returns_no_reply(tmp_path: Path) -> None:
         store, event_id="m2", thread_id=str(decision.thread_id), turn_id=str(decision.turn_id)
     )
     task = asyncio.create_task(wrapper.generate_reply(_event_model(message_id="m1"), object()))
-    await started.wait()
+    await asyncio.wait_for(started.wait(), timeout=30)
     correction = _event_model(message_id="m2")
     correction.raw_metadata["processing_kind"] = "delete"
     correction.raw_metadata["explicit_correction"] = True
@@ -982,7 +988,7 @@ async def test_two_threads_do_not_mix_state_or_effects(tmp_path: Path) -> None:
             object(),
         )
     )
-    await inner.started.wait()
+    await asyncio.wait_for(inner.started.wait(), timeout=30)
     task_b = asyncio.create_task(
         wrapper.generate_reply(
             _event_model(message_id="b1", sender="b@s.whatsapp.net", chat_id="chat-b@g.us"),

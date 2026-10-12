@@ -16,6 +16,8 @@ from yeoman_gateway.processing.store import ProcessingStore
 from yeoman_shared.config.schema import WhatsAppConfig
 from yeoman_shared.whatsapp_protocol import PROTOCOL_VERSION
 
+from tests.gateway.history_test_helpers import ProjectedHistory
+
 CHAT = "chat@g.us"
 NOW = 1_700_000_000_000
 
@@ -45,6 +47,7 @@ def _frame(
 
 def _channel(store: ProcessingStore) -> WhatsAppChannel:
     channel = WhatsAppChannel(WhatsAppConfig(), MessageBus())
+    channel._history_projector = ProjectedHistory(Path(store.path).parent / f"history-{id(channel)}")
     channel.set_processing_signals(SignalJournalSink(store, clock=lambda: NOW))
     return channel
 
@@ -223,6 +226,7 @@ def test_replay_with_new_bridge_observation_is_idempotent_after_ack(tmp_path: Pa
     store = ProcessingStore(tmp_path / "processing.db")
     commit_times = iter((NOW + 100, NOW + 200))
     channel = WhatsAppChannel(WhatsAppConfig(), MessageBus())
+    channel._history_projector = ProjectedHistory(tmp_path / f"history-{id(channel)}")
     channel.set_processing_signals(
         SignalJournalSink(store, clock=lambda: next(commit_times))
     )
@@ -519,6 +523,7 @@ def _parsed_message(channel: WhatsAppChannel, message_id: str, text: str):
 def test_stop_waits_for_timer_owned_debounce_publisher(tmp_path: Path) -> None:
     store = ProcessingStore(tmp_path / "processing.db")
     channel = WhatsAppChannel(WhatsAppConfig(debounce_ms=1), MessageBus())
+    channel._history_projector = ProjectedHistory(tmp_path / f"history-{id(channel)}")
     channel._chat_registry = None
     old_started = asyncio.Event()
     release_old = asyncio.Event()
@@ -549,6 +554,7 @@ def test_stop_waits_for_timer_owned_debounce_publisher(tmp_path: Path) -> None:
 def test_debounce_old_batch_completes_before_new_arrival(tmp_path: Path) -> None:
     store = ProcessingStore(tmp_path / "processing.db")
     channel = WhatsAppChannel(WhatsAppConfig(debounce_ms=1), MessageBus())
+    channel._history_projector = ProjectedHistory(tmp_path / f"history-{id(channel)}")
     channel._chat_registry = None
     old_started = asyncio.Event()
     release_old = asyncio.Event()
@@ -696,6 +702,7 @@ def test_start_aborts_when_replay_ack_fails(tmp_path: Path) -> None:
                 ),
                 MessageBus(),
             )
+            channel._history_projector = ProjectedHistory(tmp_path / f"history-{id(channel)}")
             channel.set_processing_signals(SignalJournalSink(store, clock=lambda: NOW))
             channel._runtime.ensure_ready = lambda **kwargs: None  # type: ignore[method-assign]
             await channel.start()
@@ -714,6 +721,7 @@ def test_debounce_bucket_flushes_before_item_or_byte_ceiling(tmp_path: Path) -> 
     channel = WhatsAppChannel(
         WhatsAppConfig(debounce_ms=60_000, debounce_media_ms=60_000), MessageBus()
     )
+    channel._history_projector = ProjectedHistory(tmp_path / f"history-{id(channel)}")
     channel.set_processing_signals(SignalJournalSink(store, clock=lambda: NOW))
     channel._debounce_max_items = 2
     channel._debounce_max_bytes = 10_000
@@ -763,6 +771,7 @@ def test_debounce_bucket_flushes_before_item_or_byte_ceiling(tmp_path: Path) -> 
 def test_stop_waits_for_boundary_owned_debounce_publisher(tmp_path: Path) -> None:
     store = ProcessingStore(tmp_path / "processing.db")
     channel = WhatsAppChannel(WhatsAppConfig(debounce_ms=60_000), MessageBus())
+    channel._history_projector = ProjectedHistory(tmp_path / f"history-{id(channel)}")
     channel._chat_registry = None
     channel._debounce_max_items = 1
     old_started = asyncio.Event()
@@ -799,6 +808,7 @@ def test_stop_waits_for_boundary_owned_debounce_publisher(tmp_path: Path) -> Non
 def test_boundary_arrivals_keep_triggering_event_before_successor(tmp_path: Path) -> None:
     store = ProcessingStore(tmp_path / "processing.db")
     channel = WhatsAppChannel(WhatsAppConfig(debounce_ms=60_000), MessageBus())
+    channel._history_projector = ProjectedHistory(tmp_path / f"history-{id(channel)}")
     channel._chat_registry = None
     channel._debounce_max_items = 1
     old_started = asyncio.Event()
@@ -836,6 +846,7 @@ def test_boundary_arrivals_keep_triggering_event_before_successor(tmp_path: Path
 def test_timer_publish_failure_starts_successor_for_buffered_arrival(tmp_path: Path) -> None:
     store = ProcessingStore(tmp_path / "processing.db")
     channel = WhatsAppChannel(WhatsAppConfig(debounce_ms=1), MessageBus())
+    channel._history_projector = ProjectedHistory(tmp_path / f"history-{id(channel)}")
     channel._chat_registry = None
     first_started = asyncio.Event()
     release_first = asyncio.Event()
@@ -870,6 +881,7 @@ def test_concurrent_timer_and_boundary_admission_preserves_order_and_bounds(
 ) -> None:
     store = ProcessingStore(tmp_path / "processing.db")
     channel = WhatsAppChannel(WhatsAppConfig(debounce_ms=1), MessageBus())
+    channel._history_projector = ProjectedHistory(tmp_path / f"history-{id(channel)}")
     channel._chat_registry = None
     channel._debounce_max_items = 2
     channel._debounce_max_bytes = 10_000
@@ -1237,6 +1249,7 @@ def test_edit_delete_invalidation_is_deferred_after_ack_to_task4(tmp_path: Path)
         invalidated.append(kind)
 
     channel = WhatsAppChannel(WhatsAppConfig(), MessageBus())
+    channel._history_projector = ProjectedHistory(tmp_path / f"history-{id(channel)}")
     channel.set_processing_signals(
         SignalJournalSink(store, clock=lambda: NOW, invalidator=invalidator)
     )
@@ -1270,6 +1283,7 @@ def test_ack_failure_does_not_invalidate_edit_or_delete(tmp_path: Path) -> None:
     store = ProcessingStore(tmp_path / "processing.db")
     invalidated: list[str] = []
     channel = WhatsAppChannel(WhatsAppConfig(), MessageBus())
+    channel._history_projector = ProjectedHistory(tmp_path / f"history-{id(channel)}")
     channel.set_processing_signals(
         SignalJournalSink(store, clock=lambda: NOW, invalidator=lambda kind, payload: invalidated.append(kind))
     )
@@ -1328,6 +1342,7 @@ def test_reader_authenticates_subscribes_and_resolves_live_ack_response(tmp_path
 
     store = ProcessingStore(tmp_path / "processing.db")
     channel = WhatsAppChannel(WhatsAppConfig(bridge_token="secret"), MessageBus())
+    channel._history_projector = ProjectedHistory(tmp_path / f"history-{id(channel)}")
     channel.set_processing_signals(SignalJournalSink(store, clock=lambda: NOW))
     routed: list[str] = []
     commands: list[dict] = []

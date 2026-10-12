@@ -8,36 +8,8 @@ from yeoman_gateway.adapters.responder_llm import LLMResponder
 from yeoman_gateway.bus.queue import MessageBus
 from yeoman_gateway.core.models import InboundEvent, PolicyDecision
 from yeoman_gateway.knowledge._memory.service import MemoryService
-from yeoman_gateway.knowledge._memory.session_state import resolve_session_state_dir
 from yeoman_gateway.providers.base import LLMProvider, LLMResponse
 from yeoman_shared.config.schema import Config
-from yeoman_shared.telemetry import InMemoryTelemetry
-
-
-class CaptureMemoryProvider(LLMProvider):
-    def __init__(self, wal_file: Path) -> None:
-        super().__init__()
-        self.wal_file = wal_file
-        self.messages_seen: list[list[dict[str, Any]]] = []
-        self.pre_write_seen = False
-
-    async def chat(
-        self,
-        messages: list[dict[str, Any]],
-        tools: list[dict[str, Any]] | None = None,
-        model: str | None = None,
-        max_tokens: int = 4096,
-        temperature: float = 0.7,
-        reasoning: dict[str, Any] | None = None,
-    ) -> LLMResponse:
-        del tools, model, max_tokens, temperature, reasoning
-        self.messages_seen.append(messages)
-        if self.wal_file.exists() and " PRE" in self.wal_file.read_text(encoding="utf-8"):
-            self.pre_write_seen = True
-        return LLMResponse(content="ok")
-
-    def get_default_model(self) -> str:
-        return "dummy/model"
 
 
 class CountProvider(LLMProvider):
@@ -111,65 +83,13 @@ class SequenceProvider(LLMProvider):
         return "dummy/model"
 
 
-@pytest.mark.asyncio
-async def test_responder_injects_retrieved_memory_without_writing_session_state(tmp_path: Path) -> None:
-    workspace = tmp_path / "ws"
-    workspace.mkdir()
 
-    cfg = Config()
-    cfg.memory.db_path = str(tmp_path / "longterm.db")
-    memory_service = MemoryService(workspace=workspace, config=cfg.memory)
+@pytest.fixture(autouse=True)
+def _project_whatsapp_responder_history(monkeypatch, request, tmp_path):
+    from tests.gateway.history_test_helpers import install_projected_responder_history
 
-    # Seed one manual memory entry.
-    memory_service.record_manual(
-        channel="cli",
-        chat_id="direct",
-        sender_id="direct",
-        scope_type="user",
-        kind="preference",
-        text="I prefer concise responses",
-        importance=0.9,
-    )
+    install_projected_responder_history(monkeypatch, request, tmp_path)
 
-    wal_file = resolve_session_state_dir(workspace, cfg.memory.wal.state_dir) / "cli_test.md"
-    provider = CaptureMemoryProvider(wal_file=wal_file)
-    telemetry = InMemoryTelemetry()
-    responder = LLMResponder(
-        bus=MessageBus(),
-        provider=provider,
-        workspace=workspace,
-        memory_service=memory_service,
-        telemetry=telemetry,
-    )
-
-    out = await responder.process_direct(
-        "Please keep concise responses.",
-        session_key="cli:test",
-        channel="cli",
-        chat_id="direct",
-    )
-
-    await responder.aclose()
-    memory_service.close()
-
-    assert out == "ok"
-    assert provider.pre_write_seen is False
-
-    sent = provider.messages_seen[-1]
-    memory_system_msgs = [
-        msg["content"]
-        for msg in sent
-        if msg.get("role") == "system"
-        and isinstance(msg.get("content"), str)
-        and "[Retrieved Memory]" in msg["content"]
-    ]
-    assert memory_system_msgs
-
-    assert not wal_file.exists()
-    assert not wal_file.parent.exists()
-    assert telemetry.get_counter("memory_recall_hit") == 1
-    assert telemetry.get_counter("memory_prompt_chars") > 0
-    assert telemetry.get_counter("memory_capture_dropped_low_conf") >= 1
 
 
 def test_remaining_copies_reports_frozen_session_state_files(tmp_path: Path) -> None:

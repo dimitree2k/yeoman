@@ -2,26 +2,16 @@
 
 from __future__ import annotations
 
-from typing import TYPE_CHECKING, Any
+from typing import Any
 
 from yeoman_gateway.agent.tools.base import Tool
 from yeoman_gateway.history.live import HistoryPaused
-
-if TYPE_CHECKING:
-    from yeoman_gateway.knowledge._contacts.service import ContactsService
 
 
 class ContactsTool(Tool):
     """CRUD operations on the contacts CRM."""
 
-    def __init__(
-        self,
-        contacts: "ContactsService | None" = None,
-        knowledge: object | None = None,
-    ) -> None:
-        #: The legacy cache is kept only so the transitional composition can still build
-        #: this tool; every action below answers from the public knowledge facade.
-        self._contacts = contacts
+    def __init__(self, knowledge: object | None = None) -> None:
         #: Public person-knowledge facade.  Identifier lookups go through it so this
         #: tool never reads the contacts cache directly.
         self._knowledge = knowledge
@@ -110,7 +100,7 @@ class ContactsTool(Tool):
 
     async def execute(self, **kwargs: Any) -> str:
         from yeoman_gateway.processing.tool_context import tool_history_snapshot
-        snapshot = tool_history_snapshot(selected=getattr(self, '_history_selected', False))
+        snapshot = tool_history_snapshot()
         if snapshot is not None and self._knowledge is None:
             from yeoman_gateway.history.live import HistoryPaused
             raise HistoryPaused('history_knowledge_required')

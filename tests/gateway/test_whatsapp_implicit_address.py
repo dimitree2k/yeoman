@@ -15,6 +15,8 @@ from yeoman_gateway.bus.queue import MessageBus
 from yeoman_gateway.channels.whatsapp import InboundEvent, WhatsAppChannel
 from yeoman_shared.config.schema import WhatsAppConfig
 
+from tests.gateway.history_test_helpers import ProjectedHistory
+
 CHAT = "gruppe@g.us"
 
 
@@ -65,6 +67,7 @@ def _channel(monkeypatch: pytest.MonkeyPatch, tmp_path: Path) -> tuple[WhatsAppC
         WhatsAppConfig(enabled=True, bridge_url="ws://localhost:3001", bridge_token="secret"),
         MessageBus(),
     )
+    channel._history_projector = ProjectedHistory(tmp_path / "implicit-address-history")
     gate = _RecordingGate()
     channel._processing_gate = gate
     return channel, gate

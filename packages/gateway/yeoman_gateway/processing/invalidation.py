@@ -35,9 +35,6 @@ class SignalInvalidation:
     turn_id: str = ""
     turn_revision: int = 0
     effects_cancelled: tuple[str, ...] = ()
-    facts_revoked: tuple[str, ...] = ()
-    facts_superseded: tuple[str, ...] = ()
-    jobs_cancelled: int = 0
     refused: str = ""
 
     @property
@@ -53,16 +50,12 @@ class SignalInvalidator:
         *,
         store: Any,
         actors: Any | None = None,
-        memory: Any | None = None,
         statements: Any | None = None,
         mapper: WhatsAppSignalMapper | None = None,
         clock: Any = None,
     ) -> None:
         self._store = store
         self._actors = actors
-        self._memory = memory
-        #: Statements derived from the invalidated sources.  A revocation that only
-        #: reached the memory projection would leave the statement layer readable.
         self._statements = statements
         self._mapper = mapper or WhatsAppSignalMapper()
         self._clock = clock
@@ -99,7 +92,6 @@ class SignalInvalidator:
             return SignalInvalidation(kind=str(kind), refused="sender_is_not_author")
 
         newest = mine[-1]
-        now = int(self._clock()) if self._clock is not None else None
         result = SignalInvalidation(
             kind=str(kind), source_event_ids=tuple(str(event.event_id) for event in mine)
         )
@@ -120,20 +112,6 @@ class SignalInvalidator:
             )
             result.turn_revision = self._turn_revision(turn_id)
 
-        if self._memory is not None:
-            try:
-                report = self._memory.invalidate_sources(
-                    list(result.source_event_ids),
-                    now_ms=int(now if now is not None else 0),
-                    kind="edit" if str(kind) == "edit" else "delete",
-                )
-            except Exception as exc:  # pragma: no cover - defensive
-                logger.warning("fact invalidation failed kind={} error={}", kind, exc)
-            else:
-                result.facts_revoked = tuple(getattr(report, "revoked", ()) or ())
-                result.facts_superseded = tuple(getattr(report, "superseded", ()) or ())
-                result.jobs_cancelled = int(getattr(report, "jobs_cancelled", 0) or 0)
-
         invalidate_statements = getattr(self._statements, "invalidate_event_sources", None)
         if callable(invalidate_statements) and result.source_event_ids:
             try:
@@ -148,16 +126,12 @@ class SignalInvalidator:
                 )
 
         logger.info(
-            "signal invalidation kind={} message={} turn={} revision={} cancelled={} "
-            "revoked={} superseded={} jobs={}",
+            "signal invalidation kind={} message={} turn={} revision={} cancelled={}",
             kind,
             target_message_id,
             result.turn_id or "-",
             result.turn_revision,
             len(result.effects_cancelled),
-            len(result.facts_revoked),
-            len(result.facts_superseded),
-            result.jobs_cancelled,
         )
         return result
 

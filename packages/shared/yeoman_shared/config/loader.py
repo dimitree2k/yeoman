@@ -8,10 +8,14 @@ from typing import Any
 from urllib.parse import urlparse
 
 from yeoman_shared.config.defaults import apply_missing_defaults
-from yeoman_shared.config.schema import Config
+from yeoman_shared.config.schema import (
+    Config,
+    UnsupportedHistoryConfigError,
+    _reject_disabled_history_selectors,
+)
 from yeoman_shared.utils.backups import backup_file
 
-CONFIG_VERSION = 2
+CONFIG_VERSION = 3
 
 
 def get_config_path() -> Path:
@@ -131,6 +135,8 @@ def load_config(config_path: Path | None = None) -> Config:
                 _backup_config(path)
                 _atomic_write_config(path, validated)
             return _apply_env_overrides(validated)
+        except UnsupportedHistoryConfigError:
+            raise
         except (json.JSONDecodeError, ValueError) as e:
             print(f"Warning: Failed to load config from {path}: {e}")
             print("Using default configuration.")
@@ -212,10 +218,16 @@ def _migrate_config_with_change(data: dict[str, Any]) -> tuple[dict[str, Any], b
                 if "bridgePort" not in wa and parsed.port is not None:
                     wa["bridgePort"] = parsed.port
 
+    # Retired history selectors are ignored only when they never explicitly disable.
+    _reject_disabled_history_selectors(data.get("history"))
+
     # Normalize to snake_case for semantic migrations.
     snake = convert_keys(data)
     if not isinstance(snake, dict):
         raise ValueError("Config migration produced invalid root payload")
+
+    _reject_disabled_history_selectors(snake.get("history"))
+    snake.pop("history", None)
 
     channels_cfg = snake.get("channels")
     whatsapp_cfg = channels_cfg.get("whatsapp") if isinstance(channels_cfg, dict) else None

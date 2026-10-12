@@ -1060,7 +1060,6 @@ async def test_available_actions_shrink_with_budgets_but_never_lose_silence(
     from tests.gateway.test_participation_delivery import (
         GROUP,
         _AllowSecurity,
-        _FakeMemory,
     )
 
     policy = PolicyConfig.model_validate(
@@ -1088,7 +1087,7 @@ async def test_available_actions_shrink_with_budgets_but_never_lose_silence(
         bus=MessageBus(),
         log=log,
         inbound_archive=object(),
-        memory=_FakeMemory(),
+
         security=_AllowSecurity(),
         approval_store=SpeakupApprovalStore(tmp_path / "approvals.json"),
     )

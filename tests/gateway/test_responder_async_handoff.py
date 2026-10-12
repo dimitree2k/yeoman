@@ -94,8 +94,8 @@ class _RecordingTool(Tool):
 def _event() -> InboundEvent:
     return InboundEvent(
         channel="whatsapp",
-        chat_id="chat@s.whatsapp.net",
-        sender_id="sender@s.whatsapp.net",
+        chat_id="10002@s.whatsapp.net",
+        sender_id="10001@s.whatsapp.net",
         content="mach mal deep research",
     )
 
@@ -126,6 +126,14 @@ async def _run(
         responder.tools.register(tool)
     result = await responder.generate_reply(_event(), decision)
     return responder, result
+
+
+
+@pytest.fixture(autouse=True)
+def _project_whatsapp_responder_history(monkeypatch, request, tmp_path):
+    from tests.gateway.history_test_helpers import install_projected_responder_history
+
+    install_projected_responder_history(monkeypatch, request, tmp_path)
 
 
 @pytest.mark.asyncio

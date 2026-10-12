@@ -420,11 +420,8 @@ async def test_gateway_runtime_recovers_before_channels_start(tmp_path: Path) ->
         channels=channels,
         cron=object(),
         heartbeat=object(),
-        inbound_archive=object(),
+        history_projector=object(),
         responder=object(),
-        memory=object(),
-        contacts=object(),
-        chat_registry=object(),
         reconciliation=service,
     )
 
@@ -446,11 +443,8 @@ async def test_gateway_runtime_processing_services_are_optional() -> None:
         channels=object(),
         cron=object(),
         heartbeat=object(),
-        inbound_archive=object(),
+        history_projector=object(),
         responder=object(),
-        memory=object(),
-        contacts=object(),
-        chat_registry=object(),
     )
 
     await runtime._start_processing_services()  # disabled mode: nothing to start
