@@ -12,7 +12,8 @@ Version: **1.0.0**
 | Orchestrator pipeline | `yeoman_gateway/core/orchestrator.py` |
 | Policy engine | `yeoman_gateway/policy/engine.py` |
 | Person knowledge (public API) | `yeoman_gateway/knowledge/{api,models}.py` (people, statements, recall, migration) |
-| Memory / contacts (private) | `yeoman_gateway/knowledge/_memory/`, `yeoman_gateway/knowledge/_contacts/` — owned by `knowledge`, reachable only through its API |
+| Conversation history | `yeoman_gateway/history/` — Layer 1 raw archive → `history.db` projector (`live.py`, `incremental.py`), queries, owner attestations |
+| Knowledge internals (private) | `yeoman_gateway/knowledge/_*.py` — statements, retrieval, capture, embeddings (`_embeddings.py`, `_embedding_index.py`), person identity reads — reachable only through `knowledge/api.py` |
 | Channel adapters | `yeoman_gateway/channels/{telegram,discord,whatsapp,feishu}.py` |
 | Tool registry | `yeoman_gateway/agent/tools/registry.py` |
 | Provider registry | `yeoman_gateway/providers/registry.py` (single source of truth) |
@@ -21,7 +22,7 @@ Version: **1.0.0**
 | WhatsApp bridge (TS) | `packages/bridge/src/` |
 | Tests | `tests/shared/`, `tests/gateway/`, `tests/overseer/` |
 | Architecture docs | `docs/` |
-| Runtime data dir | `~/.yeoman/` (config, policy, memory, logs — see `~/.yeoman/CLAUDE.md`) |
+| Runtime data dir | `~/.yeoman/` (config, policy, history, knowledge, logs — see `~/.yeoman/CLAUDE.md`) |
 
 
 ## Two Repositories
@@ -135,7 +136,8 @@ Media (ASR/TTS/vision) is cross-cutting: channels enrich inbound, responder synt
 | `bus/` | gateway | Async message queue with deduplication |
 | `providers/` | gateway | LLM registry, LiteLLM wrapper, OpenAI-compat, transcription |
 | `policy/` | gateway | Engine, schema, loader, identity normalization, personas, admin handlers |
-| `knowledge/` | gateway | Person knowledge: public `api.py`/`models.py`, private `_store`, `_identity`, `_statements`, `_retrieval`, `_migration`, plus the owned `_memory/` and `_contacts/` adapters (one SQLite connection, one transaction owner) |
+| `history/` | gateway | Conversation history: raw archive projection into `history.db`, identity resolution, queries, attestations |
+| `knowledge/` | gateway | Person knowledge: public `api.py`/`models.py`, private `_store`, `_person_identity` (read-only identity), `_statements`, `_retrieval`, `_capture*`, `_embeddings`/`_embedding_index`, `_source_catchup` (one SQLite connection, one transaction owner). The pre-cutover `_memory/`/`_contacts/` services were removed in G6 (2026-10-12) |
 | `media/` | gateway | ASR (Groq Whisper), TTS (ElevenLabs), vision, routing, storage |
 | `security/` | gateway | Rule engine, built-in rules, noop (dev) |
 | `skills/` | gateway | Bundled skills (github, weather, summarize, tmux, cron, etc.) |
