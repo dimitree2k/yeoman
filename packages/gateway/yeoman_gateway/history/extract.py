@@ -46,7 +46,7 @@ def rank_of(ref: str) -> int:
     return SOURCE_RANKS.get(stem, 7)
 
 
-@dataclass
+@dataclass(slots=True)
 class MessageCopy:
     ref: str
     rank: int
@@ -73,7 +73,7 @@ class MessageCopy:
     parent_native_id: str | None = None
 
 
-@dataclass
+@dataclass(slots=True)
 class EventCopy:
     ref: str
     rank: int

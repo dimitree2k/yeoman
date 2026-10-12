@@ -9,11 +9,12 @@ import stat
 import time
 from bisect import bisect_left, bisect_right, insort
 from collections import ChainMap, Counter, defaultdict
-from collections.abc import Sequence
+from collections.abc import Iterable, Mapping, Sequence
 from copy import copy, deepcopy
 from dataclasses import dataclass, replace
 from functools import cache
 from pathlib import Path
+from types import MappingProxyType
 from typing import Any, cast
 
 from yeoman_shared.raw_archive.records import (
@@ -61,15 +62,13 @@ class ProjectionDelta:
     pending_pairs: dict[str, list[str]]
 
 
-def _read_prefix(raw_root: Path, boundaries: Sequence[SourceBoundary]) -> tuple[
-    list[Layer1Line], dict[str, int], dict[str, tuple[int, int]], dict[str, bytes]
-]:
-    lines, blanks, inodes, data_by_file = [], {}, {}, {}
-    for boundary in boundaries:
+def _read_prefix(raw_root: Path, boundaries: Sequence[SourceBoundary],
+                 blanks: dict[str, int], files: dict[str, _File]) -> Iterable[Layer1Line]:
+    for boundary in sorted(boundaries, key=lambda b: b.relative_path):
         rel = boundary.relative_path
         parts = Path(rel).parts
         if (len(parts) != 2 or parts[0] not in SUBDIRS or not parts[1].endswith('.jsonl')
-                or rel != '/'.join(parts) or rel in data_by_file
+                or rel != '/'.join(parts) or rel in files
                 or boundary.end_offset < 0 or boundary.line_number < 0):
             raise RebuildRequired('invalid committed boundary')
         path = raw_root / rel
@@ -84,15 +83,19 @@ def _read_prefix(raw_root: Path, boundaries: Sequence[SourceBoundary]) -> tuple[
                 data = source.read(boundary.end_offset)
         except OSError as exc:
             raise RebuildRequired('checkpointed source unavailable') from exc
+        digest = hashlib.sha256(data)
         if (len(data) != boundary.end_offset or data.count(b'\n') != boundary.line_number
                 or (data and not data.endswith(b'\n'))
-                or hashlib.sha256(data).hexdigest() != boundary.prefix_sha256):
+                or digest.hexdigest() != boundary.prefix_sha256):
             raise RebuildRequired('committed prefix changed')
-        inodes[rel] = (source_stat.st_dev, source_stat.st_ino)
-        data_by_file[rel] = data
+        files[rel] = _File(boundary, digest, (source_stat.st_dev, source_stat.st_ino),
+                           source_stat.st_size, source_stat.st_mtime_ns)
         blanks[rel] = 0
-        for number, physical in enumerate(data.split(b'\n')[:-1], 1):
-            text = physical.decode('utf-8', errors='replace')
+        offset = 0
+        for number in range(1, boundary.line_number + 1):
+            end = data.index(b'\n', offset)
+            text = data[offset:end].decode('utf-8', errors='replace')
+            offset = end + 1
             if not text.strip():
                 blanks[rel] += 1
                 continue
@@ -100,8 +103,7 @@ def _read_prefix(raw_root: Path, boundaries: Sequence[SourceBoundary]) -> tuple[
                 record = json.loads(text)
             except json.JSONDecodeError:
                 record = None
-            lines.append(Layer1Line(f'{rel}#{number}', record if isinstance(record, dict) else None))
-    return sorted(lines, key=lambda line: (line.ref.split('#')[0], int(line.ref.split('#')[1]))), blanks, inodes, data_by_file
+            yield Layer1Line(f'{rel}#{number}', record if isinstance(record, dict) else None)
 
 
 def _pair_key(line: Layer1Line) -> str | None:
@@ -121,36 +123,29 @@ def _units(lines: Sequence[Layer1Line]) -> dict[str, list[Layer1Line]]:
     return groups
 
 
-def _combine(units: dict[str, Extracted]) -> Extracted:
-    out = Extracted()
-    for key in sorted(units, key=lambda key: (key.startswith('pair:'),
-                      key if key.startswith('pair:') else key.split('#')[0],
-                      0 if key.startswith('pair:') else int(key.split('#')[1]))):
-        ex = units[key]
-        for name in ('messages', 'events', 'descriptions', 'media_records', 'attestations', 'contact_id_records'):
-            getattr(out, name).extend(getattr(ex, name))
-        out.pending_pairs.update(ex.pending_pairs)
-        out.outcomes.update(ex.outcomes)
-        for name, entries in ex.review.items():
-            out.review.setdefault(name, []).extend(entries)
-        inp = ex.identity
-        for ident, sighting in inp.sightings.items():
-            if ident in out.identity.sightings:
-                out.identity.sightings[ident].merge(sighting)
-            else:
-                out.identity.sightings[ident] = deepcopy(sighting)
-        out.identity.groups.update(inp.groups)
-        out.identity.links.extend(inp.links)
-        out.identity.link_times.update(inp.link_times)
-        for node, names in inp.names.items():
-            out.identity.names[node].extend(names)
-        for ref, contact in inp.contact_records.items():
-            out.identity.contact_records.setdefault(ref, contact)
-    out.identity.attestations = list(out.attestations)
-    return out
+def _merge(out: Extracted, ex: Extracted) -> None:
+    for name in ('messages', 'events', 'descriptions', 'media_records', 'attestations', 'contact_id_records'):
+        getattr(out, name).extend(getattr(ex, name))
+    out.pending_pairs.update(ex.pending_pairs)
+    out.outcomes.update(ex.outcomes)
+    for name, entries in ex.review.items():
+        out.review.setdefault(name, []).extend(entries)
+    inp = ex.identity
+    for ident, sighting in inp.sightings.items():
+        if ident in out.identity.sightings:
+            out.identity.sightings[ident].merge(sighting)
+        else:
+            out.identity.sightings[ident] = deepcopy(sighting)
+    out.identity.groups.update(inp.groups)
+    out.identity.links.extend(inp.links)
+    out.identity.link_times.update(inp.link_times)
+    for node, names in inp.names.items():
+        out.identity.names[node].extend(names)
+    for ref, contact in inp.contact_records.items():
+        out.identity.contact_records.setdefault(ref, contact)
 
 
-def _chats(ex: Extracted) -> set[tuple[str, str]]:
+def _chats(ex: Extracted | _Unit) -> set[tuple[str, str]]:
     copies: list[MessageCopy | EventCopy | Description | MediaRecord] = [
         *ex.messages, *ex.events, *ex.descriptions, *ex.media_records]
     return {(copy.channel, copy.chat_id) for copy in copies}
@@ -262,6 +257,46 @@ def _ref_order(ref: str) -> tuple[str, int]:
     return path, int(number.split('/')[0])
 
 
+_EMPTY_REVIEW: Mapping[str, list[dict[str, Any]]] = MappingProxyType({})
+
+
+@dataclass(slots=True)
+class _Unit:
+    # Only dependency copies and retraction accounting survive extraction.
+    messages: tuple[MessageCopy, ...]
+    events: tuple[EventCopy, ...]
+    descriptions: tuple[Description, ...]
+    media_records: tuple[MediaRecord, ...]
+    outcomes: tuple[tuple[str, str, int], ...]
+    review: Mapping[str, list[dict[str, Any]]]
+    has_identity: bool
+
+    @classmethod
+    def store(cls, ex: Extracted, idents: dict[Ident, Ident], strings: dict[str, str]) -> _Unit:
+        for copies, attr, raw in ((ex.messages, 'sender', 'sender_raw'),
+                                 (ex.events, 'actor', 'actor_raw')):
+            for c in copies:
+                ident = getattr(c, attr)
+                if ident is not None:
+                    setattr(c, attr, idents.setdefault(ident, ident))
+                value = getattr(c, raw)
+                if value is not None:
+                    setattr(c, raw, strings.setdefault(value, value))
+                c.channel = strings.setdefault(c.channel, c.channel)
+                c.chat_id = strings.setdefault(c.chat_id, c.chat_id)
+        return cls(tuple(ex.messages), tuple(ex.events), tuple(ex.descriptions),
+                   tuple(ex.media_records),
+                   tuple((strings.setdefault(file, file), outcome, count)
+                         for (file, outcome), count in ex.outcomes.items()),
+                   {name: items for name, items in ex.review.items() if items} or _EMPTY_REVIEW,
+                   _identity_evidence(ex))
+
+
+def _store_pair(group: Sequence[Layer1Line]) -> tuple[tuple[str, str], ...]:
+    # JSON keeps incomplete pairs replayable without keeping their parsed object graphs.
+    return tuple((line.ref, json.dumps(line.record)) for line in group)
+
+
 @dataclass
 class _Plan:
     delta: ProjectionDelta
@@ -283,8 +318,10 @@ class ProjectionIndex:
     _blanks: dict[str, int]
     _boundaries: tuple[SourceBoundary, ...]
     _files: dict[str, _File]
-    _groups: dict[str, list[Layer1Line]]
-    _extracted: dict[str, Extracted]
+    _groups: dict[str, tuple[tuple[str, str], ...]]
+    _extracted: dict[str, _Unit]
+    _idents: dict[Ident, Ident]
+    _strings: dict[str, str]
     _input: IdentityInput
     _resolution: Resolution
     _report: dict[str, Any]
@@ -311,47 +348,14 @@ class ProjectionIndex:
     @classmethod
     def from_prefix(cls, raw_root: Path, boundaries: Sequence[SourceBoundary]) -> ProjectionIndex:
         self = cls()
-        lines, self._blanks, inodes, data = _read_prefix(raw_root, boundaries)
         self._boundaries = tuple(sorted(boundaries, key=lambda b: b.relative_path))
         self._files = {}
-        for boundary in self._boundaries:
-            info = (raw_root / boundary.relative_path).stat()
-            if (info.st_dev, info.st_ino) != inodes[boundary.relative_path] or info.st_size < boundary.end_offset:
-                raise RebuildRequired('source changed during startup validation')
-            self._files[boundary.relative_path] = _File(boundary, hashlib.sha256(data[boundary.relative_path]),
-                                                       (info.st_dev, info.st_ino), info.st_size, info.st_mtime_ns)
-        self._groups = _units(lines)
-        self._extracted = {key: extract(group) for key, group in self._groups.items()}
-        # Lineage suppression depends on purged sources outside its extraction unit.
-        purged_refs = {line.ref for line in lines if is_tombstone(line.record or {})}
-        for line in lines:
-            payload = (line.record or {}).get('payload')
-            segments = payload.get('segments') if isinstance(payload, dict) else None
-            if isinstance(segments, list):
-                purged_refs.update(f'{line.ref}/{i}' for i, part in enumerate(segments)
-                                   if part == {'purged_version': 1})
-        for unit in self._extracted.values():
-            for line in list(unit.contact_id_records):
-                refs = (line.record or {})['source_refs']
-                if any(ref in purged_refs or ref.split('#')[0] + '#' + ref.split('#')[1].split('/')[0]
-                       in purged_refs for ref in refs):
-                    unit.contact_id_records.remove(line)
-                    outcome = (line.ref.split('#')[0], 'contact_id_lineage')
-                    unit.outcomes[outcome] -= 1
-                    if not unit.outcomes[outcome]:
-                        del unit.outcomes[outcome]
-                    unit.count(line.ref, 'skipped:purged')
-        combined = _combine(self._extracted)
-        rows = build_rows(combined)
-        self._lineage_records = combined.contact_id_records
-        self._reserved_ids = {line.record['contact_id'] for line in self._lineage_records if line.record is not None}
-        self._input = combined.identity
-        self._resolution = rows.resolution
-        self._report = rows.report
-        self._pending = combined.pending_pairs
-        self._outcomes = {file: dict(counts) for file, counts in rows.report['outcomes'].items()}
-        self._messages_rows = {m['message_id']: m for m in rows.messages}
-        self._events_rows = {e['event_id']: e for e in rows.events}
+        self._blanks = {}
+        self._ref_unit = {}
+        self._groups = {}
+        self._extracted = {}
+        self._idents = {}
+        self._strings = {}
         self._snapshot_times = defaultdict(list)
         self._payload_cache = {}
         self._accepted_payloads = {}
@@ -363,9 +367,74 @@ class ProjectionIndex:
         self._loose_texts = defaultdict(set)
         self._unit_rows = defaultdict(set)
         self._unit_events = defaultdict(set)
-        self._ref_unit = {}
         self._copies_by_ident = defaultdict(set)
         self._chat_names = defaultdict(Counter)
+        combined = Extracted()
+        pairs: dict[str, list[Layer1Line]] = {}
+        purged_refs = set()
+        for line in _read_prefix(raw_root, boundaries, self._blanks, self._files):
+            record = line.record or {}
+            if is_tombstone(record):
+                purged_refs.add(line.ref)
+            payload = record.get('payload')
+            segments = payload.get('segments') if isinstance(payload, dict) else None
+            if isinstance(segments, list):
+                purged_refs.update(f'{line.ref}/{i}' for i, part in enumerate(segments)
+                                   if part == {'purged_version': 1})
+            pair = _pair_key(line)
+            key = 'pair:' + pair if pair else line.ref
+            self._ref_unit[line.ref] = key
+            if pair:
+                pairs.setdefault(key, []).append(line)
+            else:
+                ex = extract([line])
+                _merge(combined, ex)
+                self._extracted[key] = _Unit.store(ex, self._idents, self._strings)
+                self._index_unit(key, ex, True)
+        for key, group in sorted(pairs.items()):
+            ex = extract(group)
+            _merge(combined, ex)
+            self._groups[key] = _store_pair(group)
+            self._extracted[key] = _Unit.store(ex, self._idents, self._strings)
+            self._index_unit(key, ex, True)
+        combined.identity.attestations = list(combined.attestations)
+        # Lineage suppression depends on purged sources outside its extraction unit.
+        for line in list(combined.contact_id_records):
+            refs = (line.record or {})['source_refs']
+            if any(ref in purged_refs or ref.split('#')[0] + '#' + ref.split('#')[1].split('/')[0]
+                   in purged_refs for ref in refs):
+                combined.contact_id_records.remove(line)
+                key = self._ref_unit[line.ref]
+                unit = self._extracted[key]
+                outcomes = Counter({(file, outcome): count for file, outcome, count in unit.outcomes})
+                outcome = (line.ref.split('#')[0], 'contact_id_lineage')
+                outcomes[outcome] -= 1
+                combined.outcomes[outcome] -= 1
+                if not outcomes[outcome]:
+                    del outcomes[outcome]
+                if not combined.outcomes[outcome]:
+                    del combined.outcomes[outcome]
+                outcomes[(outcome[0], 'skipped:purged')] += 1
+                combined.count(line.ref, 'skipped:purged')
+                self._extracted[key] = replace(unit, outcomes=tuple((file, outcome, count)
+                    for (file, outcome), count in outcomes.items()))
+        for boundary in self._boundaries:
+            info = (raw_root / boundary.relative_path).stat()
+            state = self._files[boundary.relative_path]
+            if (info.st_dev, info.st_ino) != state.inode or info.st_size < boundary.end_offset:
+                raise RebuildRequired('source changed during startup validation')
+            state.size, state.mtime = info.st_size, info.st_mtime_ns
+        del pairs
+        rows = build_rows(combined)
+        self._lineage_records = combined.contact_id_records
+        self._reserved_ids = {line.record['contact_id'] for line in self._lineage_records if line.record is not None}
+        self._input = combined.identity
+        self._resolution = rows.resolution
+        self._report = rows.report
+        self._pending = combined.pending_pairs
+        self._outcomes = {file: dict(counts) for file, counts in rows.report['outcomes'].items()}
+        self._messages_rows = {m['message_id']: m for m in rows.messages}
+        self._events_rows = {e['event_id']: e for e in rows.events}
         self._author_attestations = [a for a in combined.attestations if a.type in ('author', 'message_author')]
         self._author_refs = defaultdict(list)
         for att in self._author_attestations:
@@ -375,8 +444,6 @@ class ProjectionIndex:
             if count:
                 self._outcomes.setdefault(rel, {})['skipped:blank'] = count
         self._staged = None
-        for key, ex in self._extracted.items():
-            self._index_unit(key, ex, True)
         for row in rows.messages:
             self._index_row(row, False, True)
         for row in rows.events:
@@ -465,15 +532,12 @@ class ProjectionIndex:
             if row.kind != 'push_name':
                 self._numeric_values[numeric_part(row.value)].add(row.value)
 
-    def _index_unit(self, key: str, ex: Extracted, add: bool) -> None:
+    def _index_unit(self, key: str, ex: Extracted | _Unit, add: bool) -> None:
         def update(index: dict[Any, set[str]], slot: Any) -> None:
             if add:
                 index[slot].add(key)
             else:
                 index[slot].discard(key)
-        for line in self._groups.get(key, []):
-            if add:
-                self._ref_unit[line.ref] = key
         for name in ('messages', 'events', 'descriptions', 'media_records'):
             for c in getattr(ex, name):
                 update(self._by_chat, (c.channel, c.chat_id))
@@ -797,7 +861,7 @@ class ProjectionIndex:
         rejected: dict[tuple[str, str, str, str], str] = {}
         for key, ex in changes.items():
             prior_unit = self._extracted.get(key)
-            if prior_unit and _identity_evidence(prior_unit):
+            if prior_unit and prior_unit.has_identity:
                 raise RebuildRequired('identity contribution retraction requires rebuild')
             inp = ex.identity
             slow |= bool(inp.contact_records or ex.attestations)
@@ -1010,9 +1074,10 @@ class ProjectionIndex:
         self._payload_cache = dict(self._accepted_payloads)
         groups, changes = {}, {}
         for key, additions in _units(lines).items():
-            prior = {line.ref: line for line in self._groups.get(key, ())}
+            prior = {ref: Layer1Line(ref, json.loads(record))
+                     for ref, record in self._groups.get(key, ())}
             for line in additions:
-                if line.ref in prior:
+                if self._ref_unit.get(line.ref) == key or line.ref in prior:
                     raise RebuildRequired('source ref replayed outside checkpoint')
                 if line.ref.split('#')[0] == 'derived/contact-ids.jsonl':
                     raise RebuildRequired('external contact ID lineage requires fenced rebuild')
@@ -1033,7 +1098,7 @@ class ProjectionIndex:
         outcomes = {file: dict(counts) for file, counts in self._outcomes.items()}
         pending = dict(self._pending) if any(key.startswith('pair:') for key in changes) else self._pending
         reviews = dict(self._report['review'])
-        def adjust_reviews(before: dict[str, list[Any]], after: dict[str, list[Any]]) -> None:
+        def adjust_reviews(before: Mapping[str, list[Any]], after: Mapping[str, list[Any]]) -> None:
             for category in before.keys() | after.keys():
                 if before.get(category, []) == after.get(category, []):
                     continue
@@ -1042,14 +1107,16 @@ class ProjectionIndex:
                 counts.update(canonical_json(item) for item in after.get(category, []))
                 reviews[category] = [json.loads(item) for item, count in sorted(counts.items()) for _ in range(max(0, count))]
         for key, unit in changes.items():
-            previous = self._extracted.get(key, Extracted())
-            for sign, contribution in ((-1, previous), (1, unit)):
-                for (file, outcome), count in contribution.outcomes.items():
+            previous = self._extracted.get(key)
+            before = previous.outcomes if previous else ()
+            for sign, entries in ((-1, before),
+                                  (1, ((file, outcome, count) for (file, outcome), count in unit.outcomes.items()))):
+                for file, outcome, count in entries:
                     dest = outcomes.setdefault(file, {})
                     dest[outcome] = dest.get(outcome, 0) + sign * count
                     if not dest[outcome]:
                         dest.pop(outcome)
-            adjust_reviews(previous.review, unit.review)
+            adjust_reviews(previous.review if previous else {}, unit.review)
             if key.startswith('pair:'):
                 pending.pop(key[5:], None)
                 pending.update(unit.pending_pairs)
@@ -1109,8 +1176,11 @@ class ProjectionIndex:
             old = self._extracted.get(key)
             if old is not None:
                 self._index_unit(key, old, False)
-            self._groups[key] = staged.groups[key]
-            self._extracted[key] = unit
+            if key.startswith('pair:'):
+                self._groups[key] = _store_pair(staged.groups[key])
+            for line in staged.groups[key]:
+                self._ref_unit[line.ref] = key
+            self._extracted[key] = _Unit.store(unit, self._idents, self._strings)
             self._index_unit(key, unit, True)
         for row in delta.rows.messages:
             self._messages_rows[row['message_id']] = row

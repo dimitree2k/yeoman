@@ -49,7 +49,7 @@ class ContactRecord:
     ref: str
 
 
-@dataclass(frozen=True)
+@dataclass(frozen=True, slots=True)
 class IdentityLink:
     a: str
     b: str
