@@ -62,7 +62,7 @@ def persona_evolution_status(
     chat_id: str | None = typer.Option(None, "--chat-id", help="Optional chat id"),
     limit: int = typer.Option(5, "--limit", "-n", min=1, max=50),
 ) -> None:
-    """Show compact persona-evolution and learned-taste status."""
+    """Show compact persona-evolution status."""
 
     from yeoman_gateway.history.export import cli_secondary_request
     result = cli_secondary_request('persona_evolution_read', dict(persona_file=persona_file, window_days=1, limit=limit))

@@ -780,7 +780,7 @@ class ProcessingParticipationConfig(BaseModel):
 
     #: Global feature switch. It cannot enable a single chat by itself.
     enabled: bool = False
-    #: Evaluate and record only: no generation, typing, approval, effect or taste write.
+    #: Evaluate and record only: no generation, typing, approval or effect.
     shadow: bool = True
     #: Explicit existing model-route key. There is no hidden model fallback.
     judge_route: str = Field(default="", alias="judgeRoute")
@@ -1030,10 +1030,6 @@ def _reject_disabled_history_selectors(history: Any) -> None:
         for family in ("participation", "whatsapp", "responder", "tools", "secondary", "knowledge"):
             if readers.get(family) is False:
                 raise UnsupportedHistoryConfigError(f"history.readers.{family}=false is unsupported")
-
-
-
-
 
 
 class Config(BaseSettings):

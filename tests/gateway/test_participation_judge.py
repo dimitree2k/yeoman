@@ -923,7 +923,7 @@ async def test_judge_classifies_provider_completion_before_parsing(
 
 
 @pytest.mark.asyncio
-async def test_knowledge_and_taste_reach_actual_judge_request_without_widening_evidence() -> None:
+async def test_knowledge_reaches_actual_judge_request_without_widening_evidence() -> None:
     private_selection = object()
     client = _Client(
         _payload(
@@ -940,15 +940,13 @@ async def test_knowledge_and_taste_reach_actual_judge_request_without_widening_e
         _opportunity(),
         _context(
             selected_knowledge_text="[untrusted prior knowledge] The venue is Riverside.",
-            advisory_taste=[{"content": "Prefer concise replies.", "provenance": "participation:v1"}],
             _knowledge_selection=private_selection,
         ),
     )
 
     request = "\n".join(message["content"] for message in client.calls[0])
     assert "The venue is Riverside." in request
-    assert "Prefer concise replies." in request
-    assert "advisory" in request.lower()
+    assert "Advisory taste" not in request
     assert "untrusted" in request.lower()
     assert "private_selection" not in request
     assert "id=" not in request.split("Relevant prior knowledge", 1)[-1]

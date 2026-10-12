@@ -2673,9 +2673,6 @@ async def test_historical_sent_row_is_preserved_but_not_verified(tmp_path: Path)
     assert await log.delivered_reservation_rows(
         channel=CHANNEL, chat_id=CHAT, since_ms=0, limit=10
     ) == []
-    assert await log.participation_outcome_samples(
-        channel=CHANNEL, chat_id=CHAT, limit=10
-    ) == []
     assert await log.pending_outcome_deliveries(before_ms=10**12) == []
     log.close()
 

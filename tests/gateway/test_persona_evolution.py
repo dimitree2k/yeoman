@@ -71,7 +71,7 @@ def _seed_preferences(archive, knowledge, memory):
                                         "observed_source_batch", (source,))
         seeded = getattr(archive, "_seeded_preferences", set())
         archive._seeded_preferences = seeded
-        for hit in memory.learned_chat_taste(channel="whatsapp", chat_id="group-a@g.us", limit=20):
+        for hit in memory.recent_chat_preferences(channel="whatsapp", chat_id="group-a@g.us", limit=20):
             if hit.entry.content in seeded:
                 continue
             seeded.add(hit.entry.content)
@@ -104,7 +104,7 @@ class PreferenceSeeds:
     def record_manual(self, *, channel, chat_id, text, **_kwargs):
         self.rows.append((channel, chat_id, SimpleNamespace(entry=SimpleNamespace(content=text))))
 
-    def learned_chat_taste(self, *, channel, chat_id, limit):
+    def recent_chat_preferences(self, *, channel, chat_id, limit):
         return [hit for ch, chat, hit in self.rows if (ch, chat) == (channel, chat_id)][:limit]
 
     def close(self):
@@ -135,7 +135,7 @@ def _record_messages(
     count: int,
     memory: PreferenceSeeds | None = None,
 ) -> None:
-    tastes = memory.learned_chat_taste(channel="whatsapp", chat_id=chat_id, limit=1) if memory else []
+    preferences = memory.recent_chat_preferences(channel="whatsapp", chat_id=chat_id, limit=1) if memory else []
     for index in range(count):
         archive.add_message(
             channel="whatsapp",
@@ -143,7 +143,7 @@ def _record_messages(
             message_id=f"d{day}-m{index}",
             participant=f"1000{index % 3}@s.whatsapp.net",
             sender_id=f"1000{index % 3}@s.whatsapp.net",
-            text=tastes[0].entry.content if tastes else f"message {day}-{index}",
+            text=preferences[0].entry.content if preferences else f"message {day}-{index}",
             timestamp=int(datetime(2026, 5, day, 12, index, tzinfo=UTC).timestamp()),
         )
 
@@ -322,7 +322,6 @@ async def test_collect_persona_evolution_evidence_excludes_raw_messages(
     rendered = render_persona_evolution_proposal(evidence)
 
     assert evidence.current_evolution_text == "# Evolution Layer: Alpha\n"
-    assert evidence.chats[0].learned_taste == []
     assert evidence.chats[0].recent_message_count == 1
     assert "Alpha should lead with compact market numbers before any broader take" in rendered
     assert "Raw speakup text should not appear" not in rendered
@@ -555,7 +554,7 @@ async def test_run_persona_evolution_cron_skips_redundant_durable_lesson(
 
 
 @pytest.mark.asyncio
-async def test_run_persona_evolution_cron_converts_chat_taste_to_alpha_behavior(
+async def test_run_persona_evolution_cron_converts_chat_preferences_to_alpha_behavior(
     knowledge,
     tmp_path: Path,
 ) -> None:
@@ -978,8 +977,6 @@ async def test_run_persona_evolution_cron_rejects_output_outside_workspace(
 
     assert result.startswith("persona_evolution no proposal: invalid_output_path")
     assert not outside_output.exists()
-
-
 
 
 def test_approval_message_is_compact_for_telegram_review(tmp_path: Path) -> None:
@@ -1601,7 +1598,6 @@ async def test_collect_persona_non_whatsapp_keeps_policy_evidence_without_legacy
         assert evidence.chats[0].chat.channel == "telegram"
         assert evidence.chats[0].recent_message_count == 0
         assert evidence.chats[0].recent_preferences == []
-        assert evidence.chats[0].learned_taste == []
     finally:
         log.close()
         archive.close()

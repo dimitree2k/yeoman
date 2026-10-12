@@ -98,13 +98,12 @@ def _opportunity(*sources: str, revision: int = 5) -> ParticipationOpportunity:
     )
 
 
-async def _builder(tmp_path: Path, *, anchors=None, taste=None):
+async def _builder(tmp_path: Path, *, anchors=None):
     engine = PolicyEngine(_policy(), workspace=tmp_path)
     history = _archive(tmp_path)
     builder = ParticipationContextBuilder(
         policy=engine,
         anchors=anchors,
-        taste=taste,
         source_authorizer=lambda row: True,
     )
     return history.wire(builder)
@@ -654,22 +653,6 @@ async def test_context_renders_trusted_intents_and_remaining_budgets(tmp_path: P
     assert context["allowed_actions"] == ["silence", "comment"]
     assert context["allowed_intents"] == ["continue"]
     assert context["remaining_budgets"] == {"comments_per_window": 2}
-
-
-@pytest.mark.asyncio
-async def test_advisory_taste_requires_provenance(tmp_path: Path) -> None:
-    def _taste(channel: str, chat_id: str):
-        del channel, chat_id
-        return [
-            {"content": "prefers short replies", "provenance": "participation:v1"},
-            {"content": "old unverified pattern"},
-        ]
-
-    builder = await _builder(tmp_path, taste=_taste)
-    context = await _build_context(builder, _opportunity())
-    patterns = context["advisory_taste"]
-    assert isinstance(patterns, list) and len(patterns) == 1
-    assert patterns[0]["provenance"] == "participation:v1"
 
 
 @pytest.mark.asyncio

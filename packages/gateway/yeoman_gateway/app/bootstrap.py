@@ -933,20 +933,6 @@ def _offer_participation_trigger(
     return None
 
 
-def _participation_taste_opted_in(
-    policy_adapter: object | None, channel: str, chat_id: str
-) -> bool:
-    """Taste writes require current production permission, including no pause."""
-    current = getattr(policy_adapter, "current_activation", None)
-    snapshot = current(channel, chat_id) if callable(current) else None
-    pause_reason = getattr(policy_adapter, "participation_pause_reason", None)
-    return bool(
-        snapshot is not None
-        and getattr(snapshot, "live", False)
-        and not (callable(pause_reason) and pause_reason(channel, chat_id))
-    )
-
-
 def _build_participation_runtime(
     *,
     config: Config,
@@ -1011,27 +997,6 @@ def _build_participation_runtime(
         else None
     )
 
-    def _taste_hits(channel: str, chat_id: str) -> list[dict[str, object]]:
-        taste_reader = getattr(responder, "memory", None)
-        if taste_reader is None or not hasattr(taste_reader, "learned_chat_taste"):
-            return []
-        hits = taste_reader.learned_chat_taste(
-            channel=channel,
-            chat_id=chat_id,
-            limit=5,
-            require_meta={"provenance": "participation:v1"},
-        )
-        rendered: list[dict[str, object]] = []
-        for hit in hits:
-            entry = getattr(hit, "entry", None)
-            rendered.append(
-                {
-                    "content": str(getattr(entry, "content", "")),
-                    "provenance": "participation:v1",
-                    "confidence": getattr(entry, "confidence", None),
-                }
-            )
-        return rendered
 
     def _source_authorized(row: Mapping[str, object]) -> bool:
         return participant_is_allowed(
@@ -1044,7 +1009,6 @@ def _build_participation_runtime(
     context_builder = ParticipationContextBuilder(
         policy=policy_engine,
         anchors=anchors,
-        taste=_taste_hits,
         source_authorizer=_source_authorized,
     )
 
@@ -1409,7 +1373,6 @@ class _ParticipationSubmission:
                 "writer_dropped_entry_ids",
                 "writer_dropped_entry_count",
                 "knowledge_rendered_to_writer",
-                "taste_rendered_to_writer",
             ):
                 if key in writer_context:
                     original_context[key] = writer_context[key]
@@ -3834,7 +3797,6 @@ def build_gateway_runtime(
                 ParticipationMaintenance,
             )
 
-            taste_distiller = None
             participation_maintenance = ParticipationMaintenance(
                 ledger=speakup_log,
                 # Receipt projection is owned by ReconciliationService. Maintenance
@@ -3847,10 +3809,6 @@ def build_gateway_runtime(
                 ),
                 batch_size=int(getattr(maintenance_config, "batch_size", 20)),
                 interval_seconds=int(getattr(maintenance_config, "interval_seconds", 900)),
-                taste_distiller=taste_distiller,
-                taste_opted_in=lambda channel, chat_id: _participation_taste_opted_in(
-                    policy_adapter, channel, chat_id
-                ),
             )
 
         if participation_runtime is not None:

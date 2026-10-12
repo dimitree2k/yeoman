@@ -3133,7 +3133,6 @@ async def test_writer_budget_keeps_required_target_and_complete_shared_knowledge
             {"event_id": "optional", "sender": "Anna", "text": "optional context " * 600},
         ],
         "selected_knowledge_text": "The venue is Riverside.",
-        "advisory_taste": [{"content": "Prefer concise replies.", "provenance": "participation:v1"}],
         "_knowledge_selection": selection,
     }
     from yeoman_gateway.app.bootstrap import _ParticipationSubmission
@@ -3158,13 +3157,10 @@ async def test_writer_budget_keeps_required_target_and_complete_shared_knowledge
     )
     assert target in prompt
     assert "The venue is Riverside." in prompt
-    assert "Prefer concise replies." in prompt
     assert "optional context" not in prompt
     assert context["writer_dropped_entry_ids"] == ["optional"]
     assert context["writer_dropped_entry_count"] == 1
     assert context["knowledge_rendered_to_writer"] is True
-    assert context["taste_rendered_to_writer"] is True
-    assert "provenance=participation:v1" in prompt
     assert "object at 0x" not in prompt
     from yeoman_gateway.adapters.responder_llm import _render_participation_transcript
 

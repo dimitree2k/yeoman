@@ -311,9 +311,7 @@ class ParticipationJudge:
     ) -> None:
         """Fit whole optional entries before the provider sees the prompt."""
         from yeoman_gateway.processing.participation_context import (
-            render_advisory_taste,
             render_knowledge_block,
-            render_taste_block,
         )
 
         messages = context.get("messages")
@@ -346,15 +344,8 @@ class ParticipationJudge:
         )
         max_target = max(target_sizes, default=0)
         knowledge = str(context.get("selected_knowledge_text") or "").strip()
-        taste = render_advisory_taste(context.get("advisory_taste"))
         knowledge_block = render_knowledge_block(knowledge)
-        taste_block = render_taste_block(context.get("advisory_taste"))
-        fixed_length = max_target + sum(len(item) for item in (knowledge_block, taste_block))
-        if fixed_length + 2 > 4000 and taste:
-            context.pop("advisory_taste", None)
-            taste = ""
-            taste_block = ""
-            fixed_length = max_target + len(knowledge_block)
+        fixed_length = max_target + len(knowledge_block)
         if fixed_length + 2 > 4000 and knowledge:
             context.pop("selected_knowledge_text", None)
             selection = context.get("_knowledge_selection")
@@ -365,7 +356,7 @@ class ParticipationJudge:
             context["knowledge_rendered_chars"] = 0
             knowledge = ""
             knowledge_block = ""
-            fixed_length = max_target + len(taste_block)
+            fixed_length = max_target
         if max_target > 4000 or fixed_length + 2 > 4000:
             raise ParticipationDecisionError("context_too_large", detail="context_budget_exceeded")
 
@@ -390,10 +381,6 @@ class ParticipationJudge:
             if anchors:
                 anchors.pop(0)
                 continue
-            if taste:
-                context.pop("advisory_taste", None)
-                taste = ""
-                continue
             if knowledge:
                 context.pop("selected_knowledge_text", None)
                 selection = context.get("_knowledge_selection")
@@ -410,7 +397,6 @@ class ParticipationJudge:
         context["judge_dropped_entry_ids"] = dropped[:32]
         context["judge_dropped_entry_count"] = len(dropped)
         context["knowledge_rendered_to_judge"] = bool(context.get("selected_knowledge_text"))
-        context["taste_rendered_to_judge"] = bool(context.get("advisory_taste"))
 
     async def _decide(
         self,
@@ -704,7 +690,6 @@ class _JudgeContext:
     direct_addressed: bool
     allows_continuation: bool
     selected_knowledge_text: str
-    advisory_taste: str
     rendered: str
 
     @classmethod
@@ -793,7 +778,6 @@ class _JudgeContext:
             for item in (context.get("allowed_contribution_types") or ())
             if str(item).strip()
         )
-        from yeoman_gateway.processing.participation_context import render_advisory_taste
 
         return cls(
             evidence_ids=frozenset(evidence),
@@ -812,21 +796,17 @@ class _JudgeContext:
             direct_addressed=bool(context.get("direct_addressed")),
             allows_continuation=bool(context.get("allows_continuation", False)),
             selected_knowledge_text=str(context.get("selected_knowledge_text") or ""),
-            advisory_taste=render_advisory_taste(context.get("advisory_taste")),
             rendered="\n".join(lines) if lines else "(no retained context)",
         )
 
     def render(self) -> str:
         from yeoman_gateway.processing.participation_context import (
             render_knowledge_block,
-            render_taste_block,
         )
 
         blocks = [self.rendered]
         if self.selected_knowledge_text:
             blocks.append(render_knowledge_block(self.selected_knowledge_text))
-        if self.advisory_taste:
-            blocks.append(render_taste_block(self.advisory_taste))
         return "\n\n".join(blocks)
 
 

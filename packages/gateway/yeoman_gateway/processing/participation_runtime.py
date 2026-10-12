@@ -9,7 +9,7 @@ Boundaries enforced here, in order:
 
 1. hard preflight (feature/chat enabled, pause, sender access, feasible actions);
 2. the shadow lane stops after judging: no generation, tool, typing, effect, preview
-   or taste write may happen in shadow;
+   may happen in shadow;
 3. exactly one judge attempt, charged to the persisted hourly quota;
 4. a ``comment`` acquires the ledger reservation *before* generation and submits one
    stable managed effect; a ``react`` submits one reaction effect with a receipt;
@@ -203,14 +203,13 @@ class ParticipationRuntime:
     @staticmethod
     def _record_knowledge_stage(context: Mapping[str, Any], stage: str) -> None:
         logger.info(
-            "participation_knowledge stage={} outcome={} count={} chars={} elapsed_ms={} knowledge_rendered={} taste_rendered={} revalidated={}",
+            "participation_knowledge stage={} outcome={} count={} chars={} elapsed_ms={} knowledge_rendered={} revalidated={}",
             stage,
             str(context.get("knowledge_selection_status") or "disabled"),
             int(context.get("knowledge_selected_count") or 0),
             int(context.get("knowledge_rendered_chars") or 0),
             int(context.get("knowledge_selection_elapsed_ms") or 0),
             bool(context.get(f"knowledge_rendered_to_{stage}", False)),
-            bool(context.get(f"taste_rendered_to_{stage}", False)),
             bool(context.get("knowledge_revalidated", False)),
         )
 
@@ -455,7 +454,7 @@ class ParticipationRuntime:
 
         if lane == "shadow":
             # Shadow records the decision and stops: no generation, effect, preview,
-            # typing or taste write may be caused by a shadow decision.
+            # typing may be caused by a shadow decision.
             self._count("shadow_decision")
             await self._record(opportunity, f"shadow_{decision.action}", decision.reason)
             return {
@@ -2029,13 +2028,12 @@ class ParticipationRuntime:
         )
         observed = _revision_token(fresh_snapshot, fresh_opportunity, context)
         changed = _revision_token_changed(baseline, observed)
-        if (self._history_projector is None and not knowledge_changed and not changed
-                and not context.get("advisory_taste")):
+        if self._history_projector is None and not knowledge_changed and not changed:
             return None
         fresh_inputs = await self._decision_inputs(fresh_opportunity, fresh_snapshot)
         fresh_context: dict[str, Any] = dict(context)
-        rebuild = baseline[:2] != observed[:2] or baseline[4:] != observed[4:]
-        if self._history_projector is not None or rebuild or context.get("advisory_taste"):
+        rebuild = baseline[:2] != observed[:2] or baseline[3:] != observed[3:]
+        if self._history_projector is not None or rebuild:
             fresh_context = dict(
                 await self._context_builder.build(
                     fresh_opportunity, inputs=fresh_inputs
@@ -2307,11 +2305,10 @@ def _revision_token(
     snapshot: Mapping[str, Any] | None,
     opportunity: ParticipationOpportunity,
     context: Mapping[str, Any] | None,
-) -> tuple[int, tuple[str, ...], str, str, str]:
+) -> tuple[int, tuple[str, ...], str, str]:
     revision = int(opportunity.observed_revision)
     source_ids = tuple(opportunity.source_event_ids)
     knowledge_revision = ""
-    taste_revision = ""
     policy_inputs: list[tuple[tuple[str, Any], ...]] = []
     for value in (snapshot, context):
         if value is None:
@@ -2327,8 +2324,6 @@ def _revision_token(
             knowledge_revision = str(getattr(selection, "revision", "") or "") or canonical_hash(
                 str(getattr(selection, "text", ""))
             )
-        if "advisory_taste" in value:
-            taste_revision = canonical_hash(value.get("advisory_taste"))
         policy_inputs.append(
             tuple(
                 (name, value.get(name))
@@ -2344,12 +2339,12 @@ def _revision_token(
             )
         )
     policy_revision = canonical_hash(tuple(policy_inputs))
-    return revision, source_ids, knowledge_revision, taste_revision, policy_revision
+    return revision, source_ids, knowledge_revision, policy_revision
 
 
 def _revision_token_changed(
-    baseline: tuple[int, tuple[str, ...], str, str, str],
-    observed: tuple[int, tuple[str, ...], str, str, str],
+    baseline: tuple[int, tuple[str, ...], str, str],
+    observed: tuple[int, tuple[str, ...], str, str],
 ) -> bool:
     return observed[0] > baseline[0] or observed[1:] != baseline[1:]
 

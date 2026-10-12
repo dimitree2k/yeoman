@@ -2445,65 +2445,6 @@ class SpeakupLog:
                 ),
             )
 
-    async def participation_outcome_samples(
-        self, *, channel: str, chat_id: str, limit: int = 50, before_ms: int | None = None
-    ) -> list[dict[str, Any]]:
-        """Delivered, provenance-tagged participation samples for one chat.
-
-        Untagged historical records and unverified deliveries are excluded, so old
-        patterns are never promoted to authoritative new guidance.
-        """
-        with self._lock:
-            rows = self._conn.execute(
-                """
-                SELECT * FROM delivery_reservations
-                WHERE origin = 'participation' AND lane = 'production'
-                  AND channel = ? AND chat_id = ? AND delivery_state = 'delivered'
-                  AND outcome IS NOT NULL AND outcome_kind IS NOT NULL
-                  AND (? IS NULL OR delivered_at_ms <= ?)
-                ORDER BY outcome_at_ms DESC, delivered_at_ms DESC
-                LIMIT ?
-                """,
-                (
-                    str(channel),
-                    str(chat_id),
-                    int(before_ms) if before_ms is not None else None,
-                    int(before_ms) if before_ms is not None else None,
-                    max(1, int(limit)),
-                ),
-            ).fetchall()
-        return [dict(row) for row in rows]
-
-    async def participation_outcome_chats(self, *, limit: int = 50) -> list[dict[str, Any]]:
-        with self._lock:
-            rows = self._conn.execute(
-                """
-                SELECT channel, chat_id, MAX(outcome_at_ms) AS latest_at
-                FROM delivery_reservations
-                WHERE origin = 'participation' AND lane = 'production'
-                  AND delivery_state = 'delivered' AND outcome IS NOT NULL
-                  AND outcome_kind IS NOT NULL
-                GROUP BY channel, chat_id
-                ORDER BY latest_at DESC
-                LIMIT ?
-                """,
-                (max(1, int(limit)),),
-            ).fetchall()
-        return [dict(row) for row in rows]
-
-    async def last_taste_distillation_at(
-        self, *, channel: str, chat_id: str
-    ) -> float | None:
-        """Latest successful/in-flight claim time for the exact chat."""
-        with self._lock:
-            row = self._conn.execute(
-                """
-                SELECT MAX(created_at) AS latest_at FROM taste_distillations
-                WHERE channel = ? AND chat_id = ?
-                """,
-                (str(channel), str(chat_id)),
-            ).fetchone()
-        return float(row["latest_at"]) if row and row["latest_at"] is not None else None
 
     async def delivered_reservation_rows(
         self,
@@ -2819,24 +2760,10 @@ class SpeakupLog:
                 """,
                 (channel, chat_id),
             ).fetchall()
-            distillations = self._conn.execute(
-                """
-                SELECT COUNT(*) AS c, MAX(created_at) AS latest_at
-                FROM taste_distillations
-                WHERE channel = ? AND chat_id = ?
-                """,
-                (channel, chat_id),
-            ).fetchone()
         return {
             "sent_speakups": int(sent["c"] if sent else 0),
             "labeled_outcomes": int(labeled["c"] if labeled else 0),
             "outcomes": {str(row["outcome"]): int(row["c"]) for row in outcomes},
-            "taste_distillations": int(distillations["c"] if distillations else 0),
-            "last_taste_distillation_at": (
-                datetime.fromtimestamp(float(distillations["latest_at"]), UTC).isoformat()
-                if distillations and distillations["latest_at"] is not None
-                else None
-            ),
         }
 
     def _insert(
@@ -2880,82 +2807,6 @@ class SpeakupLog:
             )
             self._conn.commit()
 
-    async def has_taste_distillation(
-        self,
-        *,
-        channel: str,
-        chat_id: str,
-        sample_fingerprint: str,
-    ) -> bool:
-        with self._lock:
-            row = self._conn.execute(
-                """
-                SELECT 1
-                FROM taste_distillations
-                WHERE channel = ? AND chat_id = ? AND sample_fingerprint = ?
-                LIMIT 1
-                """,
-                (channel, chat_id, sample_fingerprint),
-            ).fetchone()
-        return row is not None
-
-    async def record_taste_distillation(
-        self,
-        *,
-        channel: str,
-        chat_id: str,
-        sample_fingerprint: str,
-        now: float | None = None,
-    ) -> None:
-        ts = float(now if now is not None else time.time())
-        with self._lock:
-            self._conn.execute(
-                """
-                INSERT OR IGNORE INTO taste_distillations (
-                    channel, chat_id, sample_fingerprint, created_at
-                ) VALUES (?, ?, ?, ?)
-                """,
-                (channel, chat_id, sample_fingerprint, ts),
-            )
-            self._conn.commit()
-
-    async def claim_taste_distillation(
-        self,
-        *,
-        channel: str,
-        chat_id: str,
-        sample_fingerprint: str,
-        now: float | None = None,
-    ) -> bool:
-        ts = float(now if now is not None else time.time())
-        with self._lock:
-            cursor = self._conn.execute(
-                """
-                INSERT OR IGNORE INTO taste_distillations (
-                    channel, chat_id, sample_fingerprint, created_at
-                ) VALUES (?, ?, ?, ?)
-                """,
-                (channel, chat_id, sample_fingerprint, ts),
-            )
-            self._conn.commit()
-        return cursor.rowcount == 1
-
-    async def delete_taste_distillation(
-        self,
-        *,
-        channel: str,
-        chat_id: str,
-        sample_fingerprint: str,
-    ) -> None:
-        with self._lock:
-            self._conn.execute(
-                """
-                DELETE FROM taste_distillations
-                WHERE channel = ? AND chat_id = ? AND sample_fingerprint = ?
-                """,
-                (channel, chat_id, sample_fingerprint),
-            )
-            self._conn.commit()
 
     def close(self) -> None:
         with self._lock:

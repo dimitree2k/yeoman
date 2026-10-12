@@ -335,19 +335,6 @@ class ConsciousnessTools:
             return {'status': 'ok', 'hits': [{'content': text} for text in result.entry_texts]}
         return {"status": "ok", "hits": []}
 
-    async def read_learned_chat_taste(
-        self,
-        chat_id: str,
-        limit: int = 5,
-        *,
-        channel: str | None = None,
-    ) -> dict[str, object]:
-        eligible = self._resolve_eligible(chat_id, channel=channel)
-        if eligible == "ambiguous_chat_id":
-            return {"status": "rejected", "reason": "ambiguous_chat_id", "patterns": []}
-        if eligible is None:
-            return {"status": "rejected", "reason": "chat_not_eligible", "patterns": []}
-        return {"status": "ok", "patterns": []}
 
     async def read_speakup_history(
         self,

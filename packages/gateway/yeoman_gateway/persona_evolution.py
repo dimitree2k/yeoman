@@ -71,7 +71,6 @@ class PersonaChatRef:
 @dataclass(frozen=True, slots=True)
 class ChatEvolutionEvidence:
     chat: PersonaChatRef
-    learned_taste: list[str] = field(default_factory=list)
     recent_preferences: list[str] = field(default_factory=list)
     speakup_outcomes: dict[str, int] = field(default_factory=dict)
     speakups: list[dict[str, Any]] = field(default_factory=list)
@@ -783,7 +782,7 @@ def _clean_legacy_suggested_note(note: str) -> str:
         note,
     )
     if legacy:
-        lesson = _clean_taste_pattern(legacy.group("lesson"))
+        lesson = _clean_preference_pattern(legacy.group("lesson"))
         return (
             f"{legacy.group('prefix')} confidence=medium "
             f"evidence={legacy.group('evidence')}: {lesson}"
@@ -986,7 +985,6 @@ async def collect_persona_evolution_evidence(
         chats.append(
             ChatEvolutionEvidence(
                 chat=chat,
-                learned_taste=[],
                 recent_preferences=preference_texts,
                 speakup_outcomes=outcome_counts,
                 speakups=[_safe_speakup(row) for row in speakups],
@@ -1054,14 +1052,14 @@ def render_persona_evolution_proposal(
     for chat_evidence in active_chats:
         chat = chat_evidence.chat
         sent = sum(chat_evidence.speakup_outcomes.values())
-        unique_patterns = _unique_taste_patterns(chat_evidence)
+        unique_patterns = _unique_preference_patterns(chat_evidence)
         lines.extend(
             [
                 (
                     f"- `{chat.channel}:{chat.chat_id}`: policy_source=`{chat.source}`, "
                     f"messages=`{chat_evidence.recent_message_count}`, "
                     f"speakups=`{sent}`, "
-                    f"taste_patterns=`{len(unique_patterns)}`, "
+                    f"preference_patterns=`{len(unique_patterns)}`, "
                     f"outcomes=`{json.dumps(chat_evidence.speakup_outcomes, sort_keys=True)}`"
                 ),
             ]
@@ -1084,7 +1082,6 @@ def _active_evidence_chats(evidence: PersonaEvolutionEvidence) -> list[ChatEvolu
         for chat in evidence.chats
         if chat.recent_message_count > 0
         or bool(chat.speakup_outcomes)
-        or bool(chat.learned_taste)
         or bool(chat.recent_preferences)
     ]
 
@@ -1093,7 +1090,7 @@ def _proposed_change_notes(evidence: PersonaEvolutionEvidence) -> list[str]:
     notes: list[str] = []
     for chat_evidence in _active_evidence_chats(evidence):
         sent = sum(chat_evidence.speakup_outcomes.values())
-        patterns = _unique_taste_patterns(chat_evidence)
+        patterns = _unique_preference_patterns(chat_evidence)
         if not patterns:
             continue
         chat = chat_evidence.chat
@@ -1102,9 +1099,9 @@ def _proposed_change_notes(evidence: PersonaEvolutionEvidence) -> list[str]:
             evidence_parts.append(f"{sent} speakups")
         if chat_evidence.recent_message_count:
             evidence_parts.append(f"{chat_evidence.recent_message_count} messages")
-        evidence_text = ", ".join(evidence_parts) if evidence_parts else "learned taste"
+        evidence_text = ", ".join(evidence_parts) if evidence_parts else "recent preferences"
         for pattern in patterns:
-            behavior_delta = _behavior_delta_from_taste_pattern(pattern)
+            behavior_delta = _behavior_delta_from_preference_pattern(pattern)
             if not behavior_delta:
                 continue
             notes.append(
@@ -1119,8 +1116,8 @@ def _proposed_change_notes(evidence: PersonaEvolutionEvidence) -> list[str]:
     ]
 
 
-def _behavior_delta_from_taste_pattern(pattern: str) -> str | None:
-    cleaned = _ensure_sentence(_clean_taste_pattern(pattern))
+def _behavior_delta_from_preference_pattern(pattern: str) -> str | None:
+    cleaned = _ensure_sentence(_clean_preference_pattern(pattern))
     if not cleaned:
         return None
     lowered = cleaned.casefold()
@@ -1203,11 +1200,11 @@ def _redundancy_tokens(text: str) -> set[str]:
     return tokens
 
 
-def _unique_taste_patterns(chat_evidence: ChatEvolutionEvidence) -> list[str]:
+def _unique_preference_patterns(chat_evidence: ChatEvolutionEvidence) -> list[str]:
     unique: list[str] = []
     seen: set[str] = set()
-    for raw in [*chat_evidence.learned_taste, *chat_evidence.recent_preferences]:
-        pattern = _clean_taste_pattern(raw)
+    for raw in chat_evidence.recent_preferences:
+        pattern = _clean_preference_pattern(raw)
         key = re.sub(r"\s+", " ", pattern).strip().casefold()
         if not key or key in seen:
             continue
@@ -1216,7 +1213,7 @@ def _unique_taste_patterns(chat_evidence: ChatEvolutionEvidence) -> list[str]:
     return unique
 
 
-def _clean_taste_pattern(value: str) -> str:
+def _clean_preference_pattern(value: str) -> str:
     cleaned = str(value).strip()
     prefix = "Proactive speakup taste pattern:"
     if cleaned.startswith(prefix):
@@ -1530,13 +1527,11 @@ def persona_evolution_signal_score(evidence: PersonaEvolutionEvidence) -> float:
     score = 0.0
     for chat_evidence in evidence.chats:
         score += chat_evidence.recent_message_count * 0.25
-        score += len(chat_evidence.learned_taste) * 3.0
         score += len(chat_evidence.recent_preferences) * 2.0
         for outcome, count in chat_evidence.speakup_outcomes.items():
             weight = 2.0 if str(outcome) in {"replied", "approved", "denied"} else 1.0
             score += max(0, int(count)) * weight
     return score
-
 
 
 def _compact_proposal(row: dict[str, Any]) -> dict[str, Any]:

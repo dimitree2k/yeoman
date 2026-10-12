@@ -571,7 +571,6 @@ def _render_participation_transcript(context: dict[str, object], *, limit: int =
     """Allocate the Writer's data budget by complete evidence entry."""
     from yeoman_gateway.processing.participation_context import (
         render_knowledge_block,
-        render_taste_block,
     )
 
     target_id = str(context.get("target_message_id") or "").strip()
@@ -609,9 +608,7 @@ def _render_participation_transcript(context: dict[str, object], *, limit: int =
 
     knowledge = str(context.get("selected_knowledge_text") or "").strip()
     knowledge_block = render_knowledge_block(knowledge)
-    taste_block = render_taste_block(context.get("advisory_taste"))
-    fixed = [target_line, *([knowledge_block] if knowledge_block else []),
-             *([taste_block] if taste_block else [])]
+    fixed = [target_line, *([knowledge_block] if knowledge_block else [])]
     if sum(map(len, fixed)) + len(fixed) - 1 > limit:
         raise ValueError("required participation context exceeds writer budget")
     rendered = "\n".join(fixed)
@@ -625,7 +622,6 @@ def _render_participation_transcript(context: dict[str, object], *, limit: int =
     context["writer_dropped_entry_ids"] = [item for item in dropped if item]
     context["writer_dropped_entry_count"] = len(dropped)
     context["knowledge_rendered_to_writer"] = bool(knowledge_block)
-    context["taste_rendered_to_writer"] = bool(taste_block)
     return rendered
 
 

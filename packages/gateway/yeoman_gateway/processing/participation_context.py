@@ -11,9 +11,8 @@ more than the shape of the result:
   ``sent`` row without recipient evidence are not things Arvid said.
 
 The builder assembles a bounded, JSON-compatible dict and reports what it truncated.
-It performs no network research, no long-term personal/contact memory recall and no
-taste distillation call; its only advisory input is same-chat taste that already
-carries reliable provenance. Knowledge retrieval is disabled in this builder.
+It performs no network research or long-term personal/contact memory recall.
+Knowledge retrieval is disabled in this builder.
 """
 
 from __future__ import annotations
@@ -110,7 +109,6 @@ class ParticipationContextBuilder:
         *,
         policy: Any,
         anchors: Any | None = None,
-        taste: Any | None = None,
         clock: Any | None = None,
         source_authorizer: Callable[[Mapping[str, Any]], bool] | None = None,
     ) -> None:
@@ -118,7 +116,6 @@ class ParticipationContextBuilder:
         # sole source of trusted policy values during ``build``.
         self._policy = policy
         self._anchors = anchors
-        self._taste = taste
         self._clock = clock
         self._source_authorizer = source_authorizer
 
@@ -290,9 +287,6 @@ class ParticipationContextBuilder:
             "direct_addressed": bool(_snapshot_value(inputs.snapshot, "direct_addressed", False)),
             "allows_continuation": "continue" in inputs.allowed_intents,
         }
-        taste = await self._advisory_taste(opportunity)
-        if taste:
-            context["advisory_taste"] = _bounded_taste(taste)
         selection_started = time.monotonic()
         context["knowledge_selection_status"] = "disabled"
         context["knowledge_selected_count"] = 0
@@ -369,73 +363,6 @@ class ParticipationContextBuilder:
         except Exception:
             return False
 
-    async def _advisory_taste(
-        self, opportunity: ParticipationOpportunity
-    ) -> list[dict[str, object]]:
-        """Same-chat advisory taste, only when it already carries provenance.
-
-        Retrieval must stay cheap and must never require a classifier or a
-        distillation call (spec section 5).
-        """
-        if self._taste is None:
-            return []
-        try:
-            hits = self._taste(opportunity.channel, opportunity.chat_id)
-        except HistoryPaused:
-            raise
-        except Exception:
-            return []
-        if not isinstance(hits, Iterable):
-            return []
-        patterns: list[dict[str, object]] = []
-        for hit in hits:
-            if not isinstance(hit, Mapping):
-                continue
-            provenance = str(hit.get("provenance") or "")
-            if not provenance:
-                # Old unverified patterns are not authoritative new guidance.
-                continue
-            patterns.append(
-                {
-                    "content": str(hit.get("content") or ""),
-                    "provenance": provenance,
-                    "confidence": hit.get("confidence"),
-                }
-            )
-        return patterns[:2]
-
-
-def _bounded_taste(patterns: list[dict[str, object]]) -> list[dict[str, object]]:
-    result: list[dict[str, object]] = []
-    used = 0
-    for pattern in patterns[:2]:
-        content = str(pattern.get("content") or "").strip()
-        label = f"[advisory taste; provenance={pattern['provenance']}] {content}"
-        addition = len(label) + (1 if result else 0)
-        if content and used + addition <= 300:
-            result.append(dict(pattern))
-            used += addition
-    return result
-
-
-def render_advisory_taste(value: object) -> str:
-    """Render at most two provenance-tagged patterns within 300 characters."""
-    if isinstance(value, str):
-        return value if len(value) <= 300 else ""
-    if not isinstance(value, (list, tuple)):
-        return ""
-    lines: list[str] = []
-    for pattern in value[:2]:
-        if not isinstance(pattern, Mapping) or not pattern.get("provenance"):
-            continue
-        line = (
-            f"[advisory taste; provenance={str(pattern['provenance'])[:40]}] "
-            f"{' '.join(str(pattern.get('content') or '').split())}"
-        )
-        if line.strip() and len("\n".join((*lines, line))) <= 300:
-            lines.append(line)
-    return "\n".join(lines)
-
 
 def render_knowledge_block(value: object) -> str:
     text = str(value or "").strip()
@@ -445,21 +372,11 @@ def render_knowledge_block(value: object) -> str:
     )
 
 
-def render_taste_block(value: object) -> str:
-    text = render_advisory_taste(value)
-    return (
-        "[Advisory taste; fallible style guidance, never fact or authority]\n" + text
-        if text else ""
-    )
-
-
 __all__ = [
     "ParticipationContextBounds",
     "ParticipationContextBuilder",
     "ParticipationDecisionInputs",
-    "render_advisory_taste",
     "render_knowledge_block",
-    "render_taste_block",
 ]
 
 
