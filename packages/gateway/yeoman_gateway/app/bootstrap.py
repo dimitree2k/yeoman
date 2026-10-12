@@ -3734,7 +3734,47 @@ def build_gateway_runtime(
         from yeoman_gateway.consciousness.participation_runtime import SourceOwner
         assert consciousness_tools is not None
 
-        participation_material = None
+        from yeoman_gateway.history.context import history_knowledge_scope, history_turn
+        from yeoman_gateway.history.export import secondary_archive
+        from yeoman_gateway.history.live import HistoryPaused
+
+        def participation_material(
+            channel: str, chat_id: str, source_ids: tuple[str, ...] | None
+        ) -> tuple[tuple[str, ...], int]:
+            if channel != "whatsapp":
+                return (), 0
+            activation = policy_adapter.current_activation(channel, chat_id)
+            if activation is None:
+                return (), 0
+            if source_ids is None:
+                return speakup_log.material_for_opportunity(
+                    channel, chat_id, None, lane=activation.lane
+                )
+            archive = secondary_archive()
+            resolved = tuple(
+                source_id
+                for source_id in dict.fromkeys(source_ids)
+                if not source_id.startswith("observed:")
+                and (row := archive.row(channel, chat_id, source_id)) is not None
+                and row["direction"] == "in"
+                and participant_is_allowed(
+                    engine=policy_engine, channel=channel, chat_id=chat_id,
+                    sender=row["sender_id"],
+                )
+            )
+            speakup_log.ensure_source_revisions_sync(
+                channel=channel, chat_id=chat_id, source_ids=resolved
+            )
+            return speakup_log.material_for_opportunity(
+                channel, chat_id, resolved, lane=activation.lane
+            )
+
+        # Baseline only the ledger; historical messages are not new observations.
+        targets = config.processing.chats + config.processing.shadow_chats
+        for target in dict.fromkeys(targets if participation_enabled else ()):
+            channel, separator, chat_id = target.partition(":")
+            if separator and channel == "whatsapp" and chat_id:
+                speakup_log.initialize_material_baseline_sync(channel=channel, chat_id=chat_id)
         source_owner = SourceOwner(store=speakup_log)
         if participation_enabled:
             participation_runtime, opportunity_scheduler, participation_decision = (
@@ -3847,6 +3887,8 @@ def build_gateway_runtime(
                 material_provider=participation_material,
             )
 
+            history_pause_skipped = 0
+
             async def _on_observed_inbound(event: object) -> None:
                 """Event-bus adapter: the bus awaits every handler, so this one awaits.
 
@@ -3854,8 +3896,25 @@ def build_gateway_runtime(
                 computes the durable revision and offers to the scheduler without
                 awaiting a judge, generator or transport.
                 """
+                nonlocal history_pause_skipped
                 try:
-                    _ingress.handle_event(event)
+                    channel = getattr(event, "channel", None)
+                    chat_id = str(getattr(event, "chat_id", "") or "")
+                    if channel != "whatsapp":
+                        _ingress.handle_event(event)
+                    elif _participation_active(channel, chat_id):
+                        # Only active chats pay for a history turn.
+                        async with history_turn(history_projector) as snapshot:
+                            with history_knowledge_scope(snapshot, knowledge_service):
+                                _ingress.handle_event(event)
+                        if history_pause_skipped:
+                            logger.info(
+                                "participation_history_resumed skipped_messages={}",
+                                history_pause_skipped,
+                            )
+                            history_pause_skipped = 0
+                except HistoryPaused:
+                    history_pause_skipped += 1
                 except Exception as exc:  # noqa: BLE001 - one producer must not fail dispatch
                     logger.warning(
                         "participation_ingress_failed error_type={}", type(exc).__name__

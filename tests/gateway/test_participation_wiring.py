@@ -2122,3 +2122,106 @@ async def test_real_effect_transport_denies_participation_after_pause(
             store.close()
             archive.close()
             log.close()
+
+
+@pytest.mark.asyncio
+async def test_production_participation_material_from_projected_history(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    from loguru import logger
+    from yeoman_gateway.history.live import HistoryPaused
+
+    from tests.gateway.history_test_helpers import ProjectedHistory
+
+    class NeverProvider:
+        def get_default_model(self) -> str:
+            return "test/provider"
+
+        async def chat(self, *args: Any, **kwargs: Any) -> None:
+            raise AssertionError("material admission must not call an LLM")
+
+    monkeypatch.setattr("yeoman_gateway.processing.model_route.RouteClient",
+                        lambda **kwargs: NeverProvider())
+    history = ProjectedHistory(tmp_path / "material-history")
+    monkeypatch.setenv("YEOMAN_HOME", str(tmp_path))
+    monkeypatch.setattr("yeoman_gateway.app.bootstrap.build_history_projector",
+                        lambda *args: history)
+    # The composition also exposes projector.control to IPC, which is not used here.
+    history.control = lambda *args: None
+    config = Config.model_validate({
+        "knowledge": _history_knowledge_config(tmp_path, "material-knowledge"),
+        "security": {"enabled": False},
+        "personaEvolution": {"enabled": False},
+        "processing": {"enabled": True, "chats": ["whatsapp:group@g.us"],
+                       "participation": {"enabled": True, "shadow": False,
+                                         "judgeRoute": "participation.judge"}},
+    })
+    policy = PolicyEngine(PolicyConfig.model_validate({"channels": {"whatsapp": {
+        "chats": {"group@g.us": {"participation": {"enabled": True},
+            "whoCanTalk": {"mode": "allowlist", "senders": ["10001@s.whatsapp.net"]}}}
+    }}}), workspace=tmp_path)
+    bus = MessageBus()
+    runtime = build_gateway_runtime(config=config, provider=NeverProvider(),
+        policy_engine=policy, policy_path=None, workspace=tmp_path / "workspace", bus=bus)
+    handler = next(item for item in bus._event_handlers["InboundObservedEvent"]
+                   if item.__name__ == "_on_observed_inbound")
+    cells = dict(zip(handler.__code__.co_freevars,
+                     (cell.cell_contents for cell in handler.__closure__), strict=True))
+    ingress = cells["_ingress"]
+    assert ingress._material_provider is not None
+    trigger = next(item.__self__._on_burst for item in bus._event_handlers["InboundObservedEvent"]
+                   if getattr(item, "__self__", None).__class__.__name__ == "BurstObserver")
+    trigger_cells = dict(zip(trigger.__code__.co_freevars,
+                             (cell.cell_contents for cell in trigger.__closure__), strict=True))
+    trigger_function = trigger_cells["_trigger"]
+    trigger_material = dict(zip(trigger_function.__code__.co_freevars,
+        (cell.cell_contents for cell in trigger_function.__closure__), strict=True))["participation_material"]
+    assert trigger_material is ingress._material_provider
+    offers = []
+    monkeypatch.setattr(ingress._runtime, "offer_source", lambda **kwargs: offers.append(kwargs) or True)
+    lines = []
+    sink = logger.add(lambda message: lines.append(str(message)), level="INFO")
+
+    def event(message_id: str, channel: str = "whatsapp") -> InboundObservedEvent:
+        return InboundObservedEvent(channel=channel, chat_id="group@g.us",
+            sender_id="10001@s.whatsapp.net", content="human material", timestamp=1,
+            message_id=message_id, source_event_ids=(message_id,), is_group=True)
+
+    try:
+        for message_id, chat_id, sender, direction in (
+            ("allowed", "group@g.us", "10001@s.whatsapp.net", "in"),
+            ("denied", "group@g.us", "10002@s.whatsapp.net", "in"),
+            ("other", "other@g.us", "10001@s.whatsapp.net", "in"),
+            ("bot", "group@g.us", "10001@s.whatsapp.net", "out"),
+        ):
+            history.add_message(chat_id=chat_id, message_id=message_id, text="material",
+                                timestamp=1, sender_id=sender, direction=direction)
+        for message_id in ("denied", "missing", "other", "bot", "observed:synthetic"):
+            await handler(event(message_id))
+        assert offers == []
+        assert trigger_material("telegram", "group@g.us", None) == ((), 0)
+        await handler(event("allowed"))
+        assert len(offers) == 1
+        assert offers[0]["source_event_ids"] == ("allowed",)
+        assert offers[0]["observed_revision"] == 1
+        assert runtime.speakup_log.material_for_opportunity("whatsapp", "group@g.us", None) == (("allowed",), 1)
+        assert trigger_material("whatsapp", "group@g.us", None) == (("allowed",), 1)
+
+        async def paused():
+            raise HistoryPaused("startup")
+
+        original = history.read_turn
+        monkeypatch.setattr(history, "read_turn", paused)
+        await handler(event("allowed"))
+        await handler(event("allowed"))
+        assert len(offers) == 1
+        monkeypatch.setattr(history, "read_turn", original)
+        await handler(event("missing"))
+        pause_lines = [line for line in lines if "participation_history_resumed" in line]
+        assert len(pause_lines) == 1
+        assert "skipped_messages=2" in pause_lines[0]
+    finally:
+        logger.remove(sink)
+        history.close()
+        runtime.speakup_log.close()
+        runtime.processing.close()
