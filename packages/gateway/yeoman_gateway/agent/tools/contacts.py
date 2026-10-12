@@ -48,7 +48,9 @@ class ContactsTool(Tool):
     def description(self) -> str:
         return (
             "Search people, read profiles, and add or remove contact information. "
-            "Actions: search, get, add_field, remove_field."
+            "Actions: search, get, add_field, remove_field. "
+            "`search` always needs `query` (a name, nickname or phone number); "
+            "listing all contacts is not supported."
         )
 
     @property
@@ -67,7 +69,7 @@ class ContactsTool(Tool):
                 },
                 "query": {
                     "type": "string",
-                    "description": "Search query (name or alias).",
+                    "description": "Required for action=search: a name, nickname or phone number.",
                 },
                 "kind": {
                     "type": "string",
@@ -115,7 +117,11 @@ class ContactsTool(Tool):
 
     def _search(self, query: str) -> str:
         if not query:
-            return "Error: query is required for search"
+            return (
+                "Error: search needs a query (a name, nickname or phone number); "
+                "listing all contacts is not supported. Retry once with the person's name, "
+                "or ask the user who they mean."
+            )
         if self._knowledge is None:
             return "Error: knowledge is unavailable"
         found = self._knowledge.search_people_with_policy(

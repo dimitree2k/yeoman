@@ -331,3 +331,12 @@ class TestResolveContactTool:
         payload = json.loads(result)
         assert payload["ok"] is False
         assert payload["error_code"] == "contact_not_resolved"
+
+
+def test_search_without_query_explains_how_to_recover():
+    tool = ContactsTool(knowledge=None)
+    result = tool._search("")
+    assert result.startswith("Error: search needs a query")
+    assert "listing all contacts is not supported" in result
+    assert "query" in tool.parameters["properties"]
+    assert "Required for action=search" in tool.parameters["properties"]["query"]["description"]
