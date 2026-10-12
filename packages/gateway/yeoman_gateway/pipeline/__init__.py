@@ -7,7 +7,6 @@ Each module contains one middleware class extracted from the monolithic
 from yeoman_gateway.pipeline.access import AccessControlMiddleware, NoReplyFilterMiddleware
 from yeoman_gateway.pipeline.admin import AdminCommandMiddleware
 from yeoman_gateway.pipeline.dedup import DeduplicationMiddleware
-from yeoman_gateway.pipeline.idea_capture import IdeaCaptureMiddleware
 from yeoman_gateway.pipeline.implicit_address import ImplicitBotAddressMiddleware
 from yeoman_gateway.pipeline.new_chat import NewChatNotifyMiddleware
 from yeoman_gateway.pipeline.normalize import NormalizationMiddleware
@@ -22,7 +21,6 @@ __all__ = [
     "AccessControlMiddleware",
     "AdminCommandMiddleware",
     "DeduplicationMiddleware",
-    "IdeaCaptureMiddleware",
     "ImplicitBotAddressMiddleware",
     "InputSecurityMiddleware",
     "NewChatNotifyMiddleware",

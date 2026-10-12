@@ -24,7 +24,6 @@ from yeoman_gateway.pipeline.forward import (
     ForwardSourceLookup,
     ForwardTargetResolver,
 )
-from yeoman_gateway.pipeline.idea_capture import IdeaCaptureMiddleware
 from yeoman_gateway.pipeline.implicit_address import ImplicitBotAddressMiddleware
 from yeoman_gateway.pipeline.new_chat import NewChatNotifyMiddleware
 from yeoman_gateway.pipeline.normalize import NormalizationMiddleware
@@ -174,13 +173,12 @@ class Orchestrator:
         if workflow_state and approval_trigger:
             layers.append(ApprovalMiddleware(workflow_state=workflow_state, trigger_callback=approval_trigger))
         layers.extend([
-            IdeaCaptureMiddleware(security=security),
-            AccessControlMiddleware(security=security),
+            AccessControlMiddleware(),
             NewChatNotifyMiddleware(
                 owner_alert_resolver=owner_alert_resolver,
                 global_pause=global_pause_probe,
             ),
-            NoReplyFilterMiddleware(security=security),
+            NoReplyFilterMiddleware(),
             InputSecurityMiddleware(security=security, classifier=security_classifier, block_message=security_block_message),
             ResponderMiddleware(
                 responder=responder,

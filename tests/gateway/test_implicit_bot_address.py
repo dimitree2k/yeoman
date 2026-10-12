@@ -6,7 +6,7 @@ from dataclasses import dataclass
 from datetime import UTC, datetime, timedelta
 
 import pytest
-from yeoman_gateway.core.intents import QueueMemoryNotesCaptureIntent, SendReactionIntent
+from yeoman_gateway.core.intents import RecordMetricIntent, SendReactionIntent
 from yeoman_gateway.core.models import InboundEvent, PolicyDecision
 from yeoman_gateway.core.pipeline import PipelineContext
 from yeoman_gateway.pipeline.access import AccessControlMiddleware
@@ -825,7 +825,9 @@ async def test_denied_early_bait_reaches_access_control(
     assert ctx.reply is None
     assert not [intent for intent in ctx.intents if isinstance(intent, SendReactionIntent)]
     assert [
-        intent for intent in ctx.intents if isinstance(intent, QueueMemoryNotesCaptureIntent)
+        intent
+        for intent in ctx.intents
+        if isinstance(intent, RecordMetricIntent) and intent.name == "policy_drop_access"
     ]
 
 

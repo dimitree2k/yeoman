@@ -29,8 +29,6 @@ from yeoman_gateway.core.control_ack import OwnerControlAcknowledgements
 from yeoman_gateway.core.intents import (
     OrchestratorIntent,
     PersistSessionIntent,
-    QueueMemoryNotesCaptureIntent,
-    RecordManualMemoryIntent,
     RecordMetricIntent,
     SendOutboundIntent,
     SendReactionIntent,
@@ -423,20 +421,6 @@ class OrchestratorService:
             case PersistSessionIntent():
                 # Sessions are persisted by the responder implementation.
                 return
-            case QueueMemoryNotesCaptureIntent():
-                return
-            case RecordManualMemoryIntent():
-                from yeoman_gateway.pipeline.idea_capture import RETIRED_MEMORY_MESSAGE
-                await self._dispatch_intent(
-                    SendOutboundIntent(
-                        event=OutboundEvent(
-                            channel=intent.channel,
-                            chat_id=intent.chat_id,
-                            content=RETIRED_MEMORY_MESSAGE,
-                        )
-                    ),
-                    principal=principal,
-                )
             case RecordMetricIntent():
                 self._telemetry.incr(intent.name, intent.value, intent.labels)
             case _:
