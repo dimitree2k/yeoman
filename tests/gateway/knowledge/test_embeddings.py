@@ -1,14 +1,18 @@
 """Synthetic statement production, hybrid rights and opt-in Pi search benchmark."""
 from __future__ import annotations
 
+import ast
 import asyncio
 import json
+import math
+import random
 import sqlite3
 import statistics
 import sys
 import threading
 import time
 from array import array
+from pathlib import Path
 from types import SimpleNamespace
 
 import pytest
@@ -141,6 +145,7 @@ def test_hybrid_semantic_rights_parity_and_timeout(knowledge_harness):
     asyncio.run(w.run_once(now_ms=1000))
     w.start()
     assert w._ready.wait(30)
+    assert w._vector_cache_ready.wait(30)
     try:
         # FTS token misses, but fake query vector matches the statement vector.
         query = RecallQuery("orchardsemantic", limit=10)
@@ -206,36 +211,49 @@ def test_search_all_rows_ranking_mismatch_and_incremental_retirement():
 def test_pi_search_benchmark():
     import resource
 
-    import numpy as np
 
     owner = index_store()
     conn = owner.connection
-    rng = np.random.default_rng(23)
-    vectors = rng.uniform(-1,1,(10000,1536)).astype(np.float32)
+    rng = random.Random(23)
+    vectors = [array("f", (rng.uniform(-1, 1) for _ in range(1536))) for _ in range(10000)]
     conn.executemany("INSERT INTO memory2_embedding_index "
         "(document_id,content_hash,source_revision_hash,model_id,dimension,preprocessing_version,workspace_id,node_id,vector,created_ms) "
         "VALUES (?,'hash','hash','perf',1536,?,'workspace',?,?,0)",
         ((str(i),EMBEDDING_PREPROCESSING_VERSION,str(i),v.tobytes()) for i,v in enumerate(vectors)))
     index = EmbeddingIndex(owner=owner)
     def search(q):
-        return index.search_embedding_index(workspace_id="workspace",query_vector=q.tolist(),scope_keys=[],limit=12,
+        return index.search_embedding_index(workspace_id="workspace",query_vector=list(q),scope_keys=[],limit=12,
             model_id="perf",preprocessing_version=EMBEDDING_PREPROCESSING_VERSION)
     started = time.perf_counter()
     assert search(vectors[0])[0]["node_id"] == "0"
     build = time.perf_counter()-started
     durations = []
-    for q in vectors[1:31]:
+    for q in vectors[1:201]:
         started = time.perf_counter()
         assert search(q)
         durations.append((time.perf_counter()-started)*1000)
     blocks = next(iter(index._caches.values()))["blocks"]
-    matrix_bytes = sum(matrix.nbytes for _,matrix in blocks)
+    matrix_bytes = sum(sys.getsizeof(vector) + sys.getsizeof(code) + sys.getsizeof(norm)
+                       for _, vectors in blocks for vector, code, norm in vectors)
     metadata_bytes = sum(sys.getsizeof(item)+sum(sys.getsizeof(v) for v in item.values()) for items,_ in blocks for item in items)
+    seen = set()
+    def cache_size(value):
+        if id(value) in seen:
+            return 0
+        seen.add(id(value))
+        size = sys.getsizeof(value)
+        if isinstance(value, dict):
+            size += sum(cache_size(k) + cache_size(v) for k, v in value.items())
+        elif isinstance(value, (tuple, list)):
+            size += sum(cache_size(v) for v in value)
+        return size
+    cache_bytes = cache_size(index._caches)
     p95 = statistics.quantiles(durations,n=20)[18]
-    print(json.dumps(dict(dimension=1536,vectors=10000,build_s=build,p95_ms=p95,
-                         cache_matrix_bytes=matrix_bytes,cache_metadata_bytes=metadata_bytes,
+    print(json.dumps(dict(dimension=1536,vectors=10000,build_s=build,p50_ms=statistics.median(durations),p95_ms=p95,
+                         cache_vector_fingerprint_bytes=matrix_bytes,cache_metadata_bytes=metadata_bytes,
+                         cache_bytes=cache_bytes,samples=len(durations),pool=128,
                          process_peak_rss_kib=resource.getrusage(resource.RUSAGE_SELF).ru_maxrss)),flush=True)
-    assert build <= 5
+    assert build <= 3.0  # background warm-up; recall never waits for it
     assert p95 <= 80
     conn.close()
 
@@ -497,3 +515,81 @@ async def test_changed_provider_inputs_keep_short_interval(knowledge_harness, mo
     with pytest.raises(asyncio.CancelledError):
         await w._work()
     assert delays == [w.poll_seconds]
+
+
+def test_synthetic_ranking_matches_exact_cosine():
+    owner = index_store()
+    rng = random.Random(17)
+    vectors = [array("f", (rng.uniform(-1, 1) for _ in range(16))) for _ in range(40)]
+    query = vectors[7]
+    for i, vector in enumerate(vectors):
+        insert_vector(owner.connection, str(i), vector)
+    expected = sorted(range(len(vectors)), key=lambda i: (
+        math.sumprod(vectors[i], query) / math.sqrt(math.sumprod(vectors[i], vectors[i]) *
+                                                  math.sumprod(query, query)), str(i)), reverse=True)[:10]
+    result = EmbeddingIndex(owner=owner).search_embedding_index(
+        workspace_id="workspace", query_vector=list(query), scope_keys=[], limit=10)
+    assert [row["node_id"] for row in result] == [str(i) for i in expected]
+    owner.connection.close()
+
+
+def test_no_module_imports_numpy():
+    root = Path(__file__).resolve().parents[3]
+    for folder in ("packages", "tests"):
+        for path in (root / folder).rglob("*.py"):
+            for node in ast.walk(ast.parse(path.read_text())):
+                if isinstance(node, ast.Import):
+                    assert all(alias.name.split(".")[0] != "numpy" for alias in node.names), path
+                elif isinstance(node, ast.ImportFrom):
+                    assert (node.module or "").split(".")[0] != "numpy", path
+
+
+def test_fingerprints_match_stored_and_query_float32_including_signed_zero():
+    from yeoman_gateway.knowledge._embedding_index import _fingerprint
+
+    values = [0.0, -0.0, 1.0, -1.0, 1e-46, -1e-46]
+    published = array("f", values).tobytes()
+    query = array("f", list(array("f", published))).tobytes()
+    assert _fingerprint(published) == _fingerprint(query)
+    assert _fingerprint(array("f", [0.0]).tobytes()) == 0
+    assert _fingerprint(array("f", [-0.0]).tobytes()) == 1
+    owner = index_store()
+    insert_vector(owner.connection, "zeros", values)
+    result = EmbeddingIndex(owner=owner).search_embedding_index(
+        workspace_id="workspace", query_vector=values, scope_keys=[])
+    assert result[0]["score"] == pytest.approx(1.0)
+    owner.connection.close()
+
+
+def test_first_recall_during_cache_warming_is_lexical_and_does_not_wait(knowledge_harness, monkeypatch):
+    h = knowledge_harness
+    sid, _ = statement(h, "apple orchard")
+    context = h.read_context(h.person("Tom"))
+    query = RecallQuery("apple")
+    baseline = h.service.recall(query, context=context, require_match=True)
+    w = h.service.configure_embeddings(FakeEmbedder())
+    entered, release = threading.Event(), threading.Event()
+    original = w._warm_cache
+    def blocked_warm():
+        entered.set()
+        assert release.wait(30)
+        original()
+    monkeypatch.setattr(w, "_warm_cache", blocked_warm)
+    def forbidden(*args, **kwargs):
+        pytest.fail("warming recall attempted vector generation/search")
+    monkeypatch.setattr(w, "embed", forbidden)
+    reasons = []
+    monkeypatch.setattr(w, "_reason", reasons.append)
+    w.start()
+    try:
+        assert entered.wait(30)
+        started = time.monotonic()
+        result = h.service.recall(query, context=context, require_match=True)
+        assert time.monotonic() - started < 0.5
+        assert result == baseline
+        assert sid in result.statement_ids
+        assert "vector_cache_warming" in reasons
+        assert not w._vector_cache_ready.is_set()
+    finally:
+        release.set()
+        asyncio.run(w.stop())

@@ -719,6 +719,8 @@ class RetrievalEngine:
         """
         if embedder is None or not query.text.strip():
             return ()
+        if not getattr(embedder, "vector_cache_ready", True):
+            return ()
         if not self._store.has_table("memory2_embedding_index"):
             return ()
         try:

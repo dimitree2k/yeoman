@@ -695,7 +695,8 @@ class KnowledgeService:
         """Build the worker at the composition boundary, without starting it."""
         from yeoman_gateway.knowledge._embeddings import KnowledgeEmbeddingWorker
 
-        worker = KnowledgeEmbeddingWorker(self._store, embedder, workspace_id=self.workspace_id)
+        worker = KnowledgeEmbeddingWorker(self._store, embedder, workspace_id=self.workspace_id,
+                                          embedding_index=self._retrieval._embedding_index)
         self._embedder = worker
         return worker
 

@@ -5,6 +5,7 @@ import heapq
 import json
 import math
 import sqlite3
+import sys
 import threading
 from array import array
 from collections.abc import Mapping
@@ -120,6 +121,7 @@ class EmbeddingIndex:
         scope_keys: list[str],
         limit: int = 12,
         candidate_limit: int = 256,
+        pool: int = 128,
         model_id: str | None = None,
         preprocessing_version: str | None = None,
         allowed_node_ids: set[str] | None = None,
@@ -131,71 +133,93 @@ class EmbeddingIndex:
         can never be scored against a different version.  Rows whose source is no longer
         proven and unrevoked are dropped here, immediately before output.
         """
-        del candidate_limit  # All compatible rows are scored, regardless of age.
+        del candidate_limit  # Compatibility is independent of row age.
         if not query_vector or not all(math.isfinite(x) for x in query_vector):
             return []
-        import numpy as np
 
         key = (workspace_id, model_id, len(query_vector), preprocessing_version)
-        with self._cache_lock, self._lock:
-            cache = self._caches.setdefault(key, {"stamp": None, "blocks": []})
-            stamp = (self._conn.total_changes, self._conn.execute("PRAGMA data_version").fetchone()[0])
-            clauses = "workspace_id=? AND dimension=?"
-            params: list[Any] = [workspace_id, len(query_vector)]
-            for name, value in (("model_id", model_id), ("preprocessing_version", preprocessing_version)):
-                if value is not None:
-                    clauses += f" AND {name}=?"
-                    params.append(value)
-            if cache["stamp"] != stamp:
-                active = {row[0] for row in self._conn.execute(
-                    f"SELECT rowid FROM memory2_embedding_index WHERE {clauses} AND status='active'", params
-                )}
-                blocks, cached = [], set()
-                for items, matrix in cache["blocks"]:
-                    keep = [i for i, item in enumerate(items) if item["cache_id"] in active]
-                    if keep:
-                        retained = [items[i] for i in keep]
-                        blocks.append((retained, matrix if len(keep) == len(items) else matrix[keep]))
-                        cached.update(item["cache_id"] for item in retained)
-                missing = sorted(active - cached)
-                for start in range(0, len(missing), 256):
-                    ids = missing[start:start + 256]
-                    placeholders = ",".join("?" for _ in ids)
-                    rows = self._conn.execute(
-                        f"SELECT rowid AS cache_id, * FROM memory2_embedding_index WHERE rowid IN ({placeholders}) ORDER BY rowid", ids
-                    )
-                    items, vectors = [], []
-                    for row in rows:
-                        vector = np.frombuffer(row["vector"], dtype=np.float32)
-                        if len(vector) != len(query_vector) or not np.isfinite(vector).all():
-                            continue
-                        norm = float(np.linalg.norm(vector))
-                        if norm <= 0 or not math.isfinite(norm):
-                            continue
-                        item = _embedding_index_row(row)
-                        del item["vector"]
-                        items.append(item)
-                        vectors.append(vector / norm)
-                    if vectors:
-                        blocks.append((items, np.stack(vectors)))
-                cache["blocks"] = blocks
-                cache["stamp"] = stamp
-            q = np.asarray(query_vector, dtype=np.float32)
-            norm = float(np.linalg.norm(q))
-            if norm <= 0:
+        with self._cache_lock:
+            cache = self._refresh_cache(key)
+            norm = math.sqrt(math.sumprod(query_vector, query_vector))
+            if norm <= 0 or not math.isfinite(norm):
                 return []
-            q /= norm
+            q = array("f", query_vector)
+            norm = math.sqrt(math.sumprod(q, q))
+            if norm <= 0 or not math.isfinite(norm):
+                return []
+            fingerprint = _fingerprint(q.tobytes())
+            candidates = (((code ^ fingerprint).bit_count(), item, vector, vector_norm)
+                          for items, vectors in cache["blocks"]
+                          for item, (vector, code, vector_norm) in zip(items, vectors, strict=True)
+                          if (not scope_keys or item["scope_key"] in scope_keys)
+                          and (allowed_node_ids is None or item["node_id"] in allowed_node_ids))
+            nearest = heapq.nsmallest(max(1, int(pool)), candidates, key=lambda row: (row[0], row[1]["document_id"]))
             scored = []
-            for items, matrix in cache["blocks"]:
-                scores = np.einsum("ij,j->i", matrix, q, optimize=False)
-                scored.extend((float(score), item) for score, item in zip(scores, items, strict=True)
-                              if score > 0
-                              and (not scope_keys or item["scope_key"] in scope_keys)
-                              and (allowed_node_ids is None or item["node_id"] in allowed_node_ids))
+            for _, item, vector, vector_norm in nearest:
+                score = math.sumprod(vector, q) / (vector_norm * norm)
+                if score > 0:
+                    scored.append((score, item))
             best = heapq.nlargest(max(1, int(limit)), scored,
                                  key=lambda pair: (pair[0], pair[1]["document_id"]))
             return [dict(item, score=min(1.0, score)) for score, item in best
                     if self._source_still_readable(item)]
+
+
+    def warm_cache(self, *, workspace_id: str, model_id: str, dimension: int,
+                   preprocessing_version: str) -> None:
+        with self._cache_lock:
+            self._refresh_cache((workspace_id, model_id, dimension, preprocessing_version))
+
+    def _refresh_cache(self, key: tuple[Any, ...]) -> dict[str, Any]:
+        workspace_id, model_id, dimension, preprocessing_version = key
+        cache = self._caches.setdefault(key, {"stamp": None, "blocks": []})
+        with self._lock:
+            stamp = (self._conn.total_changes, self._conn.execute("PRAGMA data_version").fetchone()[0])
+            if cache["stamp"] == stamp:
+                return cache
+            clauses = "workspace_id=? AND dimension=?"
+            params: list[Any] = [workspace_id, dimension]
+            for name, value in (("model_id", model_id), ("preprocessing_version", preprocessing_version)):
+                if value is not None:
+                    clauses += f" AND {name}=?"
+                    params.append(value)
+            active = {row[0] for row in self._conn.execute(
+                f"SELECT rowid FROM memory2_embedding_index WHERE {clauses} AND status='active'", params
+            )}
+        blocks, cached = [], set()
+        for items, vectors in cache["blocks"]:
+            keep = [i for i, item in enumerate(items) if item["cache_id"] in active]
+            if keep:
+                retained = [items[i] for i in keep]
+                blocks.append((retained, vectors if len(keep) == len(items) else [vectors[i] for i in keep]))
+                cached.update(item["cache_id"] for item in retained)
+        missing = sorted(active - cached)
+        for start in range(0, len(missing), 256):
+            ids = missing[start:start + 256]
+            placeholders = ",".join("?" for _ in ids)
+            with self._lock:
+                rows = self._conn.execute(
+                    f"SELECT rowid AS cache_id, * FROM memory2_embedding_index WHERE rowid IN ({placeholders}) AND status='active' ORDER BY rowid", ids
+                ).fetchall()
+            items, vectors = [], []
+            for row in rows:
+                blob = row["vector"]
+                vector = array("f", blob)
+                if len(vector) != dimension:
+                    continue
+                norm = math.sqrt(math.sumprod(vector, vector))
+                if norm <= 0 or not math.isfinite(norm):
+                    continue
+                item = _embedding_index_row(row)
+                del item["vector"]
+                items.append(item)
+                vectors.append((vector, _fingerprint(blob), norm))
+            if vectors:
+                blocks.append((items, vectors))
+        cache["blocks"] = blocks
+        # Any concurrent writer leaves this stamp stale, forcing reconciliation next time.
+        cache["stamp"] = stamp
+        return cache
 
 
     def _source_still_readable(self, item: Mapping[str, Any]) -> bool:
@@ -224,7 +248,7 @@ class EmbeddingIndex:
 
 
 def _embedding_index_row(row: sqlite3.Row) -> dict[str, Any]:
-    item = {key: row[key] for key in row.keys()}
+    item = dict(zip(row.keys(), row, strict=True))
     item["conversation_ids"] = _decode_ids(item.get("conversation_ids_json"))
     return item
 
@@ -251,3 +275,12 @@ def _cosine_similarity(a: list[float], b: list[float]) -> float:
         return 0.0
     return dot / ((norm_a**0.5) * (norm_b**0.5))
 
+
+
+_SIGN_TRANSLATION = b"0" * 128 + b"1" * 128
+_SIGN_BYTE = 3 if sys.byteorder == "little" else 0
+
+
+def _fingerprint(blob: bytes) -> int:
+    # Signed zero retains its sign in both stored and query float32 fingerprints.
+    return int(blob[_SIGN_BYTE::4].translate(_SIGN_TRANSLATION), 2)

@@ -18,6 +18,7 @@ from loguru import logger
 from yeoman_gateway.knowledge._embedding_index import (
     _EMBEDDING_INDEX_SCHEMA,
     EMBEDDING_PREPROCESSING_VERSION,
+    EmbeddingIndex,
 )
 from yeoman_gateway.knowledge._retrieval import CURRENT_STATEMENT_SQL
 
@@ -75,13 +76,15 @@ class KnowledgeEmbeddingWorker:
 
     def __init__(self, store: Any, embedder: Any, *, workspace_id: str,
                  poll_seconds: float = 2.0, query_timeout: float = 1.5,
-                 idle_seconds: float = 30.0) -> None:
+                 idle_seconds: float = 30.0, embedding_index: EmbeddingIndex | None = None) -> None:
         self.store, self.embedder = store, embedder
         # Fresh schema-3 stores omit these legacy tables; retain their exact existing DDL.
         with store.transaction() as conn:
             for sql in _EMBEDDING_INDEX_SCHEMA:
                 conn.execute(sql)
         self.workspace_id = workspace_id
+        self._embedding_index = embedding_index or EmbeddingIndex(owner=store)
+        self._vector_cache_ready = threading.Event()
         self.model, self.dimension = embedder.model, embedder.dimension
         self.poll_seconds = poll_seconds
         self.idle_seconds = idle_seconds
@@ -116,6 +119,10 @@ class KnowledgeEmbeddingWorker:
         task = loop.create_task(self._work())
         self._ready.set()
         try:
+            try:
+                self._warm_cache()
+            except Exception:
+                self._reason("vector_cache_warm_failed")
             loop.run_forever()
         finally:
             task.cancel()
@@ -124,16 +131,30 @@ class KnowledgeEmbeddingWorker:
             loop.run_until_complete(asyncio.gather(*asyncio.all_tasks(loop), return_exceptions=True))
             loop.close()
 
+    def _warm_cache(self) -> None:
+        self._embedding_index.warm_cache(
+            workspace_id=self.workspace_id, model_id=self.model, dimension=self.dimension,
+            preprocessing_version=EMBEDDING_PREPROCESSING_VERSION)
+        self._vector_cache_ready.set()
+
+    @property
+    def vector_cache_ready(self) -> bool:
+        ready = self._vector_cache_ready.is_set()
+        if not ready:
+            self._reason("vector_cache_warming")
+        return ready
+
     async def stop(self) -> None:
         if self._thread is None:
             return
         await asyncio.to_thread(self._ready.wait, 30)
-        if self._loop is not None and self._loop.is_running():
+        if self._loop is not None:
             self._loop.call_soon_threadsafe(self._loop.stop)
         await asyncio.to_thread(self._thread.join, 30)
         self._thread = None
         self._loop = None
         self._ready.clear()
+        self._vector_cache_ready.clear()
 
     async def _work(self) -> None:
         with self._write() as conn:
@@ -153,6 +174,8 @@ class KnowledgeEmbeddingWorker:
 
     def embed(self, text: str) -> list[float] | None:
         """Synchronous recall boundary; async I/O runs on the worker's dedicated loop."""
+        if not self.vector_cache_ready:
+            return None
         text = embedding_text(text)
         with self._cache_lock:
             if text in self._queries:
