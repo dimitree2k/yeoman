@@ -5,7 +5,6 @@ from __future__ import annotations
 from pathlib import Path
 
 import pytest
-from yeoman_gateway.knowledge._memory.read_gate import build_read_context, registry_members
 from yeoman_gateway.processing.reconcile import _effect_meta
 from yeoman_gateway.processing.store import ProcessingStore
 
@@ -80,45 +79,8 @@ def test_f07_effect_meta_is_found_behind_five_hundred_terminal_rows(tmp_path: Pa
     store.close()
 
 
-def test_f11_registry_lookup_uses_the_real_api(tmp_path: Path) -> None:
-    """ChatRegistry exposes ``get_chat``; the gate looked for methods that never existed."""
-
-    class _RealShapeRegistry:
-        """Only the production method, so the contract is what is tested."""
-
-        def get_chat(self, channel: str, chat_id: str):
-            if chat_id != "gruppe@g.us":
-                return None
-            return {
-                "chat_id": chat_id,
-                "metadata": {"participants": [{"id": "alice"}, {"id": "bob"}]},
-            }
-
-    registry = _RealShapeRegistry()
-    members = registry_members(registry, channel="whatsapp", chat_id="gruppe@g.us")
-
-    assert members == {"alice", "bob"}
-
-    context = build_read_context(
-        principal_id="alice",
-        channel="whatsapp",
-        chat_id="gruppe@g.us",
-        chat_registry=registry,
-        now_ms=T0,
-    )
-    assert context.membership_known is True
-    assert context.current_members == frozenset({"alice", "bob"})
-
-    # An unknown chat stays unknown rather than optimistically open.
-    assert registry_members(registry, channel="whatsapp", chat_id="other@g.us") == set()
 
 
-def test_f11_accepts_string_participants_too() -> None:
-    class _Strings:
-        def get_chat(self, channel: str, chat_id: str):
-            return {"metadata": {"participants": ["alice", "bob"]}}
-
-    assert registry_members(_Strings(), channel="whatsapp", chat_id="x") == {"alice", "bob"}
 
 
 def test_f01_an_unopenable_store_stops_startup_instead_of_falling_back(tmp_path: Path) -> None:

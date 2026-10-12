@@ -1032,15 +1032,8 @@ def _reject_disabled_history_selectors(history: Any) -> None:
                 raise UnsupportedHistoryConfigError(f"history.readers.{family}=false is unsupported")
 
 
-class _HistoryCompatibility:
-    __slots__ = ()
-
-    @property
-    def legacy_writers_disabled(self) -> bool:
-        return True
 
 
-_HISTORY_COMPATIBILITY = _HistoryCompatibility()
 
 
 class Config(BaseSettings):
@@ -1091,9 +1084,6 @@ class Config(BaseSettings):
     processing: ProcessingConfig = Field(default_factory=ProcessingConfig)
     raw: RawArchiveConfig = Field(default_factory=RawArchiveConfig)
 
-    @property
-    def history(self) -> _HistoryCompatibility:
-        return _HISTORY_COMPATIBILITY
 
     @property
     def workspace_path(self) -> Path:

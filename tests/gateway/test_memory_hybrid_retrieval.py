@@ -11,6 +11,7 @@ Offline and synthetic: temporary database, recording embedder, no network.
 from __future__ import annotations
 
 import hashlib
+from array import array
 from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Iterator
@@ -76,9 +77,8 @@ class HybridHarness(ProjectedKnowledgeHarness):
         the additive retrieval index directly while retaining its real schema and source
         identity, so the guarded vector search and final Knowledge gate remain under test.
         """
-        from yeoman_gateway.knowledge._memory.store import (
+        from yeoman_gateway.knowledge._embedding_index import (
             _EMBEDDING_INDEX_SCHEMA,
-            MemoryStore,
         )
 
         store = self._raw_service._store
@@ -120,7 +120,7 @@ class HybridHarness(ProjectedKnowledgeHarness):
                 0,
                 0,
                 len(str(text)),
-                MemoryStore._serialize_vector([0.5] * dimension),
+                array("f", [0.5] * dimension).tobytes(),
                 self.clock.now_ms(),
             ),
         )

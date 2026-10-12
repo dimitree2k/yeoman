@@ -34,7 +34,7 @@ from yeoman_gateway.knowledge._capture import (
     observed_event,
     promoter_reason,
 )
-from yeoman_gateway.knowledge._memory.extraction_jobs import (
+from yeoman_gateway.knowledge._screening import (
     REJECT_BASES,
     is_hedged,
     screen_capture_input,
@@ -197,7 +197,7 @@ class StatementExtractor:
         return drafts
 
     def _ask_model(self, listing: str) -> list[Mapping[str, Any]]:
-        from yeoman_gateway.knowledge._memory.fact_extractor import _extract_json
+        from yeoman_gateway.knowledge._json_extract import _extract_json
 
         messages = [
             {"role": "system", "content": STATEMENT_SYSTEM_PROMPT},

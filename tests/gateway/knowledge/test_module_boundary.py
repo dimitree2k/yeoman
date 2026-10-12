@@ -27,7 +27,7 @@ PACKAGE_ROOT = Path(__file__).resolve().parents[3] / "packages" / "gateway" / "y
 #: may import.
 PRIVATE_MODULES = (
     "yeoman_gateway.knowledge._store",
-    "yeoman_gateway.knowledge._identity",
+    "yeoman_gateway.knowledge._person_identity",
     "yeoman_gateway.knowledge._statements",
     "yeoman_gateway.knowledge._retrieval",
     "yeoman_gateway.knowledge._migration",

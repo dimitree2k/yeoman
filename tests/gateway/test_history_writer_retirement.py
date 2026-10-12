@@ -1,9 +1,6 @@
 """Synthetic fail-closed writer retirement witnesses."""
-import hashlib
 import json
 import sqlite3
-import threading
-from pathlib import Path
 from types import SimpleNamespace
 from unittest.mock import MagicMock
 
@@ -22,41 +19,10 @@ def configure(monkeypatch, tmp_path, disabled):
     return root
 
 
-def writer(kind, path, disabled=False):
-    from yeoman_gateway.knowledge._contacts.service import ContactsService
-    from yeoman_gateway.knowledge._contacts.store import ContactsStore
-    from yeoman_gateway.knowledge._identity import IdentityEngine
-    from yeoman_gateway.knowledge._memory.extraction_jobs import SharedFactExtractionQueue
-    from yeoman_gateway.knowledge._memory.service import MemoryService
-    from yeoman_gateway.knowledge._memory.store import MemoryStore
-    from yeoman_gateway.knowledge._store import KnowledgeStore
-    from yeoman_gateway.session.manager import SessionManager
-    factories = {
-        'session': lambda: SessionManager(path.parent, sessions_dir=path.parent / 'sessions'),
-        'identity': lambda: IdentityEngine(KnowledgeStore(path), authority=MagicMock(), policy=MagicMock()),
-        'contacts-store': lambda: ContactsStore(path, legacy_history_disabled=disabled),
-        'contacts-service': lambda: ContactsService(path, legacy_history_disabled=disabled),
-        'memory-store': lambda: MemoryStore(path, legacy_history_disabled=disabled),
-        'auto-semantic-notes': lambda: MemoryService(workspace=path.parent, config=Config(memory={'db_path': str(path)}).memory, legacy_history_disabled=disabled),
-        'shared-facts': lambda: SharedFactExtractionQueue(store=MagicMock(), legacy_history_disabled=disabled),
-    }
-    return factories[kind]()
 
 
-KINDS = ( 'contacts-store', 'contacts-service', 'memory-store', 'auto-semantic-notes', 'shared-facts')
 
 
-@pytest.mark.parametrize('kind', KINDS)
-@pytest.mark.parametrize('direct_file', [False, True])
-def test_retired_writer_constructor_fails_before_file_creation(tmp_path, monkeypatch, kind, direct_file):
-    from yeoman_gateway.history.writer_guard import LegacyHistoryWriterDisabled
-    configure(monkeypatch, tmp_path, direct_file)
-    path = tmp_path / 'uncreated' / 'legacy.db'
-    threads = set(threading.enumerate())
-    with pytest.raises(LegacyHistoryWriterDisabled):
-        writer(kind, path, disabled=not direct_file)
-    assert not path.parent.exists()
-    assert set(threading.enumerate()) == threads
 
 
 def mutation(kind, obj):
@@ -77,39 +43,6 @@ def mutation(kind, obj):
     return obj.start()
 
 
-@pytest.mark.parametrize('kind', (*KINDS, 'identity'))
-@pytest.mark.parametrize('transition', ['instance', 'explicit-after-file-change'])
-def test_retired_writer_call_fails_on_existing_instance(tmp_path, monkeypatch, kind, transition):
-    from yeoman_gateway.history.writer_guard import LegacyHistoryWriterDisabled
-    root = configure(monkeypatch, tmp_path, False)
-    path = tmp_path / 'legacy.db'
-    obj = writer(kind, path)
-    def files():
-        return {str(p.relative_to(tmp_path)): hashlib.sha256(p.read_bytes()).hexdigest()
-                for p in tmp_path.rglob('*') if p.is_file() and root not in p.parents}
-    if kind == 'session':
-        from yeoman_gateway.session.manager import Session
-        obj.save(Session('whatsapp:synthetic'))
-    before = files()
-    threads = set(threading.enumerate())
-    if transition == 'instance':
-        obj.legacy_history_disabled = True
-    else:
-        (root / 'config.json').write_text(json.dumps({'configVersion': 3}))
-        obj.legacy_history_disabled = True
-    try:
-        with pytest.raises(LegacyHistoryWriterDisabled):
-            mutation(kind, obj)
-        if kind == "identity":
-            with pytest.raises(LegacyHistoryWriterDisabled):
-                obj._resolve_verified_provider_pair(None, pair=(), evidence_ref="synthetic", context=None, create_stub=True)
-        assert files() == before
-        assert set(threading.enumerate()) == threads
-    finally:
-        if hasattr(obj, 'close'):
-            obj.close()
-        elif kind == 'identity':
-            obj._store.close()
 
 
 @pytest.mark.parametrize('missing', ['adapter', 'knowledge', 'handover'])
@@ -143,13 +76,11 @@ def test_statement_writes_continue_while_identity_tables_are_frozen(case):  # no
     from yeoman_gateway.knowledge._history_upgrade import FROZEN_IDENTITY_TABLES
     from yeoman_gateway.knowledge.models import (
         StatementCandidate,
-        TrustedAdminContext,
         TrustedCaptureContext,
     )
 
     from tests.gateway.test_history_knowledge_upgrade import digest
     service, queries, sources, _ = case
-    service.legacy_history_disabled = True
     before = {t: digest(service._store.connection, t) for t in FROZEN_IDENTITY_TABLES}
     legacy_before = {t: digest(service._store.connection, t) for t in ('memory2_meta', 'memory2_fact_jobs', 'idea_backlog_items')}
     legacy_nodes = service._store.query("SELECT * FROM memory2_nodes WHERE id NOT IN (SELECT statement_id FROM knowledge_statements)")
@@ -160,8 +91,7 @@ def test_statement_writes_continue_while_identity_tables_are_frozen(case):  # no
     with service.history_scope(queries, sources):
         assert service.capture(StatementCandidate('Synthetic new statement', (source,)), context=context).statement_ids
         service.enqueue_capture((source,), context=context)
-    with pytest.raises(RuntimeError):
-        service.set_preferred_name('a', 'Changed', context=TrustedAdminContext('synthetic', 1, 'test', True))
+    assert not hasattr(service, 'set_preferred_name')
     for table in FROZEN_IDENTITY_TABLES:
         with pytest.raises(sqlite3.IntegrityError, match='history_identity_read_only'):
             service._store.connection.execute(f'INSERT INTO {table} DEFAULT VALUES')
@@ -252,55 +182,19 @@ def test_signal_sink_only_journals_canonical_event(tmp_path):
     try:
         sink.capture('message', {'chatJid': 'synthetic@g.us', 'messageId': 'm', 'text': 'Synthetic'})
         assert store.count_events() == 1
-        assert not hasattr(sink, 'legacy_history_disabled')
         assert not hasattr(sink, 'index_enrichments')
         assert not hasattr(sink, '_memory')
     finally:
         store.close()
 
 
-def test_memory_factory_uses_root_retirement_before_any_worker_or_file(tmp_path):
-    from yeoman_gateway.history.writer_guard import LegacyHistoryWriterDisabled
-    from yeoman_gateway.knowledge._memory.service import MemoryService
-    config = Config(memory={'db_path': str(tmp_path / 'uncreated' / 'legacy.db')})
-    threads = set(threading.enumerate())
-    with pytest.raises(LegacyHistoryWriterDisabled):
-        MemoryService(workspace=tmp_path, config=config.memory, root_config=config)
-    assert not (tmp_path / 'uncreated').exists()
-    assert set(threading.enumerate()) == threads
 
 
-@pytest.mark.parametrize('kind', (*KINDS, 'session', 'identity'))
-@pytest.mark.parametrize('retired', [False, True])
-def test_guarded_calls_do_not_read_config_after_construction(tmp_path, monkeypatch, kind, retired):
-    from yeoman_gateway.history.writer_guard import (
-        LegacyHistoryWriterDisabled,
-        require_legacy_history_writer,
-    )
-    configure(monkeypatch, tmp_path, False)
-    obj = writer(kind, tmp_path / 'legacy.db')
-    obj.legacy_history_disabled = retired
-    reads = MagicMock(side_effect=AssertionError('guard must not read config'))
-    monkeypatch.setattr(Path, 'read_text', reads)
-    try:
-        for _ in range(20):
-            if retired:
-                with pytest.raises(LegacyHistoryWriterDisabled):
-                    require_legacy_history_writer(disabled=obj.legacy_history_disabled, channel='whatsapp')
-            else:
-                require_legacy_history_writer(disabled=obj.legacy_history_disabled, channel='whatsapp')
-        reads.assert_not_called()
-    finally:
-        if hasattr(obj, 'close'):
-            obj.close()
-        elif kind == 'identity':
-            obj._store.close()
 
 
 def test_signal_sink_has_no_retired_memory_cache_or_guard():
     from yeoman_gateway.processing.signals import SignalJournalSink
     sink = SignalJournalSink(MagicMock())
-    assert not hasattr(sink, 'legacy_history_disabled')
     assert not hasattr(sink, 'index_enrichments')
     assert not hasattr(sink, '_memory')
 

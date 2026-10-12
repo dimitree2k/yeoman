@@ -10,7 +10,7 @@ from yeoman_gateway.history.ids import classify
 from yeoman_gateway.history.live import HistoryPaused
 from yeoman_gateway.history.queries import HistoryQueries
 from yeoman_gateway.knowledge._history_sources import HistoryKnowledgeSources, principal_identifier
-from yeoman_gateway.knowledge._identity import IdentityEngine, PersonRow
+from yeoman_gateway.knowledge._person_identity import IdentityEngine, PersonRow
 from yeoman_gateway.knowledge._store import KnowledgeStore
 from yeoman_gateway.knowledge.authority import PolicyAuthority, SourceAuthority
 from yeoman_gateway.knowledge.models import (

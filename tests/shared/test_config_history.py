@@ -1,4 +1,4 @@
-"""Retired history selectors are dropped or refused without weakening the writer guard."""
+"""Retired history selectors are dropped or refused with no compatibility shim."""
 import json
 import os
 
@@ -36,10 +36,10 @@ def test_history_environment_cannot_override_config(tmp_path, monkeypatch, key, 
     path = tmp_path / "settings.json"
     if payload is not None:
         path.write_text(json.dumps(payload))
-    assert Config().history.legacy_writers_disabled is True
-    assert Config.model_validate({}).history.legacy_writers_disabled is True
+    assert not hasattr(Config(), "history")
+    assert not hasattr(Config.model_validate({}), "history")
     loaded = load_config(path)
-    assert loaded.history.legacy_writers_disabled is True
+    assert not hasattr(loaded, "history")
     assert os.environ[key].startswith("{") or os.environ[key] == "false"
 
 
@@ -60,7 +60,7 @@ def test_true_retired_values_are_removed_on_migration_and_persisted(tmp_path, mo
     assert "history" not in persisted
     assert persisted["configVersion"] == 3
     assert "history" not in config.model_dump()
-    assert config.history.legacy_writers_disabled is True
+    assert not hasattr(config, "history")
     assert "history" not in Config.model_fields
 
 
@@ -107,24 +107,3 @@ def test_history_env_filter_preserves_other_config_sources(tmp_path, monkeypatch
     assert os.environ["YEOMAN_GATEWAY__PORT"] == "19001"
 
 
-def test_direct_writer_flag_is_file_only_and_does_not_normalize_config(tmp_path, monkeypatch):
-    from yeoman_gateway.history.writer_guard import (
-        LegacyHistoryWriterDisabled,
-        legacy_history_writers_disabled,
-        require_legacy_history_writer,
-    )
-
-    root = tmp_path / "not-created"
-    monkeypatch.setenv("YEOMAN_HOME", str(root))
-    monkeypatch.setenv("YEOMAN_HISTORY__legacyWritersDisabled", "true")
-    require_legacy_history_writer(disabled=legacy_history_writers_disabled(), channel="whatsapp")
-    assert not root.exists()
-    root.mkdir()
-    path = root / "config.json"
-    text = '{"history":{"legacyWritersDisabled":true}}'
-    path.write_text(text)
-    with pytest.raises(LegacyHistoryWriterDisabled):
-        require_legacy_history_writer(disabled=legacy_history_writers_disabled(), channel="whatsapp")
-    require_legacy_history_writer(disabled=True, channel="telegram")
-    assert path.read_text() == text
-    assert sorted(p.name for p in root.iterdir()) == ["config.json"]

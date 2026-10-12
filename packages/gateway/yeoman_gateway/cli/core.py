@@ -140,11 +140,6 @@ def make_provider(config):
     )
 
 
-def make_memory_service(config):
-    """Create memory service from config/workspace."""
-    from yeoman_gateway.knowledge._memory import MemoryService
-
-    return MemoryService(workspace=config.workspace_path, config=config.memory, root_config=config)
 
 
 def make_policy_engine(config):

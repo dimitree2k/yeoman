@@ -25,7 +25,7 @@ from dataclasses import dataclass, replace
 from typing import Any
 
 from yeoman_gateway.knowledge import _reasons
-from yeoman_gateway.knowledge._identity import IdentityEngine
+from yeoman_gateway.knowledge._person_identity import IdentityEngine
 from yeoman_gateway.knowledge._statements import StatementEngine
 from yeoman_gateway.knowledge._store import KnowledgeStore
 from yeoman_gateway.knowledge.models import (
@@ -716,12 +716,12 @@ class RetrievalEngine:
             return ()
         if not vector:
             return ()
-        from yeoman_gateway.knowledge._memory.embeddings import (
+        from yeoman_gateway.knowledge._embedding_index import (
             EMBEDDING_PREPROCESSING_VERSION,
+            EmbeddingIndex,
         )
-        from yeoman_gateway.knowledge._memory.store import MemoryStore
 
-        memory = MemoryStore(owner=self._store)
+        memory = EmbeddingIndex(owner=self._store)
         rows = memory.search_embedding_index(
             workspace_id=self.workspace_id,
             query_vector=list(vector),

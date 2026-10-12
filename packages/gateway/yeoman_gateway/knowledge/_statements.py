@@ -17,7 +17,7 @@ import time
 from dataclasses import dataclass, field
 from typing import Any, Final, Iterable
 
-from yeoman_gateway.knowledge._identity import IdentityEngine
+from yeoman_gateway.knowledge._person_identity import IdentityEngine
 from yeoman_gateway.knowledge._reasons import (
     SUPERSESSION_CORRECTION,
     SUPERSESSION_QUALITY_REJECTED,
@@ -1665,7 +1665,7 @@ def rescreen_statements(
     authority record survive.  ``superseded`` is chosen over ``revoked`` on purpose -
     revocation is the source-revocation signal and must not be reused as a quality mark.
     """
-    from yeoman_gateway.knowledge._memory.extraction_jobs import screen_statement_content
+    from yeoman_gateway.knowledge._screening import screen_statement_content
 
     timestamp = int(now_ms if now_ms is not None else store.now_ms())
     report = StatementRescreenReport(dry_run=not apply)

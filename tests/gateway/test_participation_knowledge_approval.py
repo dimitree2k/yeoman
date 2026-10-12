@@ -24,7 +24,7 @@ from typing import Any
 
 import pytest
 from yeoman_gateway.consciousness.log import SpeakupLog, deterministic_effect_id
-from yeoman_gateway.knowledge._memory.shared_facts import FactReadContext, FactRetrievalResult
+from yeoman_gateway.knowledge._participation_types import FactReadContext, FactRetrievalResult
 from yeoman_gateway.knowledge.models import (
     KnowledgeContext,
     SourceRef,

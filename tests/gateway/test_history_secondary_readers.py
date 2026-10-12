@@ -296,7 +296,7 @@ async def test_secondary_persona_and_policy_metadata_reopen_in_owned_scope(tmp_p
 
     from tests.gateway.convhist.test_hist_queries import event
     p = Projector()
-    config = SimpleNamespace(live_projection_enabled=True, readers=SimpleNamespace(secondary=True), legacy_writers_disabled=False)
+    config = SimpleNamespace()
     persona = 'personas/synthetic.md'
     (tmp_path / 'personas').mkdir()
     (tmp_path / persona).write_text('# Synthetic persona')

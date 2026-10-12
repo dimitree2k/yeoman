@@ -606,11 +606,7 @@ def test_a_rebuild_does_not_resurrect_a_locked_statement(knowledge_harness):
     statement_id = h.capture_text("Tom wohnt in Bonn.", source).statement_ids[0]
     _mark(h, statement_id, status="superseded", reason="quality_rejected")
 
-    from yeoman_gateway.history.writer_guard import LegacyHistoryWriterDisabled
-
-    # The historical memory-index rebuild is retired for WhatsApp-backed records.
-    with pytest.raises(LegacyHistoryWriterDisabled):
-        h.service.reindex(context=h.admin_context())
+    assert not hasattr(h.service, "reindex")
     h.history.dirty = True
     h.history.snapshot().close()
 

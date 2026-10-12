@@ -7,9 +7,7 @@ import pytest
 from yeoman_gateway.adapters.responder_llm import LLMResponder
 from yeoman_gateway.bus.queue import MessageBus
 from yeoman_gateway.core.models import InboundEvent, PolicyDecision
-from yeoman_gateway.knowledge._memory.service import MemoryService
 from yeoman_gateway.providers.base import LLMProvider, LLMResponse
-from yeoman_shared.config.schema import Config
 
 
 class CountProvider(LLMProvider):
@@ -92,21 +90,6 @@ def _project_whatsapp_responder_history(monkeypatch, request, tmp_path):
 
 
 
-def test_remaining_copies_reports_frozen_session_state_files(tmp_path: Path) -> None:
-    workspace = tmp_path / "ws"
-    state_dir = workspace / "data/memory/session-state"
-    state_dir.mkdir(parents=True)
-    cfg = Config()
-    cfg.memory.db_path = str(tmp_path / "longterm.db")
-    cfg.memory.wal.state_dir = str(state_dir)
-    memory_service = MemoryService(workspace=workspace, config=cfg.memory)
-
-    try:
-        assert "session_state_markdown" not in memory_service.remaining_copies()
-        (state_dir / "frozen.md").write_text("legacy copy", encoding="utf-8")
-        assert "session_state_markdown" in memory_service.remaining_copies()
-    finally:
-        memory_service.close()
 
 
 @pytest.mark.asyncio

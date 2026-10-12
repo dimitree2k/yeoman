@@ -116,7 +116,6 @@ class _LowerStoreHarness:
     def __init__(self, path):
         from types import SimpleNamespace
 
-        from yeoman_gateway.knowledge._identity import IdentityEngine
         from yeoman_gateway.knowledge._statements import StatementEngine
         from yeoman_gateway.knowledge._store import KnowledgeStore
         from yeoman_gateway.knowledge.models import (
@@ -125,11 +124,13 @@ class _LowerStoreHarness:
             TrustedCaptureContext,
         )
         from yeoman_gateway.knowledge.runtime import RuntimeKnowledgePolicy, RuntimeKnowledgeSources
+
+        from tests.gateway.schema_identity_helpers import SyntheticSchemaIdentity
         self._SourceRef, self._StatementCandidate, self._TrustedCaptureContext = SourceRef, StatementCandidate, TrustedCaptureContext
         self._authority = RuntimeKnowledgeSources()
         self._policy = RuntimeKnowledgePolicy(engine=None)
         self.store = KnowledgeStore(path / "lower-schema-contract.db")
-        identity = IdentityEngine(self.store, authority=self._authority, policy=self._policy, legacy_history_disabled=True)
+        identity = SyntheticSchemaIdentity(self.store, authority=self._authority, policy=self._policy)
         self.statements = StatementEngine(self.store, identity=identity, authority=self._authority, policy=self._policy, workspace_id="synthetic")
         self.service = SimpleNamespace(_store=self.store, db_path=self.store.db_path, close=self.store.close)
 

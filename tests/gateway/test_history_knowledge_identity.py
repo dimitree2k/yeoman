@@ -2,8 +2,6 @@ import asyncio
 
 import pytest
 from yeoman_gateway.history.live import HistoryPaused
-from yeoman_gateway.knowledge._memory.read_gate import FactReadGate
-from yeoman_gateway.knowledge._memory.shared_facts import FactReadContext
 from yeoman_gateway.knowledge.models import (
     AttributeCandidate,
     AttributeValue,
@@ -12,7 +10,6 @@ from yeoman_gateway.knowledge.models import (
     PersonLinkCandidate,
     RecallQuery,
     StatementCandidate,
-    TrustedAdminContext,
     TrustedCaptureContext,
     TrustedReadContext,
 )
@@ -97,11 +94,6 @@ def test_channel_principals_authorize_old_and_new_sources_without_redirect_expan
         contact(db, 'new-holder')
         identifier(db, 'new-holder', '10001@s.whatsapp.net', start=200)
         assert not service.recall(RecallQuery('Synthetic'), context=reader(now=250)).statement_ids
-        memory = service.memory_store()
-        gate = FactReadGate(memory)
-        fact_context = FactReadContext(AUTHOR, f'channel:whatsapp:chat:{source.chat_id}', frozenset({AUTHOR, MEMBER}),
-                                       None, service._store.acl_epoch, 250)
-        assert gate.recheck((sid,), fact_context) == frozenset()
         event(db, 'removed', 'member_remove', 260, {'participants': [['10002@s.whatsapp.net']]})
         assert not service.recall(RecallQuery('Synthetic'), context=reader(MEMBER, now=300)).statement_ids
         assert frozen(service) == before
@@ -114,16 +106,8 @@ def test_history_identity_mutations_refused_but_statement_curation_continues(cas
     source = sources.issue('m')
     with service.history_scope(q, sources):
         sid, context = capture(service, source)
-        admin = TrustedAdminContext(AUTHOR, 1, 'synthetic-owner', True)
-        for call in (
-            lambda: service.set_preferred_name('a', 'Changed', context=admin),
-            lambda: service.merge_people('a', 'b', context=admin, expected_revision=1),
-            lambda: service.bind_identifier('a', Identifier('whatsapp', 'phone_jid', '10003@s.whatsapp.net'), evidence_ref='proof', mapping_verified=True, context=admin),
-        ):
-            from yeoman_gateway.history.writer_guard import LegacyHistoryWriterDisabled
-
-            with pytest.raises(LegacyHistoryWriterDisabled):
-                call()
+        for method in ('set_preferred_name', 'merge_people', 'bind_identifier'):
+            assert not hasattr(service, method)
         receipt = service.correct_statement(sid, StatementCandidate('Curated replacement', (source,)),
                                             expected_source=source, context=context)
         assert receipt.changed_ids
@@ -176,7 +160,6 @@ def test_permission_cache_does_not_survive_history_generation(case):
 
 
 def test_history_identity_read_surface_and_frozen_store_guard(case):
-    from yeoman_gateway.knowledge._contacts.store import ContactsStore
     from yeoman_gateway.knowledge._history_identity import HistoryIdentityEngine
     service, q, sources, _ = case
     ident = Identifier('whatsapp', 'phone_jid', '10001@s.whatsapp.net', namespace='whatsapp')
@@ -193,9 +176,6 @@ def test_history_identity_read_surface_and_frozen_store_guard(case):
         assert engine.aliases_of_many(('a',))['a'][0].name == 'a'
         # An observed name has no global address-release proof.
         assert engine.delivery_identifiers_for_alias('a', channel='whatsapp', scope_key='global') == ()
-        with pytest.raises(KnowledgeError) as error:
-            ContactsStore(owner=service._store)
-        assert error.value.code == 'history_identity_read_only'
         with pytest.raises(KnowledgeError):
             with service._store.transaction():
                 service._store.execute("UPDATE contacts SET display_name='changed'")

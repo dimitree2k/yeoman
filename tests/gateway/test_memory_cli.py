@@ -35,4 +35,15 @@ def test_memory_search_requires_explicit_whatsapp_chat(monkeypatch):
 def test_memory_cli_refuses_retired_maintenance(args):
     result = CliRunner().invoke(app, ["memory", *args])
     assert result.exit_code != 0
-    assert "legacy maintenance is offline only" in result.output
+    assert "No such command" in result.output
+
+
+def test_retired_identity_commands_are_unregistered_and_attest_remains():
+    from yeoman_gateway.cli import conversation_history_commands, knowledge_commands
+    commands = {command.name for command in knowledge_commands.knowledge_app.registered_commands}
+    retired = {"person-candidates-propose", "person-candidates-list", "person-candidate-decide",
+               "person-merge", "person-merge-undo", "person-name", "person-alias-retire",
+               "person-alias-restore", "person-binding-move", "person-binding-add"}
+    assert commands.isdisjoint(retired)
+    assert "person-audit" in commands
+    assert "attest" in {command.name for command in conversation_history_commands.history_app.registered_commands}

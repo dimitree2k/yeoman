@@ -16,7 +16,6 @@ from yeoman_gateway.channels.telegram import TelegramChannel
 from yeoman_gateway.consciousness.log import SpeakupLog
 from yeoman_gateway.core.models import InboundEvent, PolicyDecision
 from yeoman_gateway.core.pipeline import PipelineContext
-from yeoman_gateway.knowledge._memory.service import MemoryService
 from yeoman_gateway.persona_evolution import (
     PersonaEvolutionLedger,
     apply_persona_evolution_proposal,
@@ -32,7 +31,7 @@ from yeoman_gateway.pipeline.persona_evolution_approval import (
     PersonaEvolutionApprovalMiddleware,
 )
 from yeoman_gateway.policy.schema import PolicyConfig
-from yeoman_shared.config.schema import MemoryConfig, TelegramConfig
+from yeoman_shared.config.schema import TelegramConfig
 
 from tests.gateway.history_test_helpers import (
     ProjectedHistory,
@@ -97,11 +96,23 @@ def _policy() -> PolicyConfig:
     )
 
 
-def _memory(tmp_path: Path) -> MemoryService:
-    return MemoryService(
-        workspace=tmp_path / "workspace",
-        config=MemoryConfig(db_path=str(tmp_path / "memory.db")),
-    )
+class PreferenceSeeds:
+    """Synthetic inputs to the projected preference capture fixture."""
+    def __init__(self):
+        self.rows = []
+
+    def record_manual(self, *, channel, chat_id, text, **_kwargs):
+        self.rows.append((channel, chat_id, SimpleNamespace(entry=SimpleNamespace(content=text))))
+
+    def learned_chat_taste(self, *, channel, chat_id, limit):
+        return [hit for ch, chat, hit in self.rows if (ch, chat) == (channel, chat_id)][:limit]
+
+    def close(self):
+        pass
+
+
+def _memory(_tmp_path: Path) -> PreferenceSeeds:
+    return PreferenceSeeds()
 
 
 def _workspace(tmp_path: Path) -> Path:
@@ -122,7 +133,7 @@ def _record_messages(
     chat_id: str = "group-a@g.us",
     day: int,
     count: int,
-    memory: MemoryService | None = None,
+    memory: PreferenceSeeds | None = None,
 ) -> None:
     tastes = memory.learned_chat_taste(channel="whatsapp", chat_id=chat_id, limit=1) if memory else []
     for index in range(count):

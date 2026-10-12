@@ -11,7 +11,7 @@ from types import MappingProxyType
 from typing import Any
 
 from yeoman_gateway.history.live import HistoryPaused
-from yeoman_gateway.knowledge._memory.shared_facts import FactReadContext, FactRetrievalResult
+from yeoman_gateway.knowledge._participation_types import FactReadContext, FactRetrievalResult
 from yeoman_gateway.knowledge.models import (
     KnowledgeContext,
     RecallQuery,

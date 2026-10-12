@@ -1,6 +1,7 @@
 """Tests for the contacts LLM tool."""
 
 import json
+import sqlite3
 import time
 from pathlib import Path
 
@@ -10,23 +11,18 @@ from yeoman_gateway.agent.tools.resolve_contact import (
     ResolveContactTool,
     resolve_contact_reference,
 )
-from yeoman_gateway.knowledge._contacts.service import ContactsService
 
 from tests.gateway.history_test_helpers import (
     ProjectedHistory,
-    prepare_history_retirement_knowledge,
 )
 
 _OWNER = "4915000000000@s.whatsapp.net"
 
 
-@pytest.fixture
-def contacts(tmp_path: Path) -> ContactsService:
-    return ContactsService(db_path=tmp_path / "contacts.db")
 
 
 @pytest.fixture
-def tool(contacts: ContactsService) -> ContactsTool:
+def tool() -> ContactsTool:
     t = ContactsTool(knowledge=None)
     t.set_context(channel="whatsapp", chat_id="test@g.us")
     return t
@@ -43,8 +39,23 @@ def selected_history(tmp_path: Path):
         admin_principals=frozenset({f"whatsapp:{_OWNER}"}),
     )
     authority = FakeSourceAuthority()
+    from yeoman_gateway.knowledge._history_upgrade import upgrade_history_knowledge
+
+    from tests.gateway.test_history_knowledge_upgrade import v2
+
+    source = v2(tmp_path / "contacts-v2.db")
+    with sqlite3.connect(source) as db:
+        db.execute("INSERT INTO contacts (id, display_name, created_at, updated_at) "
+                   "VALUES ('private-fixture', 'Frank Taeger', 'date', 'date')")
+        db.execute("INSERT INTO contact_fields (contact_id, kind, value, created_at, updated_at) "
+                   "VALUES ('private-fixture', 'note', 'sensitive personal note', 'date', 'date')")
+        db.execute("INSERT INTO contact_identifiers (channel, identifier, contact_id, kind) "
+                   "VALUES ('whatsapp', '4917632625469@s.whatsapp.net', 'private-fixture', 'phone_jid')")
+    db.close()
+    target = tmp_path / "contacts-v3.db"
+    upgrade_history_knowledge(source=source, target=target)
     knowledge = open_knowledge_store(
-        prepare_history_retirement_knowledge(tmp_path, "selected"),
+        target,
         workspace_id="contacts-selected-tests",
         source_authority=authority,
         policy_authority=policy,
@@ -179,24 +190,10 @@ class TestResolveContactTool:
     @pytest.mark.asyncio
     async def test_resolves_partial_name_without_disclosing_fields(
         self,
-        contacts: ContactsService,
         selected_history,
     ) -> None:
         history, knowledge = selected_history
         phone = "4917632625469@s.whatsapp.net"
-        contact_id = contacts.ensure_contact(
-            channel="whatsapp",
-            identifier=phone,
-            kind="phone_jid",
-            push_name="Frank Taeger",
-        )
-        contacts.store.add_field(
-            contact_id=contact_id,
-            kind="note",
-            value="sensitive personal note",
-        )
-        # A proven platform observation is what makes this person resolvable; the legacy
-        # row above only proves the tool never reads its private fields.
         _add_person(history, phone=phone, name="Frank Taeger")
         resolver = ResolveContactTool(knowledge=knowledge)
         resolver.set_context(channel="whatsapp", chat_id="finance@g.us")
@@ -253,7 +250,6 @@ class TestResolveContactTool:
     @pytest.mark.asyncio
     async def test_an_unproven_legacy_contact_is_not_a_delivery_target(
         self,
-        contacts: ContactsService,
         selected_history,
     ) -> None:
         """Knowledge is the sole authority: the legacy cache is not a second opinion.
@@ -261,12 +257,8 @@ class TestResolveContactTool:
         The WhatsApp resolver never falls back to the legacy cache when Knowledge is wired.
         """
         history, knowledge = selected_history
-        contacts.ensure_contact(
-            channel="whatsapp",
-            identifier="4917632625469@s.whatsapp.net",
-            kind="phone_jid",
-            push_name="Frank Taeger",
-        )
+        assert knowledge._store.scalar("SELECT count(*) FROM contact_identifiers "
+                                       "WHERE contact_id='private-fixture'") == 1
         resolver = ResolveContactTool(knowledge=knowledge)
         resolver.set_context(channel="whatsapp", chat_id="finance@g.us")
 
@@ -278,18 +270,11 @@ class TestResolveContactTool:
     @pytest.mark.asyncio
     async def test_resolves_lid_mention_to_phone_jid_in_current_group(
         self,
-        contacts: ContactsService,
         selected_history,
     ) -> None:
         history, knowledge = selected_history
         phone = "4917632625469@s.whatsapp.net"
         lid = "46918273106072@lid"
-        contacts.ensure_contact(
-            channel="whatsapp",
-            identifier=phone,
-            kind="phone_jid",
-            push_name="Frank Taeger",
-        )
         _add_person(history, phone=phone, lid=lid, name="Frank Taeger")
         resolver = ResolveContactTool(knowledge=knowledge)
         resolver.set_context(channel="whatsapp", chat_id="finance@g.us")
@@ -303,16 +288,10 @@ class TestResolveContactTool:
 
     @pytest.mark.asyncio
     async def test_name_resolution_does_not_use_substring_only_match(
-        self, contacts: ContactsService, selected_history,
+        self, selected_history,
     ) -> None:
         history, knowledge = selected_history
         phone = "4917000000000@s.whatsapp.net"
-        contacts.ensure_contact(
-            channel="whatsapp",
-            identifier=phone,
-            kind="phone_jid",
-            push_name="Joanne Miller",
-        )
         _add_person(history, phone=phone, name="Joanne Miller")
         resolver = ResolveContactTool(knowledge=knowledge)
         resolver.set_context(
@@ -338,18 +317,11 @@ class TestResolveContactTool:
     )
     async def test_identifier_resolution_requires_token_boundaries(
         self,
-        contacts: ContactsService,
         selected_history,
         query: str,
     ) -> None:
         history, knowledge = selected_history
         phone = "4917632625469@s.whatsapp.net"
-        contacts.ensure_contact(
-            channel="whatsapp",
-            identifier=phone,
-            kind="phone_jid",
-            push_name="Frank Taeger",
-        )
         resolver = ResolveContactTool(knowledge=knowledge)
         resolver.set_context(channel="whatsapp", chat_id="finance@g.us")
 

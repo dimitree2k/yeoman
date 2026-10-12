@@ -23,7 +23,6 @@ def v2(path):
     store.execute("INSERT INTO contact_aliases(contact_id,alias,source,first_seen,last_seen,status,address_allowed,normalized_alias)"
                   " VALUES ('curated','Synthetic','owner_confirmed','date','date','confirmed',1,'synthetic')")
     store.commit_if_idle()
-    from yeoman_gateway.knowledge._identity import IdentityEngine
     from yeoman_gateway.knowledge._statements import StatementEngine
     from yeoman_gateway.knowledge.authority import EvidenceAudience
     from yeoman_gateway.knowledge.models import (
@@ -34,11 +33,13 @@ def v2(path):
         StatementCandidate,
         TrustedCaptureContext,
     )
+
+    from tests.gateway.schema_identity_helpers import SyntheticSchemaIdentity
     authority = RuntimeKnowledgeSources()
     source = SourceRef('curated-source', 4, 'whatsapp', 'curated@g.us', 'whatsapp:10009', 100)
     authority.register_source(source, EvidenceAudience.author_only())
     policy = RuntimeKnowledgePolicy(engine=None)
-    identity = IdentityEngine(store, authority=authority, policy=policy, legacy_history_disabled=True)
+    identity = SyntheticSchemaIdentity(store, authority=authority, policy=policy)
     statements = StatementEngine(store, identity=identity, authority=authority, policy=policy,
                                  workspace_id='synthetic')
     context = TrustedCaptureContext('synthetic', 1, 'native', (source,))

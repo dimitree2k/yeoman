@@ -25,20 +25,20 @@ def _fixture_dbs(tmp_path: Path) -> tuple[Path, Path]:
 
     sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
     from yeoman_gateway.knowledge._history_upgrade import upgrade_history_knowledge
-    from yeoman_gateway.knowledge._identity import IdentityEngine
     from yeoman_gateway.knowledge._statements import StatementEngine
     from yeoman_gateway.knowledge._store import KnowledgeStore
     from yeoman_gateway.knowledge.authority import EvidenceAudience
     from yeoman_gateway.knowledge.models import SourceRef, StatementCandidate, TrustedCaptureContext
     from yeoman_gateway.knowledge.runtime import RuntimeKnowledgePolicy, RuntimeKnowledgeSources
 
+    from tests.gateway.schema_identity_helpers import SyntheticSchemaIdentity
     from tests.gateway.test_history_knowledge_upgrade import v2
 
     source_v2 = v2(tmp_path / "knowledge-v2.db")
     store = KnowledgeStore(source_v2, create=False)
     authority = RuntimeKnowledgeSources()
     policy = RuntimeKnowledgePolicy(engine=None)
-    identity = IdentityEngine(store, authority=authority, policy=policy, legacy_history_disabled=True)
+    identity = SyntheticSchemaIdentity(store, authority=authority, policy=policy)
     statements = StatementEngine(store, identity=identity, authority=authority, policy=policy,
                                  workspace_id="synthetic")
     revoked_source = SourceRef("revocation-source", 1, "whatsapp", "curated@g.us", "whatsapp:10009", 200)
