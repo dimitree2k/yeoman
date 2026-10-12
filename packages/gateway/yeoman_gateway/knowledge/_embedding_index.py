@@ -1,8 +1,11 @@
 """Read-only view of the existing, rebuildable Knowledge embedding index."""
 from __future__ import annotations
 
+import heapq
 import json
+import math
 import sqlite3
+import threading
 from array import array
 from collections.abc import Mapping
 from typing import Any
@@ -87,6 +90,8 @@ class EmbeddingIndex:
         self.source_authority = source_authority
         self._lock = getattr(owner, "lock")
         self._conn = getattr(owner, "connection")
+        self._cache_lock = threading.RLock()
+        self._caches: dict[tuple[Any, ...], dict[str, Any]] = {}
 
     def query(self, sql: str, params: tuple[Any, ...] = ()) -> list[sqlite3.Row]:
         with self._lock:
@@ -117,6 +122,7 @@ class EmbeddingIndex:
         candidate_limit: int = 256,
         model_id: str | None = None,
         preprocessing_version: str | None = None,
+        allowed_node_ids: set[str] | None = None,
     ) -> list[dict[str, Any]]:
         """Nearest sections with a *compatible* document key.
 
@@ -125,50 +131,71 @@ class EmbeddingIndex:
         can never be scored against a different version.  Rows whose source is no longer
         proven and unrevoked are dropped here, immediately before output.
         """
-        if not scope_keys or not query_vector:
+        del candidate_limit  # All compatible rows are scored, regardless of age.
+        if not query_vector or not all(math.isfinite(x) for x in query_vector):
             return []
-        clauses = [
-            "workspace_id = ?",
-            "status = 'active'",
-            "dimension = ?",
-        ]
-        params: list[Any] = [str(workspace_id), len(query_vector)]
-        if model_id is not None:
-            clauses.append("model_id = ?")
-            params.append(str(model_id))
-        if preprocessing_version is not None:
-            clauses.append("preprocessing_version = ?")
-            params.append(str(preprocessing_version))
-        scope_placeholders = ",".join("?" for _ in scope_keys)
-        clauses.append(f"scope_key IN ({scope_placeholders})")
-        params.extend(str(item) for item in scope_keys)
-        rows = self.query(
-            f"SELECT * FROM memory2_embedding_index WHERE {' AND '.join(clauses)}"
-            " ORDER BY created_ms DESC LIMIT ?",
-            (*params, int(candidate_limit)),
-        )
-        scored: list[tuple[float, dict[str, Any]]] = []
-        for row in rows:
-            payload = row["vector"]
-            if payload is None:
-                continue
-            scored.append(
-                (
-                    _cosine_similarity(query_vector, self._deserialize_vector(bytes(payload))),
-                    _embedding_index_row(row),
-                )
-            )
-        kept: list[dict[str, Any]] = []
-        for score, item in sorted(scored, key=lambda pair: (-pair[0], pair[1]["document_id"])):
-            if score <= 0.0:
-                continue
-            if not self._source_still_readable(item):
-                continue
-            item["score"] = max(0.0, min(1.0, float(score)))
-            kept.append(item)
-            if len(kept) >= max(1, int(limit)):
-                break
-        return kept
+        import numpy as np
+
+        key = (workspace_id, model_id, len(query_vector), preprocessing_version)
+        with self._cache_lock, self._lock:
+            cache = self._caches.setdefault(key, {"stamp": None, "blocks": []})
+            stamp = (self._conn.total_changes, self._conn.execute("PRAGMA data_version").fetchone()[0])
+            clauses = "workspace_id=? AND dimension=?"
+            params: list[Any] = [workspace_id, len(query_vector)]
+            for name, value in (("model_id", model_id), ("preprocessing_version", preprocessing_version)):
+                if value is not None:
+                    clauses += f" AND {name}=?"
+                    params.append(value)
+            if cache["stamp"] != stamp:
+                active = {row[0] for row in self._conn.execute(
+                    f"SELECT rowid FROM memory2_embedding_index WHERE {clauses} AND status='active'", params
+                )}
+                blocks, cached = [], set()
+                for items, matrix in cache["blocks"]:
+                    keep = [i for i, item in enumerate(items) if item["cache_id"] in active]
+                    if keep:
+                        retained = [items[i] for i in keep]
+                        blocks.append((retained, matrix if len(keep) == len(items) else matrix[keep]))
+                        cached.update(item["cache_id"] for item in retained)
+                missing = sorted(active - cached)
+                for start in range(0, len(missing), 256):
+                    ids = missing[start:start + 256]
+                    placeholders = ",".join("?" for _ in ids)
+                    rows = self._conn.execute(
+                        f"SELECT rowid AS cache_id, * FROM memory2_embedding_index WHERE rowid IN ({placeholders}) ORDER BY rowid", ids
+                    )
+                    items, vectors = [], []
+                    for row in rows:
+                        vector = np.frombuffer(row["vector"], dtype=np.float32)
+                        if len(vector) != len(query_vector) or not np.isfinite(vector).all():
+                            continue
+                        norm = float(np.linalg.norm(vector))
+                        if norm <= 0 or not math.isfinite(norm):
+                            continue
+                        item = _embedding_index_row(row)
+                        del item["vector"]
+                        items.append(item)
+                        vectors.append(vector / norm)
+                    if vectors:
+                        blocks.append((items, np.stack(vectors)))
+                cache["blocks"] = blocks
+                cache["stamp"] = stamp
+            q = np.asarray(query_vector, dtype=np.float32)
+            norm = float(np.linalg.norm(q))
+            if norm <= 0:
+                return []
+            q /= norm
+            scored = []
+            for items, matrix in cache["blocks"]:
+                scores = np.einsum("ij,j->i", matrix, q, optimize=False)
+                scored.extend((float(score), item) for score, item in zip(scores, items, strict=True)
+                              if score > 0
+                              and (not scope_keys or item["scope_key"] in scope_keys)
+                              and (allowed_node_ids is None or item["node_id"] in allowed_node_ids))
+            best = heapq.nlargest(max(1, int(limit)), scored,
+                                 key=lambda pair: (pair[0], pair[1]["document_id"]))
+            return [dict(item, score=min(1.0, score)) for score, item in best
+                    if self._source_still_readable(item)]
 
 
     def _source_still_readable(self, item: Mapping[str, Any]) -> bool:

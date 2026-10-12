@@ -1368,3 +1368,27 @@ def _fail(code: str, detail: str, reason: str = "") -> NoReturn:
     message = f"{label}: {detail}" if detail else label
     console.print(Text(message, style="red"))
     raise typer.Exit(code=_FAILURE_EXIT)
+
+
+embeddings_app = typer.Typer(help="Knowledge embedding counters (read-only)")
+knowledge_app.add_typer(embeddings_app, name="embeddings")
+
+
+@embeddings_app.command("status")
+def embeddings_status(
+    target: Path = typer.Option(Path("~/.yeoman/data/knowledge/knowledge.db"), "--target"),
+) -> None:
+    """Report current statements and versioned vector/job counts without writing."""
+    import sqlite3
+    from contextlib import closing
+
+    from yeoman_gateway.knowledge._embeddings import embedding_status
+
+    path = target.expanduser().resolve()
+    try:
+        with closing(sqlite3.connect(path.as_uri() + "?mode=ro", uri=True)) as conn:
+            conn.execute("BEGIN")
+            report = embedding_status(conn)
+    except sqlite3.Error:
+        _fail("source_error", "embedding status unavailable")
+    console.print_json(json.dumps(report))

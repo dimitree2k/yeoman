@@ -183,6 +183,9 @@ class RetrievalEngine:
         self._statements = statements
         self._policy = policy
         self.workspace_id = str(workspace_id)
+        from yeoman_gateway.knowledge._embedding_index import EmbeddingIndex
+        self._embedding_index = EmbeddingIndex(owner=store)
+        self._embedding_failure_logged = False
 
     # ── context validation ───────────────────────────────────────────────────
 
@@ -642,6 +645,9 @@ class RetrievalEngine:
         context: TrustedReadContext,
         embedder: Any | None = None,
         preprocessing_version: str | None = None,
+        max_chars: int | None = None,
+        group_wide: bool = False,
+        require_match: bool = False,
     ) -> KnowledgeContext:
         """Merge exact/FTS and vector candidates by statement identity, then gate again.
 
@@ -651,30 +657,33 @@ class RetrievalEngine:
         never a lexically findable statement.  Immediately before rendering, every merged
         id is re-checked against current rights and revocation.
         """
+        lexical = self.recall(query, context=context, max_chars=max_chars,
+                              group_wide=group_wide, require_match=require_match)
         decision = self.decide(context)
         if not decision.allowed:
-            return KnowledgeContext(
-                text="",
-                statement_ids=(),
-                source_refs=(),
-                identity_revision=self._store.identity_revision,
-                acl_epoch=self._store.acl_epoch,
-                context_revision=self.context_revision(context, decision, ()),
-                reason=decision.reason,
+            return lexical
+        merged = list(lexical.statement_ids)
+        try:
+            vector_ids = self._vector_candidates(
+                query, context=context, embedder=embedder,
+                preprocessing_version=preprocessing_version, group_wide=group_wide,
             )
-        rows, decision = self.candidates(query, context=context)
-        merged = list(rows.statement_ids)
-        for statement_id in self._vector_candidates(
-            query,
-            context=context,
-            embedder=embedder,
-            preprocessing_version=preprocessing_version,
-        ):
+        except Exception:
+            if not self._embedding_failure_logged:
+                from loguru import logger
+                logger.warning("knowledge embeddings reason=search_failed")
+                self._embedding_failure_logged = True
+            vector_ids = ()
+        if not vector_ids:
+            return lexical
+        for statement_id in vector_ids:
+            if len(merged) >= query.limit:
+                break
             if statement_id not in merged:
                 merged.append(statement_id)
-        allowed_ids = self._recheck_ids(tuple(merged), context, decision)
+        allowed_ids = self._recheck_ids(tuple(merged), context, decision, group_wide=group_wide)
         text, rendered_ids, source_refs, source_refs_by_statement, entry_texts = self._render(
-            allowed_ids, context, decision
+            allowed_ids, context, decision, max_chars=max_chars
         )
         return KnowledgeContext(
             text=text,
@@ -683,10 +692,11 @@ class RetrievalEngine:
             source_refs_by_statement=source_refs_by_statement,
             identity_revision=self._store.identity_revision,
             acl_epoch=self._store.acl_epoch,
-            context_revision=self.context_revision(context, decision, rendered_ids),
+            context_revision=self.context_revision(context, decision, rendered_ids, group_wide=group_wide),
             reason="ok" if allowed_ids else "empty",
-            denied_count=rows.denied,
+            denied_count=lexical.denied_count,
             entry_texts=entry_texts,
+            truncated=lexical.truncated or len(rendered_ids) < len(allowed_ids),
         )
 
     def _vector_candidates(
@@ -696,6 +706,7 @@ class RetrievalEngine:
         context: TrustedReadContext,
         embedder: Any | None,
         preprocessing_version: str | None = None,
+        group_wide: bool = False,
     ) -> tuple[str, ...]:
         """Statement ids whose embedding section is nearest, or nothing at all.
 
@@ -718,14 +729,21 @@ class RetrievalEngine:
             return ()
         from yeoman_gateway.knowledge._embedding_index import (
             EMBEDDING_PREPROCESSING_VERSION,
-            EmbeddingIndex,
         )
 
-        memory = EmbeddingIndex(owner=self._store)
-        rows = memory.search_embedding_index(
+        decision = self.decide(context)
+        clause, params = self._gate_clause(context, decision, group_wide=group_wide)
+        person_clause, person_params = self._person_filter_clause(query.person_ids, query.roles)
+        allowed = {str(row[0]) for row in self._store.query(
+            f"SELECT s.statement_id FROM knowledge_statements s WHERE {clause}"
+            + (f" AND {person_clause}" if person_clause else ""),
+            (*params, *person_params),
+        )}
+        rows = self._embedding_index.search_embedding_index(
             workspace_id=self.workspace_id,
             query_vector=list(vector),
-            scope_keys=[context.scope_key()],
+            scope_keys=[],
+            allowed_node_ids=allowed,
             limit=64,
             model_id=str(getattr(embedder, "model", "") or "") or None,
             preprocessing_version=preprocessing_version or EMBEDDING_PREPROCESSING_VERSION,

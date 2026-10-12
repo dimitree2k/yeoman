@@ -458,6 +458,7 @@ class GatewayRuntime:
     reconciliation: object | None = None
     retention: object | None = None
     statement_capture: object | None = None
+    knowledge_embeddings: Any | None = None
     startup_hook: Callable[[], Awaitable[None]] | None = None
 
     async def _start_processing_services(self) -> None:
@@ -509,6 +510,8 @@ class GatewayRuntime:
                 result = self.statement_capture.start()
                 if inspect.isawaitable(result):
                     await result
+            if self.knowledge_embeddings is not None:
+                self.knowledge_embeddings.start()
             tasks = [
                 self.orchestrator.run(),
                 self.channels.start_all(),
@@ -572,6 +575,8 @@ class GatewayRuntime:
                     await attempt_async(self.statement_capture.stop)
                 else:
                     attempt_sync(self.statement_capture.stop)
+            if self.knowledge_embeddings is not None:
+                await attempt_async(self.knowledge_embeddings.stop)
             if self.processing is not None:
                 attempt_sync(self.processing.close)
             await attempt_async(self.history_projector.stop)
@@ -2415,6 +2420,14 @@ def build_gateway_runtime(
         raise
 
 
+    knowledge_embeddings = None
+    if config.memory.embedding.enabled:
+        from yeoman_gateway.knowledge._embeddings import KnowledgeEmbedder
+        try:
+            knowledge_embeddings = knowledge_service.configure_embeddings(KnowledgeEmbedder(config))
+        except Exception:
+            logger.warning("knowledge embeddings reason=route_unavailable")
+
     cron_store_path = get_operational_store_path("cron")
     cron = CronService(cron_store_path, sessions_dir=get_operational_data_path() / "inbound")
     private_handoffs = PrivateHandoffStore(get_operational_data_path() / "policy" / "private_handoffs.json")
@@ -3941,5 +3954,6 @@ def build_gateway_runtime(
         ),
         retention=build_retention_service(config, processing_store),
         statement_capture=statement_capture,
+        knowledge_embeddings=knowledge_embeddings,
         startup_hook=_notify_pending_persona_evolution_reviews,
     )

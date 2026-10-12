@@ -357,6 +357,7 @@ class KnowledgeService:
             from yeoman_gateway.history.live import HistoryPaused
             raise HistoryPaused("retired_knowledge_requires_history_schema")
         self._store = store
+        self._embedder: Any | None = None
         # One wrapper so administrative sources registered later are visible to the
         # statement engine through the very same object.
         from yeoman_gateway.knowledge._history_identity import ScopedKnowledgeAdapter
@@ -676,6 +677,11 @@ class KnowledgeService:
         inspection, still never ``revoked`` content).
         """
         checked = self._read_context(context)
+        if self._embedder is not None and query.text.strip() and view == "current":
+            return self._retrieval.recall_hybrid(
+                query, context=checked, embedder=self._embedder, max_chars=max_chars,
+                group_wide=group_wide, require_match=require_match,
+            )
         return self._retrieval.recall(
             query,
             context=checked,
@@ -684,6 +690,14 @@ class KnowledgeService:
             group_wide=group_wide,
             require_match=require_match,
         )
+
+    def configure_embeddings(self, embedder: Any) -> Any:
+        """Build the worker at the composition boundary, without starting it."""
+        from yeoman_gateway.knowledge._embeddings import KnowledgeEmbeddingWorker
+
+        worker = KnowledgeEmbeddingWorker(self._store, embedder, workspace_id=self.workspace_id)
+        self._embedder = worker
+        return worker
 
     def recall_hybrid(
         self,
