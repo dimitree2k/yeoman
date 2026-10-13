@@ -172,6 +172,7 @@ class ParticipationSnapshot:
     activation_epoch: int
     sources: dict[str, str]
     invalid_reason: str = ""
+    context_mode: str = "window"
 
     @property
     def opted_in(self) -> bool:
@@ -687,6 +688,7 @@ class PolicyEngine:
             activation_epoch=int(activation_epoch),
             sources=sources,
             invalid_reason=invalid_reason,
+            context_mode=str(getattr(participation_config, "context_mode", "window")),
         )
 
     @staticmethod

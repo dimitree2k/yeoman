@@ -1017,6 +1017,7 @@ def _build_participation_runtime(
         policy=policy_engine,
         anchors=anchors,
         source_authorizer=_source_authorized,
+        thread_lookup=getattr(processing_store, "thread_for_message", None),
     )
 
     def _continuation_candidate(opportunity: object | None) -> bool:
@@ -1149,6 +1150,11 @@ def _build_participation_runtime(
             ),
             "context_window_minutes": int(resolved.context_window_minutes),
             "context_max_messages": int(resolved.context_max_messages),
+            "context_mode": str(resolved.context_mode),
+            # Conversations reuse the live lull/burst definitions (Spec A, decision A2).
+            "conversation_lull_minutes": int(config.consciousness.lull_silence_minutes),
+            "conversation_burst_messages": int(config.consciousness.burst_threshold_messages),
+            "conversation_burst_minutes": int(config.consciousness.burst_window_minutes),
             "context_revision": context_revision,
             "current_source_ids": current_source_ids,
             "max_reevaluations": int(resolved.max_reevaluations),

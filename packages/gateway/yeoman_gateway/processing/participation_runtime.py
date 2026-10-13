@@ -203,7 +203,7 @@ class ParticipationRuntime:
     @staticmethod
     def _record_knowledge_stage(context: Mapping[str, Any], stage: str) -> None:
         logger.info(
-            "participation_knowledge stage={} outcome={} count={} chars={} elapsed_ms={} knowledge_rendered={} revalidated={}",
+            "participation_knowledge stage={} outcome={} count={} chars={} elapsed_ms={} knowledge_rendered={} revalidated={} context_mode={} conversation_id={}",
             stage,
             str(context.get("knowledge_selection_status") or "disabled"),
             int(context.get("knowledge_selected_count") or 0),
@@ -211,6 +211,8 @@ class ParticipationRuntime:
             int(context.get("knowledge_selection_elapsed_ms") or 0),
             bool(context.get(f"knowledge_rendered_to_{stage}", False)),
             bool(context.get("knowledge_revalidated", False)),
+            str(context.get("context_mode") or "window"),
+            str(context.get("conversation_id") or "none"),
         )
 
     async def _record_judge_failure(
@@ -758,6 +760,16 @@ class ParticipationRuntime:
             ),
             max_anchors=_snapshot_positive_int(
                 snapshot, "context_max_anchors", default=10
+            ),
+            context_mode=_snapshot_context_mode(snapshot),
+            lull_minutes=_snapshot_positive_int(
+                snapshot, "conversation_lull_minutes", default=25
+            ),
+            burst_messages=_snapshot_positive_int(
+                snapshot, "conversation_burst_messages", default=8
+            ),
+            burst_minutes=_snapshot_positive_int(
+                snapshot, "conversation_burst_minutes", default=15
             ),
         )
         remaining_budgets = (
@@ -2243,6 +2255,7 @@ def _snapshot_mapping(snapshot: Any) -> dict[str, Any]:
         "policy_version",
         "context_window_minutes",
         "context_max_messages",
+        "context_mode",
         "max_reevaluations",
         "opportunity_ttl_seconds",
         "participation",
@@ -2505,6 +2518,15 @@ def _snapshot_positive_int(snapshot: Any, name: str, *, default: int) -> int:
     if value <= 0:
         raise ParticipationBlockedError("invalid_snapshot")
     return value
+
+
+def _snapshot_context_mode(snapshot: Any) -> str:
+    value = _snapshot_value(snapshot, "context_mode")
+    if value is _MISSING or value is None:
+        return "window"
+    if value not in {"window", "conversation"}:
+        raise ParticipationBlockedError("invalid_snapshot")
+    return str(value)
 
 
 def _snapshot_nonnegative_int(snapshot: Any, name: str, *, default: int) -> int:
