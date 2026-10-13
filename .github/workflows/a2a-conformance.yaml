@@ -25,9 +25,10 @@ jobs:
           repository: dimitree2k/hermes-yeoman-a2a-contracts
           ref: ${{ steps.pin.outputs.ref }}
           path: .contracts
+      # Pin the interpreter: the runner's newest Python has no lxml/pydantic-core wheels.
       - uses: astral-sh/setup-uv@v6
-      # lxml has no wheel for the runner's Python and builds from source.
-      - run: sudo apt-get update && sudo apt-get install -y libxml2-dev libxslt1-dev
+        with:
+          python-version: "3.14"
       - run: uv sync
       # The code check compares this checkout against CONTRACT_COMMIT and against the
       # installed package's schemas, which `uv sync` resolved from the same pin.
