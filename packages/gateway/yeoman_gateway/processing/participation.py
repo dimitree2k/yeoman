@@ -706,6 +706,10 @@ class _JudgeContext:
         evidence: set[str] = set()
         message_ids: set[str] = set()
         lines: list[str] = []
+        header = str(context.get("conversation_header") or "").strip()
+        if header:
+            # One summary line of the current conversation: data, not a decision rule.
+            lines.append(header)
         for item in messages:
             event_id = str(item.get("event_id") or item.get("message_id") or "").strip()
             if event_id:
