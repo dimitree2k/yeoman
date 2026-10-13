@@ -101,6 +101,7 @@ def write_backup_bytes(
     suffix: str = ".json",
     retention: int | None = None,
     now: datetime | None = None,
+    keep_newest: int = 0,
 ) -> Path | None:
     """Store ``data`` as a snapshot inside ``directory``.
 
@@ -111,7 +112,7 @@ def write_backup_bytes(
     """
     target_dir = _ensure_dir(directory)
     days = retention_days() if retention is None else retention
-    prune_backups(target_dir, retention=days, now=now)
+    prune_backups(target_dir, retention=days, now=now, keep_newest=keep_newest)
 
     if find_identical(target_dir, data) is not None:
         return None
@@ -132,20 +133,33 @@ def prune_backups(
     *,
     retention: int | None = None,
     now: datetime | None = None,
+    keep_newest: int = 0,
 ) -> list[Path]:
     """Delete snapshots in ``directory`` older than the retention window.
 
     Age is taken from the snapshot's modification time, which is its creation
     time for snapshots written by this module. ``retention <= 0`` disables
-    pruning.
+    pruning. The ``keep_newest`` newest snapshots (by modification time) are
+    never removed, whatever their age: with content deduplication an unchanged
+    file would otherwise lose every snapshot once the window passes.
     """
     days = retention_days() if retention is None else retention
     if days <= 0 or not directory.is_dir():
         return []
     cutoff = ((now or datetime.now().astimezone()) - timedelta(days=days)).timestamp()
+    files = [c for c in directory.iterdir() if c.is_file() and not is_protected(c)]
+    kept: set[Path] = set()
+    if keep_newest > 0:
+        dated = []
+        for candidate in files:
+            try:
+                dated.append((candidate.stat().st_mtime, candidate.name, candidate))
+            except OSError:
+                continue
+        kept = {item[2] for item in sorted(dated, reverse=True)[:keep_newest]}
     removed: list[Path] = []
-    for candidate in directory.iterdir():
-        if not candidate.is_file() or is_protected(candidate):
+    for candidate in files:
+        if candidate in kept:
             continue
         try:
             if candidate.stat().st_mtime < cutoff:

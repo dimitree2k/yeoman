@@ -110,3 +110,33 @@ def test_find_identical_returns_the_retained_snapshot(tmp_path: Path) -> None:
     assert stored is not None
     assert backups.find_identical(directory, b"{}") == stored
     assert backups.find_identical(directory, b'{"x": 1}') is None
+
+
+def test_prune_keeps_newest_even_when_old(tmp_path: Path) -> None:
+    directory = tmp_path / "b"
+    directory.mkdir()
+    old = directory / "2026-01-01T000000+0000-people.db"
+    older = directory / "2025-12-01T000000+0000-people.db"
+    for path in (old, older):
+        path.write_bytes(path.name.encode())
+    os.utime(old, (100, 100))
+    os.utime(older, (50, 50))
+
+    removed = backups.prune_backups(directory, retention=30, keep_newest=1)
+
+    assert removed == [older] and old.exists()
+    backups.prune_backups(directory, retention=30)          # default unchanged
+    assert not old.exists()
+
+
+def test_write_backup_bytes_keeps_newest_unchanged_snapshot(tmp_path: Path) -> None:
+    now = datetime(2026, 10, 13, 12, 0, tzinfo=timezone.utc)
+    first = backups.write_backup_bytes(tmp_path, label="people", data=b"same", suffix=".db",
+                                       retention=30, now=now, keep_newest=1)
+    assert first is not None
+    _age(first, 90, now)
+
+    again = backups.write_backup_bytes(tmp_path, label="people", data=b"same", suffix=".db",
+                                       retention=30, now=now, keep_newest=1)
+
+    assert again is None and first.exists()

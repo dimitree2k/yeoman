@@ -49,6 +49,8 @@ from yeoman_gateway.media.router import ModelRouter
 from yeoman_gateway.media.storage import MediaStorage
 from yeoman_gateway.media.tts import TTSSynthesizer
 from yeoman_gateway.media.vision import VisionDescriber
+from yeoman_gateway.people.schema import people_db_path
+from yeoman_gateway.people.service import PeopleSyncService
 from yeoman_gateway.persona_evolution import (
     PersonaEvolutionLedger,
     build_persona_evolution_approval_message,
@@ -462,6 +464,7 @@ class GatewayRuntime:
     knowledge_embeddings: Any | None = None
     startup_hook: Callable[[], Awaitable[None]] | None = None
     source_catchup: ObservedSourceCatchup | None = None
+    people_sync: PeopleSyncService | None = None
 
     async def _start_processing_services(self) -> None:
         """Plan 04 start order: recover and reconcile before any channel consumes input.
@@ -497,6 +500,8 @@ class GatewayRuntime:
             await self.history_projector.start()
             if self.source_catchup is not None:
                 await self.source_catchup.start()
+            if self.people_sync is not None:
+                await self.people_sync.start()
             self._resume_a2a_research()
             await self.cron.start()
             await self.heartbeat.start()
@@ -583,6 +588,8 @@ class GatewayRuntime:
                 await attempt_async(self.knowledge_embeddings.stop)
             if self.source_catchup is not None:
                 await attempt_async(self.source_catchup.stop)
+            if self.people_sync is not None:
+                await attempt_async(self.people_sync.stop)
             if self.processing is not None:
                 attempt_sync(self.processing.close)
             await attempt_async(self.history_projector.stop)
@@ -3983,4 +3990,6 @@ def build_gateway_runtime(
             processing=processing_store, knowledge=knowledge_service,
             registrar=observed_sources, projector=history_projector,
         ) if observed_sources is not None else None),
+        people_sync=(PeopleSyncService(projector=history_projector, db_path=people_db_path())
+                     if history_projector is not None else None),
     )
