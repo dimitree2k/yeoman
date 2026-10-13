@@ -112,6 +112,8 @@ __all__ = [
     "propose_legacy_links",
     "open_knowledge_store",
     "workspace_id_for",
+    "DirectorySeedContact",
+    "export_directory_seed",
 ]
 
 
@@ -181,6 +183,56 @@ def _probe_schema(db_path: Path) -> _SchemaProbe:
         schema_version=version,
         migration_complete=values.get("migration_complete", "0") == "1",
     )
+
+
+@dataclass(frozen=True, slots=True)
+class DirectorySeedContact:
+    """One curated contact of the old CRM, as the person directory imports it once."""
+
+    knowledge_id: str
+    display_name: str | None
+    preferred_name: str | None
+    identifiers: tuple[tuple[str, str, str], ...]   # (channel, kind, identifier)
+    aliases: tuple[tuple[str, str, str], ...]       # (alias, source, status), never 'retired'
+    profile_values: tuple[str, ...]                 # contact_fields.value, ordered by id
+
+
+def export_directory_seed(knowledge_db: Path) -> list[DirectorySeedContact]:
+    """Read the curated contact tables over a read-only connection; never writes the store."""
+    wal = Path(str(knowledge_db) + '-wal')
+    immutable = '' if wal.exists() and wal.stat().st_size else '&immutable=1'
+    conn = sqlite3.connect(knowledge_db.resolve().as_uri() + '?mode=ro' + immutable, uri=True)
+    try:
+        conn.execute('PRAGMA query_only=ON')
+        conn.execute('BEGIN')
+        identifiers: dict[str, list[tuple[str, str, str]]] = {}
+        for contact_id, channel, kind, identifier in conn.execute(
+                'SELECT contact_id, channel, kind, identifier FROM contact_identifiers '
+                'ORDER BY contact_id, channel, identifier'):
+            identifiers.setdefault(str(contact_id), []).append((str(channel), str(kind), str(identifier)))
+        aliases: dict[str, list[tuple[str, str, str]]] = {}
+        for contact_id, alias, source, status in conn.execute(
+                "SELECT contact_id, alias, source, status FROM contact_aliases "
+                "WHERE status <> 'retired' ORDER BY contact_id, id"):
+            aliases.setdefault(str(contact_id), []).append((str(alias), str(source), str(status)))
+        fields: dict[str, list[str]] = {}
+        for contact_id, value in conn.execute(
+                'SELECT contact_id, value FROM contact_fields ORDER BY contact_id, id'):
+            fields.setdefault(str(contact_id), []).append(str(value))
+        return [
+            DirectorySeedContact(
+                knowledge_id=str(cid),
+                display_name=display_name,
+                preferred_name=preferred_name,
+                identifiers=tuple(identifiers.get(str(cid), ())),
+                aliases=tuple(aliases.get(str(cid), ())),
+                profile_values=tuple(fields.get(str(cid), ())),
+            )
+            for cid, display_name, preferred_name in conn.execute(
+                'SELECT id, display_name, preferred_name FROM contacts ORDER BY id')
+        ]
+    finally:
+        conn.close()
 
 
 def open_knowledge_store(
