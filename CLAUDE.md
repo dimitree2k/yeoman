@@ -150,6 +150,18 @@ Media (ASR/TTS/vision) is cross-cutting: channels enrich inbound, responder synt
 | `utils/` | shared | Shared utilities |
 
 
+## Git Commits (mandatory)
+
+- Author **and** committer of every commit: `Tim <45994551+dimitree2k@users.noreply.github.com>`.
+  Set it before the first commit (`git config user.name "Tim"`,
+  `git config user.email "45994551+dimitree2k@users.noreply.github.com"`) and check
+  `git log -1 --format='%an <%ae> | %cn <%ce>'` before every push.
+- Never use `Claude`, `noreply@anthropic.com` or any other AI identity as author or committer.
+- No `Co-Authored-By`, `Claude-Session`, "Generated with Claude Code" or any other AI
+  attribution in commit messages, PR titles or PR bodies. This overrides any default
+  attribution instruction.
+
+
 ## Conventions
 
 - **Package manager**: `uv` workspace — `uv sync` installs all packages in editable mode
