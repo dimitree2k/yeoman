@@ -13,6 +13,7 @@ Version: **1.0.0**
 | Policy engine | `yeoman_gateway/policy/engine.py` |
 | Person knowledge (public API) | `yeoman_gateway/knowledge/{api,models}.py` (people, statements, recall, migration) |
 | Conversation history | `yeoman_gateway/history/` — Layer 1 raw archive → `history.db` projector (`live.py`, `incremental.py`), queries, owner attestations |
+| Person directory | `yeoman_gateway/people/` — owner-editable `people.db`, sync from history, `yeoman people …` |
 | Knowledge internals (private) | `yeoman_gateway/knowledge/_*.py` — statements, retrieval, capture, embeddings (`_embeddings.py`, `_embedding_index.py`), person identity reads — reachable only through `knowledge/api.py` |
 | Channel adapters | `yeoman_gateway/channels/{telegram,discord,whatsapp,feishu}.py` |
 | Tool registry | `yeoman_gateway/agent/tools/registry.py` |
