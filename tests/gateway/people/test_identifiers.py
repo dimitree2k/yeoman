@@ -1,7 +1,11 @@
 from __future__ import annotations
 
 import pytest
-from yeoman_gateway.people.identifiers import identifier_from_history, is_valid_value, normalize_phone
+from yeoman_gateway.people.identifiers import (
+    identifier_from_history,
+    is_valid_value,
+    normalize_phone,
+)
 
 
 @pytest.mark.parametrize("raw, expected", [
