@@ -101,8 +101,14 @@ def import_knowledge_seed(store: PeopleStore, seed: list[DirectorySeedContact],
                   for i in seed_identifiers(kind, value)]
         person = _map(store, contact, idents, now_ms, report)
         for ident in [ObservedId("knowledge_person", contact.knowledge_id), *idents]:
-            if store.attach_id(person, ident, now_ms) == "added" and ident.kind == "telegram_id":
+            outcome = store.attach_id(person, ident, now_ms)
+            if outcome == "added" and ident.kind == "telegram_id":
                 report.telegram_ids += 1
+            elif outcome == "taken":
+                # Another directory person already holds this id: likely one person split in two.
+                holder = store.terminal(store.find_active(ident.kind, ident.value))
+                report.conflicts += store.suggest("merge", store.terminal(person), holder,
+                                                  evidence={"source": "knowledge_seed", "kind": ident.kind})
         for alias, source, _status in contact.aliases:
             if source in _OWNER_ALIAS_SOURCES:
                 report.owner_nicknames += _add_owner_nickname(store, person, alias)

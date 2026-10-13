@@ -147,3 +147,16 @@ def test_import_conflicting_identifiers_suggest_merge(store):
     assert r.conflicts == 1
     assert store.conn.execute("SELECT person_a, person_b, kind FROM suggestions").fetchall()[0][:] == (1, 2, "merge")
     assert store.terminal(2) == 2                                         # never merged automatically
+
+
+def test_import_suggests_merge_when_an_id_is_held_by_another_person(store):
+    first_sync(store, [op("k1"), op("k2")])
+    seed = [seed_contact("k1", identifiers=[("telegram", "telegram_id", "42|franky_t")]),
+            seed_contact("k2", identifiers=[("telegram", "telegram_id", "42|franky_two")])]
+    r = run_import(store, seed)
+    assert r.mapped_by_history_id == 2 and r.telegram_ids == 1 and r.conflicts == 1
+    rows = store.conn.execute("SELECT kind, person_a, person_b FROM suggestions").fetchall()
+    assert [tuple(row) for row in rows] == [("merge", 1, 2)]
+    assert store.find_active("telegram_username", "franky_two") == 2
+    run_import(store, seed)
+    assert store.conn.execute("SELECT count(*) FROM suggestions").fetchone()[0] == 1
