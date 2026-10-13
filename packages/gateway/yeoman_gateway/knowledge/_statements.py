@@ -49,6 +49,10 @@ VISIBILITY_CHAT_SHARED = "chat_shared"
 VISIBILITY_PRINCIPALS = "principals"
 VISIBILITY_AUTHOR_ONLY = "author_only"
 
+#: Attribute keys a person holds exactly one current value of.  A newer positive value
+#: ends the period of an older one in the same chat and visibility scope.
+SINGLE_VALUED_ATTRIBUTE_KEYS: Final[frozenset[str]] = frozenset({"residence"})
+
 _AUTHOR_ONLY_BASES = frozenset({"owner_private_note", "owner_only", "author_only"})
 _UNKNOWN_AUDIENCE_BASES = frozenset({"unknown", "unproven", "denied_unknown_basis"})
 
@@ -214,6 +218,14 @@ class StatementEngine:
         # Structured facets are published in the same transaction as the statement and its
         # roles, and only for a person who actually holds an *active subject* role here.
         self._insert_attributes(statement_id, candidate.attributes, ts=ts)
+        self._supersede_single_valued(
+            statement_id,
+            scope_key=scope_key,
+            visibility=visibility,
+            valid_from_ms=valid_from,
+            actor=context.actor_principal,
+            ts=ts,
+        )
         # `speaker` may already have been proposed by the extractor with the same
         # evidence; the primary key makes the second insert a no-op.
         link_rows = int(
@@ -1068,6 +1080,7 @@ class StatementEngine:
             superseded_by=new_id,
             supersession_reason=SUPERSESSION_CORRECTION,
         )
+        self._close_period(statement_id, end_ms=ts)
         self._store.execute(
             "UPDATE knowledge_statements SET superseded_by = ?, updated_ms = ?"
             " WHERE statement_id = ? AND superseded_by IS NULL",
@@ -1172,6 +1185,7 @@ class StatementEngine:
             superseded_by=None,
             supersession_reason=SUPERSESSION_STATE_CHANGE,
         )
+        self._close_period(statement_id, end_ms=ts)
         self.audit(
             statement_id,
             operation="end_attribute",
@@ -1333,6 +1347,99 @@ class StatementEngine:
             " revoked_at_ms = CASE WHEN ? = 'revoked' THEN ? ELSE revoked_at_ms END,"
             " updated_ms = ? WHERE fact_id = ?",
             (status, superseded_by, status, ts, ts, str(statement_id)),
+        )
+
+    def _close_period(self, statement_id: str, *, end_ms: int) -> None:
+        """End a statement's validity period at ``end_ms``; never extends an earlier end."""
+        for table, key in (("knowledge_statements", "statement_id"), ("memory2_facts", "fact_id")):
+            self._store.execute(
+                f"UPDATE {table} SET valid_until_ms = ?"
+                f" WHERE {key} = ? AND (valid_until_ms IS NULL OR valid_until_ms > ?)",
+                (int(end_ms), str(statement_id), int(end_ms)),
+            )
+
+    def _supersede_single_valued(
+        self,
+        statement_id: str,
+        *,
+        scope_key: str,
+        visibility: str,
+        valid_from_ms: int,
+        actor: str,
+        ts: int,
+    ) -> tuple[str, ...]:
+        """End older current values of a single-valued attribute as a ``state_change``.
+
+        "Alex wohnt in Köln" followed later by "Alex wohnt in Bonn" closes the Köln period
+        at the Bonn statement's source time.  A capture that arrives out of order (its
+        source is older than a current value) closes itself instead.  Only statements of
+        the same chat and visibility scope compete, so a private or other-chat claim never
+        changes what this audience sees.  Equal source times are left as a visible conflict.
+        """
+        keys = tuple(sorted(SINGLE_VALUED_ATTRIBUTE_KEYS))
+        key_marks = ",".join("?" for _ in keys)
+        from yeoman_gateway.knowledge._retrieval import CURRENT_STATEMENT_SQL
+
+        rows = self._store.query(
+            "SELECT DISTINCT s.statement_id, s.valid_from_ms"
+            " FROM knowledge_person_attributes n"
+            " JOIN knowledge_person_attributes a"
+            "   ON a.person_id = n.person_id AND a.attribute_key = n.attribute_key"
+            "  AND a.polarity = 'positive' AND a.statement_id <> n.statement_id"
+            " JOIN knowledge_statements s ON s.statement_id = a.statement_id"
+            " WHERE n.statement_id = ? AND n.polarity = 'positive'"
+            f"   AND n.attribute_key IN ({key_marks})"
+            "   AND s.scope_key = ? AND s.visibility_scope = ?"
+            f"   AND ({CURRENT_STATEMENT_SQL})"
+            # Repeating the same value is not a change of state.
+            "   AND NOT EXISTS (SELECT 1 FROM knowledge_person_attributes x"
+            "     WHERE x.statement_id = a.statement_id AND x.person_id = n.person_id"
+            "       AND x.attribute_key = n.attribute_key AND x.value_key = n.value_key"
+            "       AND x.polarity = 'positive')",
+            (str(statement_id), *keys, str(scope_key), str(visibility)),
+        )
+        ended: list[str] = []
+        newer_starts: list[int] = []
+        for row in rows:
+            other_start = int(row["valid_from_ms"])
+            if other_start < int(valid_from_ms):
+                self._end_state(
+                    str(row["statement_id"]), end_ms=int(valid_from_ms),
+                    successor=statement_id, actor=actor, ts=ts,
+                )
+                ended.append(str(row["statement_id"]))
+            elif other_start > int(valid_from_ms):
+                newer_starts.append(other_start)
+        if newer_starts:
+            self._end_state(
+                statement_id, end_ms=min(newer_starts),
+                successor=None, actor=actor, ts=ts,
+            )
+            ended.append(statement_id)
+        if ended:
+            self._store.bump_acl_epoch()
+        return tuple(ended)
+
+    def _end_state(
+        self, statement_id: str, *, end_ms: int, successor: str | None, actor: str, ts: int
+    ) -> None:
+        # No ``superseded_by``: the historic view only shows a state change without a
+        # successor link, as ``end_attribute`` writes it.  The successor goes to the audit.
+        self._set_status(
+            statement_id,
+            status="superseded",
+            ts=ts,
+            superseded_by=None,
+            supersession_reason=SUPERSESSION_STATE_CHANGE,
+        )
+        self._close_period(statement_id, end_ms=end_ms)
+        self.audit(
+            statement_id,
+            operation="state_change",
+            actor=actor,
+            reason="single_valued_attribute",
+            detail={"successor": successor, "valid_until_ms": int(end_ms)},
+            ts=ts,
         )
 
     def _redact(self, statement_id: str, *, ts: int) -> None:
