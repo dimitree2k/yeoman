@@ -502,8 +502,10 @@ def test_profile_marks_two_values_of_one_group_as_a_conflict(knowledge_harness):
 
     h = knowledge_harness
     alex = h.person("Alex")
+    # Same source time: neither value is provably newer, so neither ends the other.
+    said_at = h.clock.now_ms()
     for place in ("Köln", "Bonn"):
-        source = h.source(alex)
+        source = h.source(alex, when_ms=said_at)
         candidate = StatementCandidate(
             content=f"Alex wohnt in {place}.",
             sources=(source,),
@@ -525,7 +527,7 @@ def test_profile_marks_two_values_of_one_group_as_a_conflict(knowledge_harness):
     profile = h.service.person_profile(alex, context=h.read_context(alex))
     assert profile.conflicts == ("residence",)
     residence = [line for line in profile.card.splitlines() if line.startswith("residence:")]
-    # Both values stay visible: no global last-write-wins.
+    # Both values stay visible: only a provably newer value ends an older one.
     assert residence == ["residence: Bonn, Köln"]
 
 
