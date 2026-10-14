@@ -80,6 +80,9 @@ class ParticipationMaintenance:
         self._history_projector: Any = None
         self._history_knowledge: Any = None
         self._config: Any = None
+        #: Weekly group reaction digest job (``GroupDigestJob``); ticked after each pass,
+        #: outside the pass's history turn so its model call never holds a lease.
+        self._group_digest: Any = None
         self._ledger = ledger
         self._reconciler = reconciler
         self._archive = archive
@@ -124,10 +127,27 @@ class ParticipationMaintenance:
                 logger.warning(
                     "participation_maintenance_tick_failed error_type={}", type(exc).__name__
                 )
+            await self.run_group_digest()
             try:
                 await asyncio.sleep(self._interval_seconds)
             except asyncio.CancelledError:
                 raise
+
+    async def run_group_digest(self, *, now_ms: int | None = None) -> Any:
+        """One weekly-digest tick; its failures never stop maintenance."""
+        import asyncio
+
+        if self._group_digest is None:
+            return None
+        try:
+            return await self._group_digest.tick(
+                now_ms=int(now_ms if now_ms is not None else self._clock_ms())
+            )
+        except asyncio.CancelledError:
+            raise
+        except Exception as exc:  # noqa: BLE001 - the digest is advisory
+            logger.warning("group_digest_tick_failed error_type={}", type(exc).__name__)
+            return None
 
     @secondary_consumer
     async def run_once(self, *, now_ms: int | None = None) -> MaintenanceReport:
