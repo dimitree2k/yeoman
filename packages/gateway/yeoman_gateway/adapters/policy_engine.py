@@ -785,8 +785,8 @@ class EnginePolicyAdapter(PolicyPort):
                 voice_output_tts_route="tts.speak",
                 voice_output_voice="alloy",
                 voice_output_format="opus",
-                voice_output_max_sentences=3,
-                voice_output_max_chars=500,
+                voice_output_max_sentences=4,
+                voice_output_max_chars=750,
                 talkative_cooldown_enabled=False,
                 talkative_cooldown_streak_threshold=7,
                 talkative_cooldown_topic_overlap_threshold=0.34,
@@ -817,8 +817,8 @@ class EnginePolicyAdapter(PolicyPort):
         voice_output_tts_route = "tts.speak"
         voice_output_voice = "alloy"
         voice_output_format = "opus"
-        voice_output_max_sentences = 3
-        voice_output_max_chars = 500
+        voice_output_max_sentences = 4
+        voice_output_max_chars = 750
         talkative_cooldown_enabled = False
         talkative_cooldown_streak_threshold = 7
         talkative_cooldown_topic_overlap_threshold = 0.34

@@ -57,8 +57,12 @@ from yeoman_gateway.core.ports import ResponderPort, SecurityPort, TelemetryPort
 from yeoman_gateway.history.live import HistoryPaused
 from yeoman_gateway.history.reader import HistorySnapshot
 from yeoman_gateway.media.tts import (
+    VOICE_MAX_CHARS,
+    VOICE_MAX_RAW_BYTES,
+    VOICE_MAX_SENTENCES,
     strip_markdown_for_tts,
     truncate_for_voice,
+    voice_length_excess,
     write_tts_audio_file,
 )
 from yeoman_gateway.policy.identity import normalize_sender_list
@@ -671,7 +675,7 @@ class LLMResponder(ResponderPort):
         service_effects: object | None = None,
         tts: "TTSSynthesizer | None" = None,
         whatsapp_tts_outgoing_dir: Path | None = None,
-        whatsapp_tts_max_raw_bytes: int = 160 * 1024,
+        whatsapp_tts_max_raw_bytes: int = VOICE_MAX_RAW_BYTES,
         recording_notifier: "Callable[[str, str], Awaitable[None]] | None" = None,
         private_handoff_store: "PrivateHandoffStore | None" = None,
         a2a_registry: "A2AWorkerRegistry | None" = None,
@@ -1173,11 +1177,27 @@ class LLMResponder(ResponderPort):
         voice = str(request.voice or "").strip() or "alloy"
         if request.verbatim:
             limited = content
+        elif request.max_sentences is not None or request.max_chars is not None:
+            # An explicit cap comes from a scheduled job with fixed text: trim to whole
+            # sentences rather than fail the delivery.
+            limited = truncate_for_voice(
+                strip_markdown_for_tts(content),
+                max_sentences=max(1, int(request.max_sentences or VOICE_MAX_SENTENCES)),
+                max_chars=max(1, int(request.max_chars or VOICE_MAX_CHARS)),
+            )
         else:
-            max_sentences = max(1, int(request.max_sentences or 3))
-            max_chars = max(1, int(request.max_chars or 260))
-            plain = strip_markdown_for_tts(content)
-            limited = truncate_for_voice(plain, max_sentences=max_sentences, max_chars=max_chars)
+            # The model wrote this text, so an over-long note goes back to it for a
+            # shorter rewrite instead of being cut off mid-thought.
+            limited = strip_markdown_for_tts(content)
+            excess = voice_length_excess(
+                limited, max_sentences=VOICE_MAX_SENTENCES, max_chars=VOICE_MAX_CHARS
+            )
+            if excess is not None:
+                logger.info("send_voice rejected over-long content ({})", excess)
+                return (
+                    f"Error: Voice note too long ({excess}); nothing was sent. Rewrite it "
+                    "shorter as complete sentences and call send_voice again."
+                )
         if not limited:
             return "Error: Nothing to synthesize after normalization"
 
@@ -3190,10 +3210,10 @@ class LLMResponder(ResponderPort):
         ):
             metadata["voice_reply_expected"] = True
             metadata["voice_reply_max_sentences"] = int(
-                getattr(decision, "voice_output_max_sentences", 3) or 3
+                getattr(decision, "voice_output_max_sentences", 4) or 4
             )
             metadata["voice_reply_max_chars"] = int(
-                getattr(decision, "voice_output_max_chars", 500) or 500
+                getattr(decision, "voice_output_max_chars", 750) or 750
             )
         if decision.private_handoff_active:
             metadata["private_handoff_active"] = True

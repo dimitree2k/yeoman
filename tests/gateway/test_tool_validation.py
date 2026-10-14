@@ -1000,7 +1000,7 @@ async def test_send_voice_tool_call_does_not_emit_text_confirmation(
 
     assert out == ""
     assert provider.calls == 1
-    assert tts.last_text == "Kurze Sprachnachricht."
+    assert tts.last_text == "Kurze Sprachnachricht"
     outbound = await bus.consume_outbound()
     assert outbound.channel == "whatsapp"
     assert outbound.chat_id == "34596062240904@lid"

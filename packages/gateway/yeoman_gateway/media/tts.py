@@ -33,40 +33,91 @@ def strip_markdown_for_tts(text: str) -> str:
     return " ".join(text.split()).strip()
 
 
+# Voice notes are written short by the model; these are ceilings, not targets.
+VOICE_MAX_SENTENCES = 4
+VOICE_MAX_CHARS = 750
+# Observed WhatsApp opus output is ~62 kbps (~7.7 KB/s), so 512 KiB holds about a
+# minute of speech: a full 750-character note fits with room to spare.
+VOICE_MAX_RAW_BYTES = 512 * 1024
+
+# Lower-cased tokens whose trailing dot never ends a sentence (German + English).
+_ABBREVIATIONS = frozenset(
+    "bzw ca d.h dr etc evtl ggf inkl jh max min mio mrd nr prof s sog str u.a usw vgl z.b "
+    "z.t e.g i.e mr mrs ms vs approx no".split()
+)
+_SENTENCE_END_RE = re.compile(r"[.!?\u2026]+[\"'\u201c\u201d\u00bb)]*(?=\s|$)")
+
+
+def split_sentences(text: str) -> list[str]:
+    """Split text into sentences without breaking on abbreviations, decimals or ordinals."""
+    cleaned = " ".join((text or "").split()).strip()
+    sentences: list[str] = []
+    start = 0
+    for match in _SENTENCE_END_RE.finditer(cleaned):
+        end = match.end()
+        if (
+            match.group().startswith(".")
+            and len(match.group().rstrip("\"'\u201c\u201d\u00bb)")) == 1
+        ):
+            word = cleaned[start : match.start()].rsplit(" ", 1)[-1].lower()
+            # "z.B.", "Dr.", "3." (ordinal), "A." (initial) do not end a sentence.
+            if word in _ABBREVIATIONS or word.isdigit() or len(word) == 1:
+                continue
+        sentence = cleaned[start:end].strip()
+        if sentence:
+            sentences.append(sentence)
+        start = end
+    tail = cleaned[start:].strip()
+    if tail:
+        sentences.append(tail)
+    return sentences
+
+
+def voice_length_excess(text: str, *, max_sentences: int, max_chars: int) -> str | None:
+    """Describe how text exceeds the voice-note limits, or None when it fits."""
+    cleaned = " ".join((text or "").split()).strip()
+    sentence_count = len(split_sentences(cleaned))
+    if len(cleaned) > max_chars:
+        return f"{len(cleaned)} characters > {max_chars}"
+    if sentence_count > max_sentences:
+        return f"{sentence_count} sentences > {max_sentences}"
+    return None
+
+
 def truncate_for_voice(text: str, *, max_sentences: int, max_chars: int) -> str:
-    """Deterministically truncate assistant text to fit voice guardrails."""
+    """Safety net: keep whole leading sentences that fit the voice limits.
+
+    Never cuts inside a sentence. When even the first sentence is over the
+    character limit it is kept whole, since a complete long sentence beats a
+    fragment. Logs a warning whenever anything is dropped.
+    """
     cleaned = " ".join((text or "").split()).strip()
     if not cleaned:
         return ""
 
     max_sentences = max(1, int(max_sentences))
     max_chars = max(1, int(max_chars))
+    sentences = split_sentences(cleaned)
 
-    normalized = cleaned.replace("!", ".").replace("?", ".")
-    sentences = [s.strip() for s in normalized.split(".") if s.strip()]
-    if sentences:
-        candidate = ". ".join(sentences[:max_sentences]).strip()
-        if candidate and candidate[-1] not in ".!?":
-            candidate += "."
-    else:
-        candidate = cleaned
+    kept: list[str] = []
+    for sentence in sentences[:max_sentences]:
+        candidate = " ".join([*kept, sentence])
+        if kept and len(candidate) > max_chars:
+            break
+        kept.append(sentence)
+    result = " ".join(kept)
 
-    if len(candidate) <= max_chars:
-        return candidate
-
-    ellipsis = "..."
-    if max_chars <= len(ellipsis):
-        return candidate[:max_chars].rstrip()
-
-    clipped = candidate[: max_chars - len(ellipsis)].rstrip()
-    if " " in clipped:
-        clipped = clipped.rsplit(" ", 1)[0].rstrip()
-    if not clipped:
-        clipped = candidate[: max_chars - len(ellipsis)].rstrip()
-    clipped = clipped.rstrip(" .")
-    if not clipped:
-        return candidate[:max_chars].rstrip()
-    return clipped + ellipsis
+    if len(kept) < len(sentences):
+        logger.warning(
+            "voice_truncated kept_sentences={}/{} chars={}/{} max_sentences={} max_chars={}",
+            len(kept),
+            len(sentences),
+            len(result),
+            len(cleaned),
+            max_sentences,
+            max_chars,
+        )
+    return result
 
 
 def write_tts_audio_file(outgoing_dir: Path, audio_bytes: bytes, *, ext: str = ".ogg") -> Path:
@@ -155,7 +206,9 @@ class OpenAITTSProvider:
                 return None, "openai_no_response"
             response.raise_for_status()
         except Exception as e:
-            logger.error("OpenAI TTS error {}: {}", e.__class__.__name__, getattr(response, "text", ""))
+            logger.error(
+                "OpenAI TTS error {}: {}", e.__class__.__name__, getattr(response, "text", "")
+            )
             status = getattr(response, "status_code", "unknown")
             return None, f"openai_http_{status}"
 
@@ -184,9 +237,7 @@ class ElevenLabsTTSProvider:
     ) -> None:
         self.api_key = api_key or os.environ.get("ELEVENLABS_API_KEY")
         self.api_base = (
-            api_base
-            or os.environ.get("ELEVENLABS_API_BASE")
-            or "https://api.elevenlabs.io/v1"
+            api_base or os.environ.get("ELEVENLABS_API_BASE") or "https://api.elevenlabs.io/v1"
         )
         self.timeout_seconds = timeout_seconds
         self.extra_headers = extra_headers
@@ -277,13 +328,20 @@ def _pcm16_to_ogg_opus(pcm_data: bytes) -> bytes | None:
     try:
         result = subprocess.run(
             [
-                "ffmpeg", "-y",
-                "-f", "s16le",
-                "-ar", str(_OPENROUTER_PCM_SAMPLE_RATE),
-                "-ac", "1",
-                "-i", pcm_path,
-                "-c:a", "libopus",
-                "-b:a", "32k",
+                "ffmpeg",
+                "-y",
+                "-f",
+                "s16le",
+                "-ar",
+                str(_OPENROUTER_PCM_SAMPLE_RATE),
+                "-ac",
+                "1",
+                "-i",
+                pcm_path,
+                "-c:a",
+                "libopus",
+                "-b:a",
+                "32k",
                 ogg_path,
             ],
             capture_output=True,
@@ -385,11 +443,7 @@ class OpenRouterAudioTTSProvider:
                             parsed = json.loads(raw_text)
                             inner = parsed.get("error", {})
                             metadata = inner.get("metadata", {})
-                            detail = (
-                                metadata.get("raw")
-                                or inner.get("message")
-                                or raw_text
-                            )
+                            detail = metadata.get("raw") or inner.get("message") or raw_text
                         except Exception:
                             pass
                         logger.error(
@@ -589,7 +643,9 @@ class TTSSynthesizer:
                 extra_headers=self._openai_extra_headers,
                 timeout_seconds=timeout_s,
             )
-            audio, error = await client.synthesize(text=text, model=model, voice=voice, format=format)
+            audio, error = await client.synthesize(
+                text=text, model=model, voice=voice, format=format
+            )
             return (audio or None), error
         if provider in {"elevenlabs_tts", "elevenlabs"}:
             model_candidate = str(profile.model or "").strip()
@@ -622,7 +678,9 @@ class TTSSynthesizer:
                 extra_headers=self._openrouter_extra_headers,
                 timeout_seconds=timeout_s,
             )
-            audio, error = await client.synthesize(text=text, model=model, voice=voice, format=format)
+            audio, error = await client.synthesize(
+                text=text, model=model, voice=voice, format=format
+            )
             return (audio or None), error
 
         if provider in {"fish_audio"}:
@@ -635,7 +693,9 @@ class TTSSynthesizer:
                 api_base=self._fish_api_base,
                 timeout_seconds=timeout_s,
             )
-            audio, error = await client.synthesize(text=text, model=model, voice=voice_candidate, format=format)
+            audio, error = await client.synthesize(
+                text=text, model=model, voice=voice_candidate, format=format
+            )
             return (audio or None), error
 
         return None, f"tts_provider_unsupported:{provider}"

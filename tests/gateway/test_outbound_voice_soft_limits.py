@@ -217,7 +217,7 @@ async def test_voice_reply_sends_text_when_reply_is_too_structured_for_audio(tmp
 @pytest.mark.asyncio
 async def test_voice_reply_sends_text_when_reply_exceeds_hard_audio_length(tmp_path):
     tts = _TTS()
-    reply = "x" * 501
+    reply = "x" * 751
 
     ctx = await _run_outbound(reply=reply, tmp_path=tmp_path, tts=tts)
 

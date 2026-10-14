@@ -98,7 +98,7 @@ class Orchestrator:
         model_router: "ModelRouter | None" = None,
         tts: "TTSSynthesizer | None" = None,
         whatsapp_tts_outgoing_dir: Path | None = None,
-        whatsapp_tts_max_raw_bytes: int = 160 * 1024,
+        whatsapp_tts_max_raw_bytes: int = 512 * 1024,  # media.tts.VOICE_MAX_RAW_BYTES
         owner_alert_resolver: "Callable[[str], list[str]] | None" = None,
         owner_alert_cooldown_seconds: int = 300,
         allowed_reaction_emojis: Sequence[str] | None = None,
