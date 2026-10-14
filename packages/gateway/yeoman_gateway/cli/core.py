@@ -120,14 +120,18 @@ def make_provider(config):
     from yeoman_gateway.providers.litellm_provider import LiteLLMProvider
 
     model = config.agents.defaults.model
+    provider_name = None
     try:
         profile = ModelRouter(config.models).resolve("assistant.reply")
         if profile.model:
             model = profile.model
+            # A pinned provider wins over keyword matching: "~z-ai/..." on OpenRouter
+            # otherwise matches zhipu's keyword and lands on the local vLLM fallback.
+            provider_name = profile.provider or None
     except KeyError:
         pass
 
-    provider_cfg = config.get_provider(model)
+    provider_cfg = config.get_provider(model, provider_name=provider_name)
     if not (provider_cfg and provider_cfg.api_key) and not model.startswith("bedrock/"):
         console.print("[red]Error: No API key configured.[/red]")
         console.print("Set one in ~/.yeoman/config.json under providers section")
