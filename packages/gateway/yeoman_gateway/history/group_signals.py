@@ -602,7 +602,7 @@ def _arvid_effect(
         if not conversation.arvid_addressed:
             continue
         addressed += 1
-        index = next(
+        answer_at = next(
             (
                 position for position, row in enumerate(members)
                 if row.get("direction") == "out"
@@ -610,17 +610,18 @@ def _arvid_effect(
             ),
             None,
         )
-        if index is None:  # pragma: no cover - arvid_addressed implies a registry message
+        if answer_at is None:  # pragma: no cover - arvid_addressed implies a registry message
             continue
-        answer = members[index]
+        answer = members[answer_at]
         target = by_native.get(str(answer.get("reply_to_native_id") or ""))
         if target is None or target.get("direction") == "out":
             target = next(
-                (row for row in reversed(members[:index]) if row.get("direction") != "out"), None
+                (row for row in reversed(members[:answer_at]) if row.get("direction") != "out"),
+                None,
             )
         addresser = _sender_key(target) if target is not None else ""
         others = {
-            _sender_key(row) for row in members[index + 1:] if row.get("direction") != "out"
+            _sender_key(row) for row in members[answer_at + 1:] if row.get("direction") != "out"
         } - {"", addresser}
         others_total += len(others)
         addressed_with_others += 1 if others else 0
