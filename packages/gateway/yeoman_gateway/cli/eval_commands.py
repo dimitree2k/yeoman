@@ -478,3 +478,317 @@ def eval_participation_context_review(
     finally:
         history.close()
     _echo_label_summary(labels)
+
+
+def _groupnotes_replay_args(setup, context_mode: str) -> dict:
+    """Spec A's setup reduced to one view: the live context mode."""
+    args = dict(setup.replay_args)
+    window = args.pop("window_bounds")
+    conversation = args.pop("conversation_bounds")
+    args["bounds"] = conversation if context_mode == "conversation" else window
+    return args
+
+
+def _digest_runner_for(config, history):
+    """A digest runner per week over an in-memory sink; registry threads as of week end."""
+    from yeoman_gateway.app.bootstrap import _processing_store_path
+    from yeoman_gateway.evaluation.participation_context_ab import registry_lookup
+    from yeoman_gateway.evaluation.participation_groupnotes_replay import MemoryDigestSink
+    from yeoman_gateway.processing.group_digest import DigestBounds, GroupDigestRunner
+
+    lookup = registry_lookup(_processing_store_path(config))
+    bounds = DigestBounds.from_config(config)
+
+    def _no_client():
+        raise AssertionError("the replay passes its digest client explicitly")
+
+    def runner_for(week):
+        return GroupDigestRunner(
+            knowledge=MemoryDigestSink(), history=history, bounds=bounds,
+            client_factory=_no_client,
+            thread_lookup=(lambda native: lookup(native, week.end_ms - 1)) if lookup else None,
+        )
+
+    return runner_for
+
+
+@eval_app.command("participation-groupnotes")
+def eval_participation_groupnotes(
+    days: int = typer.Option(14, "--days", min=1, max=90),
+    no_judge: bool = typer.Option(
+        False, "--no-judge",
+        help="No model calls: stored notes only (else 'note unavailable'), token estimates",
+    ),
+    route: str = typer.Option("participation.judge", "--route"),
+    profile: str | None = typer.Option(None, "--profile"),
+    limit: int | None = typer.Option(None, "--limit", min=1, help="Newest N opportunities only"),
+    concurrency: int = typer.Option(6, "--concurrency", min=1, help="Parallel model calls"),
+    chats: list[str] | None = typer.Option(
+        None, "--chat", help="Only this chat (id or exact group subject); repeatable"
+    ),
+    from_report: Path | None = typer.Option(
+        None, "--from-report",
+        help="Replay exactly the opportunities (and notes) of this earlier report (ignores "
+        "--days and --limit; --chat still filters); checks new B against its labels.jsonl",
+    ),
+    judge_repeats: int = typer.Option(
+        1, "--judge-repeats", min=1, max=10,
+        help="Ask the B Judge N times per opportunity; the majority decides",
+    ),
+    use_stored: bool = typer.Option(
+        False, "--use-stored",
+        help="Reuse a stored digest of the chat-week when there is one (default: generate)",
+    ),
+) -> None:
+    """Replay recorded group Judge opportunities without (A) and with (B) group notes.
+
+    The note of an opportunity is the one of the ISO week before its own, generated in
+    memory from that week only (never stored); one digest call per chat-week.
+    """
+    import time
+
+    from yeoman_shared.config.loader import load_config
+    from yeoman_shared.utils.helpers import get_operational_store_path, get_var_path
+
+    from yeoman_gateway.evaluation.participation_context_ab import (
+        LABELS_FILE,
+        FrozenHistory,
+        UsageCapture,
+        captured_usage,
+        chat_subjects,
+        label_check,
+        load_opportunities,
+        looks_like_chat_id,
+        read_labels,
+        read_records,
+        record_opportunity,
+        resolve_chat,
+    )
+    from yeoman_gateway.evaluation.participation_groupnotes_replay import (
+        NOTES_FILE,
+        REPORT_DIR,
+        ReplayNotes,
+        read_notes,
+        render_markdown,
+        replay,
+        stored_note_reader,
+        summarize,
+        write_outputs,
+    )
+    from yeoman_gateway.evaluation.report import new_report_dir
+    from yeoman_gateway.history.live import history_db_path
+    from yeoman_gateway.processing.participation import ParticipationJudge
+
+    source_dir = from_report.expanduser() if from_report is not None else None
+    source_records: list[dict] = []
+    if source_dir is not None:
+        if not (source_dir / "records.jsonl").is_file():
+            typer.echo("error: --from-report: records.jsonl missing")
+            raise typer.Exit(2)
+        source_records = read_records(source_dir / "records.jsonl")
+    config = load_config()
+    participation = config.processing.participation
+    context_mode = str(participation.context_mode)
+    speakups = get_operational_store_path("speakups", create=False)
+    if (source_dir is None and not speakups.is_file()) or not history_db_path().is_file():
+        typer.echo("error: speakups.db or history.db not found")
+        raise typer.Exit(2)
+    history = FrozenHistory(history_db_path())
+    try:
+        chat_ids: list[str] | None = None
+        if chats:
+            subjects = (
+                {} if all(looks_like_chat_id(value) for value in chats)
+                else asyncio.run(chat_subjects(history))
+            )
+            try:
+                chat_ids = [resolve_chat(value, subjects) for value in chats]
+            except ValueError as exc:
+                typer.echo(f"error: --chat: {exc}")
+                raise typer.Exit(2) from exc
+        if source_dir is not None:
+            wanted = None if chat_ids is None else set(chat_ids)
+            opportunities = [
+                record_opportunity(record) for record in source_records
+                if wanted is None or str(record.get("chat_id")) in wanted
+            ]
+        else:
+            until_ms = int(time.time() * 1000)
+            opportunities = load_opportunities(
+                speakups, since_ms=until_ms - days * 86_400_000, until_ms=until_ms,
+                chat_ids=chat_ids,
+            )
+            if limit is not None:
+                opportunities = opportunities[-limit:]
+        setup = _participation_replay_setup(config)
+        judge = None
+        digest_client = None
+        if not no_judge:
+            from yeoman_gateway.evaluation.judge_format import build_eval_client
+            from yeoman_gateway.processing.group_digest import DIGEST_ROUTE
+            from yeoman_gateway.processing.model_route import RouteClient, RouteUnavailableError
+
+            try:
+                client = UsageCapture(build_eval_client(
+                    config, route=None if profile else route, profile=profile,
+                ))
+                digest_client = RouteClient(config=config, route_key=DIGEST_ROUTE)
+            except RouteUnavailableError as exc:
+                typer.echo(f"error: {exc}")
+                raise typer.Exit(2) from exc
+            judge = ParticipationJudge(
+                client=client, allowed_emojis=setup.emojis, max_input_tokens=setup.max_input,
+                timeout_seconds=float(participation.judge_timeout_seconds),
+                max_output_tokens=int(participation.judge_max_output_tokens),
+            )
+            typer.echo(
+                f"model calls: up to {(1 + judge_repeats) * len(opportunities)} judge and one "
+                f"digest per chat-week ({concurrency} in parallel)"
+            )
+        notes = ReplayNotes(
+            runner_for=_digest_runner_for(config, history),
+            client=digest_client,
+            generate=not no_judge,
+            stored=stored_note_reader(Path(config.knowledge.db_path).expanduser()),
+            use_stored=use_stored,
+            seeded=read_notes(source_dir / NOTES_FILE) if source_dir is not None else None,
+        )
+        records = asyncio.run(replay(
+            opportunities, history=history, notes=notes, judge=judge, usage=captured_usage,
+            concurrency=concurrency, judge_repeats=judge_repeats,
+            **_groupnotes_replay_args(setup, context_mode),
+        ))
+    finally:
+        history.close()
+    summary = summarize(records, notes.notes(), judged=judge is not None,
+                        context_mode=context_mode)
+    if source_dir is not None:
+        summary["source_report"] = source_dir.name
+        labels = read_labels(source_dir / LABELS_FILE)
+        if labels and judge is not None:
+            summary["label_check"] = label_check(records, source_records, labels)
+    directory = new_report_dir("replay", base=get_var_path().joinpath(*REPORT_DIR))
+    markdown = render_markdown(
+        summary, days=days, source_report=source_dir.name if source_dir is not None else None
+    )
+    write_outputs(directory, records, summary, markdown, notes.notes())
+    typer.echo(
+        f"opportunities={summary['opportunities']} built_both={summary['built_both']} "
+        f"digest_calls={summary['notes']['digest_calls']} "
+        f"agreement={summary.get('agreement_rate')} report: {directory}"
+    )
+
+
+@eval_app.command("participation-groupnotes-review")
+def eval_participation_groupnotes_review(
+    report_dir: Path = typer.Argument(..., help="A participation-groupnotes replay report directory"),
+    every: bool = typer.Option(
+        False, "--all", help="Every disagreement, not only the summary's sample of up to 30"
+    ),
+    summary_only: bool = typer.Option(
+        False, "--summary", help="Print the label counts only; no review"
+    ),
+) -> None:
+    """Owner labelling of without/with-note disagreements; text is shown here only."""
+    import json
+    from datetime import UTC, datetime
+
+    from yeoman_gateway.evaluation.participation_context_ab import (
+        LABEL_KEYS,
+        LABELS_FILE,
+        FrozenHistory,
+        append_label,
+        chat_subjects,
+        disagreement_ids,
+        read_labels,
+        read_records,
+    )
+    from yeoman_gateway.evaluation.participation_groupnotes_replay import (
+        NOTES_FILE,
+        note_block,
+        read_notes,
+        rebuild_views,
+    )
+
+    directory = report_dir.expanduser()
+    records_path = directory / "records.jsonl"
+    if not records_path.is_file() or not (directory / "summary.json").is_file():
+        typer.echo("error: not a replay report (records.jsonl / summary.json missing)")
+        raise typer.Exit(2)
+    labels_path = directory / LABELS_FILE
+    labels = read_labels(labels_path)
+    if summary_only:
+        _echo_label_summary(labels)
+        return
+    records = read_records(records_path)
+    summary = json.loads((directory / "summary.json").read_text(encoding="utf-8"))
+    notes = read_notes(directory / NOTES_FILE)
+    by_id = {str(record["opportunity_id"]): record for record in records}
+    todo = [item for item in disagreement_ids(records, summary, every=every)
+            if item in by_id and item not in labels]
+    if not todo:
+        typer.echo("nothing to label")
+        _echo_label_summary(labels)
+        return
+
+    from yeoman_shared.config.loader import load_config
+
+    from yeoman_gateway.history.live import history_db_path
+
+    if not history_db_path().is_file():
+        typer.echo("error: history.db not found")
+        raise typer.Exit(2)
+    setup = _participation_replay_setup(load_config())
+    args = _groupnotes_replay_args(setup, str(summary.get("context_mode") or "window"))
+    history = FrozenHistory(history_db_path())
+    prompt = "[a] A better / [b] B better / [s] same / [k] skip / [q] quit"
+    try:
+        subjects = asyncio.run(chat_subjects(history))
+        for index, opportunity_id in enumerate(todo, start=1):
+            record = by_id[opportunity_id]
+            meta = record.get("note") or {}
+            note = notes.get((str(meta.get("chat_id")), str(meta.get("week"))))
+            if note is None:
+                typer.echo(f"=== {opportunity_id}: note missing from {NOTES_FILE}; skipped")
+                continue
+            views = asyncio.run(rebuild_views(
+                record, note, history=history, builder=args["builder"], bounds=args["bounds"],
+                estimator=args["estimator"], guidance_for=args["guidance_for"],
+                set_as_of=args["set_as_of"],
+            ))
+            a_lines = views["A"].splitlines()
+            b_lines = views["B"].splitlines()
+            moment = datetime.fromtimestamp(int(record["at_ms"]) / 1000).astimezone()
+            typer.echo("")
+            typer.echo(f"=== {index}/{len(todo)} {opportunity_id}")
+            typer.echo(f"chat: {subjects.get(str(record.get('chat_id')), '(no subject)')}")
+            typer.echo(f"time: {moment:%Y-%m-%d %H:%M %Z}")
+            typer.echo("--- A (live context, no note)")
+            typer.echo(views["A"])
+            typer.echo(f"--- B = A plus the note of week {note.week}")
+            if not record.get("B", {}).get("group_notes_rendered"):
+                typer.echo("(the note was dropped by the budget)")
+            typer.echo(note_block(note))
+            dropped = [line for line in a_lines if line not in set(b_lines)]
+            if dropped:
+                typer.echo(f"(B drops {len(dropped)} line(s) of A to fit the budget)")
+            for key in ("A", "B"):
+                typer.echo(f"{key} decision: {_decision_line(record.get(key) or {})}")
+            while True:
+                try:
+                    answer = typer.prompt(prompt).strip().lower()
+                except typer.Abort:
+                    answer = "q"
+                if answer in {*LABEL_KEYS, "k", "q"}:
+                    break
+                typer.echo("please answer a, b, s, k or q")
+            if answer == "q":
+                break
+            if answer == "k":
+                continue
+            append_label(labels_path, opportunity_id, LABEL_KEYS[answer],
+                         labelled_at=datetime.now(UTC).isoformat(timespec="seconds"))
+            labels[opportunity_id] = LABEL_KEYS[answer]
+    finally:
+        history.close()
+    _echo_label_summary(labels)
