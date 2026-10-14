@@ -66,8 +66,10 @@ class SendVoiceTool(Tool):
         default_channel: str = "",
         default_chat_id: str = "",
         group_resolver: Callable[[str], tuple[str | None, str | None]] | None = None,
+        style_guidance: Callable[[], str] | None = None,
     ) -> None:
         self._send_callback = send_callback
+        self._style_guidance = style_guidance
         self._default_channel = default_channel
         self._default_chat_id = default_chat_id
         self._group_resolver = group_resolver
@@ -94,13 +96,22 @@ class SendVoiceTool(Tool):
 
     @property
     def description(self) -> str:
-        return (
+        base = (
             "Synthesize text-to-speech and send as a voice note. "
             "Supports explicit chat_id or WhatsApp group alias/name. "
             "Write the note short from the start: usually one or two sentences, and up to "
             f"{VOICE_MAX_SENTENCES} sentences / {VOICE_MAX_CHARS} characters only when the "
             "content needs it. Longer text is rejected and must be rewritten shorter."
         )
+        style = ""
+        if self._style_guidance is not None:
+            try:
+                style = self._style_guidance().strip()
+            except Exception:
+                style = ""
+        if not style:
+            return base
+        return f"{base}\n\nWrite `content` as a voice script following these rules:\n{style}"
 
     @property
     def parameters(self) -> dict[str, Any]:

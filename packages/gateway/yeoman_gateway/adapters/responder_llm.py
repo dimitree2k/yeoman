@@ -60,7 +60,10 @@ from yeoman_gateway.media.tts import (
     VOICE_MAX_CHARS,
     VOICE_MAX_RAW_BYTES,
     VOICE_MAX_SENTENCES,
+    is_drama_profile,
+    load_voice_style_prompt,
     strip_markdown_for_tts,
+    strip_voice_directions,
     truncate_for_voice,
     voice_length_excess,
     write_tts_audio_file,
@@ -836,6 +839,9 @@ class LLMResponder(ResponderPort):
             SendVoiceTool(
                 send_callback=self._send_voice_message,
                 group_resolver=self._resolve_group_reference,
+                style_guidance=lambda: self._voice_style_prompt(
+                    route="tts.speak", channel="whatsapp"
+                ),
             )
         )
 
@@ -1053,6 +1059,16 @@ class LLMResponder(ResponderPort):
             return self._model_router.resolve(task_key)
         return self._model_router.resolve(task_key, channel=channel)
 
+    def _voice_style_prompt(self, *, route: str, channel: str) -> str:
+        """Drama 3 style prompt for voice text on this route, or "" for other models."""
+        try:
+            profile = self._resolve_tts_profile(route=route, channel=channel)
+        except Exception:
+            return ""
+        if not is_drama_profile(profile):
+            return ""
+        return load_voice_style_prompt(self.workspace)
+
     async def _outbound_dispatch_callback(self, message: OutboundMessage) -> None:
         """Single outbound entry point for tool producers.
 
@@ -1198,6 +1214,8 @@ class LLMResponder(ResponderPort):
                     f"Error: Voice note too long ({excess}); nothing was sent. Rewrite it "
                     "shorter as complete sentences and call send_voice again."
                 )
+        if not request.verbatim and not is_drama_profile(profile):
+            limited = strip_voice_directions(limited)
         if not limited:
             return "Error: Nothing to synthesize after normalization"
 
@@ -3002,7 +3020,14 @@ class LLMResponder(ResponderPort):
         # Only add messages if they weren't already added (for new sessions)
         if not _user_message_already_added:
             session.add_message("user", content, **self._session_user_metadata(sender_id, metadata))
-        session.add_message("assistant", final_content)
+        # Drama 3 markup is for the voice model only; history keeps the spoken words so
+        # later text replies don't imitate it.
+        stored_content = (
+            strip_voice_directions(final_content)
+            if metadata.get("voice_style_prompt")
+            else final_content
+        )
+        session.add_message("assistant", stored_content)
         self.sessions.save(session)
         if private_handoff_id and self._private_handoff_store is not None:
             try:
@@ -3215,6 +3240,10 @@ class LLMResponder(ResponderPort):
             metadata["voice_reply_max_chars"] = int(
                 getattr(decision, "voice_output_max_chars", 750) or 750
             )
+            voice_route = str(getattr(decision, "voice_output_tts_route", "") or "")
+            style_prompt = self._voice_style_prompt(route=voice_route, channel=route_channel)
+            if style_prompt:
+                metadata["voice_style_prompt"] = style_prompt
         if decision.private_handoff_active:
             metadata["private_handoff_active"] = True
             metadata["private_handoff_origin_chat_id"] = (

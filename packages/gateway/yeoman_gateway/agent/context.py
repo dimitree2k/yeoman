@@ -816,6 +816,9 @@ When a user asks you to send, create, or reply with a voice message / Sprachnach
             "instruction: Write a complete, natural voice note. Short interactions get short "
             "notes; never pad. Anything over the ceiling is not spoken.\n"
         )
+        style_prompt = str(metadata.get("voice_style_prompt") or "").strip()
+        if style_prompt:
+            prefix += f"[Voice Script Style]\n{style_prompt}\n[End Voice Script Style]\n"
         return f"{prefix}\n{text}"
 
     def _with_private_handoff_context(self, text: str, metadata: dict[str, Any] | None) -> str:
