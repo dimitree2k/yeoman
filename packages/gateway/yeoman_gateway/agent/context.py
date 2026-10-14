@@ -796,15 +796,25 @@ When a user asks you to send, create, or reply with a voice message / Sprachnach
         if not metadata or not bool(metadata.get("voice_reply_expected", False)):
             return text
 
-        max_sentences = min(3, max(1, int(metadata.get("voice_reply_max_sentences") or 3)))
-        max_chars = min(500, max(1, int(metadata.get("voice_reply_max_chars") or 500)))
+        from yeoman_gateway.media.tts import VOICE_MAX_CHARS, VOICE_MAX_SENTENCES
+
+        max_sentences = min(
+            VOICE_MAX_SENTENCES,
+            max(1, int(metadata.get("voice_reply_max_sentences") or VOICE_MAX_SENTENCES)),
+        )
+        max_chars = min(
+            VOICE_MAX_CHARS,
+            max(1, int(metadata.get("voice_reply_max_chars") or VOICE_MAX_CHARS)),
+        )
 
         prefix = (
             "[Voice Reply Guidance]\n"
             "target: concise_for_tts\n"
-            f"target_sentences: {max_sentences}\n"
-            f"target_chars: {max_chars}\n"
-            "instruction: Keep the answer naturally short, complete, and direct for a voice note.\n"
+            "default_length: one or two short sentences\n"
+            f"ceiling: {max_sentences} sentences / {max_chars} characters, "
+            "only when the content truly needs it\n"
+            "instruction: Write a complete, natural voice note. Short interactions get short "
+            "notes; never pad. Anything over the ceiling is not spoken.\n"
         )
         return f"{prefix}\n{text}"
 

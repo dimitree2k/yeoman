@@ -8,6 +8,7 @@ from typing import Any, Awaitable, Callable
 
 from yeoman_gateway.agent.tools.base import Tool
 from yeoman_gateway.history.live import HistoryPaused
+from yeoman_gateway.media.tts import VOICE_MAX_CHARS, VOICE_MAX_SENTENCES
 
 _PHONE_CHARS_RE = re.compile(r"[\s().-]+")
 
@@ -95,7 +96,10 @@ class SendVoiceTool(Tool):
     def description(self) -> str:
         return (
             "Synthesize text-to-speech and send as a voice note. "
-            "Supports explicit chat_id or WhatsApp group alias/name."
+            "Supports explicit chat_id or WhatsApp group alias/name. "
+            "Write the note short from the start: usually one or two sentences, and up to "
+            f"{VOICE_MAX_SENTENCES} sentences / {VOICE_MAX_CHARS} characters only when the "
+            "content needs it. Longer text is rejected and must be rewritten shorter."
         )
 
     @property
@@ -138,13 +142,19 @@ class SendVoiceTool(Tool):
                     "type": "integer",
                     "minimum": 1,
                     "maximum": 12,
-                    "description": "Optional: sentence cap before synthesis",
+                    "description": (
+                        "Optional, for scheduled jobs: trim to this many whole sentences "
+                        "instead of rejecting long text"
+                    ),
                 },
                 "max_chars": {
                     "type": "integer",
                     "minimum": 1,
                     "maximum": 2000,
-                    "description": "Optional: character cap before synthesis",
+                    "description": (
+                        "Optional, for scheduled jobs: trim whole sentences to fit this "
+                        "many characters instead of rejecting long text"
+                    ),
                 },
                 "verbatim": {
                     "type": "boolean",

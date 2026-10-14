@@ -42,7 +42,7 @@ _LOG_LINE_RE = re.compile(
     r"(?:DEBUG|INFO|WARNING|ERROR|CRITICAL)\b)"
 )
 _SENTENCE_SPLIT_RE = re.compile(r"(?<=[.!?])\s+")
-_VOICE_HARD_MAX_CHARS = 500
+_VOICE_HARD_MAX_CHARS = 750  # media.tts.VOICE_MAX_CHARS
 _SOCIAL_REPLY_CHAR_CAPS = {
     "social_one_liner": 180,
     "one_liner": 220,
@@ -170,7 +170,7 @@ class OutboundMiddleware:
         security_block_message: str = "😂",
         tts: "TTSSynthesizer | None" = None,
         whatsapp_tts_outgoing_dir: Path | None = None,
-        whatsapp_tts_max_raw_bytes: int = 160 * 1024,
+        whatsapp_tts_max_raw_bytes: int = 512 * 1024,  # media.tts.VOICE_MAX_RAW_BYTES
         model_router: "ModelRouter | None" = None,
         owner_alert_resolver: Callable[[str], list[str]] | None = None,
         owner_alert_cooldown_seconds: int = 300,
