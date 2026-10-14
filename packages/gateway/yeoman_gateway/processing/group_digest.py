@@ -46,7 +46,7 @@ from yeoman_gateway.processing.model_route import RouteUnavailableError
 
 #: Model route of the weekly call (owner item O1: no fallback route).
 DIGEST_ROUTE = "participation.digest"
-DIGEST_PROMPT_VERSION = "group-digest-v1"
+DIGEST_PROMPT_VERSION = "group-digest-v2"
 #: Input budget of the one call; the selection is cut by rank, never mid-message.
 MAX_INPUT_TOKENS = 12_000
 MAX_OUTPUT_TOKENS = 700
@@ -55,6 +55,11 @@ TIMEOUT_SECONDS = 60.0
 MAX_BULLETS = 3
 MAX_BULLET_CHARS = 160
 MAX_RENDERED_CHARS = 600
+# What the prompt asks for: below the hard limits, because models do not count characters.
+TARGET_BULLET_CHARS = 90
+TARGET_RENDERED_CHARS = 450
+# Validation failures one shortening retry can fix.
+_SHORTEN_REASONS = frozenset({"rendered_too_long", "bullet_too_long", "too_many_bullets"})
 #: Job timing (owner item O3: Monday 04:00 local) and failure handling (spec §7).
 RUN_WEEKDAY_HOUR = 4
 MAX_ATTEMPTS = 3
@@ -104,8 +109,10 @@ DIGEST_SYSTEM_PROMPT = (
     "individuals. Write about the group as a whole.\n"
     "- Name heated or quarrelsome topics as heated.\n"
     "- Say 'unclear' rather than guess when the data shows no pattern.\n"
-    f"- At most {MAX_BULLETS} bullets per part, each at most {MAX_BULLET_CHARS} "
-    f"characters; the whole note at most {MAX_RENDERED_CHARS} characters.\n"
+    f"- Be brief: one or two bullets per part ({MAX_BULLETS} at most), each under "
+    f"{TARGET_BULLET_CHARS} characters; all bullets together under "
+    f"{TARGET_RENDERED_CHARS} characters. Hard limits: {MAX_BULLET_CHARS} characters per "
+    f"bullet, {MAX_RENDERED_CHARS} for the whole note.\n"
     "Return only JSON: {\"goes_down_well\": [...], \"engages\": [... with tone], "
     "\"arvid_effect\": [...], \"confidence\": \"low|medium|high\"}"
 )
@@ -224,6 +231,28 @@ class DigestInvalidError(ValueError):
     def __init__(self, reason: str) -> None:
         super().__init__(reason)
         self.reason = reason
+
+
+def shorten_request(reason: str) -> str:
+    """The follow-up turn after an answer that broke a length limit."""
+    return (
+        f"That note failed validation ({reason}). Return the same JSON, shorter: at most "
+        f"{MAX_BULLETS} bullets per part, each under {TARGET_BULLET_CHARS} characters, all "
+        f"bullets together under {TARGET_RENDERED_CHARS} characters. Keep the substance; "
+        "drop detail."
+    )
+
+
+def _add_usage(total: Mapping[str, Any], more: Mapping[str, Any]) -> dict[str, Any]:
+    """Token counts summed over calls; non-numeric fields keep the latest value."""
+    merged = dict(total)
+    for key, value in dict(more).items():
+        old = merged.get(key)
+        if isinstance(value, (int, float)) and isinstance(old, (int, float)):
+            merged[key] = old + value
+        else:
+            merged[key] = value
+    return merged
 
 
 def render_digest(content: Mapping[str, Any]) -> str:
@@ -413,49 +442,64 @@ class GroupDigestRunner:
             return DigestOutcome("failed", "route_unavailable", signals=signals)
         digest_input = build_digest_input(signals, max_input_tokens=self._max_input_tokens)
         messages = digest_messages(digest_input.payload)
-        # Provider work: no history turn and no SQLite transaction is open here.
-        try:
-            reply = await asyncio.wait_for(
-                route.chat_with_usage(
-                    messages,
-                    max_tokens=self._max_output_tokens,
-                    response_format=response_format_for(
-                        str(getattr(route, "structured_output", "json_schema_strict"))
+        usage: dict[str, Any] = {}
+        calls = 0
+        while True:
+            # Provider work: no history turn and no SQLite transaction is open here.
+            calls += 1
+            try:
+                reply = await asyncio.wait_for(
+                    route.chat_with_usage(
+                        messages,
+                        max_tokens=self._max_output_tokens,
+                        response_format=response_format_for(
+                            str(getattr(route, "structured_output", "json_schema_strict"))
+                        ),
                     ),
-                ),
-                timeout=self._timeout_seconds,
+                    timeout=self._timeout_seconds,
+                )
+            except asyncio.CancelledError:
+                raise
+            except TimeoutError:
+                return DigestOutcome(
+                    "failed", "timeout", signals=signals, model_calls=calls, usage=usage
+                )
+            except Exception as exc:  # noqa: BLE001 - provider failures are a retry, not a crash
+                logger.warning(
+                    "group_digest_provider_failed chat={} week={} error_type={}",
+                    _short(chat_id), week.label, type(exc).__name__,
+                )
+                return DigestOutcome(
+                    "failed", "provider_error", signals=signals, model_calls=calls, usage=usage
+                )
+            usage = _add_usage(usage, getattr(reply, "usage", {}) or {})
+            finish = str(
+                (getattr(reply, "diagnostics", None) or {}).get("native_finish_reason")
+                or getattr(reply, "finish_reason", "") or ""
             )
-        except asyncio.CancelledError:
-            raise
-        except TimeoutError:
-            return DigestOutcome("failed", "timeout", signals=signals, model_calls=1)
-        except Exception as exc:  # noqa: BLE001 - provider failures are a retry, not a crash
-            logger.warning(
-                "group_digest_provider_failed chat={} week={} error_type={}",
-                _short(chat_id), week.label, type(exc).__name__,
-            )
-            return DigestOutcome("failed", "provider_error", signals=signals, model_calls=1)
-        usage = dict(getattr(reply, "usage", {}) or {})
-        finish = str(
-            (getattr(reply, "diagnostics", None) or {}).get("native_finish_reason")
-            or getattr(reply, "finish_reason", "") or ""
-        )
-        if finish == "length":
-            return DigestOutcome(
-                "failed", "output_truncated", signals=signals, model_calls=1, usage=usage
-            )
-        try:
-            content, rendered = validate_digest(
-                str(getattr(reply, "content", "") or ""), names=names, phones=phones
-            )
-        except DigestInvalidError as exc:
-            logger.warning(
-                "group_digest_invalid chat={} week={} reason={}",
-                _short(chat_id), week.label, exc.reason,
-            )
-            return DigestOutcome(
-                "failed", exc.reason, signals=signals, model_calls=1, usage=usage
-            )
+            if finish == "length":
+                return DigestOutcome(
+                    "failed", "output_truncated", signals=signals, model_calls=calls, usage=usage
+                )
+            answer = str(getattr(reply, "content", "") or "")
+            try:
+                content, rendered = validate_digest(answer, names=names, phones=phones)
+                break
+            except DigestInvalidError as exc:
+                logger.warning(
+                    "group_digest_invalid chat={} week={} reason={} call={}",
+                    _short(chat_id), week.label, exc.reason, calls,
+                )
+                if calls > 1 or exc.reason not in _SHORTEN_REASONS:
+                    return DigestOutcome(
+                        "failed", exc.reason, signals=signals, model_calls=calls, usage=usage
+                    )
+                # One shortening retry: the model rarely meets a character budget first time.
+                messages = [
+                    *messages,
+                    {"role": "assistant", "content": answer},
+                    {"role": "user", "content": shorten_request(exc.reason)},
+                ]
         view = self._knowledge.store_group_digest(
             chat_id=chat_id,
             week=week.label,
@@ -476,7 +520,7 @@ class GroupDigestRunner:
             digest_input.estimated_tokens, digest_input.dropped, usage,
         )
         return DigestOutcome(
-            "done", "", signals=signals, digest=view, model_calls=1, usage=usage
+            "done", "", signals=signals, digest=view, model_calls=calls, usage=usage
         )
 
 

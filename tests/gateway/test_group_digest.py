@@ -269,7 +269,7 @@ async def test_run_makes_one_call_and_stores_with_sources(h: Harness) -> None:
     assert "Bertram" not in prompt and _phone(1) not in prompt
     digest = outcome.digest
     assert digest.week == "2026-W40" and digest.version == 1 and digest.status == "active"
-    assert digest.prompt_version == "group-digest-v1"
+    assert digest.prompt_version == "group-digest-v2"
     assert digest.model_version == "fake/digest-model"
     assert {role for _mid, role in digest.sources} == {"approval", "engagement", "arvid"}
     assert digest.signals["reactions"] == outcome.signals.reactions
@@ -292,6 +292,37 @@ async def test_names_from_history_reject_the_note_and_store_nothing(h: Harness) 
     h.client = FakeClient(json.dumps({**GOOD, "engages": ["Bertram starts the rate debates"]}))
     outcome = await h.runner().run(CHAT, WEEK)
     assert (outcome.state, outcome.reason) == ("failed", "names_participant")
+    assert h.knowledge.group_digests(chat_id=CHAT) == ()
+
+
+@pytest.mark.asyncio
+async def test_too_long_note_gets_one_shortening_retry(h: Harness) -> None:
+    _busy_week(h.history)
+    long_note = json.dumps({**GOOD, "engages": ["y" * 150, "z" * 150, "w" * 150]})
+    h.client = FakeClient(long_note, json.dumps(GOOD))
+    outcome = await h.runner().run(CHAT, WEEK)
+    assert outcome.state == "done" and outcome.model_calls == 2
+    assert len(h.client.calls) == 2
+    retry = h.client.calls[1]
+    assert retry[-2] == {"role": "assistant", "content": long_note}
+    assert "rendered_too_long" in retry[-1]["content"] and retry[-1]["role"] == "user"
+    assert len(h.knowledge.group_digests(chat_id=CHAT)) == 1
+
+
+@pytest.mark.asyncio
+async def test_shortening_retry_happens_once_and_only_for_length(h: Harness) -> None:
+    _busy_week(h.history)
+    long_note = json.dumps({**GOOD, "engages": ["y" * 150, "z" * 150, "w" * 150]})
+    h.client = FakeClient(long_note, long_note, json.dumps(GOOD))
+    outcome = await h.runner().run(CHAT, WEEK)
+    assert (outcome.state, outcome.reason, outcome.model_calls) == (
+        "failed", "rendered_too_long", 2
+    )
+    assert len(h.client.calls) == 2
+    h.client = FakeClient("not json", json.dumps(GOOD))
+    outcome = await h.runner().run(CHAT, WEEK)
+    assert (outcome.reason, outcome.model_calls) == ("invalid_json", 1)
+    assert len(h.client.calls) == 1
     assert h.knowledge.group_digests(chat_id=CHAT) == ()
 
 
