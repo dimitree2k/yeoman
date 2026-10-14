@@ -21,6 +21,7 @@ from yeoman_gateway.knowledge.runtime import RuntimeKnowledgeSources
 from yeoman_gateway.processing import group_digest as digest_module
 from yeoman_gateway.processing.group_digest import (
     HISTORY_PAUSE_DELAY_MS,
+    MAX_OUTPUT_TOKENS,
     MAX_RENDERED_CHARS,
     RETRY_BACKOFF_MS,
     STALE_RUNNING_MS,
@@ -324,6 +325,26 @@ async def test_shortening_retry_happens_once_and_only_for_length(h: Harness) -> 
     assert (outcome.reason, outcome.model_calls) == ("invalid_json", 1)
     assert len(h.client.calls) == 1
     assert h.knowledge.group_digests(chat_id=CHAT) == ()
+
+
+@pytest.mark.asyncio
+async def test_cut_off_answer_gets_one_plain_retry(h: Harness) -> None:
+    _busy_week(h.history)
+    cut = RouteReply(content='{"goes_down_well": ["Ima', finish_reason="length")
+    h.client = FakeClient(cut, json.dumps(GOOD))
+    outcome = await h.runner().run(CHAT, WEEK)
+    assert outcome.state == "done" and outcome.model_calls == 2
+    assert h.client.calls[1] == h.client.calls[0]  # same request, no follow-up turn
+    h.client = FakeClient(cut, cut, json.dumps(GOOD))
+    outcome = await h.runner().run(CHAT, WEEK)
+    assert (outcome.state, outcome.reason, outcome.model_calls) == (
+        "failed", "output_truncated", 2
+    )
+    assert len(h.client.calls) == 2
+
+
+def test_output_budget_leaves_room_for_reasoning_models() -> None:
+    assert MAX_OUTPUT_TOKENS >= 2_000
 
 
 # ── storage ──────────────────────────────────────────────────────────────────

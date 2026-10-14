@@ -49,7 +49,9 @@ DIGEST_ROUTE = "participation.digest"
 DIGEST_PROMPT_VERSION = "group-digest-v2"
 #: Input budget of the one call; the selection is cut by rank, never mid-message.
 MAX_INPUT_TOKENS = 12_000
-MAX_OUTPUT_TOKENS = 700
+#: Generous on purpose: the note itself is short (validation caps it at 600 characters),
+#: but reasoning models spend output tokens before the answer; only what is used is billed.
+MAX_OUTPUT_TOKENS = 2_000
 TIMEOUT_SECONDS = 60.0
 #: Output limits enforced in code.
 MAX_BULLETS = 3
@@ -478,9 +480,16 @@ class GroupDigestRunner:
                 or getattr(reply, "finish_reason", "") or ""
             )
             if finish == "length":
-                return DigestOutcome(
-                    "failed", "output_truncated", signals=signals, model_calls=calls, usage=usage
+                logger.warning(
+                    "group_digest_invalid chat={} week={} reason=output_truncated call={}",
+                    _short(chat_id), week.label, calls,
                 )
+                if calls > 1:
+                    return DigestOutcome(
+                        "failed", "output_truncated", signals=signals, model_calls=calls,
+                        usage=usage,
+                    )
+                continue  # one plain retry: a cut-off answer is usually a one-off
             answer = str(getattr(reply, "content", "") or "")
             try:
                 content, rendered = validate_digest(answer, names=names, phones=phones)
