@@ -2567,6 +2567,9 @@ def build_gateway_runtime(
         fish_default_voice_id="71c095ed4c03459fb98500db63b88fbe",
         max_concurrency=config.channels.whatsapp.media.max_tts_concurrency,
     )
+    from yeoman_gateway.media.voice_script import build_voice_script_writer
+
+    tts.script_writer = build_voice_script_writer(config, workspace)
 
     # CalDAV service — enabled when iCloud credentials are in env
     _caldav_service = None

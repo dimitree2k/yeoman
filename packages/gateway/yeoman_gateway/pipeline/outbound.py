@@ -333,18 +333,10 @@ class OutboundMiddleware:
             if mention_candidates:
                 outbound_metadata["mention_candidates"] = mention_candidates
 
-        # On a Drama 3 voice turn the reply carries spoken markup; wherever it ends up as
-        # text (fallback message, session history) only the spoken words remain.
-        text_reply = reply
-        if self._drama_voice_turn(ctx, outbound_channel):
-            from yeoman_gateway.media.tts import strip_voice_directions
-
-            text_reply = strip_voice_directions(reply)
-
         outbound = OutboundEvent(
             channel=outbound_channel,
             chat_id=outbound_chat_id,
-            content=text_reply,
+            content=reply,
             reply_to=event.message_id if should_thread else None,
             metadata=outbound_metadata,
         )
@@ -365,7 +357,7 @@ class OutboundMiddleware:
             PersistSessionIntent(
                 session_key=f"{event.channel}:{event.chat_id}",
                 user_content=event.content,
-                assistant_content=text_reply,
+                assistant_content=reply,
             )
         )
         ctx.metric("response_sent", labels=(("channel", event.channel),))
@@ -411,16 +403,12 @@ class OutboundMiddleware:
         voice = str(getattr(decision, "voice_output_voice", "") or "").strip() or "alloy"
 
         from yeoman_gateway.media.tts import (
-            is_drama_profile,
             strip_markdown_for_tts,
-            strip_voice_directions,
             write_tts_audio_file,
         )
 
         plain = strip_markdown_for_tts(reply)
-        if not is_drama_profile(profile):
-            plain = strip_voice_directions(plain)
-        if _is_unsuitable_for_voice(strip_voice_directions(reply)):
+        if _is_unsuitable_for_voice(reply):
             return None
         if not plain:
             return None
@@ -458,21 +446,6 @@ class OutboundMiddleware:
             reply_to=ctx.event.message_id,
             media=(str(path),),
         )
-
-    def _drama_voice_turn(self, ctx: PipelineContext, outbound_channel: str) -> bool:
-        """True when this reply was written for a Drama 3 voice note."""
-        decision = ctx.decision
-        if self._tts is None or decision is None or outbound_channel != "whatsapp":
-            return False
-        mode = str(getattr(decision, "voice_output_mode", "text") or "text").strip().lower()
-        if mode in {"", "off", "text"}:
-            return False
-        if mode == "in_kind" and not self._is_inbound_voice(ctx.event):
-            return False
-        route = str(getattr(decision, "voice_output_tts_route", "") or "").strip() or "tts.speak"
-        from yeoman_gateway.media.tts import is_drama_profile
-
-        return is_drama_profile(self._resolve_tts_profile(route=route, channel=outbound_channel))
 
     @staticmethod
     def _is_inbound_voice(event: object) -> bool:

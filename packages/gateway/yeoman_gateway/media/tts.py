@@ -9,6 +9,7 @@ import os
 import re
 import uuid
 from pathlib import Path
+from typing import Awaitable, Callable
 from urllib.parse import quote
 
 import httpx
@@ -631,6 +632,8 @@ class TTSSynthesizer:
         self._fish_api_base = fish_api_base
         self._fish_default_voice_id = fish_default_voice_id
         self._semaphore = asyncio.Semaphore(max(1, int(max_concurrency)))
+        # Optional async text -> Drama 3 script rewrite, applied only on Drama 3 profiles.
+        self.script_writer: Callable[[str], Awaitable[str]] | None = None
 
     async def synthesize(
         self,
@@ -656,6 +659,8 @@ class TTSSynthesizer:
         voice: str,
         format: str,
     ) -> tuple[bytes | None, str | None]:
+        if self.script_writer is not None and is_drama_profile(profile):
+            text = await self.script_writer(text)
         async with self._semaphore:
             return await self._synthesize_once(
                 text,
