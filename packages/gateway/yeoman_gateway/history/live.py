@@ -289,6 +289,21 @@ class HistoryProjector:
             self._failed(exc)
             raise HistoryPaused(self._reason) from exc
 
+    async def wait_until_ready(self, *, poll_seconds: float = 0.25) -> bool:
+        """Wait out startup or repair; ``False`` once history cannot become ready by itself.
+
+        Startup replays the whole raw archive and takes about a minute on the Pi.  Inbound
+        work that arrives in that window waits here instead of failing on ``HistoryPaused``.
+        """
+        while True:
+            if self._stopping:
+                return False
+            if self._status in ('ready', 'backlog'):
+                return True
+            if self._status not in ('starting', 'rebuilding'):
+                return False
+            await asyncio.sleep(poll_seconds)
+
     def _require_ready(self) -> None:
         if self._status not in ('ready', 'backlog') or self._stopping:
             raise HistoryPaused(self._reason or self._status)
