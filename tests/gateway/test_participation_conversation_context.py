@@ -366,4 +366,24 @@ def test_knowledge_log_line_names_the_context_mode_and_conversation() -> None:
     finally:
         logger.remove(sink)
     assert "context_mode=conversation conversation_id=conv:0123456789abcdef" in lines[0]
-    assert "context_mode=window conversation_id=none" in lines[1]
+    assert "context_mode=window conversation_id=none group_notes=none" in lines[1]
+
+
+def test_knowledge_log_line_names_the_group_note_week_per_stage() -> None:
+    from yeoman_gateway.processing.participation_runtime import ParticipationRuntime
+
+    lines: list[str] = []
+    sink = logger.add(lambda message: lines.append(str(message)), level="INFO")
+    context = {
+        "group_notes_week": "2026-W41",
+        "group_notes_rendered_to_judge": True,
+        "group_notes_rendered_to_writer": False,
+        "group_notes_status": "budget_dropped",
+    }
+    try:
+        ParticipationRuntime._record_knowledge_stage(context, "judge")
+        ParticipationRuntime._record_knowledge_stage(context, "writer")
+    finally:
+        logger.remove(sink)
+    assert lines[0].rstrip().endswith("group_notes=2026-W41")
+    assert lines[1].rstrip().endswith("group_notes=budget_dropped")

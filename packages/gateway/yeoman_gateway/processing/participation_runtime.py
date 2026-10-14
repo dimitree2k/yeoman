@@ -210,7 +210,7 @@ class ParticipationRuntime:
     @staticmethod
     def _record_knowledge_stage(context: Mapping[str, Any], stage: str) -> None:
         logger.info(
-            "participation_knowledge stage={} outcome={} count={} chars={} elapsed_ms={} knowledge_rendered={} revalidated={} context_mode={} conversation_id={}",
+            "participation_knowledge stage={} outcome={} count={} chars={} elapsed_ms={} knowledge_rendered={} revalidated={} context_mode={} conversation_id={} group_notes={}",
             stage,
             str(context.get("knowledge_selection_status") or "disabled"),
             int(context.get("knowledge_selected_count") or 0),
@@ -220,6 +220,7 @@ class ParticipationRuntime:
             bool(context.get("knowledge_revalidated", False)),
             str(context.get("context_mode") or "window"),
             str(context.get("conversation_id") or "none"),
+            _group_notes_log_value(context, stage),
         )
 
     async def _record_judge_failure(
@@ -2330,6 +2331,13 @@ def _snapshot_value(snapshot: Any, name: str, default: Any = _MISSING) -> Any:
     elif nested is not None and hasattr(nested, name):
         return getattr(nested, name)
     return default
+
+
+def _group_notes_log_value(context: Mapping[str, Any], stage: str) -> str:
+    # The note week when the stage saw the note, else why it did not (or "none").
+    if context.get(f"group_notes_rendered_to_{stage}"):
+        return str(context.get("group_notes_week") or "unknown_week")
+    return str(context.get("group_notes_status") or "none")
 
 
 def _snapshot_mapping(snapshot: Any) -> dict[str, Any]:
