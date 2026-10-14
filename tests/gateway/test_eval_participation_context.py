@@ -21,6 +21,7 @@ from yeoman_gateway.evaluation.participation_context_ab import (
     UsageCapture,
     captured_usage,
     chat_subjects,
+    label_check,
     label_summary,
     load_opportunities,
     registry_lookup,
@@ -128,10 +129,10 @@ class _FakeJudgeClient:
                           model="fake", finish_reason="stop")
 
 
-def _bounds(mode: str) -> ParticipationContextBounds:
+def _bounds(mode: str, *, floor: int = 0) -> ParticipationContextBounds:
     return ParticipationContextBounds(
         window_minutes=120, max_messages=40, context_mode=mode,
-        lull_minutes=25, burst_messages=4, burst_minutes=15,
+        lull_minutes=25, burst_messages=4, burst_minutes=15, conversation_min_messages=floor,
     )
 
 
@@ -155,7 +156,7 @@ class _SlowFakeJudgeClient(_FakeJudgeClient):
 
 
 async def _run(tmp_path: Path, *, judged: bool, registry=None, client=None, concurrency: int = 1,
-               subject: str | None = None):
+               subject: str | None = None, judge_repeats: int = 1, floor: int = 0):
     history = _history(tmp_path, subject=subject)
     opportunities = load_opportunities(
         _speakups(tmp_path / "speakups.db"), since_ms=T0, until_ms=T0 + 100 * MIN
@@ -179,14 +180,15 @@ async def _run(tmp_path: Path, *, judged: bool, registry=None, client=None, conc
     try:
         records = await replay(
             opportunities, history=frozen, builder=builder,
-            window_bounds=_bounds("window"), conversation_bounds=_bounds("conversation"),
+            window_bounds=_bounds("window"),
+            conversation_bounds=_bounds("conversation", floor=floor),
             estimator=ParticipationJudge(client=StaticClient("{}"), allowed_emojis=("👍",)),
             judge=ParticipationJudge(
                 client=UsageCapture(client) if capture else _Recording(), allowed_emojis=("👍",),
             ) if judged else None,
             usage=captured_usage if capture else (lambda: last.get("usage") or {}),
             set_as_of=lambda moment: as_of.__setitem__("ms", moment),
-            concurrency=concurrency,
+            concurrency=concurrency, judge_repeats=judge_repeats,
         )
     finally:
         frozen.close()
@@ -448,3 +450,188 @@ def test_label_summary_threshold() -> None:
     stats = label_summary({"o1": "b_better", "o2": "same", "o3": "b_better", "o4": "a_better"})
     assert stats["b_better_or_same_share"] == 0.75 and stats["meets_threshold"] is True
     assert label_summary({})["b_better_or_same_share"] is None
+
+
+class _CyclingJudgeClient(_FakeJudgeClient):
+    """Window view: always react. Conversation view: the next action of a fixed cycle."""
+
+    def __init__(self, cycle: tuple[str, ...]) -> None:
+        super().__init__()
+        self.cycle = cycle
+        self.conversation_calls = 0
+
+    async def chat_with_usage(self, messages, **kwargs) -> RouteReply:
+        prompt = messages[-1]["content"]
+        if "Conversation since" not in prompt:
+            return await super().chat_with_usage(messages, **kwargs)
+        self.prompts.append(prompt)
+        action = self.cycle[self.conversation_calls % len(self.cycle)]
+        self.conversation_calls += 1
+        if action == "error":
+            content = "not json"
+        elif action == "react":
+            content = '{"action":"react","intent":"initiate","emoji":"👍","reason":"x"}'
+        else:
+            content = '{"action":"silence","intent":"initiate","reason":"x"}'
+        return RouteReply(content=content, usage={"prompt_tokens": len(prompt) // 4},
+                          model="fake", finish_reason="stop")
+
+
+@pytest.mark.asyncio
+async def test_floor_in_the_replay_adds_earlier_context_to_b(tmp_path: Path) -> None:
+    _, records, _ = await _run(tmp_path, judged=False, floor=8)
+    by_id = {record["opportunity_id"]: record for record in records}
+    b = by_id["opp-1"]["B"]
+    assert b["message_ids"] == ["old-1", "old-2", "new-1", "new-2"]
+    assert b["conversation"]["earlier_messages"] == 2
+    assert b["conversation"]["message_count"] == 3  # the conversation itself only
+
+
+@pytest.mark.asyncio
+async def test_judge_repeats_record_the_distribution_and_use_the_majority(
+    tmp_path: Path,
+) -> None:
+    client = _CyclingJudgeClient(("silence", "react", "silence"))
+    _, records, _ = await _run(tmp_path, judged=True, client=client, judge_repeats=3)
+    by_id = {record["opportunity_id"]: record for record in records}
+    assert client.conversation_calls == 6  # two opportunities, three B repeats each
+    for opportunity_id in ("opp-1", "opp-2"):
+        b = by_id[opportunity_id]["B"]
+        assert b["status"] == "decided"
+        assert b["judge_repeats"] == 3
+        assert sorted(b["action_distribution"].items()) == [("react", 1), ("silence", 2)]
+        assert b["action"] == "silence" and b["unanimous"] is False
+        assert [run["action"] for run in b["repeats"]] == ["silence", "react", "silence"]
+        assert "repeats" not in by_id[opportunity_id]["A"]  # A is asked once
+    summary = summarize(records, judged=True)
+    assert summary["judge_repeats"] == 3
+    assert summary["b_unanimous_share"] == 0.0
+    assert summary["b_split_ids"] == ["opp-2", "opp-1"]
+    assert summary["actions"]["B"] == {"silence": 2}
+    assert "reason" not in json.dumps(records)
+
+
+@pytest.mark.asyncio
+async def test_judge_repeats_ties_take_the_earliest_and_errors_do_not_vote(
+    tmp_path: Path,
+) -> None:
+    client = _CyclingJudgeClient(("react", "error", "silence"))
+    _, records, _ = await _run(tmp_path / "tie", judged=True, client=client, judge_repeats=3)
+    b = {record["opportunity_id"]: record for record in records}["opp-2"]["B"]
+    assert b["action"] == "react" and b["emoji"] == "👍"
+    assert b["action_distribution"] == {"react": 1, "silence": 1}
+    assert [run["status"] for run in b["repeats"]] == ["decided", "judge_error", "decided"]
+    assert b["unanimous"] is False and "error" not in b
+
+    failing = _CyclingJudgeClient(("error",))
+    _, records, _ = await _run(tmp_path / "err", judged=True, client=failing, judge_repeats=2)
+    b = {record["opportunity_id"]: record for record in records}["opp-1"]["B"]
+    assert b["status"] == "judge_error" and b["action_distribution"] == {}
+    assert summarize(records, judged=True)["decided_both"] == 0
+
+
+@pytest.mark.asyncio
+async def test_unanimous_repeats(tmp_path: Path) -> None:
+    client = _CyclingJudgeClient(("silence",))
+    _, records, _ = await _run(tmp_path, judged=True, client=client, judge_repeats=2)
+    summary = summarize(records, judged=True)
+    assert summary["b_unanimous_share"] == 1.0 and summary["b_split_ids"] == []
+
+
+def _decided(action: str) -> dict[str, object]:
+    return {"status": "decided", "action": action}
+
+
+def test_label_check_scores_new_b_against_source_labels() -> None:
+    source = [
+        {"opportunity_id": "a1", "A": _decided("react"), "B": _decided("silence")},
+        {"opportunity_id": "a2", "A": _decided("react"), "B": _decided("silence")},
+        {"opportunity_id": "b1", "A": _decided("react"), "B": _decided("silence")},
+        {"opportunity_id": "b2", "A": _decided("silence"), "B": _decided("comment")},
+        {"opportunity_id": "s1", "A": _decided("react"), "B": _decided("silence")},
+        {"opportunity_id": "s2", "A": _decided("react"), "B": _decided("silence")},
+        {"opportunity_id": "u1", "A": _decided("react"), "B": {"status": "judge_error"}},
+    ]
+    new = [
+        {"opportunity_id": "a1", "B": _decided("react")},     # now matches A -> same
+        {"opportunity_id": "a2", "B": _decided("silence")},   # still B -> a_better
+        {"opportunity_id": "b1", "B": _decided("silence")},   # still source B -> b_better
+        {"opportunity_id": "b2", "B": _decided("react")},     # changed -> unknown
+        {"opportunity_id": "s1", "B": _decided("react")},     # equals A -> same
+        {"opportunity_id": "s2", "B": _decided("comment")},   # neither -> unknown
+        {"opportunity_id": "u1", "B": _decided("react")},     # source B undecided
+    ]
+    labels = {"a1": "a_better", "a2": "a_better", "b1": "b_better", "b2": "b_better",
+              "s1": "same", "s2": "same", "u1": "a_better", "gone": "same"}
+    check = label_check(new, source, labels)
+    assert check["labelled"] == 8 and check["checked"] == 6
+    assert check["unchecked_ids"] == ["gone", "u1"]
+    assert check["by_label"]["a_better"] == {"labelled": 3, "checked": 2, "matches": 1, "share": 0.5}
+    assert check["by_label"]["b_better"] == {"labelled": 2, "checked": 2, "matches": 1, "share": 0.5}
+    assert check["by_label"]["same"] == {"labelled": 3, "checked": 2, "matches": 1, "share": 0.5}
+    assert check["estimated"] == {"a_better": 1, "b_better": 1, "same": 2, "unknown": 2}
+    assert check["estimated_b_better_or_same_share"] == 0.5
+    assert check["meets_threshold"] is False
+    empty = label_check([], [], {})
+    assert empty["checked"] == 0 and empty["estimated_b_better_or_same_share"] is None
+
+
+def test_cli_from_report_replays_the_same_ids_and_checks_labels(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    import yeoman_gateway.evaluation.judge_format as judge_format
+    import yeoman_gateway.evaluation.participation_context_ab as ab
+
+    home = _cli_home(tmp_path, monkeypatch)
+    _, records, _ = asyncio.run(_run(tmp_path / "judged", judged=True))
+    source = tmp_path / "source-report"
+    source.mkdir()
+    write_outputs(source, records, summarize(records, judged=True), "# report\n")
+    # Source: A reacted and B stayed silent on both opportunities.
+    (source / "labels.jsonl").write_text(
+        json.dumps({"opportunity_id": "opp-1", "label": "a_better", "labelled_at": "x"}) + "\n"
+        + json.dumps({"opportunity_id": "opp-2", "label": "b_better", "labelled_at": "x"}) + "\n",
+        encoding="utf-8",
+    )
+
+    def no_speakups(*args, **kwargs):
+        raise AssertionError("--from-report must not read speakups.db")
+
+    monkeypatch.setattr(ab, "load_opportunities", no_speakups)
+    client = _CyclingJudgeClient(("react",))  # the new B now reacts everywhere
+    monkeypatch.setattr(judge_format, "build_eval_client", lambda config, **kwargs: client)
+    result = CliRunner().invoke(app, [
+        "eval", "participation-context", "--from-report", str(source),
+        "--days", "1", "--limit", "1", "--judge-repeats", "2", "--concurrency", "1",
+    ])
+    assert result.exit_code == 0, result.output
+    assert "model calls: up to 9" in result.output
+    assert "label_check=0.5 of 2" in result.output
+    [directory] = list((home / "var" / "eval" / "participation-context-ab").glob("*-replay"))
+    summary = json.loads((directory / "summary.json").read_text())
+    replayed = [json.loads(line)["opportunity_id"]
+                for line in (directory / "records.jsonl").read_text().splitlines()]
+    assert replayed == ["opp-2", "opp-1", "opp-3"]  # --days/--limit do not apply
+    assert summary["source_report"] == "source-report"
+    assert summary["judge_repeats"] == 2
+    check = summary["label_check"]
+    assert check["by_label"]["a_better"]["matches"] == 1  # new B == source A -> same
+    assert check["by_label"]["b_better"]["matches"] == 0  # new B left source B -> unknown
+    assert check["estimated"] == {"a_better": 0, "b_better": 0, "same": 1, "unknown": 1}
+    markdown = (directory / "summary.md").read_text()
+    assert "exactly those of report `source-report`" in markdown
+    assert "## Label check" in markdown and "unknown counts against B" in markdown
+    for path in directory.iterdir():
+        assert SECRET not in path.read_text()
+
+    filtered = CliRunner().invoke(app, [
+        "eval", "participation-context", "--from-report", str(source), "--no-judge",
+        "--chat", "120000000000000099@g.us",
+    ])
+    assert filtered.exit_code == 0, filtered.output
+    assert "opportunities=0" in filtered.output and "label_check" not in filtered.output
+
+    missing = CliRunner().invoke(app, [
+        "eval", "participation-context", "--from-report", str(tmp_path / "nope"), "--no-judge",
+    ])
+    assert missing.exit_code == 2 and "records.jsonl missing" in missing.output

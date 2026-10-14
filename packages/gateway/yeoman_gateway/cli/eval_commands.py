@@ -199,6 +199,7 @@ def _participation_replay_setup(config):
         "lull_minutes": int(config.consciousness.lull_silence_minutes),
         "burst_messages": int(config.consciousness.burst_threshold_messages),
         "burst_minutes": int(config.consciousness.burst_window_minutes),
+        "conversation_min_messages": int(participation.conversation_min_messages),
     }
 
     def guidance_for(channel: str, chat_id: str) -> str:
@@ -232,6 +233,15 @@ def eval_participation_context(
     chats: list[str] | None = typer.Option(
         None, "--chat", help="Only this chat (id or exact group subject); repeatable"
     ),
+    from_report: Path | None = typer.Option(
+        None, "--from-report",
+        help="Replay exactly the opportunities of this earlier report (ignores --days and "
+        "--limit; --chat still filters); checks new B against its labels.jsonl",
+    ),
+    judge_repeats: int = typer.Option(
+        1, "--judge-repeats", min=1, max=10,
+        help="Ask the B Judge N times per opportunity; the majority decides",
+    ),
 ) -> None:
     """Replay recorded Judge opportunities with the window (A) and conversation (B) views."""
     import time
@@ -240,13 +250,18 @@ def eval_participation_context(
     from yeoman_shared.utils.helpers import get_operational_store_path, get_var_path
 
     from yeoman_gateway.evaluation.participation_context_ab import (
+        LABELS_FILE,
         REPORT_DIR,
         FrozenHistory,
         UsageCapture,
         captured_usage,
         chat_subjects,
+        label_check,
         load_opportunities,
         looks_like_chat_id,
+        read_labels,
+        read_records,
+        record_opportunity,
         render_markdown,
         replay,
         resolve_chat,
@@ -257,10 +272,17 @@ def eval_participation_context(
     from yeoman_gateway.history.live import history_db_path
     from yeoman_gateway.processing.participation import ParticipationJudge
 
+    source_dir = from_report.expanduser() if from_report is not None else None
+    source_records: list[dict] = []
+    if source_dir is not None:
+        if not (source_dir / "records.jsonl").is_file():
+            typer.echo("error: --from-report: records.jsonl missing")
+            raise typer.Exit(2)
+        source_records = read_records(source_dir / "records.jsonl")
     config = load_config()
     participation = config.processing.participation
     speakups = get_operational_store_path("speakups", create=False)
-    if not speakups.is_file() or not history_db_path().is_file():
+    if (source_dir is None and not speakups.is_file()) or not history_db_path().is_file():
         typer.echo("error: speakups.db or history.db not found")
         raise typer.Exit(2)
     history = FrozenHistory(history_db_path())
@@ -276,12 +298,21 @@ def eval_participation_context(
             except ValueError as exc:
                 typer.echo(f"error: --chat: {exc}")
                 raise typer.Exit(2) from exc
-        until_ms = int(time.time() * 1000)
-        opportunities = load_opportunities(
-            speakups, since_ms=until_ms - days * 86_400_000, until_ms=until_ms, chat_ids=chat_ids,
-        )
-        if limit is not None:
-            opportunities = opportunities[-limit:]
+        if source_dir is not None:
+            # The same opportunity ids in the same order; --days/--limit do not apply.
+            wanted = None if chat_ids is None else set(chat_ids)
+            opportunities = [
+                record_opportunity(record) for record in source_records
+                if wanted is None or str(record.get("chat_id")) in wanted
+            ]
+        else:
+            until_ms = int(time.time() * 1000)
+            opportunities = load_opportunities(
+                speakups, since_ms=until_ms - days * 86_400_000, until_ms=until_ms,
+                chat_ids=chat_ids,
+            )
+            if limit is not None:
+                opportunities = opportunities[-limit:]
         setup = _participation_replay_setup(config)
         judge = None
         if not no_judge:
@@ -300,20 +331,34 @@ def eval_participation_context(
                 timeout_seconds=float(participation.judge_timeout_seconds),
                 max_output_tokens=int(participation.judge_max_output_tokens),
             )
-            typer.echo(f"model calls: up to {2 * len(opportunities)} ({concurrency} in parallel)")
+            calls = (1 + judge_repeats) * len(opportunities)
+            typer.echo(f"model calls: up to {calls} ({concurrency} in parallel)")
 
         records = asyncio.run(replay(
             opportunities, history=history, judge=judge, usage=captured_usage,
-            concurrency=concurrency, **setup.replay_args,
+            concurrency=concurrency, judge_repeats=judge_repeats, **setup.replay_args,
         ))
     finally:
         history.close()
     summary = summarize(records, judged=judge is not None)
+    if source_dir is not None:
+        summary["source_report"] = source_dir.name
+        labels = read_labels(source_dir / LABELS_FILE)
+        if labels and judge is not None:
+            summary["label_check"] = label_check(records, source_records, labels)
     directory = new_report_dir("replay", base=get_var_path().joinpath(*REPORT_DIR))
-    write_outputs(directory, records, summary, render_markdown(summary, days=days))
+    markdown = render_markdown(
+        summary, days=days, source_report=source_dir.name if source_dir is not None else None
+    )
+    write_outputs(directory, records, summary, markdown)
+    check = summary.get("label_check")
+    estimate = (
+        f" label_check={check['estimated_b_better_or_same_share']} of {check['checked']}"
+        if check else ""
+    )
     typer.echo(
         f"opportunities={summary['opportunities']} built_both={summary['built_both']} "
-        f"agreement={summary.get('agreement_rate')} report: {directory}"
+        f"agreement={summary.get('agreement_rate')}{estimate} report: {directory}"
     )
 
 
@@ -323,6 +368,9 @@ def _decision_line(variant: dict) -> str:
     parts = [str(variant.get("action"))]
     if variant.get("emoji"):
         parts.append(str(variant["emoji"]))
+    if variant.get("action_distribution"):
+        spread = ", ".join(f"{key} {value}" for key, value in variant["action_distribution"].items())
+        parts.append(f"({spread} of {variant.get('judge_repeats')})")
     if variant.get("reason"):
         parts.append(f"reason: {variant['reason']}")
     return " ".join(parts)
@@ -363,6 +411,7 @@ def eval_participation_context_review(
         chat_subjects,
         disagreement_ids,
         read_labels,
+        read_records,
         rebuild_views,
     )
 
@@ -376,8 +425,7 @@ def eval_participation_context_review(
     if summary_only:
         _echo_label_summary(labels)
         return
-    records = [json.loads(line) for line in records_path.read_text(encoding="utf-8").splitlines()
-               if line.strip()]
+    records = read_records(records_path)
     summary = json.loads((directory / "summary.json").read_text(encoding="utf-8"))
     by_id = {str(record["opportunity_id"]): record for record in records}
     todo = [item for item in disagreement_ids(records, summary, every=every)

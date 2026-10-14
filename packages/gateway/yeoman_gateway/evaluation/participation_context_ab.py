@@ -6,7 +6,10 @@ modes; optionally the Judge decides on both. Reports hold ids and aggregates onl
 never message text, Judge reasons or purposes. Every store is opened read-only.
 
 The owner review rebuilds the two views of each disagreement for the local terminal
-only; ``labels.jsonl`` holds ids, labels and times.
+only; ``labels.jsonl`` holds ids, labels and times. A replay can rerun exactly the
+opportunities of an earlier report and check its new B decisions against that report's
+labels (:func:`label_check`); ``judge_repeats`` asks the B Judge several times per
+opportunity so its noise is visible.
 """
 
 from __future__ import annotations
@@ -49,6 +52,9 @@ LABELS_FILE = "labels.jsonl"
 LABEL_KEYS: dict[str, str] = {"a": "a_better", "b": "b_better", "s": "same"}
 #: Spec A section 7 step 3: B better or same in at least 70 % of labelled disagreements.
 B_BETTER_OR_SAME_THRESHOLD = 0.7
+MAX_JUDGE_REPEATS = 10
+#: Per-repeat fields kept in a record; ids and actions only.
+_REPEAT_FIELDS: tuple[str, ...] = ("status", "action", "error")
 
 
 @dataclass(frozen=True, slots=True)
@@ -346,15 +352,21 @@ async def replay(
     guidance_for: Callable[[str, str], str] = lambda channel, chat_id: "",
     set_as_of: Callable[[int], None] | None = None,
     concurrency: int = 1,
+    judge_repeats: int = 1,
 ) -> list[dict[str, Any]]:
     """One JSON-compatible record per opportunity: A (window) and B (conversation).
 
     Contexts are built one after another (history reads, as-of registry lookups);
     only the Judge calls overlap, at most ``concurrency`` at a time. Records come
-    back in opportunity order with the same content as a sequential run.
+    back in opportunity order with the same content as a sequential run. With
+    ``judge_repeats`` above 1 the B Judge decides that many times per opportunity:
+    the record keeps every repeat's action, the distribution, and the majority
+    decision (ties: the earliest repeat) as its own ``action``.
     """
+    repeats = max(1, min(int(judge_repeats), MAX_JUDGE_REPEATS))
     records: list[dict[str, Any]] = []
     pending: list[tuple[dict[str, Any], ParticipationOpportunity, dict[str, Any]]] = []
+    repeated: list[tuple[dict[str, Any], list[dict[str, Any]]]] = []
     for item in opportunities:
         record: dict[str, Any] = {
             "opportunity_id": item.opportunity_id, "attempt_id": item.attempt_id,
@@ -378,7 +390,13 @@ async def replay(
                         at_ms=item.at_ms, estimator=estimator,
                     )
                     record[key] = variant
-                    if judge is not None and context is not None:
+                    if judge is None or context is None:
+                        continue
+                    if key == "B" and repeats > 1:
+                        runs: list[dict[str, Any]] = [{} for _ in range(repeats)]
+                        repeated.append((variant, runs))
+                        pending.extend((run, opportunity, context) for run in runs)
+                    else:
                         pending.append((variant, opportunity, context))
         except HistoryPaused as exc:
             record["skipped"] = f"history_paused:{exc}"
@@ -391,7 +409,27 @@ async def replay(
                 await _judge_variant(*job, judge=judge, usage=usage)
 
         await asyncio.gather(*(_one(job) for job in pending))
+    for variant, runs in repeated:
+        _combine_repeats(variant, runs)
     return records
+
+
+def _combine_repeats(variant: dict[str, Any], runs: list[dict[str, Any]]) -> None:
+    """Fold repeated B decisions into one variant: majority action, distribution kept."""
+    decided = [run for run in runs if run.get("status") == "decided"]
+    counts = Counter(str(run["action"]) for run in decided)
+    variant["judge_repeats"] = len(runs)
+    variant["repeats"] = [{name: run[name] for name in _REPEAT_FIELDS if name in run}
+                          for run in runs]
+    variant["action_distribution"] = dict(counts)
+    if not decided:
+        errors = Counter(str(run.get("error") or "") for run in runs)
+        variant.update(status="judge_error", error=errors.most_common(1)[0][0])
+        return
+    top = max(counts.values())
+    majority = next(run for run in decided if counts[str(run["action"])] == top)
+    variant.update({name: value for name, value in majority.items() if name != "error"})
+    variant["unanimous"] = len(counts) == 1 and len(decided) == len(runs)
 
 
 def record_opportunity(record: Mapping[str, Any]) -> RecordedOpportunity:
@@ -497,6 +535,16 @@ def summarize(records: list[dict[str, Any]], *, judged: bool, seed: int = 0) -> 
         "disagreement_count": len(disagreements),
         "disagreement_ids": sample,
     })
+    repeated = [r["B"] for r in built if r["B"].get("judge_repeats")]
+    if repeated:
+        summary.update({
+            "judge_repeats": max(int(variant["judge_repeats"]) for variant in repeated),
+            "b_unanimous_share": round(
+                sum(bool(variant.get("unanimous")) for variant in repeated) / len(repeated), 3
+            ),
+            "b_split_ids": [r["opportunity_id"] for r in built
+                            if r["B"].get("judge_repeats") and not r["B"].get("unanimous")][:32],
+        })
     return summary
 
 
@@ -549,19 +597,132 @@ def label_summary(labels: Mapping[str, str]) -> dict[str, Any]:
     }
 
 
-def render_markdown(summary: Mapping[str, Any], *, days: int) -> str:
+def read_records(path: Path) -> list[dict[str, Any]]:
+    """The records of a replay report's ``records.jsonl``."""
+    return [json.loads(line) for line in path.read_text(encoding="utf-8").splitlines()
+            if line.strip()]
+
+
+#: How a labelled disagreement is re-estimated from the new B decision (summary.md).
+LABEL_CHECK_RULES = (
+    "a_better: new B == source A -> same, else stays a_better. "
+    "b_better: new B == source B -> stays b_better, else unknown. "
+    "same: new B == source A or source B -> stays same, else unknown. "
+    "The estimated share is (b_better + same) / checked; unknown counts against B."
+)
+
+
+def _decided_action(variant: Any) -> str | None:
+    if not isinstance(variant, Mapping) or variant.get("status") != "decided":
+        return None
+    return str(variant.get("action") or "") or None
+
+
+def label_check(
+    records: list[dict[str, Any]],
+    source_records: list[dict[str, Any]],
+    labels: Mapping[str, str],
+) -> dict[str, Any]:
+    """New B decisions against the owner labels of the source report (ids and counts).
+
+    Per label: the share of checked ids where new B matches the label's target
+    (``a_better``: source A; ``b_better``: source B; ``same``: either). Then an
+    estimated relabelling by :data:`LABEL_CHECK_RULES`. Ids without a decided new B or
+    without decided source A and B are counted as unchecked.
+    """
+    new_b = {str(r.get("opportunity_id")): _decided_action(r.get("B")) for r in records}
+    source = {str(r.get("opportunity_id")): r for r in source_records}
+    per_label: dict[str, dict[str, Any]] = {
+        label: {"labelled": 0, "checked": 0, "matches": 0} for label in LABEL_KEYS.values()
+    }
+    estimated: Counter[str] = Counter({label: 0 for label in (*LABEL_KEYS.values(), "unknown")})
+    unchecked: list[str] = []
+    for opportunity_id, label in sorted(labels.items()):
+        if label not in per_label:
+            continue
+        per_label[label]["labelled"] += 1
+        original = source.get(opportunity_id) or {}
+        a, b = _decided_action(original.get("A")), _decided_action(original.get("B"))
+        now = new_b.get(opportunity_id)
+        if now is None or a is None or b is None:
+            unchecked.append(opportunity_id)
+            continue
+        per_label[label]["checked"] += 1
+        if label == "a_better":
+            match = now == a
+            estimated["same" if match else "a_better"] += 1
+        elif label == "b_better":
+            match = now == b
+            estimated["b_better" if match else "unknown"] += 1
+        else:
+            match = now in {a, b}
+            estimated["same" if match else "unknown"] += 1
+        per_label[label]["matches"] += int(match)
+    for entry in per_label.values():
+        entry["share"] = round(entry["matches"] / entry["checked"], 3) if entry["checked"] else None
+    checked = sum(entry["checked"] for entry in per_label.values())
+    share = (round((estimated["b_better"] + estimated["same"]) / checked, 3) if checked else None)
+    return {
+        "labelled": sum(entry["labelled"] for entry in per_label.values()),
+        "checked": checked,
+        "unchecked_ids": unchecked[:32],
+        "by_label": per_label,
+        "estimated": dict(estimated),
+        "estimated_b_better_or_same_share": share,
+        "threshold": B_BETTER_OR_SAME_THRESHOLD,
+        "meets_threshold": share is not None and share >= B_BETTER_OR_SAME_THRESHOLD,
+    }
+
+
+def render_markdown(
+    summary: Mapping[str, Any], *, days: int, source_report: str | None = None
+) -> str:
+    period = (
+        f"Opportunities: exactly those of report `{source_report}`."
+        if source_report else f"Period: last {days} days."
+    )
     lines = [
         "# Participation context A/B replay (window vs conversation)",
         "",
-        f"Period: last {days} days. Ids and aggregates only; label disagreements in the "
+        f"{period} Ids and aggregates only; label disagreements in the "
         "owner's local review view (A better / B better / same).",
         "",
         "| metric | value |",
         "|---|---|",
     ]
     lines.extend(
-        f"| {key} | {json.dumps(value, ensure_ascii=False)} |" for key, value in summary.items()
+        f"| {key} | {json.dumps(value, ensure_ascii=False)} |"
+        for key, value in summary.items() if key != "label_check"
     )
+    check = summary.get("label_check")
+    if isinstance(check, Mapping):
+        lines.extend([
+            "",
+            "## Label check (new B against the source report's labels)",
+            "",
+            "Match: `a_better` ids where new B equals source A; `b_better` ids where new B "
+            "equals source B; `same` ids where new B equals either.",
+            "",
+            "| label | labelled | checked | matches | share |",
+            "|---|---|---|---|---|",
+        ])
+        for label, entry in check["by_label"].items():
+            lines.append(f"| {label} | {entry['labelled']} | {entry['checked']} | "
+                         f"{entry['matches']} | {entry['share']} |")
+        estimated = check["estimated"]
+        lines.extend([
+            "",
+            f"Estimated labels now: {json.dumps(estimated, ensure_ascii=False, sort_keys=True)}; "
+            f"B better or same: {check['estimated_b_better_or_same_share']} of "
+            f"{check['checked']} checked (threshold {check['threshold']:.0%}).",
+            "",
+            f"Rules: {LABEL_CHECK_RULES}",
+        ])
+        if summary.get("judge_repeats"):
+            lines.extend([
+                "",
+                "With judge repeats, new B is the majority decision (ties: the earliest repeat).",
+            ])
     return "\n".join(lines) + "\n"
 
 
@@ -584,10 +745,12 @@ __all__ = [
     "captured_usage",
     "chat_subjects",
     "disagreement_ids",
+    "label_check",
     "label_summary",
     "load_opportunities",
     "looks_like_chat_id",
     "read_labels",
+    "read_records",
     "rebuild_views",
     "record_opportunity",
     "registry_lookup",
