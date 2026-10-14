@@ -163,9 +163,26 @@ def test_header_rendering() -> None:
     start = datetime.fromtimestamp(T0 / 1000, UTC)
     assert header == (
         f"Conversation since {start:%H:%M} (20 min) · 3 people · 3 messages · "
-        "1 reaction (😂) · Arvid: 1 message, unanswered · state: ended"
+        "1 reaction (😂) · Arvid: 1 message, unanswered · last message 10 min ago"
     )
-    assert "Arvid: not in it" in render_header(conversation[1], tz=UTC)
+    assert first.state == "ended" and first.stats()["state"] == "ended"
+    assert first.stats()["last_gap_ms"] == 10 * MIN
+    second = render_header(conversation[1], tz=UTC)
+    assert "Arvid: not in it" in second
+    assert second.endswith("· no message before this one")
+    assert conversation[1].stats()["last_gap_ms"] is None
+
+
+def test_header_has_no_state_word() -> None:
+    rows = [_row("m1", 0, "a"), _row("m2", 3, "b")]
+    for now in (T0 + 4 * MIN, T0 + 17 * MIN, T0 + 3 * MIN + LULL):
+        conversation = _segment(rows, now_ms=now)[0]
+        header = render_header(conversation, tz=UTC)
+        assert "state" not in header
+        assert conversation.state not in header
+        assert header.endswith("· last message 3 min ago")
+    quick = _segment([_row("m1", 0, "a"), dict(_row("m2", 0, "b"), sent_ms=T0 + 20_000)])[0]
+    assert render_header(quick, tz=UTC).endswith("· last message under 1 min ago")
 
 
 def test_current_conversation_reads_history_as_of_a_moment(tmp_path: Path) -> None:

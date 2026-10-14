@@ -43,6 +43,9 @@ DecisionIntent = Literal["direct", "continue", "initiate"]
 MAX_PURPOSE_CHARS = 240
 MAX_REASON_CHARS = 160
 MAX_EVIDENCE_IDS = 8
+#: Judge view line between earlier context (below the conversation floor) and the
+#: conversation itself.
+EARLIER_CONTEXT_SEPARATOR = "— pause: the messages above are from before this conversation —"
 
 #: Stable reason codes. They are part of the recorded failure vocabulary.
 DECISION_ERROR_REASONS: tuple[str, ...] = (
@@ -710,7 +713,24 @@ class _JudgeContext:
         if header:
             # One summary line of the current conversation: data, not a decision rule.
             lines.append(header)
-        for item in messages:
+        raw_earlier = context.get("earlier_message_ids")
+        earlier_ids = {
+            str(item).strip()
+            for item in (raw_earlier if isinstance(raw_earlier, (list, tuple)) else ())
+            if str(item).strip()
+        }
+        last_earlier = max(
+            (
+                index for index, item in enumerate(messages)
+                if str(item.get("event_id") or item.get("message_id") or "").strip()
+                in earlier_ids
+            ),
+            default=-1,
+        )
+        for index, item in enumerate(messages):
+            if index == last_earlier + 1 and last_earlier >= 0:
+                # Earlier context added below the floor: one marker line, no rule.
+                lines.append(EARLIER_CONTEXT_SEPARATOR)
             event_id = str(item.get("event_id") or item.get("message_id") or "").strip()
             if event_id:
                 evidence.add(event_id)
@@ -864,6 +884,7 @@ def _parse_payload(raw: str) -> dict[str, Any] | None:
 
 __all__ = [
     "DECISION_ERROR_REASONS",
+    "EARLIER_CONTEXT_SEPARATOR",
     "JUDGE_SYSTEM_PROMPT",
     "MAX_EVIDENCE_IDS",
     "MAX_PURPOSE_CHARS",

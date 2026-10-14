@@ -52,6 +52,10 @@ class ParticipationContextBounds:
     lull_minutes: int = 25
     burst_messages: int = 8
     burst_minutes: int = 15
+    #: Conversation view floor: below this many visible conversation messages, the
+    #: newest earlier window messages before it are added as marked earlier context.
+    #: ``0`` disables the floor.
+    conversation_min_messages: int = 8
 
 
 @dataclass(frozen=True, slots=True)
@@ -233,6 +237,8 @@ class ParticipationContextBuilder:
         kept_required = required
         free = max(0, max_messages - len(kept_required))
         conversation: Conversation | None = None
+        earlier: list[dict[str, object]] = []
+        earlier_ids: list[str] = []
         if limits.context_mode == "conversation":
             try:
                 conversation = self._conversation(
@@ -252,9 +258,25 @@ class ParticipationContextBuilder:
                 and _row_sort_key(row) < _row_sort_key(in_conversation[0])
                 for row in kept_required
             )
-            selected = kept_required + _cap_conversation(
-                in_conversation, free, first_kept=first_kept
+            kept_conversation = _cap_conversation(in_conversation, free, first_kept=first_kept)
+            earlier = _earlier_context(
+                optional,
+                members,
+                start_ms=conversation.start_ms,
+                visible=len(kept_conversation)
+                + sum(_history_id(row) in members for row in kept_required),
+                floor=max(0, int(limits.conversation_min_messages)),
+                free=free - len(kept_conversation),
             )
+            selected = kept_required + kept_conversation + earlier
+            if earlier:
+                # Everything shown from before the conversation start sits above the
+                # separator, also a required source from there.
+                earlier_ids = [
+                    _row_id(row) for row in sorted(selected, key=_row_sort_key)
+                    if _history_id(row) not in members
+                    and (_history_shape(row)["sent_ms"] or 0) < conversation.start_ms
+                ]
         selected.sort(key=_row_sort_key)
         selected_ids = {_row_id(row) for row in selected}
         dropped_ids = [
@@ -325,7 +347,14 @@ class ParticipationContextBuilder:
             "context_mode": "conversation" if conversation is not None else "window",
             "conversation_id": conversation.id if conversation is not None else "",
             "conversation_header": render_header(conversation) if conversation else "",
-            "conversation": conversation.stats() if conversation is not None else None,
+            "conversation": (
+                {**conversation.stats(), "earlier_messages": len(earlier)}
+                if conversation is not None
+                else None
+            ),
+            # Shown messages from before the conversation start (only when the floor
+            # added earlier context); the Judge view draws one separator after them.
+            "earlier_message_ids": earlier_ids,
             "direct_addressed": bool(_snapshot_value(inputs.snapshot, "direct_addressed", False)),
             "allows_continuation": "continue" in inputs.allowed_intents,
         }
@@ -556,6 +585,32 @@ def _cap_conversation(
     if first_kept:
         return rows[-free:]
     return [rows[0], *(rows[-(free - 1):] if free > 1 else [])]
+
+
+def _earlier_context(
+    optional: list[dict[str, object]],
+    members: set[str],
+    *,
+    start_ms: int,
+    visible: int,
+    floor: int,
+    free: int,
+) -> list[dict[str, object]]:
+    """The newest optional rows before the conversation, up to the floor and the cap.
+
+    ``optional`` is in time order and already a subset of the window's rows, so the
+    result is too; required sources are never part of it.
+    """
+    wanted = min(floor - visible, free)
+    if wanted <= 0:
+        return []
+    before = [
+        row for row in optional
+        if _history_id(row) not in members
+        and isinstance(sent := _history_shape(row)["sent_ms"], int)
+        and sent < start_ms
+    ]
+    return before[-wanted:]
 
 
 def _freeze_budget_pairs(value: Any) -> tuple[tuple[str, int], ...]:

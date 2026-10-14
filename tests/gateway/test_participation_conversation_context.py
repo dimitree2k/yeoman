@@ -11,7 +11,7 @@ from pathlib import Path
 import pytest
 from loguru import logger
 from yeoman_gateway.processing import participation_context
-from yeoman_gateway.processing.participation import _JudgeContext
+from yeoman_gateway.processing.participation import EARLIER_CONTEXT_SEPARATOR, _JudgeContext
 from yeoman_gateway.processing.participation_context import ParticipationContextBounds
 
 from tests.gateway.test_participation_context import (
@@ -26,7 +26,9 @@ CHAT = "group@g.us"
 
 
 def _bounds(mode: str, *, max_messages: int = 40, **kwargs: int) -> ParticipationContextBounds:
-    values = {"lull_minutes": 25, "burst_messages": 4, "burst_minutes": 15, **kwargs}
+    # The floor is off unless a test sets it, so the plain conversation cut stays visible.
+    values = {"lull_minutes": 25, "burst_messages": 4, "burst_minutes": 15,
+              "conversation_min_messages": 0, **kwargs}
     return ParticipationContextBounds(
         window_minutes=120, max_messages=max_messages, context_mode=mode, **values
     )
@@ -157,7 +159,11 @@ async def test_header_is_one_line_rendered_before_the_messages(tmp_path: Path) -
     assert "(28 min)" in header
     assert "4 people · 4 messages · 1 reaction (😂)" in header
     assert "Arvid: 1 message, answered" in header
-    assert header.endswith("state: slowing")
+    # Neutral wording: the gap before the newest message, never the state word.
+    assert header.endswith("· last message 8 min ago")
+    assert "state" not in header and "slowing" not in header
+    assert context["conversation"]["state"] == "slowing"  # type: ignore[index]
+    assert context["conversation"]["last_gap_ms"] == 8 * 60_000  # type: ignore[index]
     rendered = _JudgeContext.from_mapping(context).render()
     assert rendered.splitlines()[0] == header
 
@@ -219,12 +225,13 @@ async def test_conversation_view_is_a_subset_of_the_window(tmp_path: Path, seed:
         _record(archive, message_id=f"p{index:02d}", text=f"line {index}", minutes_ago=minute,
                 sender=rng.choice(("anna", "ben", "cara")))
     in_window = {f"p{index:02d}" for index, minute in enumerate(minutes) if minute < 119.9}
+    floor = rng.choice((0, 3, 8, 20))
     candidates = sorted(in_window)
     if not candidates:
         return
     required = tuple(rng.sample(candidates, k=min(len(candidates), rng.randint(1, 2))))
     bounds = {"max_messages": rng.randint(5, 15), "lull_minutes": rng.choice((5, 15, 25)),
-              "burst_messages": 4, "burst_minutes": 15}
+              "burst_messages": 4, "burst_minutes": 15, "conversation_min_messages": floor}
     window = await _build_context(
         builder, _opportunity(*required), bounds=_bounds("window", **bounds)
     )
@@ -239,6 +246,111 @@ async def test_conversation_view_is_a_subset_of_the_window(tmp_path: Path, seed:
     assert (len(conversation_ids) + int(conversation["truncated_messages"])  # type: ignore[call-overload]
             == len(window_ids) + int(window["truncated_messages"]))  # type: ignore[call-overload]
     assert conversation["context_mode"] == "conversation"
+    stats = conversation["conversation"]
+    earlier = int(stats["earlier_messages"])  # type: ignore[index]
+    shown_members = len(conversation_ids) - earlier
+    if earlier:
+        # Earlier context only tops up a conversation below the floor.
+        assert shown_members < floor
+        assert set(conversation["earlier_message_ids"]) <= set(conversation_ids)  # type: ignore[arg-type]
+    else:
+        assert conversation["earlier_message_ids"] == []
+
+
+def _floor_chat(archive) -> None:
+    """Twelve messages, a 40-minute pause, then a three-message conversation."""
+    for index in range(12):
+        _record(archive, message_id=f"e{index:02d}", text=f"earlier {index}",
+                minutes_ago=100 - index, sender=("anna", "ben", "cara")[index % 3])
+    for index, minutes in enumerate((48, 47, 46)):
+        _record(archive, message_id=f"n{index}", text=f"now {index}", minutes_ago=minutes,
+                sender=("ben", "cara", "anna")[index])
+
+
+@pytest.mark.asyncio
+async def test_floor_adds_the_newest_earlier_messages_marked_as_earlier(tmp_path: Path) -> None:
+    builder = await _builder(tmp_path)
+    _floor_chat(builder._history_projector)
+    context = await _build_context(
+        builder, _opportunity("n2"), bounds=_bounds("conversation", conversation_min_messages=8)
+    )
+    # 3 conversation messages + the 5 newest earlier ones, in time order.
+    assert _ids(context) == ["e07", "e08", "e09", "e10", "e11", "n0", "n1", "n2"]
+    assert context["earlier_message_ids"] == ["e07", "e08", "e09", "e10", "e11"]
+    stats = context["conversation"]
+    assert stats["message_count"] == 3  # type: ignore[index]
+    assert stats["earlier_messages"] == 5  # type: ignore[index]
+    assert stats["conversation_id"] == context["conversation_id"]  # type: ignore[index]
+    assert context["truncated_messages"] == 7
+    assert context["dropped_source_ids"] == [f"e{index:02d}" for index in range(7)]
+    lines = _JudgeContext.from_mapping(context).render().splitlines()
+    separator = lines.index(EARLIER_CONTEXT_SEPARATOR)
+    assert lines.count(EARLIER_CONTEXT_SEPARATOR) == 1
+    assert lines[0] == context["conversation_header"]
+    assert 'id="e11"' in lines[separator - 1] and 'id="n0"' in lines[separator + 1]
+    assert "3 messages" in lines[0]  # the header describes the conversation only
+
+
+@pytest.mark.asyncio
+async def test_floor_zero_or_a_large_conversation_adds_nothing(tmp_path: Path) -> None:
+    builder = await _builder(tmp_path)
+    _floor_chat(builder._history_projector)
+    off = await _build_context(
+        builder, _opportunity("n2"), bounds=_bounds("conversation", conversation_min_messages=0)
+    )
+    assert _ids(off) == ["n0", "n1", "n2"]
+    assert off["earlier_message_ids"] == []
+    assert off["conversation"]["earlier_messages"] == 0  # type: ignore[index]
+    assert EARLIER_CONTEXT_SEPARATOR not in _JudgeContext.from_mapping(off).render()
+    exact = await _build_context(
+        builder, _opportunity("n2"), bounds=_bounds("conversation", conversation_min_messages=3)
+    )
+    assert _ids(exact) == ["n0", "n1", "n2"]
+
+
+@pytest.mark.asyncio
+async def test_floor_respects_the_message_cap(tmp_path: Path) -> None:
+    builder = await _builder(tmp_path)
+    _floor_chat(builder._history_projector)
+    context = await _build_context(
+        builder, _opportunity("n2"),
+        bounds=_bounds("conversation", max_messages=5, conversation_min_messages=20),
+    )
+    assert _ids(context) == ["e10", "e11", "n0", "n1", "n2"]
+    assert context["conversation"]["earlier_messages"] == 2  # type: ignore[index]
+
+
+@pytest.mark.asyncio
+async def test_floor_never_takes_messages_after_the_conversation(tmp_path: Path) -> None:
+    builder = await _builder(tmp_path)
+    archive = builder._history_projector
+    _floor_chat(archive)
+    for index, minutes in enumerate((10, 9)):
+        _record(archive, message_id=f"z{index}", text=f"later {index}", minutes_ago=minutes)
+    # The opportunity is on the older three-message conversation.
+    context = await _build_context(
+        builder, _opportunity("n1"), bounds=_bounds("conversation", conversation_min_messages=6)
+    )
+    assert _ids(context) == ["e09", "e10", "e11", "n0", "n1", "n2"]
+    assert not {"z0", "z1"} & set(_ids(context))
+
+
+@pytest.mark.asyncio
+async def test_required_source_before_the_pause_sits_above_the_separator(
+    tmp_path: Path,
+) -> None:
+    builder = await _builder(tmp_path)
+    _floor_chat(builder._history_projector)
+    context = await _build_context(
+        builder, _opportunity("e04", "n2"),
+        bounds=_bounds("conversation", conversation_min_messages=6),
+    )
+    assert _ids(context) == ["e04", "e09", "e10", "e11", "n0", "n1", "n2"]
+    assert context["conversation"]["earlier_messages"] == 3  # type: ignore[index]
+    assert context["earlier_message_ids"] == ["e04", "e09", "e10", "e11"]
+    lines = _JudgeContext.from_mapping(context).render().splitlines()
+    separator = lines.index(EARLIER_CONTEXT_SEPARATOR)
+    assert 'id="e11"' in lines[separator - 1] and 'id="n0"' in lines[separator + 1]
 
 
 def test_knowledge_log_line_names_the_context_mode_and_conversation() -> None:

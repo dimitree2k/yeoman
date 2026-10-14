@@ -60,6 +60,8 @@ class Conversation:
     #: ``(message_id, reply_to_native_id)`` for replies to a message outside this one.
     outside_replies: tuple[tuple[str, str], ...]
     state: ConversationState
+    #: Time of the message before the newest one; ``None`` for a one-message conversation.
+    previous_ms: int | None = None
 
     @property
     def duration_ms(self) -> int:
@@ -81,6 +83,9 @@ class Conversation:
             "arvid_addressed": self.arvid_addressed,
             "outside_reply_count": len(self.outside_replies),
             "state": self.state,
+            "last_gap_ms": (
+                self.last_ms - self.previous_ms if self.previous_ms is not None else None
+            ),
         }
 
 
@@ -193,7 +198,12 @@ def registry_ids(
 def render_header(
     conversation: Conversation, *, tz: tzinfo | None = None
 ) -> str:
-    """One summary line for the judge; data, not instructions."""
+    """One summary line for the judge; data, not instructions.
+
+    The line is neutral: it states how long before the newest message the one before it
+    was, never a state word such as "slowing" (owner labels showed that word pushes the
+    Judge to silence). The state stays in :meth:`Conversation.stats`.
+    """
     started = datetime.fromtimestamp(conversation.start_ms / 1000, tz)
     if tz is None:
         started = started.astimezone()
@@ -214,8 +224,16 @@ def render_header(
         )
     else:
         parts.append("Arvid: not in it")
-    parts.append(f"state: {conversation.state}")
+    parts.append(_last_gap(conversation))
     return " · ".join(parts)
+
+
+def _last_gap(conversation: Conversation) -> str:
+    """How long before the newest message the previous one was."""
+    if conversation.previous_ms is None:
+        return "no message before this one"
+    minutes = max(0, conversation.last_ms - conversation.previous_ms) // 60_000
+    return "last message under 1 min ago" if minutes < 1 else f"last message {minutes} min ago"
 
 
 def _plural(count: int, one: str, many: str) -> str:
@@ -320,6 +338,7 @@ def _conversation(
         arvid_addressed=addressed,
         outside_replies=outside,
         state=state,
+        previous_ms=times[-2] if len(times) > 1 else None,
     )
 
 
