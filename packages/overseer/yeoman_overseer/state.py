@@ -2,10 +2,15 @@
 from __future__ import annotations
 
 import json
+import logging
+import os
+import tempfile
 import time
 from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any
+
+logger = logging.getLogger(__name__)
 
 
 @dataclass
@@ -30,9 +35,27 @@ class OverseerState:
 
     @classmethod
     def load(cls, path: Path) -> OverseerState:
-        """Load from JSON file, or return defaults if missing."""
+        """Load from JSON file, or return defaults if missing or unreadable.
+
+        An empty or broken file (e.g. a write cut off by a crash) is moved aside as
+        ``<name>.corrupt-<unix time>`` so the overseer still starts.
+        """
         if path.exists():
-            raw = json.loads(path.read_text(encoding="utf-8"))
+            try:
+                raw = json.loads(path.read_text(encoding="utf-8"))
+                if not isinstance(raw, dict):
+                    raise ValueError("state is not a JSON object")
+            except (OSError, UnicodeDecodeError, ValueError) as exc:
+                aside = path.with_name(f"{path.name}.corrupt-{int(time.time())}")
+                try:
+                    path.replace(aside)
+                except OSError:
+                    aside = path
+                logger.warning(
+                    "overseer state unreadable (%s); starting from defaults, kept as %s",
+                    type(exc).__name__, aside,
+                )
+                return cls()
             return cls(
                 heartbeat_ts=raw.get("heartbeat_ts"),
                 locks=raw.get("locks", {}),
@@ -61,7 +84,17 @@ class OverseerState:
             "causal_graph": self.causal_graph,
             "cron_occurrences": self.cron_occurrences,
         }
-        path.write_text(json.dumps(data, indent=2) + "\n", encoding="utf-8")
+        # Write a temp file and rename it, so a crash never leaves a cut-off state.json.
+        fd, tmp = tempfile.mkstemp(dir=path.parent, prefix=f".{path.name}.", suffix=".tmp")
+        try:
+            with os.fdopen(fd, "w", encoding="utf-8") as handle:
+                handle.write(json.dumps(data, indent=2) + "\n")
+                handle.flush()
+                os.fsync(handle.fileno())
+            os.replace(tmp, path)
+        except BaseException:
+            Path(tmp).unlink(missing_ok=True)
+            raise
 
     def record_action(self, runbook_name: str) -> None:
         """Record an action for budget tracking."""
