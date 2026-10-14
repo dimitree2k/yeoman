@@ -26,7 +26,7 @@ jobs:
           ref: ${{ steps.pin.outputs.ref }}
           path: .contracts
       # Pin the interpreter: the runner's newest Python has no lxml/pydantic-core wheels.
-      - uses: astral-sh/setup-uv@v6
+      - uses: astral-sh/setup-uv@v7
         with:
           python-version: "3.14"
       - run: uv sync
