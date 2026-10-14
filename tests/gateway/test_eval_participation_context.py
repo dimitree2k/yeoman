@@ -5,6 +5,7 @@ Synthetic stores and a fake Judge only. Nothing here talks to a provider.
 
 from __future__ import annotations
 
+import asyncio
 import json
 import shutil
 import sqlite3
@@ -17,9 +18,14 @@ from yeoman_gateway.consciousness.log import SpeakupLog
 from yeoman_gateway.evaluation.harness import StaticClient
 from yeoman_gateway.evaluation.participation_context_ab import (
     FrozenHistory,
+    UsageCapture,
+    captured_usage,
+    chat_subjects,
+    label_summary,
     load_opportunities,
     registry_lookup,
     replay,
+    resolve_chat,
     summarize,
     write_outputs,
 )
@@ -37,10 +43,16 @@ CHAT = "120000000000000042@g.us"
 MIN = 60_000
 T0 = 1_790_000_000_000  # synthetic
 SECRET = "synthetic-private-wording"
+SUBJECT = "Synthetic Test Group"
 
 
-def _history(tmp_path: Path) -> ProjectedHistory:
+def _history(tmp_path: Path, *, subject: str | None = None) -> ProjectedHistory:
     history = ProjectedHistory(tmp_path / "history")
+    if subject is not None:
+        from tests.gateway.convhist.hist_fixtures import _raw
+
+        history.records.append(_raw("group_subject", "group_subject", dict(
+            chatJid=CHAT, value=subject, snapshot=True, observedAtMs=T0 - MIN), received=T0 - MIN))
 
     def say(message_id: str, minute: int, sender: str, *, out: bool = False) -> None:
         history.add_message(
@@ -123,12 +135,33 @@ def _bounds(mode: str) -> ParticipationContextBounds:
     )
 
 
-async def _run(tmp_path: Path, *, judged: bool, registry=None):
-    history = _history(tmp_path)
+class _SlowFakeJudgeClient(_FakeJudgeClient):
+    """The fake Judge with overlapping calls that finish out of order."""
+
+    def __init__(self) -> None:
+        super().__init__()
+        self.in_flight = 0
+        self.max_in_flight = 0
+
+    async def chat_with_usage(self, messages, **kwargs) -> RouteReply:
+        self.in_flight += 1
+        self.max_in_flight = max(self.max_in_flight, self.in_flight)
+        try:
+            # Earlier calls wait longer, so completion order differs from start order.
+            await asyncio.sleep(0.05 / (1 + len(self.prompts)))
+            return await super().chat_with_usage(messages, **kwargs)
+        finally:
+            self.in_flight -= 1
+
+
+async def _run(tmp_path: Path, *, judged: bool, registry=None, client=None, concurrency: int = 1,
+               subject: str | None = None):
+    history = _history(tmp_path, subject=subject)
     opportunities = load_opportunities(
         _speakups(tmp_path / "speakups.db"), since_ms=T0, until_ms=T0 + 100 * MIN
     )
-    client = _FakeJudgeClient()
+    capture = client is not None
+    client = client or _FakeJudgeClient()
     last: dict[str, object] = {}
 
     class _Recording(_FakeJudgeClient):
@@ -148,9 +181,12 @@ async def _run(tmp_path: Path, *, judged: bool, registry=None):
             opportunities, history=frozen, builder=builder,
             window_bounds=_bounds("window"), conversation_bounds=_bounds("conversation"),
             estimator=ParticipationJudge(client=StaticClient("{}"), allowed_emojis=("👍",)),
-            judge=ParticipationJudge(client=_Recording(), allowed_emojis=("👍",)) if judged else None,
-            usage=lambda: last.get("usage") or {},
+            judge=ParticipationJudge(
+                client=UsageCapture(client) if capture else _Recording(), allowed_emojis=("👍",),
+            ) if judged else None,
+            usage=captured_usage if capture else (lambda: last.get("usage") or {}),
             set_as_of=lambda moment: as_of.__setitem__("ms", moment),
+            concurrency=concurrency,
         )
     finally:
         frozen.close()
@@ -259,7 +295,8 @@ def test_cli_no_judge_writes_jsonl_and_summary(
     original = ab.load_opportunities
     monkeypatch.setattr(
         ab, "load_opportunities",
-        lambda path, *, since_ms, until_ms: original(path, since_ms=T0, until_ms=T0 + 100 * MIN),
+        lambda path, *, since_ms, until_ms, chat_ids=None: original(
+            path, since_ms=T0, until_ms=T0 + 100 * MIN, chat_ids=chat_ids),
     )
     result = CliRunner().invoke(app, ["eval", "participation-context", "--days", "14", "--no-judge"])
     assert result.exit_code == 0, result.output
@@ -270,3 +307,144 @@ def test_cli_no_judge_writes_jsonl_and_summary(
     assert len((directory / "records.jsonl").read_text().splitlines()) == 3
     assert SECRET not in (directory / "records.jsonl").read_text()
     assert (directory / "summary.md").read_text().startswith("# Participation context A/B")
+
+
+@pytest.mark.asyncio
+async def test_parallel_judge_calls_are_bounded_and_match_a_sequential_run(
+    tmp_path: Path,
+) -> None:
+    sequential_client = _SlowFakeJudgeClient()
+    _, sequential, _ = await _run(tmp_path / "seq", judged=True, client=sequential_client)
+    parallel_client = _SlowFakeJudgeClient()
+    _, parallel, _ = await _run(tmp_path / "par", judged=True, client=parallel_client,
+                                concurrency=3)
+    assert sequential_client.max_in_flight == 1
+    assert parallel_client.max_in_flight == 3  # four Judge calls, three slots
+    assert len(parallel_client.prompts) == 4
+    assert parallel == sequential
+    assert [record["opportunity_id"] for record in parallel] == ["opp-2", "opp-1", "opp-3"]
+    assert summarize(parallel, judged=True) == summarize(sequential, judged=True)
+    # Usage is attributed per call, not taken from whichever call finished last.
+    by_id = {record["opportunity_id"]: record for record in parallel}
+    assert by_id["opp-1"]["B"]["prompt_tokens"] < by_id["opp-1"]["A"]["prompt_tokens"]
+
+
+def test_load_opportunities_filters_by_chat(tmp_path: Path) -> None:
+    speakups = _speakups(tmp_path / "speakups.db")
+    kept = load_opportunities(speakups, since_ms=T0, until_ms=T0 + 100 * MIN, chat_ids=[CHAT])
+    assert len(kept) == 3
+    assert load_opportunities(speakups, since_ms=T0, until_ms=T0 + 100 * MIN,
+                              chat_ids=["120000000000000099@g.us"]) == []
+
+
+def test_resolve_chat_by_id_or_exact_subject() -> None:
+    subjects = {CHAT: SUBJECT, "1@g.us": "Other Private Group", "2@g.us": "Twin",
+                "3@g.us": "twin"}
+    assert resolve_chat("999@g.us", subjects) == "999@g.us"  # ids pass through
+    assert resolve_chat("-100123", subjects) == "-100123"
+    assert resolve_chat("synthetic test GROUP", subjects) == CHAT
+    with pytest.raises(ValueError, match="0 matches") as none:
+        resolve_chat("Synthetic", subjects)  # exact match only
+    with pytest.raises(ValueError, match="2 matches") as ambiguous:
+        resolve_chat("TWIN", subjects)
+    for error in (none, ambiguous):
+        assert "Other Private" not in str(error.value) and "Twin" not in str(error.value)
+
+
+@pytest.mark.asyncio
+async def test_chat_subjects_from_history(tmp_path: Path) -> None:
+    history = _history(tmp_path, subject=SUBJECT)
+    frozen = FrozenHistory(history.path)
+    try:
+        assert await chat_subjects(frozen) == {CHAT: SUBJECT}
+    finally:
+        frozen.close()
+        history.close()
+
+
+def _cli_home(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> Path:
+    import yeoman_gateway.evaluation.participation_context_ab as ab
+
+    home = tmp_path / "home"
+    monkeypatch.setenv("YEOMAN_HOME", str(home))
+    history = _history(tmp_path, subject=SUBJECT)
+    (home / "data" / "history").mkdir(parents=True)
+    shutil.copy(history.path, home / "data" / "history" / "history.db")
+    history.close()
+    (home / "data" / "ops").mkdir(parents=True)
+    _speakups(home / "data" / "ops" / "speakups.db")
+    original = ab.load_opportunities
+    monkeypatch.setattr(
+        ab, "load_opportunities",
+        lambda path, *, since_ms, until_ms, chat_ids=None: original(
+            path, since_ms=T0, until_ms=T0 + 100 * MIN, chat_ids=chat_ids),
+    )
+    return home
+
+
+def _replay_summary(home: Path, *args: str) -> dict:
+    result = CliRunner().invoke(app, ["eval", "participation-context", "--no-judge", *args])
+    assert result.exit_code == 0, result.output
+    directory = sorted((home / "var" / "eval" / "participation-context-ab").glob("*-replay"))[-1]
+    summary = json.loads((directory / "summary.json").read_text())
+    shutil.rmtree(directory)
+    return summary
+
+
+def test_cli_chat_filter_by_id_and_subject(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    home = _cli_home(tmp_path, monkeypatch)
+    assert _replay_summary(home, "--chat", CHAT)["opportunities"] == 3
+    assert _replay_summary(home, "--chat", "120000000000000099@g.us")["opportunities"] == 0
+    assert _replay_summary(home, "--chat", SUBJECT.upper())["opportunities"] == 3
+    result = CliRunner().invoke(
+        app, ["eval", "participation-context", "--no-judge", "--chat", "No Such Group"]
+    )
+    assert result.exit_code == 2
+    assert "0 matches" in result.output and SUBJECT not in result.output
+
+
+def test_cli_review_labels_disagreements_without_writing_text(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    home = _cli_home(tmp_path, monkeypatch)
+    _, records, _ = asyncio.run(_run(tmp_path / "judged", judged=True))
+    summary = summarize(records, judged=True)
+    report = home / "var" / "eval" / "participation-context-ab" / "20261012-replay"
+    report.mkdir(parents=True)
+    write_outputs(report, records, summary, "# report\n")
+    command = ["eval", "participation-context-review", str(report)]
+
+    first = CliRunner().invoke(app, command, input="x\nb\nq\n")
+    assert first.exit_code == 0, first.output
+    assert "=== 1/2 opp-2" in first.output and "=== 2/2 opp-1" in first.output  # then quit
+    assert f"chat: {SUBJECT}" in first.output
+    assert SECRET in first.output  # the owner sees the messages in the terminal
+    assert "Conversation since" in first.output  # B header line
+    assert "A decision: react 👍" in first.output and "B decision: silence" in first.output
+    assert "please answer" in first.output
+    assert "labelled=1 a_better=0 b_better=1 same=0 b_better_or_same=1.0" in first.output
+
+    second = CliRunner().invoke(app, command, input="a\n")
+    assert second.exit_code == 0, second.output
+    assert "=== 1/1 opp-1" in second.output and "opp-2" not in second.output
+    assert "b_better_or_same=0.5 (threshold 70%: not met)" in second.output
+
+    labels = [json.loads(line) for line in (report / "labels.jsonl").read_text().splitlines()]
+    assert [(item["opportunity_id"], item["label"]) for item in labels] == [
+        ("opp-2", "b_better"), ("opp-1", "a_better"),
+    ]
+    assert all(set(item) == {"opportunity_id", "label", "labelled_at"} for item in labels)
+    for path in report.iterdir():
+        assert SECRET not in path.read_text()
+
+    third = CliRunner().invoke(app, command, input="")
+    assert "nothing to label" in third.output
+    only = CliRunner().invoke(app, [*command, "--summary"])
+    assert only.exit_code == 0 and SECRET not in only.output
+    assert "labelled=2 a_better=1 b_better=1 same=0" in only.output
+
+
+def test_label_summary_threshold() -> None:
+    stats = label_summary({"o1": "b_better", "o2": "same", "o3": "b_better", "o4": "a_better"})
+    assert stats["b_better_or_same_share"] == 0.75 and stats["meets_threshold"] is True
+    assert label_summary({})["b_better_or_same_share"] is None

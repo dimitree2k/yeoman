@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import asyncio
 from dataclasses import asdict
+from pathlib import Path
 
 import typer
 
@@ -162,36 +163,13 @@ def eval_judge_format(
     )
 
 
-@eval_app.command("participation-context")
-def eval_participation_context(
-    days: int = typer.Option(14, "--days", min=1, max=90),
-    no_judge: bool = typer.Option(
-        False, "--no-judge", help="Context sizes and token estimates only; no model calls"
-    ),
-    route: str = typer.Option("participation.judge", "--route"),
-    profile: str | None = typer.Option(None, "--profile"),
-    limit: int | None = typer.Option(None, "--limit", min=1, help="Newest N opportunities only"),
-) -> None:
-    """Replay recorded Judge opportunities with the window (A) and conversation (B) views."""
-    import time
-
-    from yeoman_shared.config.loader import load_config
-    from yeoman_shared.utils.helpers import get_operational_store_path, get_var_path
+def _participation_replay_setup(config):
+    """Builder, both bounds, estimator and as-of hooks shared by replay and review."""
+    from types import SimpleNamespace
 
     from yeoman_gateway.app.bootstrap import _processing_store_path, participant_is_allowed
-    from yeoman_gateway.evaluation.harness import RecordingClient, StaticClient
-    from yeoman_gateway.evaluation.participation_context_ab import (
-        REPORT_DIR,
-        FrozenHistory,
-        load_opportunities,
-        registry_lookup,
-        render_markdown,
-        replay,
-        summarize,
-        write_outputs,
-    )
-    from yeoman_gateway.evaluation.report import new_report_dir
-    from yeoman_gateway.history.live import history_db_path
+    from yeoman_gateway.evaluation.harness import StaticClient
+    from yeoman_gateway.evaluation.participation_context_ab import registry_lookup
     from yeoman_gateway.processing.participation import ParticipationJudge
     from yeoman_gateway.processing.participation_context import (
         ParticipationContextBounds,
@@ -200,44 +178,10 @@ def eval_participation_context(
 
     from .core import make_policy_engine
 
-    config = load_config()
     participation = config.processing.participation
     engine, _policy_path = make_policy_engine(config)
-    speakups = get_operational_store_path("speakups", create=False)
-    if not speakups.is_file() or not history_db_path().is_file():
-        typer.echo("error: speakups.db or history.db not found")
-        raise typer.Exit(2)
-    until_ms = int(time.time() * 1000)
-    opportunities = load_opportunities(
-        speakups, since_ms=until_ms - days * 86_400_000, until_ms=until_ms
-    )
-    if limit is not None:
-        opportunities = opportunities[-limit:]
     emojis = tuple(config.processing.reaction_emojis)
     max_input = int(participation.judge_max_input_tokens)
-    estimator = ParticipationJudge(
-        client=StaticClient("{}"), allowed_emojis=emojis, max_input_tokens=max_input
-    )
-    judge = None
-    recording = None
-    if not no_judge:
-        from yeoman_gateway.evaluation.judge_format import build_eval_client
-        from yeoman_gateway.processing.model_route import RouteUnavailableError
-
-        try:
-            recording = RecordingClient(build_eval_client(
-                config, route=None if profile else route, profile=profile,
-            ))
-        except RouteUnavailableError as exc:
-            typer.echo(f"error: {exc}")
-            raise typer.Exit(2) from exc
-        judge = ParticipationJudge(
-            client=recording, allowed_emojis=emojis, max_input_tokens=max_input,
-            timeout_seconds=float(participation.judge_timeout_seconds),
-            max_output_tokens=int(participation.judge_max_output_tokens),
-        )
-        typer.echo(f"model calls: up to {2 * len(opportunities)}")
-
     lookup = registry_lookup(_processing_store_path(config))
     as_of = {"ms": 0}
     builder = ParticipationContextBuilder(
@@ -260,16 +204,107 @@ def eval_participation_context(
     def guidance_for(channel: str, chat_id: str) -> str:
         return str(getattr(engine.resolve_participation(channel, chat_id), "guidance", "") or "")
 
+    return SimpleNamespace(
+        emojis=emojis, max_input=max_input,
+        replay_args={
+            "builder": builder,
+            "window_bounds": ParticipationContextBounds(context_mode="window", **shared),
+            "conversation_bounds": ParticipationContextBounds(context_mode="conversation", **shared),
+            "estimator": ParticipationJudge(
+                client=StaticClient("{}"), allowed_emojis=emojis, max_input_tokens=max_input
+            ),
+            "guidance_for": guidance_for,
+            "set_as_of": lambda moment: as_of.__setitem__("ms", moment),
+        },
+    )
+
+
+@eval_app.command("participation-context")
+def eval_participation_context(
+    days: int = typer.Option(14, "--days", min=1, max=90),
+    no_judge: bool = typer.Option(
+        False, "--no-judge", help="Context sizes and token estimates only; no model calls"
+    ),
+    route: str = typer.Option("participation.judge", "--route"),
+    profile: str | None = typer.Option(None, "--profile"),
+    limit: int | None = typer.Option(None, "--limit", min=1, help="Newest N opportunities only"),
+    concurrency: int = typer.Option(6, "--concurrency", min=1, help="Parallel Judge calls"),
+    chats: list[str] | None = typer.Option(
+        None, "--chat", help="Only this chat (id or exact group subject); repeatable"
+    ),
+) -> None:
+    """Replay recorded Judge opportunities with the window (A) and conversation (B) views."""
+    import time
+
+    from yeoman_shared.config.loader import load_config
+    from yeoman_shared.utils.helpers import get_operational_store_path, get_var_path
+
+    from yeoman_gateway.evaluation.participation_context_ab import (
+        REPORT_DIR,
+        FrozenHistory,
+        UsageCapture,
+        captured_usage,
+        chat_subjects,
+        load_opportunities,
+        looks_like_chat_id,
+        render_markdown,
+        replay,
+        resolve_chat,
+        summarize,
+        write_outputs,
+    )
+    from yeoman_gateway.evaluation.report import new_report_dir
+    from yeoman_gateway.history.live import history_db_path
+    from yeoman_gateway.processing.participation import ParticipationJudge
+
+    config = load_config()
+    participation = config.processing.participation
+    speakups = get_operational_store_path("speakups", create=False)
+    if not speakups.is_file() or not history_db_path().is_file():
+        typer.echo("error: speakups.db or history.db not found")
+        raise typer.Exit(2)
     history = FrozenHistory(history_db_path())
     try:
+        chat_ids: list[str] | None = None
+        if chats:
+            subjects = (
+                {} if all(looks_like_chat_id(value) for value in chats)
+                else asyncio.run(chat_subjects(history))
+            )
+            try:
+                chat_ids = [resolve_chat(value, subjects) for value in chats]
+            except ValueError as exc:
+                typer.echo(f"error: --chat: {exc}")
+                raise typer.Exit(2) from exc
+        until_ms = int(time.time() * 1000)
+        opportunities = load_opportunities(
+            speakups, since_ms=until_ms - days * 86_400_000, until_ms=until_ms, chat_ids=chat_ids,
+        )
+        if limit is not None:
+            opportunities = opportunities[-limit:]
+        setup = _participation_replay_setup(config)
+        judge = None
+        if not no_judge:
+            from yeoman_gateway.evaluation.judge_format import build_eval_client
+            from yeoman_gateway.processing.model_route import RouteUnavailableError
+
+            try:
+                client = UsageCapture(build_eval_client(
+                    config, route=None if profile else route, profile=profile,
+                ))
+            except RouteUnavailableError as exc:
+                typer.echo(f"error: {exc}")
+                raise typer.Exit(2) from exc
+            judge = ParticipationJudge(
+                client=client, allowed_emojis=setup.emojis, max_input_tokens=setup.max_input,
+                timeout_seconds=float(participation.judge_timeout_seconds),
+                max_output_tokens=int(participation.judge_max_output_tokens),
+            )
+            typer.echo(f"model calls: up to {2 * len(opportunities)} ({concurrency} in parallel)")
+
         records = asyncio.run(replay(
-            opportunities, history=history, builder=builder,
-            window_bounds=ParticipationContextBounds(context_mode="window", **shared),
-            conversation_bounds=ParticipationContextBounds(context_mode="conversation", **shared),
-            estimator=estimator, judge=judge,
-            usage=(lambda: recording.last.usage if recording and recording.last else {}),
-            guidance_for=guidance_for,
-            set_as_of=lambda moment: as_of.__setitem__("ms", moment),
+            opportunities, history=history, judge=judge, usage=captured_usage,
+            concurrency=concurrency, **setup.replay_args,
         ))
     finally:
         history.close()
@@ -280,3 +315,118 @@ def eval_participation_context(
         f"opportunities={summary['opportunities']} built_both={summary['built_both']} "
         f"agreement={summary.get('agreement_rate')} report: {directory}"
     )
+
+
+def _decision_line(variant: dict) -> str:
+    if variant.get("status") != "decided":
+        return f"{variant.get('status')} {variant.get('error') or ''}".strip()
+    parts = [str(variant.get("action"))]
+    if variant.get("emoji"):
+        parts.append(str(variant["emoji"]))
+    if variant.get("reason"):
+        parts.append(f"reason: {variant['reason']}")
+    return " ".join(parts)
+
+
+def _echo_label_summary(labels: dict[str, str]) -> None:
+    from yeoman_gateway.evaluation.participation_context_ab import label_summary
+
+    stats = label_summary(labels)
+    share = stats["b_better_or_same_share"]
+    verdict = "n/a" if share is None else ("met" if stats["meets_threshold"] else "not met")
+    typer.echo(
+        f"labelled={stats['labelled']} a_better={stats['a_better']} b_better={stats['b_better']} "
+        f"same={stats['same']} b_better_or_same={share} "
+        f"(threshold {stats['threshold']:.0%}: {verdict})"
+    )
+
+
+@eval_app.command("participation-context-review")
+def eval_participation_context_review(
+    report_dir: Path = typer.Argument(..., help="A participation-context replay report directory"),
+    every: bool = typer.Option(
+        False, "--all", help="Every disagreement, not only the summary's sample of up to 30"
+    ),
+    summary_only: bool = typer.Option(
+        False, "--summary", help="Print the label counts only; no review"
+    ),
+) -> None:
+    """Owner labelling of A/B disagreements; message text is shown here only, never written."""
+    import json
+    from datetime import UTC, datetime
+
+    from yeoman_gateway.evaluation.participation_context_ab import (
+        LABEL_KEYS,
+        LABELS_FILE,
+        FrozenHistory,
+        append_label,
+        chat_subjects,
+        disagreement_ids,
+        read_labels,
+        rebuild_views,
+    )
+
+    directory = report_dir.expanduser()
+    records_path = directory / "records.jsonl"
+    if not records_path.is_file() or not (directory / "summary.json").is_file():
+        typer.echo("error: not a replay report (records.jsonl / summary.json missing)")
+        raise typer.Exit(2)
+    labels_path = directory / LABELS_FILE
+    labels = read_labels(labels_path)
+    if summary_only:
+        _echo_label_summary(labels)
+        return
+    records = [json.loads(line) for line in records_path.read_text(encoding="utf-8").splitlines()
+               if line.strip()]
+    summary = json.loads((directory / "summary.json").read_text(encoding="utf-8"))
+    by_id = {str(record["opportunity_id"]): record for record in records}
+    todo = [item for item in disagreement_ids(records, summary, every=every)
+            if item in by_id and item not in labels]
+    if not todo:
+        typer.echo("nothing to label")
+        _echo_label_summary(labels)
+        return
+
+    from yeoman_shared.config.loader import load_config
+
+    from yeoman_gateway.history.live import history_db_path
+
+    if not history_db_path().is_file():
+        typer.echo("error: history.db not found")
+        raise typer.Exit(2)
+    setup = _participation_replay_setup(load_config())
+    history = FrozenHistory(history_db_path())
+    prompt = "[a] A better / [b] B better / [s] same / [k] skip / [q] quit"
+    try:
+        subjects = asyncio.run(chat_subjects(history))
+        for index, opportunity_id in enumerate(todo, start=1):
+            record = by_id[opportunity_id]
+            views = asyncio.run(rebuild_views(record, history=history, **setup.replay_args))
+            moment = datetime.fromtimestamp(int(record["at_ms"]) / 1000).astimezone()
+            typer.echo("")
+            typer.echo(f"=== {index}/{len(todo)} {opportunity_id}")
+            typer.echo(f"chat: {subjects.get(str(record.get('chat_id')), '(no subject)')}")
+            typer.echo(f"time: {moment:%Y-%m-%d %H:%M %Z}")
+            for key, name in (("A", "window"), ("B", "conversation")):
+                typer.echo(f"--- {key} ({name}) context")
+                typer.echo(views[key])
+            for key in ("A", "B"):
+                typer.echo(f"{key} decision: {_decision_line(record.get(key) or {})}")
+            while True:
+                try:
+                    answer = typer.prompt(prompt).strip().lower()
+                except typer.Abort:
+                    answer = "q"
+                if answer in {*LABEL_KEYS, "k", "q"}:
+                    break
+                typer.echo("please answer a, b, s, k or q")
+            if answer == "q":
+                break
+            if answer == "k":
+                continue
+            append_label(labels_path, opportunity_id, LABEL_KEYS[answer],
+                         labelled_at=datetime.now(UTC).isoformat(timespec="seconds"))
+            labels[opportunity_id] = LABEL_KEYS[answer]
+    finally:
+        history.close()
+    _echo_label_summary(labels)
