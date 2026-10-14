@@ -42,6 +42,7 @@ from yeoman_gateway.channels.base import BaseChannel
 from yeoman_gateway.channels.whatsapp_runtime import WhatsAppRuntimeManager
 from yeoman_gateway.core.models import InboundEvent as CoreInboundEvent
 from yeoman_gateway.history.live import HistoryPaused
+from yeoman_gateway.history.queries import HistoryQueries
 from yeoman_gateway.implicit_addressing import (
     DEFAULT_BOT_NAME_ALIASES,
     contains_bot_name,
@@ -218,6 +219,17 @@ def _timestamp_to_datetime(value: int) -> datetime:
     if seconds <= 0:
         return datetime.now(UTC)
     return datetime.fromtimestamp(seconds, tz=UTC)
+
+
+def _quoted_image_text(reply_to_text: str | None, description: str) -> str:
+    base = (reply_to_text or "").strip()
+    if not base or base == "[Image]":
+        caption = "[Image]"
+    elif base.startswith("[Image] "):
+        caption = base
+    else:
+        caption = f"[Image] {base}"
+    return f"{caption}\n[image_description] {description}"
 
 
 DEDUPE_TTL_SECONDS = 20 * 60
@@ -2564,6 +2576,12 @@ class WhatsAppChannel(BaseChannel):
         if event.reply_to_text and "[image_description]" in event.reply_to_text:
             return event
 
+        # The quoted image was usually described when it arrived; reuse that text instead
+        # of paying for a second vision call that may also word it differently.
+        stored = await self._stored_image_description(event.chat_jid, event.reply_to_message_id)
+        if stored:
+            return replace(event, reply_to_text=_quoted_image_text(event.reply_to_text, stored))
+
         validated_path = self._media_storage.validate_incoming_path(event.reply_to_media_path)
         if validated_path is None:
             logger.warning(
@@ -2613,15 +2631,30 @@ class WhatsAppChannel(BaseChannel):
             text=description,
         )
 
-        base = (event.reply_to_text or "").strip()
-        if not base or base == "[Image]":
-            caption = "[Image]"
-        elif base.startswith("[Image] "):
-            caption = base
-        else:
-            caption = f"[Image] {base}"
-        enriched_reply_text = f"{caption}\n[image_description] {description}"
-        return replace(event, reply_to_text=enriched_reply_text)
+        return replace(event, reply_to_text=_quoted_image_text(event.reply_to_text, description))
+
+    async def _stored_image_description(self, chat_id: str, native_id: str) -> str | None:
+        """The description history already holds for this message, if any."""
+        if self._history_projector is None:
+            return None
+        from yeoman_gateway.history.context import history_turn
+
+        try:
+            async with history_turn(self._history_projector) as snapshot:
+                row = HistoryQueries(snapshot).native_message(chat_id=chat_id, native_id=native_id)
+        except HistoryPaused:
+            return None
+        media = row.get("media_json") if row else None
+        if isinstance(media, str):
+            try:
+                media = json.loads(media)
+            except ValueError:
+                return None
+        observation = media.get("description") if isinstance(media, dict) else None
+        text = observation.get("text") if isinstance(observation, dict) else None
+        if not isinstance(text, str):
+            return None
+        return text.strip() or None
 
     async def _enrich_primary_media_event(self, event: InboundEvent) -> InboundEvent:
         if not self.config.media.enabled:
