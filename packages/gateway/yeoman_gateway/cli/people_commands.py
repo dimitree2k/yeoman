@@ -1,4 +1,4 @@
-"""Person directory CLI: check, status, sync dry-run and the one-time Knowledge import."""
+"""Person directory CLI: check, status, sync dry-run, Knowledge import and suggestion review."""
 
 from __future__ import annotations
 
@@ -184,3 +184,63 @@ def people_import_knowledge(
         with store.transaction("import"):
             report = import_knowledge_seed(store, seed, _now_ms())
     _print({"dry_run": False, "snapshot": snapshot is not None, "report": report.as_dict()}, json_output)
+
+
+@people_app.command("suggestions")
+def people_suggestions(
+    include_decided: bool = typer.Option(False, "--all", help="Include accepted and rejected"),
+    json_output: bool = typer.Option(False, "--json", help="Output JSON"),
+) -> None:
+    """List suggestions (open ones by default) with both persons."""
+    from yeoman_gateway.people.schema import open_people_db, people_db_path
+    from yeoman_gateway.people.suggestions import list_suggestions
+
+    path = people_db_path()
+    if not path.is_file():
+        typer.echo("people.db not found.", err=True)
+        raise typer.Exit(1)
+    with closing(open_people_db(path, readonly=True)) as conn:
+        _print(list_suggestions(conn, include_decided=include_decided), json_output)
+
+
+def _decide(suggestion_id: int, *, accept: bool, note: str | None, json_output: bool) -> None:
+    from yeoman_gateway.people.backup import snapshot_people_db
+    from yeoman_gateway.people.schema import open_people_db, people_db_path
+    from yeoman_gateway.people.store import PeopleStore
+    from yeoman_gateway.people.suggestions import SuggestionError, decide_suggestion
+
+    path = people_db_path()
+    if not path.is_file():
+        typer.echo("people.db not found.", err=True)
+        raise typer.Exit(1)
+    with closing(open_people_db(path)) as conn:
+        snapshot = snapshot_people_db(path, label="people-pre-decision")
+        store = PeopleStore(conn)
+        try:
+            with store.transaction("owner"):
+                result = decide_suggestion(store, suggestion_id, accept=accept, note=note,
+                                           now_ms=_now_ms())
+        except SuggestionError as exc:
+            typer.echo(str(exc), err=True)
+            raise typer.Exit(1) from exc
+    _print({"snapshot": snapshot is not None, **result}, json_output)
+
+
+@people_app.command("accept")
+def people_accept(
+    suggestion_id: int = typer.Argument(..., help="Suggestion id (see `yeoman people suggestions`)"),
+    note: str | None = typer.Option(None, "--note", help="Why; stored with the decision"),
+    json_output: bool = typer.Option(False, "--json", help="Output JSON"),
+) -> None:
+    """Accept a suggestion. A merge is recorded as a `same` decision and applied now."""
+    _decide(suggestion_id, accept=True, note=note, json_output=json_output)
+
+
+@people_app.command("reject")
+def people_reject(
+    suggestion_id: int = typer.Argument(..., help="Suggestion id (see `yeoman people suggestions`)"),
+    note: str | None = typer.Option(None, "--note", help="Why; stored with the decision"),
+    json_output: bool = typer.Option(False, "--json", help="Output JSON"),
+) -> None:
+    """Reject a suggestion; it is never proposed again. A merge is recorded as `not_same`."""
+    _decide(suggestion_id, accept=False, note=note, json_output=json_output)
