@@ -23,6 +23,9 @@ from dataclasses import dataclass
 from datetime import UTC, datetime
 from typing import Any
 
+from loguru import logger
+
+from yeoman_gateway.history.conversations import Conversation, registry_ids, render_header, segment
 from yeoman_gateway.history.live import HistoryPaused
 from yeoman_gateway.policy.engine import ParticipationSnapshot
 from yeoman_gateway.processing.participation import (
@@ -32,6 +35,8 @@ from yeoman_gateway.processing.participation import (
 
 #: Keys a stored message row may use for its identity.
 _ID_KEYS: tuple[str, ...] = ("message_id", "event_id", "id")
+#: ``participation_conversation_fallback`` is logged at most once per chat per hour.
+_FALLBACK_LOG_INTERVAL_MS = 3_600_000
 
 
 @dataclass(frozen=True, slots=True)
@@ -41,6 +46,16 @@ class ParticipationContextBounds:
     window_minutes: int = 120
     max_messages: int = 40
     max_anchors: int = 10
+    #: ``window`` (default) or ``conversation`` (Spec A section 5.2).
+    context_mode: str = "window"
+    #: Live ``consciousness`` lull/burst definitions used to segment conversations.
+    lull_minutes: int = 25
+    burst_messages: int = 8
+    burst_minutes: int = 15
+    #: Conversation view floor: below this many visible conversation messages, the
+    #: newest earlier window messages before it are added as marked earlier context.
+    #: ``0`` disables the floor.
+    conversation_min_messages: int = 8
 
 
 @dataclass(frozen=True, slots=True)
@@ -111,6 +126,7 @@ class ParticipationContextBuilder:
         anchors: Any | None = None,
         clock: Any | None = None,
         source_authorizer: Callable[[Mapping[str, Any]], bool] | None = None,
+        thread_lookup: Callable[[str], object] | None = None,
     ) -> None:
         # Kept on the constructor for old object construction; decision inputs are the
         # sole source of trusted policy values during ``build``.
@@ -118,6 +134,9 @@ class ParticipationContextBuilder:
         self._anchors = anchors
         self._clock = clock
         self._source_authorizer = source_authorizer
+        # Registry lookup by provider message id; referenced, never changed.
+        self._thread_lookup = thread_lookup
+        self._fallback_logged_ms: dict[tuple[str, str], int] = {}
 
     @property
     def _archive(self):
@@ -150,7 +169,8 @@ class ParticipationContextBuilder:
         )
         until = datetime.fromtimestamp(moment / 1000, UTC)
         since_ms = int(since.timestamp()) * 1000
-        rows = self._archive.lookup_messages_in_range(
+        archive = self._archive
+        rows = archive.lookup_messages_in_range(
             opportunity.channel,
             opportunity.chat_id,
             since,
@@ -165,7 +185,7 @@ class ParticipationContextBuilder:
         required_ids = _unique_ids(opportunity.source_event_ids)
         required_rows: dict[str, dict[str, object]] = {}
         for source_id in required_ids:
-            row = self._archive.lookup_message(
+            row = archive.lookup_message(
                 opportunity.channel, opportunity.chat_id, source_id
             )
             if not isinstance(row, Mapping) or _row_id(row) != source_id:
@@ -216,7 +236,47 @@ class ParticipationContextBuilder:
             raise ParticipationDecisionError("context_too_large", detail="required_sources_exceed_message_limit")
         kept_required = required
         free = max(0, max_messages - len(kept_required))
-        selected = kept_required + (optional[-free:] if free else [])
+        conversation: Conversation | None = None
+        earlier: list[dict[str, object]] = []
+        earlier_ids: list[str] = []
+        if limits.context_mode == "conversation":
+            try:
+                conversation = self._conversation(
+                    archive, opportunity, range_rows, required, limits, now_ms=moment
+                )
+            except (HistoryPaused, ParticipationDecisionError):
+                raise
+            except Exception as exc:  # noqa: BLE001 - fall back to today's window
+                self._log_fallback(opportunity, exc, now_ms=moment)
+        if conversation is None:
+            selected = kept_required + (optional[-free:] if free else [])
+        else:
+            members = set(conversation.message_ids)
+            in_conversation = [row for row in optional if _history_id(row) in members]
+            first_kept = bool(in_conversation) and any(
+                _history_id(row) in members
+                and _row_sort_key(row) < _row_sort_key(in_conversation[0])
+                for row in kept_required
+            )
+            kept_conversation = _cap_conversation(in_conversation, free, first_kept=first_kept)
+            earlier = _earlier_context(
+                optional,
+                members,
+                start_ms=conversation.start_ms,
+                visible=len(kept_conversation)
+                + sum(_history_id(row) in members for row in kept_required),
+                floor=max(0, int(limits.conversation_min_messages)),
+                free=free - len(kept_conversation),
+            )
+            selected = kept_required + kept_conversation + earlier
+            if earlier:
+                # Everything shown from before the conversation start sits above the
+                # separator, also a required source from there.
+                earlier_ids = [
+                    _row_id(row) for row in sorted(selected, key=_row_sort_key)
+                    if _history_id(row) not in members
+                    and (_history_shape(row)["sent_ms"] or 0) < conversation.start_ms
+                ]
         selected.sort(key=_row_sort_key)
         selected_ids = {_row_id(row) for row in selected}
         dropped_ids = [
@@ -284,6 +344,17 @@ class ParticipationContextBuilder:
             "truncated_messages": truncated,
             "dropped_source_ids": dropped_ids[:32],
             "dropped_source_count": len(dropped_ids),
+            "context_mode": "conversation" if conversation is not None else "window",
+            "conversation_id": conversation.id if conversation is not None else "",
+            "conversation_header": render_header(conversation) if conversation else "",
+            "conversation": (
+                {**conversation.stats(), "earlier_messages": len(earlier)}
+                if conversation is not None
+                else None
+            ),
+            # Shown messages from before the conversation start (only when the floor
+            # added earlier context); the Judge view draws one separator after them.
+            "earlier_message_ids": earlier_ids,
             "direct_addressed": bool(_snapshot_value(inputs.snapshot, "direct_addressed", False)),
             "allows_continuation": "continue" in inputs.allowed_intents,
         }
@@ -295,6 +366,71 @@ class ParticipationContextBuilder:
             (time.monotonic() - selection_started) * 1000
         )
         return context
+
+    # -- conversation view ---------------------------------------------------------------
+
+    def _conversation(
+        self,
+        archive: Any,
+        opportunity: ParticipationOpportunity,
+        range_rows: list[Mapping[str, Any]],
+        required: list[dict[str, object]],
+        limits: ParticipationContextBounds,
+        *,
+        now_ms: int,
+    ) -> Conversation:
+        """The conversation holding the newest required source, from the window's rows.
+
+        Every same-chat row read for the window is segmented (also rows the judge will
+        not see, such as Arvid's own messages), so boundaries follow the real chat.
+        """
+        rows: dict[str, dict[str, Any]] = {}
+        for row in [*range_rows, *required]:
+            if str(row.get("channel") or "") != str(opportunity.channel):
+                continue
+            if str(row.get("chat_id") or "") != str(opportunity.chat_id):
+                continue
+            shaped = _history_shape(row)
+            if shaped["message_id"]:
+                rows.setdefault(str(shaped["message_id"]), shaped)
+        queries = getattr(getattr(archive, "adapter", None), "queries", None)
+        reactions = (
+            queries.reactions(message_ids=tuple(rows)[-500:], until_ms=now_ms)
+            if queries is not None and rows
+            else []
+        )
+        conversations = segment(
+            list(rows.values()),
+            reactions,
+            lull_ms=int(limits.lull_minutes) * 60_000,
+            burst_n=int(limits.burst_messages),
+            burst_ms=int(limits.burst_minutes) * 60_000,
+            now_ms=now_ms,
+            registry_ids=registry_ids(rows.values(), self._thread_lookup),
+        )
+        if not conversations:
+            raise ValueError("no conversation in the window")
+        if not required:
+            return conversations[-1]
+        newest = _history_id(max(required, key=_row_sort_key))
+        for conversation in conversations:
+            if newest in conversation.message_ids:
+                return conversation
+        raise ValueError("newest required source is in no conversation")
+
+    def _log_fallback(
+        self, opportunity: ParticipationOpportunity, exc: Exception, *, now_ms: int
+    ) -> None:
+        key = (str(opportunity.channel), str(opportunity.chat_id))
+        last = self._fallback_logged_ms.get(key)
+        if last is not None and now_ms - last < _FALLBACK_LOG_INTERVAL_MS:
+            return
+        self._fallback_logged_ms[key] = now_ms
+        logger.warning(
+            "participation_conversation_fallback chat={} error_type={}",
+            str(opportunity.chat_id)[:24],
+            type(exc).__name__,
+        )
 
     # -- source trust ------------------------------------------------------------------
 
@@ -419,6 +555,62 @@ def _row_timestamp_ms(row: Mapping[str, Any]) -> int | None:
 
 def _row_sort_key(row: Mapping[str, Any]) -> tuple[int, str]:
     return (_row_timestamp_ms(row) or 0, _row_id(row))
+
+
+def _history_id(row: Mapping[str, Any]) -> str:
+    """The history message id of an archive row (``event_id``), else its own id."""
+    return str(row.get("event_id") or _row_id(row))
+
+
+def _history_shape(row: Mapping[str, Any]) -> dict[str, Any]:
+    """An archive row in the ``messages_current`` shape that segmentation reads."""
+    sent_ms = row.get("sent_ms")
+    return {
+        **row,
+        "message_id": _history_id(row),
+        "native_message_id": str(row.get("native_message_id") or _row_id(row)),
+        "sent_ms": sent_ms if isinstance(sent_ms, int) else _row_timestamp_ms(row),
+        "reply_to_native_id": row.get("reply_to_native_id") or row.get("reply_to_message_id"),
+    }
+
+
+def _cap_conversation(
+    rows: list[dict[str, object]], free: int, *, first_kept: bool
+) -> list[dict[str, object]]:
+    """Fit optional conversation rows: its first message (the topic) plus the newest."""
+    if len(rows) <= free:
+        return list(rows)
+    if free <= 0:
+        return []
+    if first_kept:
+        return rows[-free:]
+    return [rows[0], *(rows[-(free - 1):] if free > 1 else [])]
+
+
+def _earlier_context(
+    optional: list[dict[str, object]],
+    members: set[str],
+    *,
+    start_ms: int,
+    visible: int,
+    floor: int,
+    free: int,
+) -> list[dict[str, object]]:
+    """The newest optional rows before the conversation, up to the floor and the cap.
+
+    ``optional`` is in time order and already a subset of the window's rows, so the
+    result is too; required sources are never part of it.
+    """
+    wanted = min(floor - visible, free)
+    if wanted <= 0:
+        return []
+    before = [
+        row for row in optional
+        if _history_id(row) not in members
+        and isinstance(sent := _history_shape(row)["sent_ms"], int)
+        and sent < start_ms
+    ]
+    return before[-wanted:]
 
 
 def _freeze_budget_pairs(value: Any) -> tuple[tuple[str, int], ...]:

@@ -883,8 +883,17 @@ def test_restart_activation_transition_new_offers_use_new_epoch(
                     "judgeRoute": "participation.judge",
                     "contextWindowMinutes": 5,
                     "contextMaxMessages": 5,
+                    "contextMode": "conversation",
+                    "conversationMinMessages": 6,
                 },
-            }
+            },
+            # Non-default lull/burst values: the context builder must receive these,
+            # never a silent default (Spec A section 8, composition).
+            "consciousness": {
+                "lullSilenceMinutes": 33,
+                "burstThresholdMessages": 5,
+                "burstWindowMinutes": 11,
+            },
         }
     )
     engine = PolicyEngine(
@@ -969,6 +978,21 @@ def test_restart_activation_transition_new_offers_use_new_epoch(
         )
         assert snapshot["context_window_minutes"] == 5
         assert snapshot["context_max_messages"] == 5
+        assert snapshot["context_mode"] == "conversation"
+        assert snapshot["conversation_lull_minutes"] == 33
+        assert snapshot["conversation_burst_messages"] == 5
+        assert snapshot["conversation_burst_minutes"] == 11
+        bounds = asyncio.run(
+            decision_runtime._decision_inputs(pending, snapshot)  # noqa: SLF001
+        ).bounds
+        assert (bounds.context_mode, bounds.lull_minutes, bounds.burst_messages,
+                bounds.burst_minutes) == ("conversation", 33, 5, 11)
+        assert snapshot["conversation_min_messages"] == 6
+        assert bounds.conversation_min_messages == 6
+        assert (
+            decision_runtime._context_builder._thread_lookup  # noqa: SLF001
+            == processing_store.thread_for_message
+        )
         assert snapshot["context_revision"] == 1
         assert snapshot["current_source_ids"] == ("m-live",)
         assert snapshot["max_reevaluations"] == 1

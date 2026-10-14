@@ -114,9 +114,10 @@ class HistoryQueries:
         )
 
     def recent(self, *, chat_id: str, limit: int, before_id: str | None = None,
-               after_ms: int | None = None) -> list[Row]:
+               after_ms: int | None = None, until_ms: int | None = None) -> list[Row]:
         _limit(limit)
         _time(after_ms)
+        _time(until_ms)
         conditions, parameters = "", (chat_id,)
         if before_id is not None:
             anchor = self.message(before_id)
@@ -132,6 +133,10 @@ class HistoryQueries:
         if after_ms is not None:
             conditions += " AND sent_ms>?"
             parameters += (after_ms,)
+        if until_ms is not None:
+            # An as-of read: later rows must not take the newest-first limit.
+            conditions += " AND sent_ms<=?"
+            parameters += (until_ms,)
         rows = self._rows(
             f"SELECT * FROM messages_current WHERE {_VISIBLE} AND chat_id=?{conditions}"
             " ORDER BY sent_ms DESC, message_id DESC LIMIT ?", parameters + (limit,),
@@ -492,6 +497,28 @@ class HistoryQueries:
         return self._rows(
             f"SELECT * FROM messages_current WHERE {_VISIBLE} AND chat_id=? AND media_json IS NOT NULL"
             f"{predicate} ORDER BY {_ORDER} LIMIT ?", parameters,
+        )
+
+    def reactions(self, *, message_ids: tuple[str, ...], until_ms: int, limit: int = 500) -> list[Row]:
+        """Reaction events (set and removed) on these messages, recorded at or before ``until_ms``.
+
+        Events without a recorded time are left out: an as-of read cannot place them.
+        """
+        _limit(limit)
+        _time(until_ms)
+        if not message_ids:
+            return []
+        if len(message_ids) > 500:
+            raise ValueError("at most 500 message ids")
+        return self._rows(
+            "SELECT event_id, target_message_id, actor_contact_id, actor_identifier, occurred_ms,"
+            " json_extract(payload_json, '$.emoji') AS emoji,"
+            " COALESCE(json_extract(payload_json, '$.removed'), 0) AS removed"
+            " FROM message_events WHERE channel='whatsapp' AND kind='reaction'"
+            f" AND target_message_id IN ({','.join('?' for _ in message_ids)})"
+            " AND occurred_ms IS NOT NULL AND occurred_ms<=?"
+            " ORDER BY occurred_ms, event_id LIMIT ?",
+            (*message_ids, until_ms, limit),
         )
 
     def terminal(self, contact_id: str) -> str | None:

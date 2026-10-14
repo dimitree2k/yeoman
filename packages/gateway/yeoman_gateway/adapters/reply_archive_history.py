@@ -71,8 +71,8 @@ class HistoryReplyArchiveAdapter(ReplyArchivePort):
         after = int(since.timestamp() * 1000)
         before = int((until or datetime.now(UTC)).timestamp() * 1000)
         if latest:
-            rows = self.queries.recent(chat_id=chat_id, after_ms=after - 1, limit=min(500, limit))
-            rows = [row for row in rows if row['sent_ms'] <= before]
+            rows = self.queries.recent(chat_id=chat_id, after_ms=after - 1, until_ms=before,
+                                       limit=min(500, limit))
         else:
             rows = self.queries.window(chat_id=chat_id, after_ms=after - 1, before_ms=before + 1, limit=min(500, limit))
         return [archive_row(self.queries, row) for row in rows]

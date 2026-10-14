@@ -796,6 +796,14 @@ class ProcessingParticipationConfig(BaseModel):
     #: Candidate search horizon. It bounds work and retention; it is not permission.
     context_window_minutes: int = Field(default=120, alias="contextWindowMinutes", ge=1, le=1440)
     context_max_messages: int = Field(default=40, alias="contextMaxMessages", ge=5, le=100)
+    #: ``window``: every retained message of the window. ``conversation``: only the
+    #: current conversation inside that window (lull/burst from ``consciousness``).
+    context_mode: Literal["window", "conversation"] = Field(default="window", alias="contextMode")
+    #: Conversation view floor: a conversation with fewer visible messages also shows
+    #: the newest earlier window messages, marked as earlier context. ``0`` disables it.
+    conversation_min_messages: int = Field(
+        default=8, alias="conversationMinMessages", ge=0, le=100
+    )
     max_pending_chats: int = Field(default=64, alias="maxPendingChats", ge=1, le=1024)
     max_pending_source_refs: int = Field(
         default=64, alias="maxPendingSourceRefs", ge=1, le=256

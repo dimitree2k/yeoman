@@ -172,6 +172,8 @@ class ParticipationSnapshot:
     activation_epoch: int
     sources: dict[str, str]
     invalid_reason: str = ""
+    context_mode: str = "window"
+    conversation_min_messages: int = 8
 
     @property
     def opted_in(self) -> bool:
@@ -687,6 +689,10 @@ class PolicyEngine:
             activation_epoch=int(activation_epoch),
             sources=sources,
             invalid_reason=invalid_reason,
+            context_mode=str(getattr(participation_config, "context_mode", "window")),
+            conversation_min_messages=int(
+                getattr(participation_config, "conversation_min_messages", 8)
+            ),
         )
 
     @staticmethod
