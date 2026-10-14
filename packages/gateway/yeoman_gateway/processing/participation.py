@@ -316,6 +316,9 @@ class ParticipationJudge:
         from yeoman_gateway.processing.participation_context import (
             render_knowledge_block,
         )
+        from yeoman_gateway.processing.participation_group_notes import (
+            render_group_notes_block,
+        )
 
         messages = context.get("messages")
         anchors = context.get("anchors")
@@ -348,7 +351,16 @@ class ParticipationJudge:
         max_target = max(target_sizes, default=0)
         knowledge = str(context.get("selected_knowledge_text") or "").strip()
         knowledge_block = render_knowledge_block(knowledge)
-        fixed_length = max_target + len(knowledge_block)
+        notes_block = render_group_notes_block(
+            context.get("group_notes_week"), context.get("group_notes_text")
+        )
+        # Budget order: required sources > Knowledge > group notes > optional entries.
+        # Group notes are dropped whole, and before Knowledge, when the budget is short.
+        fixed_length = max_target + len(knowledge_block) + len(notes_block)
+        if fixed_length + 2 > 4000 and notes_block:
+            _drop_group_notes(context)
+            notes_block = ""
+            fixed_length = max_target + len(knowledge_block)
         if fixed_length + 2 > 4000 and knowledge:
             context.pop("selected_knowledge_text", None)
             selection = context.get("_knowledge_selection")
@@ -384,6 +396,9 @@ class ParticipationJudge:
             if anchors:
                 anchors.pop(0)
                 continue
+            if str(context.get("group_notes_text") or "").strip():
+                _drop_group_notes(context)
+                continue
             if knowledge:
                 context.pop("selected_knowledge_text", None)
                 selection = context.get("_knowledge_selection")
@@ -400,6 +415,9 @@ class ParticipationJudge:
         context["judge_dropped_entry_ids"] = dropped[:32]
         context["judge_dropped_entry_count"] = len(dropped)
         context["knowledge_rendered_to_judge"] = bool(context.get("selected_knowledge_text"))
+        context["group_notes_rendered_to_judge"] = bool(
+            str(context.get("group_notes_text") or "").strip()
+        )
 
     async def _decide(
         self,
@@ -694,6 +712,8 @@ class _JudgeContext:
     allows_continuation: bool
     selected_knowledge_text: str
     rendered: str
+    group_notes_text: str = ""
+    group_notes_week: str = ""
 
     @classmethod
     def from_mapping(cls, context: Mapping[str, Any]) -> "_JudgeContext":
@@ -821,17 +841,31 @@ class _JudgeContext:
             allows_continuation=bool(context.get("allows_continuation", False)),
             selected_knowledge_text=str(context.get("selected_knowledge_text") or ""),
             rendered="\n".join(lines) if lines else "(no retained context)",
+            group_notes_text=str(context.get("group_notes_text") or ""),
+            group_notes_week=str(context.get("group_notes_week") or ""),
         )
 
     def render(self) -> str:
         from yeoman_gateway.processing.participation_context import (
             render_knowledge_block,
         )
+        from yeoman_gateway.processing.participation_group_notes import (
+            render_group_notes_block,
+        )
 
         blocks = [self.rendered]
         if self.selected_knowledge_text:
             blocks.append(render_knowledge_block(self.selected_knowledge_text))
+        notes = render_group_notes_block(self.group_notes_week, self.group_notes_text)
+        if notes:
+            blocks.append(notes)
         return "\n\n".join(blocks)
+
+
+def _drop_group_notes(context: dict[str, Any]) -> None:
+    """Remove the group-notes block whole; its identity stays for the record."""
+    context.pop("group_notes_text", None)
+    context["group_notes_status"] = "budget_dropped"
 
 
 def _message_sort_key(message: Mapping[str, Any]) -> tuple[float, str]:
