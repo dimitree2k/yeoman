@@ -778,6 +778,65 @@ class HistoryQueries:
             return EvidenceAudience.author_only()
         return EvidenceAudience.known(set(endpoints))
 
+    def participant_terms(self, *, chat_id: str) -> tuple[tuple[str, ...], tuple[str, ...]]:
+        """Names and phone numbers of everyone history saw in one chat, Arvid excluded.
+
+        Senders, reaction actors and roster entries, resolved through every identifier
+        history ever recorded for them. A deny list for generated text, never a roster.
+        """
+        rows = self._rows(
+            "SELECT sender_contact_id AS contact_id, sender_identifier AS identifier"
+            " FROM messages WHERE channel='whatsapp' AND chat_id=? AND direction='in'"
+            " UNION SELECT actor_contact_id, actor_identifier FROM message_events"
+            " WHERE channel='whatsapp' AND chat_id=?", (chat_id, chat_id),
+        )
+        identifiers = {str(row["identifier"]) for row in rows if row["identifier"]}
+        for event in self._rows(
+            "SELECT payload_json FROM message_events WHERE channel='whatsapp' AND chat_id=?"
+            " AND kind IN ('member_snapshot','member_add','member_remove')", (chat_id,),
+        ):
+            try:
+                participants = json.loads(event["payload_json"]).get("participants")
+            except (TypeError, ValueError, AttributeError):
+                continue
+            for entry in participants if isinstance(participants, list) else ():
+                values = entry if isinstance(entry, list) else [entry]
+                identifiers.update(str(value) for value in values if isinstance(value, str))
+        contacts = {str(row["contact_id"]) for row in rows if row["contact_id"]}
+        if identifiers:
+            contacts.update(str(row["contact_id"]) for row in self._rows(
+                "SELECT DISTINCT contact_id FROM identifier_history WHERE channel='whatsapp'"
+                " AND value IN (SELECT value FROM json_each(?))",
+                (json.dumps(sorted(identifiers)),),
+            ))
+        terminals = {terminal for item in contacts if (terminal := self.terminal(item))}
+        people = self._rows(
+            "WITH RECURSIVE aliases(contact_id) AS (SELECT value FROM json_each(?) UNION"
+            " SELECT c.contact_id FROM contacts c JOIN aliases a ON c.merged_into=a.contact_id)"
+            " SELECT c.contact_id, c.role, c.display_name FROM contacts c"
+            " JOIN aliases a ON a.contact_id=c.contact_id",
+            (json.dumps(sorted(terminals)),),
+        )
+        assistants = {str(row["contact_id"]) for row in people if row["role"] == "assistant"}
+        kept = [row for row in people if str(row["contact_id"]) not in assistants]
+        names = {str(row["display_name"]).strip() for row in kept if row["display_name"]}
+        known = self._rows(
+            "SELECT kind, value FROM identifier_history WHERE channel='whatsapp'"
+            " AND contact_id IN (SELECT value FROM json_each(?))",
+            (json.dumps(sorted(str(row["contact_id"]) for row in kept)),),
+        )
+        names.update(str(row["value"]).strip() for row in known if row["kind"] == "push_name")
+        phones = {
+            str(row["value"]).split("@", 1)[0] for row in known if row["kind"] in ("pn_jid", "numeric")
+        }
+        phones.update(
+            value.split("@", 1)[0] for value in identifiers if value.endswith("@s.whatsapp.net")
+        )
+        return (
+            tuple(sorted((name for name in names if name), key=str.casefold)),
+            tuple(sorted(phone for phone in phones if phone.isdigit())),
+        )
+
     def mention(self, value: str, *, chat_id: str, at_ms: int) -> str | None:
         _time(at_ms)
         owner = self.resolve_identifier(value, at_ms=at_ms, time_basis="native")

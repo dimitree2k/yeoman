@@ -1392,3 +1392,211 @@ def embeddings_status(
     except sqlite3.Error:
         _fail("source_error", "embedding status unavailable")
     console.print_json(json.dumps(report))
+
+
+digest_app = typer.Typer(help="Weekly group reaction digests: signals, one model call, review")
+knowledge_app.add_typer(digest_app, name="digest")
+
+
+def _digest_week(week: str | None):
+    import time
+
+    from yeoman_gateway.history.group_signals import iso_week, previous_week
+
+    if week is None:
+        return previous_week(int(time.time() * 1000))
+    try:
+        return iso_week(week)
+    except ValueError as exc:
+        _fail("source_error", f"--week: {exc}")
+
+
+def _digest_history():
+    from yeoman_gateway.evaluation.participation_context_ab import FrozenHistory
+    from yeoman_gateway.history.live import history_db_path
+
+    path = history_db_path()
+    if not path.is_file():
+        _fail("source_error", "history.db not found")
+    return FrozenHistory(path)
+
+
+def _digest_chat(value: str, history: Any) -> str:
+    """A chat id (``whatsapp:`` prefix allowed) or the one group with that exact subject."""
+    import asyncio
+
+    from yeoman_gateway.evaluation.participation_context_ab import (
+        chat_subjects,
+        looks_like_chat_id,
+        resolve_chat,
+    )
+
+    text = str(value).strip().removeprefix("whatsapp:")
+    try:
+        subjects = {} if looks_like_chat_id(text) else asyncio.run(chat_subjects(history))
+        return resolve_chat(text, subjects)
+    except ValueError as exc:
+        _fail("source_error", f"--chat: {exc}")
+
+
+def _digest_runner(config: Any, history: Any, week: Any, *, knowledge: Any = None):
+    from yeoman_gateway.app.bootstrap import _processing_store_path
+    from yeoman_gateway.evaluation.participation_context_ab import registry_lookup
+    from yeoman_gateway.processing.group_digest import (
+        DIGEST_ROUTE,
+        DigestBounds,
+        GroupDigestRunner,
+    )
+    from yeoman_gateway.processing.model_route import RouteClient
+
+    lookup = registry_lookup(_processing_store_path(config))
+    return GroupDigestRunner(
+        knowledge=knowledge,
+        history=history,
+        bounds=DigestBounds.from_config(config),
+        client_factory=lambda: RouteClient(config=config, route_key=DIGEST_ROUTE),
+        # Registry threads as of the end of the week, like the replay tooling.
+        thread_lookup=(lambda native: lookup(native, week.end_ms - 1)) if lookup else None,
+    )
+
+
+@digest_app.command("run")
+def digest_run(
+    chat: str = typer.Option(..., "--chat", help="Group chat id (or its exact subject)"),
+    week: str | None = typer.Option(
+        None, "--week", help="ISO week YYYY-Www; default: the last complete week"
+    ),
+    dry_run: bool = typer.Option(
+        False, "--dry-run", help="Signals and aggregates only: no model call, no write"
+    ),
+) -> None:
+    """Compute one group's weekly signals; without --dry-run, make the one model call.
+
+    The dry run prints aggregates only (counts and descriptors, never message text). A
+    real run stores the validated note, which supersedes the group's previous one.
+    """
+    import asyncio
+
+    from yeoman_shared.config.loader import load_config
+
+    from yeoman_gateway.history.live import HistoryPaused
+    from yeoman_gateway.processing.group_digest import DIGEST_ROUTE
+    from yeoman_gateway.processing.model_route import RouteUnavailableError
+
+    target = _digest_week(week)
+    history = _digest_history()
+    try:
+        chat_id = _digest_chat(chat, history)
+        if dry_run:
+            config = load_config()
+            runner = _digest_runner(config, history, target)
+            try:
+                signals, _names, _phones = asyncio.run(runner.read(chat_id, target))
+            except HistoryPaused:
+                _fail("source_error", "history is paused; try again shortly")
+            console.print_json(json.dumps(signals.aggregates(), ensure_ascii=False))
+            _line(
+                f"week {target.label}: minimum signal "
+                f"{'met' if signals.meets_minimum else 'not met'} "
+                f"({signals.reactions}/{signals.min_reactions} reactions, "
+                f"{signals.conversations}/{signals.min_conversations} conversations); "
+                "model calls: 0"
+            )
+            return
+        config, knowledge, processing = _open_capture_runtime()
+        try:
+            runner = _digest_runner(config, history, target, knowledge=knowledge)
+            try:
+                client = runner.client()
+            except RouteUnavailableError as exc:
+                _fail(
+                    "source_error",
+                    f"{exc}; add models.routes['{DIGEST_ROUTE}'] (for example the profile"
+                    " used by participation.judge)",
+                )
+            outcome = asyncio.run(runner.run(chat_id, target, client=client))
+        finally:
+            knowledge.close()
+            processing.close()
+    finally:
+        history.close()
+    _line(
+        f"week {target.label}: {outcome.state}"
+        + (f" ({outcome.reason})" if outcome.reason else "")
+        + f"; model calls: {outcome.model_calls}"
+    )
+    if outcome.digest is not None:
+        _line(f"digest {outcome.digest.digest_id} version {outcome.digest.version}")
+        _line(outcome.digest.rendered)
+    if outcome.state == "failed":
+        raise typer.Exit(code=_FAILURE_EXIT)
+
+
+@digest_app.command("show")
+def digest_show(
+    chat: str | None = typer.Option(None, "--chat", help="Only this group (id or subject)"),
+    every: bool = typer.Option(
+        False, "--all", help="Every version, including superseded and stale ones"
+    ),
+) -> None:
+    """The stored weekly notes (owner review) and the state of the weekly jobs."""
+    import asyncio
+    from datetime import datetime
+
+    from yeoman_gateway.history.context import history_turn
+    from yeoman_gateway.history.live import HistoryPaused
+    from yeoman_gateway.history.queries import HistoryQueries
+
+    history = _digest_history()
+    try:
+        chat_id = _digest_chat(chat, history) if chat else None
+        _config, knowledge, processing = _open_capture_runtime()
+        try:
+
+            async def _read() -> tuple[Any, ...]:
+                # A deleted source message marks the digest stale before it renders.
+                async with history_turn(history) as snapshot:
+                    queries = HistoryQueries(snapshot)
+                    return knowledge.group_digests(
+                        chat_id=chat_id,
+                        source_present=lambda message_id: queries.message(message_id) is not None,
+                    )
+
+            try:
+                digests = asyncio.run(_read())
+            except HistoryPaused:
+                _line("history is paused: deleted source messages are not checked", style="yellow")
+                digests = knowledge.group_digests(chat_id=chat_id)
+            jobs = knowledge.group_digest_jobs(chat_id=chat_id, limit=20)
+        finally:
+            knowledge.close()
+            processing.close()
+    finally:
+        history.close()
+    seen: set[str] = set()
+    shown = 0
+    for digest in digests:
+        if not every and digest.chat_id in seen:
+            continue
+        seen.add(digest.chat_id)
+        shown += 1
+        created = datetime.fromtimestamp(digest.created_ms / 1000).astimezone()
+        _line(
+            f"[Group notes, week {digest.week}] chat {digest.chat_id} · v{digest.version} · "
+            f"{digest.status} · confidence {digest.confidence} · {created:%Y-%m-%d %H:%M}",
+            style="bold",
+        )
+        if digest.stale:
+            _line("  (stale: a source message was deleted or revoked; not rendered)")
+        else:
+            for line in digest.rendered.splitlines():
+                _line(f"  {line}")
+    if not shown:
+        _line("no group digests stored")
+    if jobs:
+        table = Table(title="weekly digest jobs", show_edge=False)
+        for column in ("week", "chat", "state", "reason", "attempts"):
+            table.add_column(column)
+        for job in jobs:
+            table.add_row(job.week, job.chat_id, job.state, job.reason, str(job.attempts))
+        console.print(table)

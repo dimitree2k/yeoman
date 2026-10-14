@@ -26,7 +26,7 @@ import hashlib
 import sqlite3
 from dataclasses import dataclass, replace
 from pathlib import Path
-from typing import Any, Iterable
+from typing import Any, Callable, Iterable, Mapping
 
 from yeoman_gateway.knowledge._conversations import ConversationEngine
 from yeoman_gateway.knowledge._episodes import EpisodeConsolidator
@@ -69,6 +69,8 @@ from yeoman_gateway.knowledge.models import (
     EndpointResolution,
     EpisodeBuildReport,
     EpisodeView,
+    GroupDigestJob,
+    GroupDigestView,
     Identifier,
     IdentityCandidate,
     IdentityCandidateWeights,
@@ -446,6 +448,7 @@ class KnowledgeService:
             retrieval=self._retrieval,
             workspace_id=self.workspace_id,
         )
+        self._group_digest_store: Any | None = None
 
     @contextmanager
     def history_scope(self, queries: HistoryQueries, sources: HistoryKnowledgeSources) -> Iterator[None]:
@@ -1183,6 +1186,116 @@ class KnowledgeService:
     def episode(self, episode_id: str, *, context: TrustedReadContext) -> EpisodeView:
         """One episode, including a superseded version kept for audit."""
         return self._episodes.get(episode_id, context=self._read_context(context))
+
+    # ── weekly group digests ─────────────────────────────────────────────────
+    #
+    # A style note about one group for one ISO week, derived from reactions and
+    # engagement.  Never about a person and never independent evidence.  Callers are the
+    # weekly job and the owner's CLI; nothing renders it into live decisions yet.
+
+    @property
+    def _group_digests(self) -> Any:
+        if self._group_digest_store is None:
+            from yeoman_gateway.knowledge._group_digests import GroupDigestStore
+
+            # Additive tables, created on first use by the store owner.
+            self._group_digest_store = GroupDigestStore(
+                self._store, workspace_id=self.workspace_id
+            )
+        return self._group_digest_store
+
+    def enqueue_group_digest(
+        self, *, chat_id: str, week: str, channel: str = "whatsapp",
+        now_ms: int | None = None, due_ms: int | None = None,
+    ) -> GroupDigestJob:
+        """Queue one chat's digest job for one ISO week; an existing job is kept as is."""
+        moment = self._now() if now_ms is None else int(now_ms)
+        return self._group_digests.enqueue(
+            channel=channel, chat_id=chat_id, week=week, now_ms=moment, due_ms=due_ms
+        )
+
+    def due_group_digest_jobs(
+        self, *, max_attempts: int, now_ms: int | None = None, limit: int = 8
+    ) -> tuple[GroupDigestJob, ...]:
+        moment = self._now() if now_ms is None else int(now_ms)
+        return self._group_digests.due(now_ms=moment, max_attempts=max_attempts, limit=limit)
+
+    def claim_group_digest_job(
+        self, job_id: str, *, max_attempts: int, now_ms: int | None = None
+    ) -> GroupDigestJob | None:
+        moment = self._now() if now_ms is None else int(now_ms)
+        return self._group_digests.claim(job_id, now_ms=moment, max_attempts=max_attempts)
+
+    def finish_group_digest_job(
+        self, job_id: str, *, state: str, reason: str = "", now_ms: int | None = None,
+        due_ms: int | None = None, refund_attempt: bool = False,
+    ) -> GroupDigestJob | None:
+        moment = self._now() if now_ms is None else int(now_ms)
+        return self._group_digests.finish(
+            job_id, state=state, reason=reason, now_ms=moment, due_ms=due_ms,
+            refund_attempt=refund_attempt,
+        )
+
+    def recover_group_digest_jobs(
+        self, *, updated_before_ms: int, now_ms: int | None = None
+    ) -> tuple[str, ...]:
+        moment = self._now() if now_ms is None else int(now_ms)
+        return self._group_digests.recover_stale(
+            updated_before_ms=updated_before_ms, now_ms=moment
+        )
+
+    def group_digest_job(self, job_id: str) -> GroupDigestJob | None:
+        return self._group_digests.job(job_id)
+
+    def group_digest_jobs(
+        self, *, chat_id: str | None = None, channel: str = "whatsapp", limit: int = 50
+    ) -> tuple[GroupDigestJob, ...]:
+        return self._group_digests.jobs(channel=channel, chat_id=chat_id, limit=limit)
+
+    def store_group_digest(
+        self,
+        *,
+        chat_id: str,
+        week: str,
+        content: Mapping[str, object],
+        rendered: str,
+        model_version: str,
+        prompt_version: str,
+        confidence: str,
+        signals: Mapping[str, object],
+        window_start_ms: int,
+        window_end_ms: int,
+        sources: Iterable[tuple[str, str]],
+        channel: str = "whatsapp",
+        now_ms: int | None = None,
+    ) -> GroupDigestView:
+        """Store a validated digest; it supersedes the chat's previous one."""
+        return self._group_digests.store(
+            channel=channel, chat_id=chat_id, week=week, content=content, rendered=rendered,
+            model_version=model_version, prompt_version=prompt_version,
+            confidence=confidence, signals=signals, window_start_ms=window_start_ms,
+            window_end_ms=window_end_ms, sources=sources,
+            now_ms=self._now() if now_ms is None else int(now_ms),
+        )
+
+    def has_group_digest(self, *, chat_id: str, week: str, channel: str = "whatsapp") -> bool:
+        return self._group_digests.has_digest(channel=channel, chat_id=chat_id, week=week)
+
+    def group_digests(
+        self,
+        *,
+        chat_id: str | None = None,
+        source_present: Callable[[str], bool] | None = None,
+        limit: int = 50,
+    ) -> tuple[GroupDigestView, ...]:
+        """Digests newest first, for the owner.  Stale ones are marked before rendering.
+
+        ``source_present`` answers whether a source message still exists in history;
+        without it only Knowledge source revocation is checked.
+        """
+        return self._group_digests.digests(
+            chat_id=chat_id, source_present=source_present, limit=limit
+        )
 
     # ── administration and diagnostics ───────────────────────────────────────
 

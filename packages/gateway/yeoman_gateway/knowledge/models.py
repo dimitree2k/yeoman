@@ -38,6 +38,10 @@ __all__ = [
     "EPISODE_STATUSES",
     "ERROR_CODES",
     "GLOBAL_SCOPE_KEY",
+    "GROUP_DIGEST_CONFIDENCES",
+    "GROUP_DIGEST_JOB_KIND",
+    "GROUP_DIGEST_SOURCE_ROLES",
+    "GROUP_DIGEST_STATUSES",
     "IDENTITY_CANDIDATE_SIGNALS",
     "IDENTITY_CANDIDATE_STATUSES",
     "LEGACY_NODE_PREFIX",
@@ -58,6 +62,8 @@ __all__ = [
     "CaptureJobReceipt",
     "CaptureJobRecord",
     "CaptureResult",
+    "GroupDigestJob",
+    "GroupDigestView",
     "ChangeReceipt",
     "ConversationMembership",
     "ConversationMembershipReceipt",
@@ -164,6 +170,14 @@ DAY_MS: Final[int] = 86_400_000
 EPISODE_CLOSURE_MS: Final[int] = 60 * DAY_MS
 
 EPISODE_STATUSES: Final[tuple[str, ...]] = ("active", "superseded", "stale")
+
+#: Weekly group reaction digests (group-reaction-digest spec): a style note about one
+#: group, never about a person, rebuilt weekly and superseded like an episode.
+GROUP_DIGEST_STATUSES: Final[tuple[str, ...]] = ("active", "superseded", "stale")
+GROUP_DIGEST_SOURCE_ROLES: Final[tuple[str, ...]] = ("approval", "engagement", "arvid")
+GROUP_DIGEST_CONFIDENCES: Final[tuple[str, ...]] = ("low", "medium", "high")
+#: Job kind recorded in the existing ``knowledge_jobs`` table.
+GROUP_DIGEST_JOB_KIND: Final[str] = "group_digest"
 
 ERROR_CODES: Final[tuple[str, ...]] = (
     "history_identity_read_only",
@@ -1068,6 +1082,62 @@ class EpisodeBuildReport:
     stale: int = 0
     skipped: int = 0
     episode_ids: tuple[str, ...] = ()
+
+
+@dataclass(frozen=True, slots=True)
+class GroupDigestView:
+    """One stored weekly group note.  Style guidance from reactions, never fact.
+
+    ``rendered`` is empty when the digest is stale (a source message was deleted or
+    revoked); ``reason`` then says ``stale_source``.  Superseded versions stay readable
+    for audit and say so.
+    """
+
+    digest_id: str
+    chat_id: str = ""
+    scope_key: str = ""
+    week: str = ""
+    version: int = 1
+    status: str = "active"
+    rendered: str = ""
+    content: dict[str, object] = field(default_factory=dict)
+    signals: dict[str, object] = field(default_factory=dict)
+    confidence: str = "low"
+    model_version: str = ""
+    prompt_version: str = ""
+    window_start_ms: int = 0
+    window_end_ms: int = 0
+    supersedes: str | None = None
+    created_ms: int = 0
+    stale_ms: int | None = None
+    #: ``(message_id, role)`` of every message shown to the model.
+    sources: tuple[tuple[str, str], ...] = ()
+    reason: str = "ok"
+
+    @property
+    def derived(self) -> bool:
+        return True
+
+    @property
+    def stale(self) -> bool:
+        return self.status == "stale"
+
+
+@dataclass(frozen=True, slots=True)
+class GroupDigestJob:
+    """One ``group_digest`` row of ``knowledge_jobs``: one chat, one ISO week."""
+
+    job_id: str
+    channel: str
+    chat_id: str
+    week: str
+    state: str
+    reason: str = ""
+    attempts: int = 0
+    due_ms: int = 0
+    created_ms: int = 0
+    updated_ms: int = 0
+    created: bool = False
 
 
 # ── conversation threads ─────────────────────────────────────────────────────

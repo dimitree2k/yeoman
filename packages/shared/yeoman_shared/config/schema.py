@@ -804,6 +804,10 @@ class ProcessingParticipationConfig(BaseModel):
     conversation_min_messages: int = Field(
         default=8, alias="conversationMinMessages", ge=0, le=100
     )
+    #: Weekly group reaction notes for the Judge and Writer. ``off``: never rendered;
+    #: ``shadow``: evaluated beside live decisions only; ``on``: rendered. The weekly
+    #: digest job runs (route ``participation.digest``) whatever this says.
+    group_notes: Literal["off", "shadow", "on"] = Field(default="off", alias="groupNotes")
     max_pending_chats: int = Field(default=64, alias="maxPendingChats", ge=1, le=1024)
     max_pending_source_refs: int = Field(
         default=64, alias="maxPendingSourceRefs", ge=1, le=256

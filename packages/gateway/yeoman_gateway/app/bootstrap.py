@@ -7,7 +7,7 @@ import inspect
 import os
 import random
 import time
-from collections.abc import Awaitable, Callable, Mapping
+from collections.abc import Awaitable, Callable, Iterable, Mapping
 from dataclasses import dataclass, replace
 from datetime import UTC, datetime
 from pathlib import Path
@@ -1702,6 +1702,61 @@ def _build_participation_receipt_projection(
     if callable(feedback):
         feedback(_archive_feedback_reader(inbound_archive, reconciler))
     return reconciler, _project
+
+
+def build_group_digest_job(
+    config: "Config",
+    *,
+    knowledge: object,
+    history: object,
+    thread_lookup: Callable[[str], object] | None,
+    chats: Callable[[], Iterable[str]],
+):
+    """The weekly group reaction digest job ticked by participation maintenance.
+
+    Always built when maintenance runs: a missing ``participation.digest`` route is a
+    daily log line and an empty queue, never a silent ``None``.
+    """
+    from yeoman_gateway.processing.group_digest import (
+        DIGEST_ROUTE,
+        DigestBounds,
+        GroupDigestJob,
+        GroupDigestRunner,
+    )
+    from yeoman_gateway.processing.model_route import RouteClient
+
+    clients: dict[str, object] = {}
+
+    def _client() -> object:
+        if "client" not in clients:
+            clients["client"] = RouteClient(config=config, route_key=DIGEST_ROUTE)
+        return clients["client"]
+
+    runner = GroupDigestRunner(
+        knowledge=knowledge,
+        history=history,
+        bounds=lambda: DigestBounds.from_config(config),
+        client_factory=_client,
+        thread_lookup=thread_lookup,
+    )
+    return GroupDigestJob(runner=runner, knowledge=knowledge, chats=chats)
+
+
+def participation_group_chats(
+    config: "Config", is_active: Callable[[str, str], bool] | None = None
+) -> list[str]:
+    """WhatsApp group ids of the configured participation chats (live or shadow)."""
+    found: list[str] = []
+    for target in dict.fromkeys(
+        [*config.processing.chats, *config.processing.shadow_chats]
+    ):
+        channel, separator, chat_id = str(target).partition(":")
+        if not separator or channel != "whatsapp" or not chat_id.endswith("@g.us"):
+            continue
+        if is_active is not None and not is_active(channel, chat_id):
+            continue
+        found.append(chat_id)
+    return found
 
 
 def build_a2a_research_store(
@@ -3924,6 +3979,13 @@ def build_gateway_runtime(
             participation_maintenance._history_projector = history_projector
             participation_maintenance._history_knowledge = knowledge_service
             participation_maintenance._archive = secondary_inbound_archive
+            participation_maintenance._group_digest = build_group_digest_job(
+                config,
+                knowledge=knowledge_service,
+                history=history_projector,
+                thread_lookup=getattr(processing_store, "thread_for_message", None),
+                chats=lambda: participation_group_chats(config, _participation_active),
+            )
         burst_observer = BurstObserver(
             config=config,
             state_path=get_operational_store_path("burst_state"),

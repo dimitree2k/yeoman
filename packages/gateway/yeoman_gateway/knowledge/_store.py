@@ -723,6 +723,51 @@ _CORE_SCHEMA: tuple[str, ...] = (
 )
 
 
+#: Weekly group reaction digests, modelled on ``knowledge_episodes``.  Additive: a
+#: verified schema-3 store is opened with ``create=False``, so these tables are created
+#: by :meth:`KnowledgeStore.ensure_group_digest_schema` on first use, never by rewriting
+#: an existing table.
+GROUP_DIGEST_SCHEMA: tuple[str, ...] = (
+    """
+    CREATE TABLE IF NOT EXISTS knowledge_group_digests (
+        digest_id TEXT PRIMARY KEY,
+        workspace_id TEXT NOT NULL,
+        scope_key TEXT NOT NULL,
+        chat_id TEXT NOT NULL,
+        week TEXT NOT NULL,
+        version INTEGER NOT NULL DEFAULT 1,
+        status TEXT NOT NULL DEFAULT 'active'
+            CHECK(status IN ('active','superseded','stale')),
+        content_json TEXT NOT NULL,
+        rendered TEXT NOT NULL,
+        model_version TEXT NOT NULL,
+        prompt_version TEXT NOT NULL,
+        confidence TEXT NOT NULL CHECK(confidence IN ('low','medium','high')),
+        signal_json TEXT NOT NULL DEFAULT '{}',
+        window_start_ms INTEGER NOT NULL DEFAULT 0,
+        window_end_ms INTEGER NOT NULL DEFAULT 0,
+        supersedes TEXT REFERENCES knowledge_group_digests(digest_id),
+        created_ms INTEGER NOT NULL,
+        stale_ms INTEGER,
+        UNIQUE (workspace_id, scope_key, version)
+    )
+    """,
+    "CREATE INDEX IF NOT EXISTS knowledge_group_digests_by_scope"
+    " ON knowledge_group_digests (workspace_id, scope_key, status, version DESC)",
+    """
+    CREATE TABLE IF NOT EXISTS knowledge_group_digest_sources (
+        digest_id TEXT NOT NULL REFERENCES knowledge_group_digests(digest_id)
+            ON DELETE CASCADE,
+        message_id TEXT NOT NULL,
+        role TEXT NOT NULL CHECK(role IN ('approval','engagement','arvid')),
+        PRIMARY KEY (digest_id, message_id, role)
+    )
+    """,
+    "CREATE INDEX IF NOT EXISTS knowledge_group_digest_sources_by_message"
+    " ON knowledge_group_digest_sources (message_id)",
+)
+
+
 class StorageUnavailable(KnowledgeError):  # noqa: N818 - domain name from the design
     """The knowledge database cannot serve the request."""
 
@@ -843,6 +888,12 @@ class KnowledgeStore:
                 self._conn.rollback()
                 raise
             self._conn.commit()
+
+    def ensure_group_digest_schema(self) -> None:
+        """Create the group digest tables if missing; never touches an existing table."""
+        with self.transaction():
+            for statement in GROUP_DIGEST_SCHEMA:
+                self._conn.execute(statement)
 
     def table_names(self) -> tuple[str, ...]:
         with self._lock:
@@ -1044,6 +1095,8 @@ class KnowledgeStore:
             "conversation_relations",
             "knowledge_episodes",
             "knowledge_episode_sources",
+            "knowledge_group_digests",
+            "knowledge_group_digest_sources",
             "memory2_nodes",
             "memory2_facts",
             "memory2_fact_sources",
