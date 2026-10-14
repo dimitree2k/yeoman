@@ -231,6 +231,9 @@ BRIDGE_ACK_QUEUE_MAXSIZE = 2048
 #: A long outage leaves the bridge with a large unacknowledged backlog; the replay must be
 #: able to journal and queue it in one pass instead of closing the intake on queue pressure.
 BRIDGE_ACK_TIMEOUT_SECONDS = 20.0
+# History admission retries for an acknowledged message before it is dropped (and logged).
+INBOUND_HISTORY_ATTEMPTS = 4
+INBOUND_HISTORY_RETRY_SECONDS = 0.5
 # A single sender/chat must not be able to retain an unbounded acknowledged burst while
 # the legacy debounce timer is repeatedly reset.  Oversized/overflowing buckets are
 # flushed synchronously; no acknowledged event is dropped.
@@ -1681,6 +1684,8 @@ class WhatsAppChannel(BaseChannel):
         try:
             if self._bridge_intake_closed:
                 raise _BridgeIntakeClosedError("Bridge intake is closing")
+            if work.kind == "message":
+                await self._hold_ack_until_history_ready(work)
             await self._send_command(
                 "ack_event",
                 {"eventId": work.event_id},
@@ -1721,6 +1726,43 @@ class WhatsAppChannel(BaseChannel):
                         self._bridge_inflight.pop(work.event_id, None)
             if not work.completion.done():
                 work.completion.set_result(succeeded)
+
+    async def _hold_ack_until_history_ready(self, work: _BridgeEventWork) -> None:
+        """Keep a message unacknowledged while history is still starting.
+
+        Projection needs history, and an acknowledged message is never replayed.  Holding
+        the ACK keeps the Bridge responsible for the message: if the Gateway stops before
+        history is ready, the Bridge delivers it again on the next subscribe.  The worker
+        is serial, so later frames wait behind this one and keep their order.
+        """
+        projector = self._history_projector
+        wait_until_ready = getattr(projector, "wait_until_ready", None)
+        if not callable(wait_until_ready):
+            return
+        health = getattr(projector, "health", None)
+        status = health().get("status") if callable(health) else None
+        if status not in ("starting", "rebuilding"):
+            return
+        logger.info(
+            "WhatsApp message ACK held until history is ready status={} event_id={}",
+            status,
+            str(work.event_id)[:64],
+        )
+        waiter = asyncio.ensure_future(wait_until_ready())
+        try:
+            while not waiter.done():
+                if self._bridge_intake_closed or self._stopping:
+                    raise _BridgeIntakeClosedError("Bridge intake closed while history starts")
+                await asyncio.wait({waiter}, timeout=0.25)
+        finally:
+            if not waiter.done():
+                waiter.cancel()
+        if not waiter.result():
+            logger.warning(
+                "WhatsApp message ACK released without ready history status={} event_id={}",
+                health().get("status") if callable(health) else "-",
+                str(work.event_id)[:64],
+            )
 
     async def _project_bridge_event(self, work: _BridgeEventWork) -> None:
         if work.kind in _PROCESSING_SIGNAL_TYPES:
@@ -2090,12 +2132,34 @@ class WhatsAppChannel(BaseChannel):
 
         from yeoman_gateway.history.context import history_knowledge_scope, history_turn
         from yeoman_gateway.history.live import HistoryPaused
-        try:
-            async with history_turn(self._history_projector) as snapshot:
-                with history_knowledge_scope(snapshot, self._history_knowledge):
-                    event, ambient_candidate, denied = await self._admit_inbound_event(event)
-        except HistoryPaused:
-            return
+        attempt = 0
+        while True:
+            attempt += 1
+            try:
+                async with history_turn(self._history_projector) as snapshot:
+                    with history_knowledge_scope(snapshot, self._history_knowledge):
+                        event, ambient_candidate, denied = await self._admit_inbound_event(event)
+                break
+            except HistoryPaused as exc:
+                # The Bridge ACK is already sent, so nothing replays this message: wait for
+                # history (a backlog drain or a repair) and try again before giving up.
+                wait_until_ready = getattr(self._history_projector, "wait_until_ready", None)
+                ready = (
+                    attempt < INBOUND_HISTORY_ATTEMPTS
+                    and callable(wait_until_ready)
+                    and await wait_until_ready()
+                )
+                if not ready:
+                    logger.warning(
+                        "WhatsApp inbound dropped: history paused reason={} attempts={} "
+                        "chat={} message_id={}",
+                        str(exc) or "-",
+                        attempt,
+                        event.chat_jid,
+                        event.message_id,
+                    )
+                    return
+                await asyncio.sleep(INBOUND_HISTORY_RETRY_SECONDS * attempt)
         if denied:
             return
         await self._enrich_and_publish_inbound(event, ambient_candidate)
