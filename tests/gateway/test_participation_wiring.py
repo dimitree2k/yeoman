@@ -884,6 +884,7 @@ def test_restart_activation_transition_new_offers_use_new_epoch(
                     "contextWindowMinutes": 5,
                     "contextMaxMessages": 5,
                     "contextMode": "conversation",
+                    "conversationMinMessages": 6,
                 },
             },
             # Non-default lull/burst values: the context builder must receive these,
@@ -986,6 +987,8 @@ def test_restart_activation_transition_new_offers_use_new_epoch(
         ).bounds
         assert (bounds.context_mode, bounds.lull_minutes, bounds.burst_messages,
                 bounds.burst_minutes) == ("conversation", 33, 5, 11)
+        assert snapshot["conversation_min_messages"] == 6
+        assert bounds.conversation_min_messages == 6
         assert (
             decision_runtime._context_builder._thread_lookup  # noqa: SLF001
             == processing_store.thread_for_message

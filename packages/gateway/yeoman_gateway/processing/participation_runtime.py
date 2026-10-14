@@ -771,6 +771,9 @@ class ParticipationRuntime:
             burst_minutes=_snapshot_positive_int(
                 snapshot, "conversation_burst_minutes", default=15
             ),
+            conversation_min_messages=_snapshot_nonnegative_int(
+                snapshot, "conversation_min_messages", default=8
+            ),
         )
         remaining_budgets = (
             ("judge_calls_per_hour", judge_remaining),
@@ -2256,6 +2259,7 @@ def _snapshot_mapping(snapshot: Any) -> dict[str, Any]:
         "context_window_minutes",
         "context_max_messages",
         "context_mode",
+        "conversation_min_messages",
         "max_reevaluations",
         "opportunity_ttl_seconds",
         "participation",

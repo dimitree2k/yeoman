@@ -1151,6 +1151,7 @@ def _build_participation_runtime(
             "context_window_minutes": int(resolved.context_window_minutes),
             "context_max_messages": int(resolved.context_max_messages),
             "context_mode": str(resolved.context_mode),
+            "conversation_min_messages": int(resolved.conversation_min_messages),
             # Conversations reuse the live lull/burst definitions (Spec A, decision A2).
             "conversation_lull_minutes": int(config.consciousness.lull_silence_minutes),
             "conversation_burst_messages": int(config.consciousness.burst_threshold_messages),

@@ -59,6 +59,8 @@ def test_processing_participation_defaults_are_disabled_and_shadow() -> None:
     assert cfg.context_max_messages == 40
     assert cfg.context_mode == "window"
     assert ProcessingParticipationConfig(contextMode="conversation").context_mode == "conversation"
+    assert cfg.conversation_min_messages == 8
+    assert ProcessingParticipationConfig(conversationMinMessages=0).conversation_min_messages == 0
     assert cfg.max_pending_chats == 64
     assert cfg.max_reevaluations == 1
     assert cfg.max_pending_source_refs == 64
@@ -77,6 +79,8 @@ def test_processing_participation_defaults_are_disabled_and_shadow() -> None:
         {"contextWindowMinutes": 1441},
         {"contextMaxMessages": 4},
         {"contextMode": "thread"},
+        {"conversationMinMessages": -1},
+        {"conversationMinMessages": 101},
         {"maxPendingChats": 0},
         {"maxPendingSourceRefs": 0},
         {"maxPendingSourceBytes": 512},
@@ -273,6 +277,12 @@ def test_snapshot_carries_the_context_mode() -> None:
         processing=_processing(enabled=True, judgeRoute="r", contextMode="conversation"),
     )
     assert snapshot.context_mode == "conversation"
+    assert snapshot.conversation_min_messages == 8
+    floor = _snapshot(
+        engine,
+        processing=_processing(enabled=True, judgeRoute="r", conversationMinMessages=3),
+    )
+    assert floor.conversation_min_messages == 3
 
 
 def test_activation_matrix_shadow_lane_observes_but_never_acts() -> None:
