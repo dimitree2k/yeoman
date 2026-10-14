@@ -7,7 +7,7 @@ from dataclasses import asdict, dataclass
 
 from yeoman_gateway.knowledge.api import DirectorySeedContact
 
-from .identifiers import ObservedId, identifier_from_history, normalize_phone
+from .identifiers import ObservedId, identifier_from_history, is_valid_value, normalize_phone
 from .store import PeopleStore
 
 _OWNER_ALIAS_SOURCES = frozenset({"manual", "owner_confirmed"})
@@ -31,20 +31,28 @@ class ImportReport:
         return asdict(self)
 
 
-def seed_identifier(kind: str, value: str) -> ObservedId | None:
-    """Map a Knowledge contact_identifiers row (lid / phone_jid / telegram_id) to a directory id."""
+def seed_identifiers(kind: str, value: str) -> list[ObservedId]:
+    """Map a Knowledge contact_identifiers row (lid / phone_jid / telegram_id) to directory ids."""
     value = value.strip()
     if kind == "lid":
-        return identifier_from_history("lid", value if "@" in value else value + "@lid")
+        ident = identifier_from_history("lid", value if "@" in value else value + "@lid")
+        return [ident] if ident else []
     if kind == "phone_jid":
         if "@" in value:
-            return identifier_from_history("pn_jid", value)
+            ident = identifier_from_history("pn_jid", value)
+            return [ident] if ident else []
         phone = normalize_phone(value if value.startswith(("+", "00")) else "+" + value)
-        return ObservedId("phone", phone) if phone else None
+        return [ObservedId("phone", phone)] if phone else []
     if kind == "telegram_id":
-        digits = value.removeprefix("telegram:")
-        return ObservedId("telegram_id", digits) if _DIGITS.match(digits) else None
-    return None
+        # The Telegram adapter stores "<user id>|<username>" when the user has a username.
+        digits, _, username = value.removeprefix("telegram:").partition("|")
+        if not _DIGITS.match(digits):
+            return []
+        result = [ObservedId("telegram_id", digits)]
+        if is_valid_value("telegram_username", username):
+            result.append(ObservedId("telegram_username", username))
+        return result
+    return []
 
 
 def _map(store: PeopleStore, contact: DirectorySeedContact, idents: list[ObservedId], now_ms: int,
@@ -89,12 +97,18 @@ def import_knowledge_seed(store: PeopleStore, seed: list[DirectorySeedContact],
     report = ImportReport()
     for contact in seed:
         report.contacts += 1
-        idents = [i for kind_value in contact.identifiers
-                  if (i := seed_identifier(kind_value[1], kind_value[2])) is not None]
+        idents = [i for _channel, kind, value in contact.identifiers
+                  for i in seed_identifiers(kind, value)]
         person = _map(store, contact, idents, now_ms, report)
         for ident in [ObservedId("knowledge_person", contact.knowledge_id), *idents]:
-            if store.attach_id(person, ident, now_ms) == "added" and ident.kind == "telegram_id":
+            outcome = store.attach_id(person, ident, now_ms)
+            if outcome == "added" and ident.kind == "telegram_id":
                 report.telegram_ids += 1
+            elif outcome == "taken":
+                # Another directory person already holds this id: likely one person split in two.
+                holder = store.terminal(store.find_active(ident.kind, ident.value))
+                report.conflicts += store.suggest("merge", store.terminal(person), holder,
+                                                  evidence={"source": "knowledge_seed", "kind": ident.kind})
         for alias, source, _status in contact.aliases:
             if source in _OWNER_ALIAS_SOURCES:
                 report.owner_nicknames += _add_owner_nickname(store, person, alias)

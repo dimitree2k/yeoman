@@ -6,7 +6,7 @@ import pytest
 from yeoman_gateway.knowledge.api import DirectorySeedContact, export_directory_seed
 from yeoman_gateway.people.history_source import ObservedPerson
 from yeoman_gateway.people.identifiers import ObservedId
-from yeoman_gateway.people.knowledge_import import import_knowledge_seed, seed_identifier
+from yeoman_gateway.people.knowledge_import import import_knowledge_seed, seed_identifiers
 from yeoman_gateway.people.schema import open_people_db
 from yeoman_gateway.people.store import PeopleStore
 from yeoman_gateway.people.sync import sync_from_history
@@ -76,13 +76,17 @@ def test_export_reads_fixture_knowledge(tmp_path):
 
 
 def test_seed_identifier_forms():
-    assert seed_identifier("lid", "111@lid") == ObservedId("wa_lid", "111")
-    assert seed_identifier("lid", "111") == ObservedId("wa_lid", "111")
-    assert seed_identifier("phone_jid", "4915200000001@s.whatsapp.net").value == "4915200000001"
-    assert seed_identifier("phone_jid", "4915200000001").value == "4915200000001"
-    assert seed_identifier("telegram_id", "telegram:42") == ObservedId("telegram_id", "42")
-    assert seed_identifier("telegram_id", "abc") is None
-    assert seed_identifier("other", "x") is None
+    assert seed_identifiers("lid", "111@lid") == [ObservedId("wa_lid", "111")]
+    assert seed_identifiers("lid", "111") == [ObservedId("wa_lid", "111")]
+    assert seed_identifiers("phone_jid", "4915200000001@s.whatsapp.net")[0].value == "4915200000001"
+    assert seed_identifiers("phone_jid", "4915200000001")[0].value == "4915200000001"
+    assert seed_identifiers("telegram_id", "telegram:42") == [ObservedId("telegram_id", "42")]
+    assert seed_identifiers("telegram_id", "42|franky_t") == [
+        ObservedId("telegram_id", "42"), ObservedId("telegram_username", "franky_t")]
+    assert seed_identifiers("telegram_id", "42|x") == [ObservedId("telegram_id", "42")]
+    assert seed_identifiers("telegram_id", "abc") == []
+    assert seed_identifiers("telegram_id", "abc|franky_t") == []
+    assert seed_identifiers("other", "x") == []
 
 
 def test_import_maps_by_history_id_and_marks_owner_aliases(store):
@@ -120,10 +124,11 @@ def test_import_is_idempotent(store):
 
 
 def test_import_creates_unmapped_contact_with_telegram_id(store):
-    r = run_import(store, [seed_contact("k2", identifiers=[("telegram", "telegram_id", "42")],
+    r = run_import(store, [seed_contact("k2", identifiers=[("telegram", "telegram_id", "42|franky_t")],
                                         aliases=[("Franky", "observed", "observed")])])
     assert r.created == 1 and r.telegram_ids == 1
     person = store.find_active("telegram_id", "42")
+    assert store.find_active("telegram_username", "franky_t") == person
     assert store.find_active("knowledge_person", "k2") == person
     assert store.person_rows(person)["level"] == "seen"
 
@@ -142,3 +147,16 @@ def test_import_conflicting_identifiers_suggest_merge(store):
     assert r.conflicts == 1
     assert store.conn.execute("SELECT person_a, person_b, kind FROM suggestions").fetchall()[0][:] == (1, 2, "merge")
     assert store.terminal(2) == 2                                         # never merged automatically
+
+
+def test_import_suggests_merge_when_an_id_is_held_by_another_person(store):
+    first_sync(store, [op("k1"), op("k2")])
+    seed = [seed_contact("k1", identifiers=[("telegram", "telegram_id", "42|franky_t")]),
+            seed_contact("k2", identifiers=[("telegram", "telegram_id", "42|franky_two")])]
+    r = run_import(store, seed)
+    assert r.mapped_by_history_id == 2 and r.telegram_ids == 1 and r.conflicts == 1
+    rows = store.conn.execute("SELECT kind, person_a, person_b FROM suggestions").fetchall()
+    assert [tuple(row) for row in rows] == [("merge", 1, 2)]
+    assert store.find_active("telegram_username", "franky_two") == 2
+    run_import(store, seed)
+    assert store.conn.execute("SELECT count(*) FROM suggestions").fetchone()[0] == 1
