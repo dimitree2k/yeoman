@@ -456,6 +456,8 @@ class GatewayRuntime:
     speakup_log: object | None = None
     lull_observer: object | None = None
     opportunity_scheduler: object | None = None
+    #: The decision runtime behind the scheduler; held for composition checks only.
+    participation_decision: object | None = None
     participation_maintenance: object | None = None
     processing: "ProcessingStore | None" = None
     reconciliation: object | None = None
@@ -1013,11 +1015,13 @@ def _build_participation_runtime(
             sender=str(row.get("sender_id") or row.get("participant") or ""),
         )
 
+    group_notes, group_notes_shadow = build_group_notes_read_path(config, knowledge=knowledge)
     context_builder = ParticipationContextBuilder(
         policy=policy_engine,
         anchors=anchors,
         source_authorizer=_source_authorized,
         thread_lookup=getattr(processing_store, "thread_for_message", None),
+        group_notes=group_notes,
     )
 
     def _continuation_candidate(opportunity: object | None) -> bool:
@@ -1294,6 +1298,7 @@ def _build_participation_runtime(
         ),
         history_projector=getattr(responder, "_history_projector", None),
         history_knowledge=knowledge,
+        group_notes_shadow=group_notes_shadow,
     )
 
     async def _handle(opportunity: object) -> None:
@@ -1387,6 +1392,8 @@ class _ParticipationSubmission:
                 "writer_dropped_entry_ids",
                 "writer_dropped_entry_count",
                 "knowledge_rendered_to_writer",
+                "group_notes_rendered_to_writer",
+                "group_notes_status",
             ):
                 if key in writer_context:
                     original_context[key] = writer_context[key]
@@ -1740,6 +1747,32 @@ def build_group_digest_job(
         thread_lookup=thread_lookup,
     )
     return GroupDigestJob(runner=runner, knowledge=knowledge, chats=chats)
+
+
+def build_group_notes_read_path(
+    config: "Config", *, knowledge: object | None
+) -> tuple[object | None, object | None]:
+    """The weekly group-notes reader and its paired-shadow recorder (Spec B step B3).
+
+    Both are built whenever Knowledge is: ``processing.participation.groupNotes`` is read
+    per decision, so ``off`` renders nothing and ``shadow`` records beside live
+    decisions without changing them. Without Knowledge there are no notes to read.
+    """
+    if knowledge is None:
+        return None, None
+    from yeoman_shared.utils.helpers import get_var_path
+
+    from yeoman_gateway.evaluation.participation_groupnotes_ab import (
+        REPORT_DIR,
+        GroupNotesShadowRecorder,
+    )
+    from yeoman_gateway.processing.participation_group_notes import GroupNotesReader
+
+    reader = GroupNotesReader(
+        knowledge=knowledge,
+        mode=lambda: str(config.processing.participation.group_notes),
+    )
+    return reader, GroupNotesShadowRecorder(get_var_path().joinpath(*REPORT_DIR))
 
 
 def participation_group_chats(
@@ -3749,6 +3782,7 @@ def build_gateway_runtime(
     burst_observer = None
     lull_observer = None
     participation_maintenance = None
+    _decision_runtime = None
     def _participation_active(channel: str, chat_id: str) -> bool:
         current = getattr(policy_adapter, "current_activation", None)
         snapshot = current(channel, chat_id) if callable(current) else None
@@ -4043,6 +4077,7 @@ def build_gateway_runtime(
         speakup_log=speakup_log,
         lull_observer=lull_observer,
         opportunity_scheduler=opportunity_scheduler,
+        participation_decision=_decision_runtime,
         participation_maintenance=participation_maintenance,
         processing=processing_store,
         reconciliation=build_reconciliation_service(
