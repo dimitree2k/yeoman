@@ -572,6 +572,9 @@ def _render_participation_transcript(context: dict[str, object], *, limit: int =
     from yeoman_gateway.processing.participation_context import (
         render_knowledge_block,
     )
+    from yeoman_gateway.processing.participation_group_notes import (
+        render_group_notes_block,
+    )
 
     target_id = str(context.get("target_message_id") or "").strip()
     target_line = ""
@@ -608,7 +611,17 @@ def _render_participation_transcript(context: dict[str, object], *, limit: int =
 
     knowledge = str(context.get("selected_knowledge_text") or "").strip()
     knowledge_block = render_knowledge_block(knowledge)
+    notes_block = render_group_notes_block(
+        context.get("group_notes_week"), context.get("group_notes_text")
+    )
     fixed = [target_line, *([knowledge_block] if knowledge_block else [])]
+    # Budget order: required sources > Knowledge > group notes > optional entries. The
+    # group-notes block is dropped whole when it does not fit beside Knowledge.
+    with_notes = [*fixed, *([notes_block] if notes_block else [])]
+    if notes_block and sum(map(len, with_notes)) + len(with_notes) - 1 <= limit:
+        fixed = with_notes
+    elif notes_block:
+        context["group_notes_status"] = "budget_dropped"
     if sum(map(len, fixed)) + len(fixed) - 1 > limit:
         raise ValueError("required participation context exceeds writer budget")
     rendered = "\n".join(fixed)
@@ -622,6 +635,7 @@ def _render_participation_transcript(context: dict[str, object], *, limit: int =
     context["writer_dropped_entry_ids"] = [item for item in dropped if item]
     context["writer_dropped_entry_count"] = len(dropped)
     context["knowledge_rendered_to_writer"] = bool(knowledge_block)
+    context["group_notes_rendered_to_writer"] = bool(notes_block) and notes_block in fixed
     return rendered
 
 

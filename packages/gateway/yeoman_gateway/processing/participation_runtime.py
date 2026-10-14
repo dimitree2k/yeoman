@@ -19,6 +19,7 @@ Boundaries enforced here, in order:
 
 from __future__ import annotations
 
+import asyncio
 import time
 from collections.abc import Callable, Mapping, Sequence
 from dataclasses import dataclass, field, replace
@@ -45,6 +46,7 @@ from yeoman_gateway.processing.participation_context import (
     ParticipationContextBounds,
     ParticipationDecisionInputs,
 )
+from yeoman_gateway.processing.participation_group_notes import SHADOW_NOTE_KEY
 from yeoman_gateway.processing.participation_knowledge import (
     ParticipationKnowledgeEvidenceError,
     selection_from_mapping,
@@ -167,6 +169,7 @@ class ParticipationRuntime:
         direct_work_active: Callable[[str, str], bool] | None = None,
         revalidate_knowledge: Callable[[ParticipationOpportunity, Mapping[str, Any], Any], Any]
         | None = None,
+        group_notes_shadow: Any | None = None,
     ) -> None:
         self._history_projector = history_projector
         self._history_knowledge = history_knowledge
@@ -190,6 +193,10 @@ class ParticipationRuntime:
         self._clock_ms = clock_ms or _now_ms
         self._direct_work_active = direct_work_active
         self._revalidate_knowledge = revalidate_knowledge
+        # Paired group-notes shadow (``GroupNotesShadowRecorder``): a second, judge-only
+        # call with the weekly note beside each live judgment; no quota, no effect.
+        self._group_notes_shadow = group_notes_shadow
+        self._group_notes_tasks: set[asyncio.Task[None]] = set()
         self._counters: dict[str, int] = {}
 
     # -- observability -----------------------------------------------------------------
@@ -233,6 +240,80 @@ class ParticipationRuntime:
             outcome=failure.reason,
             detail_code=detail_code,
         )
+
+    # -- group-notes shadow (Spec B section 8.2) ---------------------------------------
+
+    def _group_notes_shadow_base(self, context: Mapping[str, Any]) -> dict[str, Any] | None:
+        """The unfitted context for the paired call, when this chat has a shadow note."""
+        if self._group_notes_shadow is None:
+            return None
+        note = context.get(SHADOW_NOTE_KEY)
+        if not isinstance(note, Mapping) or not str(note.get("text") or "").strip():
+            return None
+        return _judge_context_copy(context)
+
+    def _start_group_notes_shadow(
+        self,
+        opportunity: ParticipationOpportunity,
+        inputs: ParticipationDecisionInputs,
+        base: dict[str, Any] | None,
+        live: ParticipationDecision | BaseException,
+        live_context: Mapping[str, Any],
+    ) -> None:
+        """Start the judge-only call with the note; the live path never waits for it."""
+        if base is None or self._group_notes_shadow is None:
+            return
+        live_tokens = _judge_prompt_tokens(self._judge, opportunity, live_context)
+        task = asyncio.create_task(
+            self._run_group_notes_shadow(opportunity, inputs, base, live, live_tokens)
+        )
+        self._group_notes_tasks.add(task)
+        task.add_done_callback(self._group_notes_tasks.discard)
+
+    async def _run_group_notes_shadow(
+        self,
+        opportunity: ParticipationOpportunity,
+        inputs: ParticipationDecisionInputs,
+        base: dict[str, Any],
+        live: ParticipationDecision | BaseException,
+        live_tokens: int | None,
+    ) -> None:
+        from yeoman_gateway.evaluation.participation_groupnotes_ab import decision_record
+
+        note = dict(base.pop(SHADOW_NOTE_KEY))
+        base["group_notes_text"] = str(note.get("text") or "")
+        base["group_notes_week"] = str(note.get("week") or "")
+        base["group_notes_digest_id"] = str(note.get("digest_id") or "")
+        outcome: ParticipationDecision | BaseException
+        try:
+            if self._judge is None:
+                raise ParticipationDecisionError("provider_error", detail="no_judge")
+            outcome = await self._judge.decide(opportunity, base)
+            # The same trusted re-check the live decision passed; no reservation follows.
+            self._validate_decision(outcome, opportunity=opportunity, inputs=inputs, context=base)
+        except asyncio.CancelledError:
+            raise
+        except Exception as exc:  # noqa: BLE001 - the shadow never affects live work
+            outcome = exc
+        try:
+            self._group_notes_shadow.record(
+                opportunity,
+                note=note,
+                live=decision_record(live, prompt_tokens=live_tokens),
+                with_notes=decision_record(
+                    outcome,
+                    prompt_tokens=_judge_prompt_tokens(self._judge, opportunity, base),
+                    rendered=bool(base.get("group_notes_rendered_to_judge")),
+                ),
+                at_ms=int(self._clock_ms()),
+            )
+        except Exception as exc:  # noqa: BLE001 - evaluation output is best effort
+            logger.warning("group_notes_shadow_record_failed error_type={}", type(exc).__name__)
+
+    async def wait_group_notes_shadow(self) -> None:
+        """Wait for paired shadow calls still running (tests and shutdown)."""
+        while self._group_notes_tasks:
+            await asyncio.gather(*tuple(self._group_notes_tasks), return_exceptions=True)
 
     # -- entrypoint --------------------------------------------------------------------
 
@@ -414,9 +495,11 @@ class ParticipationRuntime:
             await self._ledger.record_judge_outcome(attempt_id, outcome="direct_superseded")
             return self._direct_superseded()
 
+        shadow_base = self._group_notes_shadow_base(context)
         try:
             decision = await self._judge.decide(opportunity, context)
         except ParticipationDecisionError as failure:
+            self._start_group_notes_shadow(opportunity, inputs, shadow_base, failure, context)
             self._count("judge_failed")
             await self._record_judge_failure(attempt_id, failure, opportunity.chat_id)
             await self._record(opportunity, "judge_failed", failure.reason)
@@ -424,6 +507,7 @@ class ParticipationRuntime:
         except HistoryPaused:
             raise
         except Exception as exc:  # noqa: BLE001 - one chat must not stop the queue
+            self._start_group_notes_shadow(opportunity, inputs, shadow_base, exc, context)
             self._count("judge_failed")
             logger.warning(
                 "participation_judge_error chat={} error_type={}",
@@ -448,10 +532,12 @@ class ParticipationRuntime:
                 context=context,
             )
         except ParticipationDecisionError as failure:
+            self._start_group_notes_shadow(opportunity, inputs, shadow_base, failure, context)
             self._count("judge_failed")
             await self._record_judge_failure(attempt_id, failure, opportunity.chat_id)
             await self._record(opportunity, "judge_failed", failure.reason)
             return {"status": "judge_failed", "reason": failure.reason}
+        self._start_group_notes_shadow(opportunity, inputs, shadow_base, decision, context)
         await self._ledger.record_judge_outcome(attempt_id, outcome=decision.action)
 
         if lane == "shadow":
@@ -2863,6 +2949,32 @@ def _provider_message_id(receipt: object) -> str | None:
     value = getattr(transport, "provider_message_id", None) if transport else None
     text = str(value or "").strip()
     return text or None
+
+
+def _judge_context_copy(context: Mapping[str, Any]) -> dict[str, Any]:
+    """A context the Judge may fit in place without touching the original's lists."""
+    copied = dict(context)
+    for key in ("messages", "anchors"):
+        value = context.get(key)
+        if isinstance(value, list):
+            copied[key] = list(value)
+    return copied
+
+
+def _judge_prompt_tokens(
+    judge: Any, opportunity: ParticipationOpportunity, context: Mapping[str, Any]
+) -> int | None:
+    """The Judge's own prompt estimate of an already fitted context, if it has one."""
+    from yeoman_gateway.processing.participation import _JudgeContext
+
+    build = getattr(judge, "_build_messages", None)
+    estimate = getattr(judge, "_estimate_tokens", None)
+    if not callable(build) or not callable(estimate):
+        return None
+    try:
+        return int(estimate(build(opportunity, _JudgeContext.from_mapping(context))))
+    except Exception:  # noqa: BLE001 - an estimate is descriptive only
+        return None
 
 
 def _now_ms() -> int:

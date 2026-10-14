@@ -127,6 +127,7 @@ class ParticipationContextBuilder:
         clock: Any | None = None,
         source_authorizer: Callable[[Mapping[str, Any]], bool] | None = None,
         thread_lookup: Callable[[str], object] | None = None,
+        group_notes: Any | None = None,
     ) -> None:
         # Kept on the constructor for old object construction; decision inputs are the
         # sole source of trusted policy values during ``build``.
@@ -136,6 +137,8 @@ class ParticipationContextBuilder:
         self._source_authorizer = source_authorizer
         # Registry lookup by provider message id; referenced, never changed.
         self._thread_lookup = thread_lookup
+        # Weekly group note reader (``GroupNotesReader``); same chat only, by mode.
+        self._group_notes = group_notes
         self._fallback_logged_ms: dict[tuple[str, str], int] = {}
 
     @property
@@ -365,7 +368,40 @@ class ParticipationContextBuilder:
         context["knowledge_selection_elapsed_ms"] = int(
             (time.monotonic() - selection_started) * 1000
         )
+        self._attach_group_note(context, opportunity, now_ms=moment)
         return context
+
+    def _attach_group_note(
+        self,
+        context: dict[str, object],
+        opportunity: ParticipationOpportunity,
+        *,
+        now_ms: int,
+    ) -> None:
+        """Add this chat's weekly note: rendered when ``on``, held aside in ``shadow``.
+
+        ``off`` (and no reader) leaves the context exactly as it was. In ``shadow`` the
+        note sits under a private key that neither the Judge nor the Writer renders;
+        only the paired shadow Judge call reads it.
+        """
+        from yeoman_gateway.processing.participation_group_notes import SHADOW_NOTE_KEY
+
+        if self._group_notes is None:
+            return
+        mode = self._group_notes.mode()
+        if mode not in ("on", "shadow"):
+            return
+        note = self._group_notes.note_for(
+            opportunity.channel, opportunity.chat_id, now_ms=now_ms
+        )
+        if note is None:
+            return
+        if mode == "on":
+            context["group_notes_text"] = note.text
+            context["group_notes_week"] = note.week
+            context["group_notes_digest_id"] = note.digest_id
+        else:
+            context[SHADOW_NOTE_KEY] = note.as_mapping()
 
     # -- conversation view ---------------------------------------------------------------
 
