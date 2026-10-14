@@ -17,6 +17,7 @@ from yeoman_shared.raw_archive.paths import (
 
 from yeoman_overseer.alerts.formatting import format_overseer_alert
 from yeoman_overseer.comms.cascading import CascadingComms
+from yeoman_overseer.executor.agent_cli_update import update_agent_clis
 from yeoman_overseer.executor.stale_agent_sessions import cleanup_stale_agent_sessions
 
 logger = logging.getLogger(__name__)
@@ -154,6 +155,21 @@ class DeterministicExecutor:
             ),
         )
 
+    async def _update_agent_clis(self, *, target: str, **_: str) -> ActionResult:
+        names = tuple(name.strip() for name in target.split(",") if name.strip())
+        if not names:
+            return ActionResult(success=False, detail="update_agent_clis needs a CLI name target")
+        try:
+            results = await update_agent_clis(names)
+        except Exception as exc:
+            detail = f"Agent CLI update failed: {exc}"
+        else:
+            detail = "; ".join(result.describe() for result in results)
+            if all(result.success for result in results):
+                return ActionResult(success=True, detail=detail)
+        await self._alert(target="agent-clis", message=f"Agent CLI update problem: {detail}")
+        return ActionResult(success=False, detail=detail)
+
 
     async def _verify_raw_archive(self, *, target: str, **_: str) -> ActionResult:
         from yeoman_shared.raw_archive.verify import verify_archive
@@ -226,5 +242,6 @@ _ACTION_REGISTRY = {
     "prune_files": DeterministicExecutor._prune_files,
     "cleanup_stale_agent_sessions": DeterministicExecutor._cleanup_stale_agent_sessions,
     "verify_raw_archive": DeterministicExecutor._verify_raw_archive,
+    "update_agent_clis": DeterministicExecutor._update_agent_clis,
     "noop": DeterministicExecutor._noop,
 }
