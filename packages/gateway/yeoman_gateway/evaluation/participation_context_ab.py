@@ -176,12 +176,17 @@ async def chat_subjects(history: Any) -> dict[str, str]:
 
 
 def resolve_chat(value: str, subjects: Mapping[str, str]) -> str:
-    """A chat id as given, or the one chat whose subject matches exactly (any case).
+    """A chat id as given (a ``whatsapp:``/``telegram:`` prefix is dropped), or the one
+    chat whose subject matches exactly (any case).
 
     Raises :class:`ValueError` with the match count only; other chats' subjects are
     never part of the message.
     """
     text = str(value).strip()
+    channel, sep, rest = text.partition(":")
+    if sep and channel in {"whatsapp", "telegram"} and looks_like_chat_id(rest):
+        # Config keys chats as "<channel>:<id>"; history stores the bare id.
+        return rest
     if looks_like_chat_id(text):
         return text
     wanted = text.casefold()

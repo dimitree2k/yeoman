@@ -344,6 +344,8 @@ def test_resolve_chat_by_id_or_exact_subject() -> None:
                 "3@g.us": "twin"}
     assert resolve_chat("999@g.us", subjects) == "999@g.us"  # ids pass through
     assert resolve_chat("-100123", subjects) == "-100123"
+    assert resolve_chat("whatsapp:999@g.us", subjects) == "999@g.us"  # config-style key
+    assert resolve_chat("telegram:-100123", subjects) == "-100123"
     assert resolve_chat("synthetic test GROUP", subjects) == CHAT
     with pytest.raises(ValueError, match="0 matches") as none:
         resolve_chat("Synthetic", subjects)  # exact match only
