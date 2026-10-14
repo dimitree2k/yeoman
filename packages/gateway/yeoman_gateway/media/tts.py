@@ -9,6 +9,7 @@ import os
 import re
 import uuid
 from pathlib import Path
+from typing import Awaitable, Callable
 from urllib.parse import quote
 
 import httpx
@@ -39,6 +40,44 @@ VOICE_MAX_CHARS = 750
 # Observed WhatsApp opus output is ~62 kbps (~7.7 KB/s), so 512 KiB holds about a
 # minute of speech: a full 750-character note fits with room to spare.
 VOICE_MAX_RAW_BYTES = 512 * 1024
+
+# Fish Audio Drama 3 reads free-form [directions] and paired word tags. Any other
+# voice model would speak that markup aloud, so it is only requested for Drama 3.
+DRAMA_TTS_MODEL = "drama-3"
+# Owner-editable style prompt, relative to the workspace; read on every use so edits
+# apply without a deploy.
+VOICE_STYLE_PROMPT_PATH = Path("prompts") / "voice-drama3.md"
+_DRAMA_PAIRED_TAG_RE = re.compile(r"</?(?:whisper|emphasis|soft|fast|slow|stress|forceful)>", re.I)
+# A short bracketed direction, not a markdown link (which is followed by "(").
+_DRAMA_DIRECTION_RE = re.compile(r"\[[^\[\]\n]{1,80}\](?!\()")
+
+
+def is_drama_profile(profile: object | None) -> bool:
+    """Return True when a resolved TTS profile synthesizes with Fish Audio Drama 3."""
+    if profile is None:
+        return False
+    provider = str(getattr(profile, "provider", "") or "").strip().lower()
+    model = str(getattr(profile, "model", "") or "").strip().lower()
+    return provider == "fish_audio" and model == DRAMA_TTS_MODEL
+
+
+def load_voice_style_prompt(workspace: Path | None) -> str:
+    """Read the Drama 3 voice style prompt from the workspace, or "" when absent."""
+    if workspace is None:
+        return ""
+    try:
+        return (Path(workspace) / VOICE_STYLE_PROMPT_PATH).read_text(encoding="utf-8").strip()
+    except OSError:
+        return ""
+
+
+def strip_voice_directions(text: str) -> str:
+    """Remove Drama 3 [directions] and paired word tags, keeping the spoken words."""
+    without_tags = _DRAMA_PAIRED_TAG_RE.sub("", text or "")
+    without_directions = _DRAMA_DIRECTION_RE.sub(" ", without_tags)
+    lines = [" ".join(line.split()) for line in without_directions.splitlines()]
+    return "\n".join(lines).strip()
+
 
 # Lower-cased tokens whose trailing dot never ends a sentence (German + English).
 _ABBREVIATIONS = frozenset(
@@ -74,8 +113,11 @@ def split_sentences(text: str) -> list[str]:
 
 
 def voice_length_excess(text: str, *, max_sentences: int, max_chars: int) -> str | None:
-    """Describe how text exceeds the voice-note limits, or None when it fits."""
-    cleaned = " ".join((text or "").split()).strip()
+    """Describe how text exceeds the voice-note limits, or None when it fits.
+
+    Only the spoken words count: Drama 3 directions and tags are not heard.
+    """
+    cleaned = " ".join(strip_voice_directions(text).split()).strip()
     sentence_count = len(split_sentences(cleaned))
     if len(cleaned) > max_chars:
         return f"{len(cleaned)} characters > {max_chars}"
@@ -514,15 +556,17 @@ class FishAudioTTSProvider:
             logger.warning("Fish Audio API key not configured for TTS")
             return None, "fish_audio_api_key_missing"
 
+        # Fish selects the model from the `model` header; a body field is ignored and
+        # the request silently falls back to Fish's default model.
         headers = {
             "Authorization": f"Bearer {self.api_key}",
             "Content-Type": "application/json",
+            "model": model or "s2-pro",
         }
         payload: dict[str, object] = {
             "text": text,
             "reference_id": voice,
             "format": format or "opus",
-            "model": model or "s2-pro",
         }
 
         async with httpx.AsyncClient() as client:
@@ -588,6 +632,8 @@ class TTSSynthesizer:
         self._fish_api_base = fish_api_base
         self._fish_default_voice_id = fish_default_voice_id
         self._semaphore = asyncio.Semaphore(max(1, int(max_concurrency)))
+        # Optional async text -> Drama 3 script rewrite, applied only on Drama 3 profiles.
+        self.script_writer: Callable[[str], Awaitable[str]] | None = None
 
     async def synthesize(
         self,
@@ -613,6 +659,8 @@ class TTSSynthesizer:
         voice: str,
         format: str,
     ) -> tuple[bytes | None, str | None]:
+        if self.script_writer is not None and is_drama_profile(profile):
+            text = await self.script_writer(text)
         async with self._semaphore:
             return await self._synthesize_once(
                 text,
