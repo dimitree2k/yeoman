@@ -1564,7 +1564,7 @@ class StatementEngine:
         """Jobs a crash left ``running``; the worker recovers them instead of stalling."""
         rows = self._store.query(
             "SELECT job_id, state, reason FROM knowledge_jobs"
-            " WHERE state = 'running' AND updated_ms <= ?"
+            " WHERE state = 'running' AND updated_ms <= ? AND kind <> 'group_digest'"
             " ORDER BY updated_ms, job_id LIMIT ?",
             (int(updated_before_ms), int(limit)),
         )
@@ -1646,6 +1646,7 @@ class StatementEngine:
         return int(
             self._store.scalar(
                 "SELECT COUNT(*) FROM knowledge_jobs WHERE state IN ('queued','running')"
+                " AND kind <> 'group_digest'"
             )
             or 0
         )
@@ -1653,6 +1654,7 @@ class StatementEngine:
     def due_jobs(self, *, now: int | None = None, limit: int = 20) -> tuple[CaptureJobReceipt, ...]:
         rows = self._store.query(
             "SELECT job_id, state, reason FROM knowledge_jobs WHERE state = 'queued'"
+            " AND kind <> 'group_digest'"
             " AND due_ms <= ? ORDER BY due_ms, job_id LIMIT ?",
             (int(now if now is not None else now_ms()), int(limit)),
         )
@@ -1839,16 +1841,21 @@ def rescreen_statements(
 def capture_status(store: KnowledgeStore, *, now_ms: int) -> dict[str, Any]:
     """Read-only promotion counters.  Never contains statement content."""
     states: dict[str, int] = {}
-    for row in store.query("SELECT state, COUNT(*) AS n FROM knowledge_jobs GROUP BY state"):
+    # Weekly group digest jobs share the table but are not statement capture.
+    for row in store.query(
+        "SELECT state, COUNT(*) AS n FROM knowledge_jobs WHERE kind <> 'group_digest'"
+        " GROUP BY state"
+    ):
         states[str(row["state"])] = int(row["n"])
     reasons: dict[str, int] = {}
     for row in store.query(
-        "SELECT reason, COUNT(*) AS n FROM knowledge_jobs"
-        " WHERE reason IS NOT NULL AND reason <> '' GROUP BY reason"
+        "SELECT reason, COUNT(*) AS n FROM knowledge_jobs WHERE kind <> 'group_digest'"
+        " AND reason IS NOT NULL AND reason <> '' GROUP BY reason"
     ):
         reasons[str(row["reason"])] = int(row["n"])
     oldest = store.query_one(
         "SELECT MIN(due_ms) AS oldest FROM knowledge_jobs WHERE state = 'queued'"
+        " AND kind <> 'group_digest'"
     )
     oldest_due = (
         int(oldest["oldest"]) if oldest is not None and oldest["oldest"] is not None else 0
