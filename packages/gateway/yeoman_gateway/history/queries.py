@@ -72,6 +72,8 @@ class HistoryQueries:
     def __init__(self, snapshot: HistorySnapshot):
         self.snapshot = snapshot
         self._audiences: dict[str, EvidenceAudience] = {}
+        self._membership_identifiers: dict[str, tuple[str, str, str] | None] = {}
+        self._membership_participants: dict[tuple[str, ...], tuple[str, frozenset[str]]] = {}
         self._audience_state = (snapshot.generation, snapshot.connection.total_changes)
         self._person_names_cache: dict[tuple[tuple[str, ...], int], dict[str, set[str]]] = {}
         self._person_names_state = self._audience_state
@@ -598,11 +600,14 @@ class HistoryQueries:
             if event["kind"] == "member_snapshot":
                 rosters.setdefault(event["occurred_ms"], []).append(event)
 
-        parsed_values: dict[str, tuple[str, str, str] | None] = {}
+        parsed_values = self._membership_identifiers
 
         def participant(values: Any) -> tuple[str, frozenset[str]] | None:
             if not isinstance(values, list) or not values or not all(isinstance(v, str) for v in values):
                 return None
+            key = tuple(values)
+            if key in self._membership_participants:
+                return self._membership_participants[key]
             items = []
             for value in values:
                 if value not in parsed_values:
@@ -621,7 +626,9 @@ class HistoryQueries:
             identifiers = frozenset(value for _, value, _ in items)
             if len(phones) > 1 or (not phones and len(identifiers) != 1):
                 return None
-            return next(iter(phones)) if phones else items[0][2], identifiers
+            result = next(iter(phones)) if phones else items[0][2], identifiers
+            self._membership_participants[key] = result
+            return result
 
         def entries(event: Row) -> list[tuple[str, frozenset[str]]] | None:
             if "entries" in event:
