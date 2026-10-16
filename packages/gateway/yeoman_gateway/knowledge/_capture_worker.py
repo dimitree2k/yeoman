@@ -197,10 +197,16 @@ class StatementExtractor:
         return drafts
 
     def _ask_model(self, listing: str) -> list[Mapping[str, Any]]:
-        from yeoman_gateway.knowledge._json_extract import _extract_json
+        from yeoman_gateway.knowledge._json_extract import _extract_json, _extract_json_rows
 
+        # Only the first max_candidates rows are kept, so asking for more just burns
+        # output tokens - and a busy batch then hits max_tokens mid-row.
+        system = (
+            f"{STATEMENT_SYSTEM_PROMPT}\n- Return at most {self._max_candidates} statements; "
+            "pick the most lasting facts."
+        )
         messages = [
-            {"role": "system", "content": STATEMENT_SYSTEM_PROMPT},
+            {"role": "system", "content": system},
             {"role": "user", "content": f"Messages:\n{listing}"},
         ]
         response = asyncio.run(
@@ -217,9 +223,24 @@ class StatementExtractor:
             return []
         payload = _extract_json(content)
         if payload is None:
-            logger.warning("statement extractor returned unparseable content")
-            return []
-        rows = payload.get("statements") if isinstance(payload, Mapping) else payload
+            rows = _extract_json_rows(content, "statements")
+            finish_reason = getattr(response, "finish_reason", None)
+            if rows is None:
+                logger.warning(
+                    "statement extractor returned unparseable content finish_reason={} chars={}",
+                    finish_reason,
+                    len(content),
+                )
+                return []
+            logger.info(
+                "statement extractor recovered {} complete rows from partial content "
+                "finish_reason={} chars={}",
+                len(rows),
+                finish_reason,
+                len(content),
+            )
+        else:
+            rows = payload.get("statements") if isinstance(payload, Mapping) else payload
         if not isinstance(rows, list):
             return []
         return [row for row in rows if isinstance(row, Mapping)]
