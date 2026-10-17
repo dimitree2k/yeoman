@@ -21,6 +21,7 @@ if TYPE_CHECKING:
         HistoryKnowledgeSources,
         HistorySourceLedger,
     )
+    from yeoman_gateway.people.resolver import ReaderContext
 
 import hashlib
 import sqlite3
@@ -1742,6 +1743,72 @@ class KnowledgeService:
         return self._identity.delivery_identifiers_for_alias(
             alias, channel=str(channel), scope_key=scope_key
         )
+
+    def directory_subject_ids(self, person_id: int, *, reader: ReaderContext) -> tuple[str, ...]:
+        """Map a directory terminal to existing subjects without changing either store."""
+        from yeoman_gateway.people.bridges import _selected, _visible, knowledge_person_ids
+        from yeoman_gateway.people.knowledge_import import seed_identifiers
+
+        index, terminal = _selected(person_id, reader)
+        subjects = set(knowledge_person_ids(terminal, reader))
+        keys = set()
+        for row in _visible(index, terminal):
+            kind, value = row["kind"], row["value"]
+            if kind == "phone":
+                keys.update(
+                    ("whatsapp", v)
+                    for v in (value, "+" + value, "00" + value, value + "@s.whatsapp.net")
+                )
+            elif kind == "wa_lid":
+                keys.update(("whatsapp", v) for v in (value, value + "@lid"))
+            elif kind == "telegram_id":
+                keys.update(("telegram", v) for v in (value, "telegram:" + value))
+        # Restrict frozen lookup to exact identifiers and existing provenance subjects.
+        clauses, params = [], []
+        for channel, value in sorted(keys):
+            clauses.append("(channel=? AND identifier=?)")
+            params.extend((channel, value))
+            if channel == "telegram":
+                clauses.append("(channel=? AND identifier LIKE ?)")
+                params.extend((channel, value + "|%"))
+        if subjects:
+            clauses.append("contact_id IN (" + ",".join("?" for _ in subjects) + ")")
+            params.extend(sorted(subjects))
+        if not clauses:
+            return tuple(sorted(subjects))
+        candidates = self._store.query(
+            "SELECT DISTINCT contact_id FROM contact_identifiers WHERE " + " OR ".join(clauses),
+            tuple(params),
+        )
+        ids = tuple(str(row["contact_id"]) for row in candidates)
+        if not ids:
+            return tuple(sorted(subjects))
+        rows = self._store.query(
+            "SELECT contact_id,kind,identifier FROM contact_identifiers WHERE contact_id IN ("
+            + ",".join("?" for _ in ids)
+            + ")",
+            ids,
+        )
+        evidence = {}
+        visible = {}
+        for row in rows:
+            holders = evidence.setdefault(str(row["contact_id"]), set())
+            for ident in seed_identifiers(str(row["kind"]), str(row["identifier"])):
+                for binding in index.identifier_rows.get((ident.kind, ident.value), ()):
+                    owner = index.terminal(binding["person_id"])
+                    if owner not in visible:
+                        visible[owner] = _visible(index, owner)
+                    if binding in visible[owner]:
+                        holders.add(owner)
+        for subject, holders in evidence.items():
+            if holders and holders != {terminal}:
+                subjects.discard(subject)
+                reader.directory._local.mapping_unavailable = (
+                    getattr(reader.directory._local, "mapping_unavailable", 0) + 1
+                )
+            elif holders == {terminal}:
+                subjects.add(subject)
+        return tuple(sorted(subjects))
 
     def person_identifiers(self, person_id: str) -> tuple[Identifier, ...]:
         """Proven identifier bindings of a person, for diagnostics and tools."""

@@ -1,26 +1,19 @@
-"""Read-only contact resolution for delivery targets.
-
-Person resolution uses Knowledge only. A target exists only for a person with an
-active proven binding; no channel falls back to an in-memory ContactsService cache.
-"""
+"""Directory recognition followed by active endpoint and delivery authorization."""
 
 from __future__ import annotations
 
 import json
-import re
+import time
 from dataclasses import dataclass
-from typing import Any
+from typing import TYPE_CHECKING, Any
 
 from loguru import logger
 
 from yeoman_gateway.agent.tools.base import Tool
 from yeoman_gateway.history.live import HistoryPaused
 
-_MENTION_TOKEN_RE = re.compile(
-    r"(?<![\w@\x80-\U0010ffff])"
-    r"@?([0-9]{5,})(?:@(lid|s\.whatsapp\.net))?"
-    r"(?![\w@.\x80-\U0010ffff])"
-)
+if TYPE_CHECKING:
+    from yeoman_gateway.people.resolver import PeopleResolver, ReaderContext
 
 
 @dataclass(frozen=True, slots=True)
@@ -30,39 +23,6 @@ class ContactResolution:
     display_name: str
     jid: str
     matched_identifier: str | None = None
-
-
-def _mention_candidates(text: str) -> list[str]:
-    candidates: list[str] = []
-    for match in _MENTION_TOKEN_RE.finditer(str(text or "")):
-        digits = match.group(1)
-        suffix = match.group(2)
-        if suffix == "lid":
-            candidates.append(f"{digits}@lid")
-        elif suffix == "s.whatsapp.net":
-            candidates.append(f"{digits}@s.whatsapp.net")
-        else:
-            candidates.append(f"{digits}@lid")
-            candidates.append(f"{digits}@s.whatsapp.net")
-    return candidates
-
-
-def _reference_matches_labels(
-    reference: str,
-    labels: list[str],
-) -> bool:
-    reference_tokens = re.findall(r"\w+", reference.casefold())
-    if not reference_tokens:
-        return False
-    width = len(reference_tokens)
-    for label in labels:
-        label_tokens = re.findall(r"\w+", str(label).casefold())
-        if any(
-            label_tokens[index:index + width] == reference_tokens
-            for index in range(0, len(label_tokens) - width + 1)
-        ):
-            return True
-    return False
 
 
 def _pick_delivery_value(identifiers: list[str]) -> str | None:
@@ -81,171 +41,111 @@ def _pick_delivery_value(identifiers: list[str]) -> str | None:
     return None
 
 
-def _proven_mention_target(
-    knowledge: Any, *, channel: str, value: str
-) -> tuple[str, str] | None:
-    """The one person a mention value is *proven* for on this channel, if any.
-
-    A mention is text until a proven binding makes it an identifier.  The value must
-    belong to exactly one person - two owners are a conflict - and it must be one of that
-    person's own proven identifiers *on this channel*, so a mention can never synthesise
-    an address the person does not have.
-    """
-    owners = knowledge.owners_of_identifier_value(value, channel=channel)
-    if len(owners) != 1:
-        return None
-    person_id = str(owners[0])
-    proven = {
-        item.value
-        for item in knowledge.person_identifiers(person_id)
-        if item.channel == channel
-    }
-    if value not in proven:
-        return None
-    return person_id, value
-
-
 def resolve_contact_reference(
     *,
     reference: str,
     channel: str,
     chat_id: str,
     knowledge: object | None = None,
+    people: PeopleResolver | None = None,
+    reader: ReaderContext | None = None,
 ) -> ContactResolution | None:
-    """Resolve a human name, phone JID, or WhatsApp LID mention to one delivery target.
+    """Recognize once, then require a proven, current and disclosable endpoint.
 
-    The current chat's explicit request is the addressing decision; the *proven binding*
-    is the technical question.  So this path requires an active verified identifier and
-    refuses ambiguity, but it does not require a separately released address alias -
-    that gate governs addressing that no conversation asked for (out-of-context service
-    delivery, see ``delivery_identifiers_for_alias``).
-
-    A knowledge outage resolves nothing and raises nothing: a missing person is a
-    degradation of this turn, not a failed turn.
+    Conversation-requested delivery retains its existing binding gate. Address release
+    for out-of-context A2A delivery remains a separate permission.
     """
-    ref = str(reference or "").strip()
-    if not ref:
-        return None
+    from yeoman_gateway.people.bridges import history_person
+    from yeoman_gateway.people.disclosure import render_person
+    from yeoman_gateway.people.resolver import _identifiers, resolve_person
 
-    if knowledge is None:
+    if people is None or reader is None or reader.directory is not people:
+        return None
+    if (channel, chat_id) != (reader.channel, reader.chat_id) or not reference.strip():
         return None
     try:
-        return _resolve_through_knowledge(
-            knowledge,
-            ref,
-            channel=channel,
-            chat_id=chat_id,
-        )
+        if reader.history is not None:
+            reader.history.assert_current(reader.history.generation)
+        found = resolve_person(reference, reader)
+        if found.person_id is None:
+            return None
+        person = found.person_id
+        if reader.kind == "group" and person not in people.scope(reader).member_ids:
+            return None
+        card = render_person(person, reader)
+        values = set()
+        if channel == "whatsapp" and reader.history is not None:
+            bridge = history_person(person, reader)
+            for ident in bridge.identifiers:
+                if (ident.valid_from_ms is None or ident.valid_from_ms <= reader.at_ms) and (
+                    ident.valid_until_ms is None or reader.at_ms < ident.valid_until_ms
+                ):
+                    values.add(ident.value)
+        elif knowledge is not None:
+            for subject in knowledge.directory_subject_ids(person, reader=reader):
+                for ident in knowledge.person_identifiers(subject):
+                    if ident.channel != channel:
+                        continue
+                    owners = knowledge.owners_of_identifier_value(ident.value, channel=channel)
+                    if tuple(owners) != (subject,):
+                        continue
+                    query = ident.value.split("|", 1)[0] if channel == "telegram" else ident.value
+                    if resolve_person(query, reader).person_id == person:
+                        values.add(ident.value)
+        chosen = _pick_delivery_value(sorted(values))
+        if chosen is None:
+            return None
+        # Rendering controls whether an endpoint may enter the model's context.
+        allowed = set(card.identifiers)
+        if chosen.endswith("@s.whatsapp.net"):
+            if ("phone", chosen.removesuffix("@s.whatsapp.net")) not in allowed:
+                return None
+        elif chosen.endswith("@lid"):
+            if ("wa_lid", chosen.removesuffix("@lid")) not in allowed:
+                return None
+        elif channel == "telegram":
+            digits = chosen.removeprefix("telegram:").split("|", 1)[0]
+            if ("telegram_id", digits) not in allowed:
+                return None
+        else:
+            return None
+        matched = None
+        if channel == "whatsapp" and reference.strip().startswith("@"):
+            from yeoman_gateway.history.queries import HistoryQueries
+
+            _, parsed = _identifiers(reference.strip(), reader)
+            for kind, value in parsed:
+                if kind not in ("phone", "wa_lid"):
+                    continue
+                candidate = value + ("@lid" if kind == "wa_lid" else "@s.whatsapp.net")
+                if resolve_person(candidate, reader).person_id != person:
+                    continue
+                if (
+                    reader.kind == "group"
+                    and HistoryQueries(reader.history).mention(
+                        candidate, chat_id=chat_id, at_ms=reader.at_ms
+                    )
+                    != chosen
+                ):
+                    continue
+                if candidate in values:
+                    matched = candidate if candidate != chosen else None
+                    break
+            else:
+                return None
+        if reader.history is not None:
+            reader.history.assert_current(reader.history.generation)
+        return ContactResolution(card.display_name, chosen, matched)
     except HistoryPaused:
         raise
     except Exception as exc:
-        # Knowledge is optional for the turn: no authority, no target. The failure
-        # stays visible instead of looking exactly like "no proven person".
+        # No authority, no target; the failure stays visible instead of looking like
+        # "no proven person".
         logger.warning(
-            "contact resolution degraded: knowledge lookup failed ({})",
+            "contact resolution degraded: directory lookup failed ({})",
             getattr(exc, "code", type(exc).__name__),
         )
         return None
-
-
-def _resolve_through_knowledge(
-    knowledge: Any,
-    ref: str,
-    *,
-    channel: str,
-    chat_id: str,
-) -> ContactResolution | None:
-    """Resolve proven targets through the selected chat scope or Knowledge facade."""
-    from yeoman_gateway.history.ids import classify
-    from yeoman_gateway.knowledge._history_identity import current_history_scope
-
-    scope = current_history_scope()
-    ident = classify(chat_id) if channel == "whatsapp" else None
-    whatsapp_group = ident is not None and ident.kind == "group"
-    if whatsapp_group and scope is None:
-        return None
-    now_ms = int(__import__("time").time() * 1000)
-    roster: set[str] | None = None
-    if whatsapp_group:
-        if scope is None:
-            return None
-        audience = scope.queries.members(chat_id=chat_id, at_ms=now_ms)
-        if audience.status != "known":
-            return None
-        roster = {
-            terminal
-            for principal in audience.members
-            if (contact := scope.queries.principal_contact(principal, now_ms))
-            and (terminal := scope.queries.terminal(contact))
-        }
-
-    mention_candidates = _mention_candidates(ref)
-    if mention_candidates:
-        # In a group, a mention only resolves through the projected current roster;
-        # the original token is never used as a fallback when History cannot prove it.
-        for candidate in mention_candidates:
-            values = (candidate,)
-            if scope is not None and channel == "whatsapp":
-                mapped = scope.queries.mention(candidate, chat_id=chat_id, at_ms=now_ms)
-                if whatsapp_group and mapped is None:
-                    continue
-                values = (mapped,) if mapped else (candidate,)
-            for value in values:
-                proven = _proven_mention_target(knowledge, channel=channel, value=value)
-                if proven is None:
-                    continue
-                person_id, proven_value = proven
-                if roster is not None and scope.queries.terminal(person_id) not in roster:
-                    continue
-                display = knowledge.person_display_name(person_id)
-                if display:
-                    return ContactResolution(
-                        display_name=display,
-                        jid=proven_value,
-                        matched_identifier=(candidate if candidate != proven_value else None),
-                    )
-        return None
-
-    if scope is not None and channel == "whatsapp":
-        found = scope.queries.resolve_person(ref, (chat_id,), now_ms)
-        people = [(found.person_id, (scope.queries.contact(found.person_id) or {}).get("display_name"))] if found.person_id else []
-        if roster is not None:
-            people = [
-                (person_id, display_name)
-                for person_id, display_name in people
-                if scope.queries.terminal(person_id) in roster
-            ]
-    else:
-        people = [(person.person_id, person.display_name) for person in knowledge.search_people_with_policy(
-            ref, channel=channel, chat_id=chat_id
-        )]
-    candidates: list[ContactResolution] = []
-    for person_id, display_name in people:
-        labels = [knowledge.person_display_name(person_id) or ""]
-        labels.extend(knowledge.alias_names(person_id))
-        if not _reference_matches_labels(ref, [label for label in labels if label]):
-            continue
-        identifiers = [
-            item.value
-            for item in knowledge.person_identifiers(person_id)
-            if item.channel == channel
-        ]
-        chosen = _pick_delivery_value(identifiers)
-        if not chosen:
-            continue
-        candidates.append(ContactResolution(display_name=display_name or chosen, jid=chosen))
-
-    if len(candidates) == 1:
-        return candidates[0]
-    return None
-
-
-def _proven_person_for_value(knowledge: Any, value: str) -> str | None:
-    """The one person a value is proven for, or nothing - never the first owner."""
-    owners = knowledge.owners_of_identifier_value(value)
-    if len(owners) != 1:
-        return None
-    return str(owners[0])
 
 
 def contact_resolution_matches_reference(
@@ -253,25 +153,31 @@ def contact_resolution_matches_reference(
     reference: str,
     resolution: ContactResolution,
     knowledge: object | None = None,
+    people: PeopleResolver | None = None,
+    reader: ReaderContext | None = None,
 ) -> bool:
-    """Check that a resolved identifier belongs to one knowledge-backed name."""
-    if knowledge is None:
+    """Confirm the same unique directory identity and currently proven endpoint."""
+    if reader is None:
         return False
-    person_id = _proven_person_for_value(knowledge, resolution.jid)
-    if person_id is None and resolution.matched_identifier:
-        person_id = _proven_person_for_value(knowledge, resolution.matched_identifier)
-    if person_id is None:
-        return False
-    labels = [knowledge.person_display_name(person_id) or ""]
-    labels.extend(knowledge.alias_names(person_id))
-    return _reference_matches_labels(reference, [label for label in labels if label])
+    expected = resolve_contact_reference(
+        reference=reference,
+        channel=reader.channel,
+        chat_id=reader.chat_id,
+        knowledge=knowledge,
+        people=people,
+        reader=reader,
+    )
+    return expected is not None and expected.jid == resolution.jid
 
 
 class ResolveContactTool(Tool):
     """Resolve a contact name or WhatsApp mention to one delivery JID."""
 
-    def __init__(self, *, knowledge: object | None = None) -> None:
+    def __init__(
+        self, *, knowledge: object | None = None, people: PeopleResolver | None = None
+    ) -> None:
         self._knowledge = knowledge
+        self._people = people
         self._channel = ""
         self._chat_id = ""
 
@@ -282,7 +188,10 @@ class ResolveContactTool(Tool):
     @property
     def _channel(self) -> str:
         from yeoman_gateway.processing.tool_context import tool_target
-        return tool_target(default_channel=self._default_channel, default_chat_id=self._default_chat_id)[0]
+
+        return tool_target(
+            default_channel=self._default_channel, default_chat_id=self._default_chat_id
+        )[0]
 
     @_channel.setter
     def _channel(self, value: str) -> None:
@@ -291,7 +200,10 @@ class ResolveContactTool(Tool):
     @property
     def _chat_id(self) -> str:
         from yeoman_gateway.processing.tool_context import tool_target
-        return tool_target(default_channel=self._default_channel, default_chat_id=self._default_chat_id)[1]
+
+        return tool_target(
+            default_channel=self._default_channel, default_chat_id=self._default_chat_id
+        )[1]
 
     @_chat_id.setter
     def _chat_id(self, value: str) -> None:
@@ -323,14 +235,34 @@ class ResolveContactTool(Tool):
         }
 
     async def execute(self, query: str, **kwargs: Any) -> str:
-        from yeoman_gateway.processing.tool_context import tool_history_snapshot
+        from yeoman_gateway.people.disclosure import reader_context
+        from yeoman_gateway.people.resolver import PeopleUnavailable
+        from yeoman_gateway.processing.tool_context import (
+            current_tool_context,
+            tool_history_snapshot,
+        )
+
         snapshot = tool_history_snapshot()
-        if snapshot is not None and self._knowledge is None:
-            from yeoman_gateway.history.live import HistoryPaused
-            raise HistoryPaused('history_knowledge_required')
+        context = current_tool_context()
         del kwargs
+        reader = None
+        if self._people is not None and context is not None:
+            try:
+                reader = reader_context(
+                    self._people,
+                    channel=context.channel,
+                    chat_id=context.chat_id,
+                    principal_id=context.canonical_user_id,
+                    is_owner=context.is_owner,
+                    at_ms=int(time.time() * 1000),
+                    history=snapshot,
+                )
+            except PeopleUnavailable:
+                pass
         result = resolve_contact_reference(
             knowledge=self._knowledge,
+            people=self._people,
+            reader=reader,
             reference=query,
             channel=self._channel,
             chat_id=self._chat_id,
