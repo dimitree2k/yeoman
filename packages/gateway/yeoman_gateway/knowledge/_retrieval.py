@@ -87,6 +87,21 @@ HISTORIC_STATEMENT_SQL: str = (
 DIAGNOSIS_STATEMENT_SQL: str = "s.status <> 'revoked' AND s.revoked_at_ms IS NULL"
 
 
+def _person_statement_clause(placeholders: str, role_sql: str) -> str:
+    """Statements linked to one of the given people through an *active* role.
+
+    Only an active role links a statement to a person: a withheld cutover row must not
+    make a statement discoverable through a person filter.  The subquery is
+    uncorrelated on purpose: as a per-statement ``EXISTS`` SQLite looked the link up
+    through the status index and rescanned every active link for every statement, which
+    took seconds on the live store and blocked the event loop.
+    """
+    return (
+        "s.statement_id IN (SELECT kp.statement_id FROM knowledge_statement_people kp"
+        f" WHERE kp.person_id IN ({placeholders}) AND kp.status = 'active'{role_sql})"
+    )
+
+
 def statement_visibility_clause(
     view: str, *, at_ms: int = 0
 ) -> tuple[str, tuple[Any, ...]]:
@@ -355,8 +370,7 @@ class RetrievalEngine:
             if roles:
                 role_sql = " AND kp.role IN (" + ",".join("?" for _ in roles) + ")"
                 params.extend(roles)
-            return ("EXISTS (SELECT 1 FROM knowledge_statement_people kp WHERE kp.statement_id=s.statement_id"
-                    f" AND kp.person_id IN ({placeholders}) AND kp.status='active'{role_sql})", params)
+            return _person_statement_clause(placeholders, role_sql), params
         originals: set[str] = set()
         for person_id in person_ids:
             originals.add(str(person_id))
@@ -387,15 +401,7 @@ class RetrievalEngine:
             role_placeholders = ",".join("?" for _ in roles)
             role_sql = f" AND kp.role IN ({role_placeholders})"
             params.extend(roles)
-        # Only an active role links a statement to a person: a withheld cutover row must
-        # not make a statement discoverable through a person filter.
-        clause = (
-            "EXISTS (SELECT 1 FROM knowledge_statement_people kp"
-            f" WHERE kp.statement_id = s.statement_id AND kp.person_id IN ({placeholders})"
-            " AND kp.status = 'active'"
-            f"{role_sql})"
-        )
-        return clause, params
+        return _person_statement_clause(placeholders, role_sql), params
 
     def candidates(
         self,
