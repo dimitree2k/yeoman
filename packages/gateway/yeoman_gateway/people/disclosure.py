@@ -53,18 +53,19 @@ def _owner_phone_code(directory: PeopleResolver, index, at_ms: int) -> str | Non
         and _active(row, at_ms)
         and index.matches("phone", row["value"], at_ms) == {owner}
     }
-    if len(phones) != 1:
+    if not phones:
         return None
-    phone = next(iter(phones))
     cached = getattr(directory._local, "owner_codes", None)
     if cached is None or cached[0] is not index:
         cached = (index, {})
         directory._local.owner_codes = cached
-    if phone not in cached[1]:
+    for phone in phones - cached[1].keys():
         cached[1][phone] = next(
             (phone[:n] for n in range(1, 4) if phone[:n] in _CALLING_CODES), None
         )
-    return cached[1][phone]
+    # Several current phones are fine when they share one country; mixed countries are not.
+    codes = {cached[1][phone] for phone in phones}
+    return next(iter(codes)) if len(codes) == 1 else None
 
 
 def reader_context(

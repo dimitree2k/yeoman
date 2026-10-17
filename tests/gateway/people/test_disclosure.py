@@ -309,3 +309,18 @@ def test_ambiguous_telegram_endpoint_does_not_grant_scope(directory_case):
     )
     assert reader.kind == "other_dm"
     assert c.directory.scope(reader).eligible_ids == frozenset()
+
+
+def test_owner_phones_sharing_a_country_keep_its_calling_code(directory_case):
+    c = directory_case
+    c.add_id(c.owner, "phone", "4917000000098")
+    reader = reader_context(
+        c.directory,
+        channel="whatsapp",
+        chat_id=c.endpoint(c.owner),
+        principal_id="whatsapp:" + c.endpoint(c.owner),
+        is_owner=True,
+        at_ms=300,
+        history=c.snapshot,
+    )
+    assert reader.national_calling_code == "49"
