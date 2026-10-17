@@ -38,6 +38,24 @@ def capture(service, source, *, attributes=False):
     return result.statement_ids[0], context
 
 
+def owner_dm_statement(service, sources, db, *,
+                       chat="10002@s.whatsapp.net", message_id="owner-dm"):
+    """Capture one ``author_only`` statement the *owner* authored in the owner's chat.
+
+    Change 2 narrowed owner scope to the owner's own material: another contact's
+    ``author_only`` statement no longer reaches an owner read, so the responder tests
+    below build the statement the owner actually wrote instead.
+    """
+    message(db, message_id, chat=chat, sender='b',
+            identifier='10002@s.whatsapp.net', text='Synthetic A')
+    statement_id, _ = capture(service, sources.issue(message_id))
+    service._store.execute(
+        "UPDATE knowledge_statements SET visibility_scope='author_only' WHERE statement_id=?",
+        (statement_id,),
+    )
+    return statement_id
+
+
 def read(principal=AUTHOR, *, now=150, chat_id="g@g.us", is_direct=False):
     return TrustedReadContext(principal, 'whatsapp', chat_id, frozenset({principal}), None, 1,
                               'reply', now, is_direct=is_direct)
@@ -203,7 +221,15 @@ def test_history_alias_delivery_preserves_frozen_release_controls(case):
 
 
 @pytest.mark.parametrize("principal", [MEMBER, "whatsapp:20002@lid"])
-def test_owner_dm_lookup_reads_author_only_statement_only_with_history_audience_proof(case, principal):
+def test_owner_dm_does_not_read_another_authors_author_only_statement(case, principal):
+    """Change 2 removed the blanket grant over *other* authors' ``author_only`` rows.
+
+    Owner scope used to replace the audience check with ``1=1`` (and admit every
+    ``author_only`` row) whenever it was on, so this setup proved the owner read of a
+    statement another contact had authored. That blanket is gone: owner scope reaches the
+    owner's own material plus shared statements that name the owner. The positive half of
+    the previous version is therefore the negative half here; nothing else changes.
+    """
     service, q, sources, db = case
     if principal.endswith("@lid"):
         identifier(db, 'b', '20002@lid', start=1)
@@ -215,7 +241,7 @@ def test_owner_dm_lookup_reads_author_only_statement_only_with_history_audience_
             principal, 'whatsapp', '10002@s.whatsapp.net', frozenset({principal}), None, 1,
             'reply', 150, is_direct=True, owner=True, owner_lookup_person_ids=('a',),
         )
-        assert service.recall(RecallQuery('Synthetic'), context=owner_dm).statement_ids == (sid,)
+        assert not service.recall(RecallQuery('Synthetic'), context=owner_dm).statement_ids
 
         normal_dm = TrustedReadContext(
             principal, 'whatsapp', '10002@s.whatsapp.net', frozenset({principal}), None, 1,
@@ -236,6 +262,30 @@ def test_owner_dm_lookup_reads_author_only_statement_only_with_history_audience_
             'proactive', 150, is_direct=True, owner=True, owner_lookup_person_ids=('a',),
         )
         assert not service.recall(RecallQuery('Synthetic'), context=proactive).statement_ids
+
+
+@pytest.mark.parametrize("principal", [MEMBER, "whatsapp:20002@lid"])
+def test_owner_cross_chat_read_still_requires_the_history_audience_proof(case, principal):
+    """The source-time proof is still the layer that decides a cross-chat owner read."""
+    service, q, sources, db = case
+    identifier(db, 'b', '20002@lid', start=1)
+    message(db, 'owner-cross', chat='g@g.us', sender='b', identifier='20002@lid',
+            text='Synthetic owner note')
+    source = sources.issue('owner-cross')
+    with service.history_scope(q, sources):
+        sid, _ = capture(service, source)
+        service._store.execute(
+            "UPDATE knowledge_statements SET visibility_scope='author_only' WHERE statement_id=?",
+            (sid,),
+        )
+        context = TrustedReadContext(
+            principal, 'whatsapp', '10002@s.whatsapp.net', frozenset({principal}), None, 1,
+            'reply', 150, is_direct=True, owner=True,
+            owner_lookup_chat_ids=('g@g.us',),
+        )
+        assert service.recall(RecallQuery('Synthetic'), context=context).statement_ids == (sid,)
+        event(db, 'owner-left', 'member_remove', 120, {'participants': [['10002@s.whatsapp.net']]})
+        assert not service.recall(RecallQuery('Synthetic'), context=context).statement_ids
 
 
 @pytest.mark.parametrize("principal", [MEMBER, "whatsapp:20002@lid"])
@@ -323,8 +373,7 @@ async def test_responder_handoff_uses_frozen_lid_principal_when_sender_canonical
     responder.knowledge = service
     monkeypatch.setattr("yeoman_gateway.history.context.current_history_snapshot", lambda: q.snapshot)
     with service.history_scope(q, sources):
-        sid, _ = capture(service, sources.issue('m'))
-        service._store.execute("UPDATE knowledge_statements SET visibility_scope='author_only' WHERE statement_id=?", (sid,))
+        owner_dm_statement(service, sources, db)
         token = set_tool_context(ToolInvocationContext(
             channel=handed_off['channel'], chat_id=handed_off['chat_id'],
             canonical_user_id=handed_off['canonical_user_id'], is_owner=handed_off['is_owner'],
@@ -337,11 +386,13 @@ async def test_responder_handoff_uses_frozen_lid_principal_when_sender_canonical
             reset_tool_context(token)
         recall = Mock(wraps=service.recall)
         monkeypatch.setattr(service, 'recall', recall)
+        # Relevance now decides what reaches the prompt, so a content-free synthetic
+        # statement needs one token the question shares with it.
         assert responder._knowledge_statement_context(
-            query="Was weißt du über Alex' Aktien?", channel=handed_off['channel'],
+            query="Synthetic: was weißt du über Alex' Aktien?", channel=handed_off['channel'],
             chat_id=handed_off['chat_id'], principal=handed_off['canonical_user_id'],
             is_owner=handed_off['is_owner'],
-        ) == 'Synthetic statement (Alex)'
+        ) == 'Synthetic statement (Alex, b)'
         assert recall.call_args.args[0].person_ids == ('a',)
 
 
@@ -381,21 +432,17 @@ def test_owner_german_person_question_retrieves_real_v3_statement(case, monkeypa
     source = sources.issue('m')
     db.execute("UPDATE contacts SET display_name='Alex' WHERE contact_id='a'")
     with service.history_scope(q, sources):
-        sid, _ = capture(service, source)
-        service._store.execute(
-            "UPDATE knowledge_statements SET visibility_scope='author_only' WHERE statement_id=?",
-            (sid,),
-        )
+        owner_dm_statement(service, sources, db)
         responder = object.__new__(LLMResponder)
         responder.knowledge = service
         monkeypatch.setattr(
             "yeoman_gateway.history.context.current_history_snapshot", lambda: q.snapshot
         )
         text = responder._knowledge_statement_context(
-            query="Was weißt du über Alex' Aktien?", channel='whatsapp',
+            query="Synthetic: Was weißt du über Alex' Aktien?", channel='whatsapp',
             chat_id=chat, principal=principal, is_owner=True,
         )
-        assert text == 'Synthetic statement (Alex)'
+        assert text == 'Synthetic statement (Alex, b)'
         assert not responder._knowledge_statement_context(
             query="Wie wird das Wetter?", channel='whatsapp',
             chat_id='10002@s.whatsapp.net', principal=MEMBER, is_owner=True,
@@ -420,19 +467,18 @@ def test_owner_german_natural_prefix_preserves_display_name_in_real_v3_result(ca
     service, q, sources, db = case
     if principal.endswith("@lid") or chat.endswith("@lid"):
         identifier(db, 'b', '20002@lid', start=1)
-    source = sources.issue('m')
     db.execute("UPDATE contacts SET display_name='AlexGrrrrr😈' WHERE contact_id='a'")
     with service.history_scope(q, sources):
-        capture(service, source)
+        owner_dm_statement(service, sources, db)
         responder = object.__new__(LLMResponder)
         responder.knowledge = service
         monkeypatch.setattr(
             "yeoman_gateway.history.context.current_history_snapshot", lambda: q.snapshot
         )
         assert responder._knowledge_statement_context(
-            query="Was weißt du über Alex' Aktien?", channel='whatsapp',
+            query="Synthetic: Was weißt du über Alex' Aktien?", channel='whatsapp',
             chat_id=chat, principal=principal, is_owner=True,
-        ) == 'Synthetic statement (AlexGrrrrr😈)'
+        ) == 'Synthetic statement (AlexGrrrrr😈, b)'
 
 
 @pytest.mark.parametrize(("principal", "chat"), [
@@ -513,7 +559,12 @@ def test_owner_lookup_denies_late_joiner_even_when_currently_in_group(case, monk
 def test_owner_cross_chat_lookup_denies_reassigned_original_audience_identifier(case):
     service, q, sources, db = case
     identifier(db, 'b', '20002@lid', start=1)
-    source = sources.issue('m')
+    # The statement is the owner's own, so the narrow author gate admits it and the
+    # temporal source proof is the layer that has to refuse it once the audience
+    # identifier changes hands.
+    message(db, 'owner-cross', chat='g@g.us', sender='b', identifier='20002@lid',
+            text='Synthetic owner note')
+    source = sources.issue('owner-cross')
     with service.history_scope(q, sources):
         sid, _ = capture(service, source)
         service._store.execute(
@@ -523,7 +574,7 @@ def test_owner_cross_chat_lookup_denies_reassigned_original_audience_identifier(
         owner_dm = TrustedReadContext(
             'whatsapp:20002@lid', 'whatsapp', '20002@lid',
             frozenset({'whatsapp:20002@lid'}), None, 1, 'reply', 150,
-            is_direct=True, owner=True, owner_lookup_person_ids=('a',),
+            is_direct=True, owner=True, owner_lookup_chat_ids=('g@g.us',),
         )
         assert service.recall(RecallQuery('Synthetic'), context=owner_dm).statement_ids == (sid,)
         db.execute("UPDATE identifier_history SET valid_until_ms=160 WHERE contact_id='b' AND value='10002@s.whatsapp.net'")

@@ -24,6 +24,7 @@ import time
 from dataclasses import dataclass, replace
 from typing import Any
 
+from yeoman_gateway.history.ids import classify
 from yeoman_gateway.knowledge import _reasons
 from yeoman_gateway.knowledge._person_identity import IdentityEngine
 from yeoman_gateway.knowledge._statements import StatementEngine
@@ -41,6 +42,55 @@ from yeoman_gateway.knowledge.models import (
 )
 
 MAX_CONTEXT_CHARS = 4000
+
+#: Hard bound on the spellings one owner may be attributed under. One person carries a
+#: handful of identifiers and every identifier contributes a fixed set of spellings, so
+#: this only guards against a pathological identity record, it is not a tuning knob.
+MAX_OWNER_AUTHOR_FORMS = 64
+
+
+def principal_spellings(principal: str) -> tuple[str, ...]:
+    """Every exact spelling one identifier may already be stored under as an author.
+
+    The archive records the same number as ``4711``, ``+4711``, ``4711@s.whatsapp.net``,
+    ``4711@lid`` and behind a ``whatsapp:`` qualifier. Only those four dimensions vary:
+    the number itself is never altered, shortened or compared by prefix, so this is
+    canonicalisation of one identifier and never identity matching between two.
+    """
+    token = str(principal or "").strip()
+    if not token:
+        return ()
+    channel, separator, value = token.partition(":")
+    if separator and not value.strip():
+        return ()
+    if separator and channel != "whatsapp":
+        # Every other channel stores exactly one spelling of its principals.
+        return (token,)
+    ident = classify(value or token)
+    if ident is None or ident.kind not in ("pn_jid", "lid", "numeric"):
+        return (token,)
+    bare = ident.value.removesuffix("@s.whatsapp.net").removesuffix("@lid")
+    if not bare.isdigit():
+        return (token,)
+    forms = (bare, f"+{bare}", f"{bare}@s.whatsapp.net", f"{bare}@lid")
+    return tuple(dict.fromkeys((*forms, *(f"whatsapp:{form}" for form in forms))))
+
+
+def _identity_forms(principal: str, channel: str) -> tuple[str, ...]:
+    """Channel-qualified spellings to ask the identity layer about.
+
+    A number without a suffix may be a phone jid or a LID, so both readings are offered;
+    which one is real is decided by the archive binding, never by this list.
+    """
+    token = str(principal or "").strip()
+    value = token.partition(":")[2] if ":" in token else token
+    value = value.strip()
+    if not value:
+        return ()
+    if "@" not in value:
+        return (f"{channel}:{value}", f"{channel}:{value}@lid")
+    return (f"{channel}:{value}",)
+
 
 #: The four reasons live in :mod:`yeoman_gateway.knowledge._reasons` so the writers and
 #: the readers share one vocabulary without an import cycle.
@@ -252,6 +302,11 @@ class RetrievalEngine:
         recipient must be named in its audience.  Role edges never widen this: a
         participant is not a reader.  The status/reason rules come from the one shared
         contract in :func:`statement_visibility_clause`; nothing here re-derives them.
+
+        An owner scope read (see :meth:`_owner_scope`) keeps that audience rule and only
+        widens *whose* name satisfies it: the owner's own material is readable under any
+        spelling the archive may have stored, and a shared statement still has to name
+        the owner.  Another author's ``author_only`` statement is never admitted.
         """
         recipients = self._acl_principals(decision)
         at_ms = self._read_time_ms(context, view)
@@ -268,8 +323,16 @@ class RetrievalEngine:
             at_ms,
             at_ms,
         ]
-        owner_lookup = context.owner_lookup_enabled and not group_wide
-        if owner_lookup:
+        owner_scope = self._owner_scope(context) and not group_wide
+        author_principals = (
+            self._owner_author_principals(context)
+            if owner_scope
+            else (str(context.principal_id),)
+        )
+        explicit_targets = bool(
+            context.owner_lookup_person_ids or context.owner_lookup_chat_ids
+        )
+        if owner_scope and explicit_targets:
             target_clauses: list[str] = []
             target_params: list[Any] = []
             if context.owner_lookup_person_ids:
@@ -293,18 +356,17 @@ class RetrievalEngine:
         else:
             clauses.append("s.scope_key = ?")
             params.append(context.scope_key())
+        author_placeholders = ",".join("?" for _ in author_principals)
         # Group-wide reads cannot inherit the triggering author's author-only right.
         if group_wide:
             clauses.append("s.visibility_scope <> 'author_only'")
         else:
             clauses.append(
-                "((s.visibility_scope = 'author_only' AND s.author_principal = ?)"
-                + (" OR s.visibility_scope = 'author_only'" if owner_lookup else "")
-                + " OR (s.visibility_scope <> 'author_only'))"
+                "((s.visibility_scope = 'author_only'"
+                f" AND s.author_principal IN ({author_placeholders}))"
+                " OR (s.visibility_scope <> 'author_only'))"
             )
-            params.append(context.principal_id)
-        # Owner-history candidates are checked against temporal source audiences below;
-        # stored principal strings can differ across phone/LID identifiers.
+            params.extend(author_principals)
         placeholders = ",".join("?" for _ in recipients)
         audience_match = (
             "(SELECT COUNT(DISTINCT p.principal_id)"
@@ -312,23 +374,31 @@ class RetrievalEngine:
             f" WHERE p.statement_id = s.statement_id AND p.role = 'audience'"
             f" AND p.principal_id IN ({placeholders})) = ?"
         )
+        owner_audience_match = (
+            "(EXISTS (SELECT 1 FROM knowledge_statement_principals p"
+            " WHERE p.statement_id = s.statement_id AND p.role = 'audience'"
+            f" AND p.principal_id IN ({author_placeholders})))"
+        )
         if recipients and group_wide:
             clauses.append("s.visibility_scope <> 'author_only' AND " + audience_match)
             params.extend(recipients)
             params.append(len(recipients))
-        elif owner_lookup:
-            # Temporal source proofs below authorize owner aliases, rather than raw strings.
-            clauses.append("1=1")
+        elif owner_scope:
+            # A shared statement still has to name the owner - by any proven spelling,
+            # because stored principal strings differ across phone and LID identifiers.
+            clauses.append(
+                "(s.visibility_scope = 'author_only' OR " + owner_audience_match + ")"
+            )
+            params.extend(author_principals)
         elif recipients:
             clauses.append(
                 "((s.visibility_scope <> 'author_only' AND " + audience_match + ")"
-                " OR (s.visibility_scope = 'author_only' AND s.author_principal = ?)"
-                + (" OR (s.visibility_scope = 'author_only' AND 1=1)" if owner_lookup else "")
-                + ")"
+                " OR (s.visibility_scope = 'author_only' AND s.author_principal IN ("
+                + author_placeholders + ")))"
             )
             params.extend(recipients)
             params.append(len(recipients))
-            params.append(context.principal_id)
+            params.extend(author_principals)
         else:
             clauses.append(
                 "((s.visibility_scope <> 'author_only' AND " + audience_match + ")"
@@ -337,6 +407,82 @@ class RetrievalEngine:
             params.append("__no_recipient__")
             params.append(0)
         return " AND ".join(clauses), params
+
+    def _owner_scope(self, context: TrustedReadContext) -> bool:
+        """Whether this read may reach the owner's own material in every spelling.
+
+        The answer is a property of the trusted context - a proven owner reading a direct
+        chat, for somebody who asked or for the owner directly - and is never derived from
+        request text.  ``decide`` re-validates the same context against Policy and the
+        archive before any clause is built, so an owner scope here always rests on an
+        owner-direct-chat proof.  A proactive draft is not somebody asking, and keeps the
+        narrow reader rules.
+        """
+        return bool(
+            context.owner and context.is_direct
+            and context.purpose in ("reply", "admin")
+        )
+
+    def _owner_author_principals(self, context: TrustedReadContext) -> tuple[str, ...]:
+        """The bounded set of spellings the owner's own statements may be stored under.
+
+        Tier 1 is syntactic (:func:`principal_spellings`).  Tier 2 is proof-based: the
+        person behind any of those spellings is resolved through the identity layer and
+        only that person's *active* bindings on the same channel add their spellings.  An
+        identity nobody proves contributes nothing beyond tier 1.
+        """
+        seeds = sorted({str(context.principal_id), *(context.recipient_principals or ())})
+        forms: set[str] = set()
+        for seed in seeds:
+            forms.update(principal_spellings(seed))
+        for value in self._owner_binding_values(seeds, str(context.channel)):
+            forms.update(principal_spellings(value))
+        return tuple(sorted(forms))[:MAX_OWNER_AUTHOR_FORMS]
+
+    def _owner_binding_values(
+        self, principals: tuple[str, ...], channel: str
+    ) -> tuple[str, ...]:
+        """Active identifier values the people behind ``principals`` prove, same channel.
+
+        A bare number is stored as both a phone jid and a LID, so both readings are
+        offered to the identity layer and the archive binding decides which is real. When
+        the principals prove more than one person the identity is contradictory and
+        nothing is added: an unproven identity never widens the set.
+        """
+        if channel != "whatsapp":
+            return ()
+        from yeoman_gateway.history.live import HistoryPaused
+        from yeoman_gateway.knowledge._history_identity import current_history_scope
+
+        scope = current_history_scope(self._store)
+        if scope is None:
+            return ()
+        people: set[str] = set()
+        try:
+            for principal in principals:
+                proved = {
+                    person
+                    for person in (
+                        scope.identity.person_id_for_principal(form)
+                        for form in _identity_forms(principal, channel)
+                    )
+                    if person
+                }
+                if len(proved) > 1:
+                    return ()
+                people |= proved
+            if len(people) != 1:
+                return ()
+            person = people.pop()
+            values: list[str] = []
+            for binding in scope.identity.active_bindings_of(person):
+                value = str(binding.identifier.value)
+                if str(binding.identifier.channel) == channel and value not in values:
+                    values.append(value)
+        except (HistoryPaused, KnowledgeError):
+            # An unavailable identity layer proves nothing; tier 1 stands alone.
+            return ()
+        return tuple(values)
 
     def _person_filter_clause(
         self, person_ids: tuple[str, ...], roles: tuple[str, ...]
@@ -434,10 +580,11 @@ class RetrievalEngine:
                                 decision: ReadDecision) -> bool:
         from yeoman_gateway.knowledge._history_identity import current_history_scope
         scope = current_history_scope(self._store)
+        owner_scope = self._owner_scope(context)
         if scope is None:
-            return not context.owner_lookup_enabled
+            return not owner_scope
         sources = self._statements.sources_of(statement_id)
-        if context.owner_lookup_enabled:
+        if owner_scope:
             def permits_owner_lookup(source: SourceRef, status: str) -> bool:
                 if status != "active" or source.channel != "whatsapp" or not scope.sources.verify_source(source):
                     return False
