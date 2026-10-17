@@ -13,7 +13,7 @@ jobs:
       - uses: astral-sh/setup-uv@v7
         with:
           python-version: "3.14"
-      - run: uv sync --locked
+      - run: uv sync
       - name: Gate synthetic accuracy and disclosure
         run: |
           ulimit -Sn 1024
