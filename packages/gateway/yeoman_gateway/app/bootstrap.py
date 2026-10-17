@@ -4105,6 +4105,8 @@ def build_gateway_runtime(
             registrar=observed_sources, projector=history_projector,
         ) if observed_sources is not None else None),
         people=people,
-        people_sync=(PeopleSyncService(projector=history_projector, db_path=people_db_path())
-                     if history_projector is not None else None),
+        people_sync=(
+            PeopleSyncService(projector=history_projector, db_path=people_db_path(), people=people)
+            if history_projector is not None else None
+        ),
     )

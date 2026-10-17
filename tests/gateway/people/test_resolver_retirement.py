@@ -62,6 +62,7 @@ def runtime_case(tmp_path, monkeypatch, request):
 def test_composition_injects_same_directory(runtime_case):
     runtime, path = runtime_case
     assert isinstance(runtime.people, PeopleResolver)
+    assert runtime.people_sync.people is runtime.people
     assert runtime.responder.people is runtime.people
     assert runtime.responder.knowledge.people is runtime.people
     assert runtime.responder._recall_tool._people is runtime.people

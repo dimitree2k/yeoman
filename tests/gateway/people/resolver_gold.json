@@ -1,0 +1,385 @@
+{
+  "version": 1,
+  "cases": [
+    {
+      "query": "Wimds",
+      "reader": {
+        "channel": "whatsapp",
+        "chat_id": "4915000000099@s.whatsapp.net",
+        "principal_id": "whatsapp:4915000000099",
+        "kind": "owner_dm",
+        "at_ms": 300
+      },
+      "expected_status": "resolved",
+      "expected_ids": [
+        1
+      ]
+    },
+    {
+      "query": "Vincent",
+      "reader": {
+        "channel": "whatsapp",
+        "chat_id": "4915000000099@s.whatsapp.net",
+        "principal_id": "whatsapp:4915000000099",
+        "kind": "owner_dm",
+        "at_ms": 300
+      },
+      "expected_status": "resolved",
+      "expected_ids": [
+        1
+      ]
+    },
+    {
+      "query": "Vinz😈",
+      "reader": {
+        "channel": "whatsapp",
+        "chat_id": "4915000000099@s.whatsapp.net",
+        "principal_id": "whatsapp:4915000000099",
+        "kind": "owner_dm",
+        "at_ms": 300
+      },
+      "expected_status": "resolved",
+      "expected_ids": [
+        1
+      ]
+    },
+    {
+      "query": "Alex",
+      "reader": {
+        "channel": "whatsapp",
+        "chat_id": "4915000000099@s.whatsapp.net",
+        "principal_id": "whatsapp:4915000000099",
+        "kind": "owner_dm",
+        "at_ms": 300
+      },
+      "expected_status": "ambiguous",
+      "expected_ids": [
+        3,
+        4
+      ]
+    },
+    {
+      "query": "Alex Müller",
+      "reader": {
+        "channel": "whatsapp",
+        "chat_id": "4915000000099@s.whatsapp.net",
+        "principal_id": "whatsapp:4915000000099",
+        "kind": "owner_dm",
+        "at_ms": 300
+      },
+      "expected_status": "resolved",
+      "expected_ids": [
+        3
+      ]
+    },
+    {
+      "query": "Ale Mül",
+      "reader": {
+        "channel": "whatsapp",
+        "chat_id": "4915000000099@s.whatsapp.net",
+        "principal_id": "whatsapp:4915000000099",
+        "kind": "owner_dm",
+        "at_ms": 300
+      },
+      "expected_status": "resolved",
+      "expected_ids": [
+        3
+      ]
+    },
+    {
+      "query": "Al",
+      "reader": {
+        "channel": "whatsapp",
+        "chat_id": "4915000000099@s.whatsapp.net",
+        "principal_id": "whatsapp:4915000000099",
+        "kind": "owner_dm",
+        "at_ms": 300
+      },
+      "expected_status": "resolved",
+      "expected_ids": [
+        5
+      ]
+    },
+    {
+      "query": "Vi",
+      "reader": {
+        "channel": "whatsapp",
+        "chat_id": "4915000000099@s.whatsapp.net",
+        "principal_id": "whatsapp:4915000000099",
+        "kind": "owner_dm",
+        "at_ms": 300
+      },
+      "expected_status": "not_found",
+      "expected_ids": []
+    },
+    {
+      "query": "+49 150 00000012",
+      "reader": {
+        "channel": "whatsapp",
+        "chat_id": "4915000000099@s.whatsapp.net",
+        "principal_id": "whatsapp:4915000000099",
+        "kind": "owner_dm",
+        "at_ms": 300
+      },
+      "expected_status": "resolved",
+      "expected_ids": [
+        1
+      ]
+    },
+    {
+      "query": "0049-150-00000012",
+      "reader": {
+        "channel": "whatsapp",
+        "chat_id": "4915000000099@s.whatsapp.net",
+        "principal_id": "whatsapp:4915000000099",
+        "kind": "owner_dm",
+        "at_ms": 300
+      },
+      "expected_status": "resolved",
+      "expected_ids": [
+        1
+      ]
+    },
+    {
+      "query": "015000000012",
+      "reader": {
+        "channel": "whatsapp",
+        "chat_id": "4915000000099@s.whatsapp.net",
+        "principal_id": "whatsapp:4915000000099",
+        "kind": "owner_dm",
+        "at_ms": 300,
+        "national_calling_code": "49"
+      },
+      "expected_status": "resolved",
+      "expected_ids": [
+        1
+      ]
+    },
+    {
+      "query": "015000000012",
+      "reader": {
+        "channel": "whatsapp",
+        "chat_id": "4915000000099@s.whatsapp.net",
+        "principal_id": "whatsapp:4915000000099",
+        "kind": "owner_dm",
+        "at_ms": 300,
+        "national_calling_code": null
+      },
+      "expected_status": "not_found",
+      "expected_ids": []
+    },
+    {
+      "query": "300000000001@lid",
+      "reader": {
+        "channel": "whatsapp",
+        "chat_id": "4915000000099@s.whatsapp.net",
+        "principal_id": "whatsapp:4915000000099",
+        "kind": "owner_dm",
+        "at_ms": 300
+      },
+      "expected_status": "resolved",
+      "expected_ids": [
+        1
+      ]
+    },
+    {
+      "query": "@300000000001@lid",
+      "reader": {
+        "channel": "whatsapp",
+        "chat_id": "g1@g.us",
+        "principal_id": "whatsapp:4915000000011",
+        "kind": "group",
+        "at_ms": 300
+      },
+      "expected_status": "resolved",
+      "expected_ids": [
+        1
+      ]
+    },
+    {
+      "query": "+4915000000011",
+      "reader": {
+        "channel": "whatsapp",
+        "chat_id": "4915000000099@s.whatsapp.net",
+        "principal_id": "whatsapp:4915000000099",
+        "kind": "owner_dm",
+        "at_ms": 199
+      },
+      "expected_status": "resolved",
+      "expected_ids": [
+        1
+      ]
+    },
+    {
+      "query": "+4915000000011",
+      "reader": {
+        "channel": "whatsapp",
+        "chat_id": "4915000000099@s.whatsapp.net",
+        "principal_id": "whatsapp:4915000000099",
+        "kind": "owner_dm",
+        "at_ms": 200
+      },
+      "expected_status": "resolved",
+      "expected_ids": [
+        2
+      ]
+    },
+    {
+      "query": "person:8",
+      "reader": {
+        "channel": "whatsapp",
+        "chat_id": "4915000000099@s.whatsapp.net",
+        "principal_id": "whatsapp:4915000000099",
+        "kind": "owner_dm",
+        "at_ms": 300
+      },
+      "expected_status": "resolved",
+      "expected_ids": [
+        1
+      ]
+    },
+    {
+      "query": "Sam Twins",
+      "reader": {
+        "channel": "whatsapp",
+        "chat_id": "4915000000099@s.whatsapp.net",
+        "principal_id": "whatsapp:4915000000099",
+        "kind": "owner_dm",
+        "at_ms": 300
+      },
+      "expected_status": "ambiguous",
+      "expected_ids": [
+        9,
+        10
+      ]
+    },
+    {
+      "query": "Secret Person",
+      "reader": {
+        "channel": "whatsapp",
+        "chat_id": "g1@g.us",
+        "principal_id": "whatsapp:4915000000011",
+        "kind": "group",
+        "at_ms": 300
+      },
+      "expected_status": "not_found",
+      "expected_ids": []
+    },
+    {
+      "query": "Secret Person",
+      "reader": {
+        "channel": "whatsapp",
+        "chat_id": "4915000000011@s.whatsapp.net",
+        "principal_id": "whatsapp:4915000000011",
+        "kind": "other_dm",
+        "at_ms": 300
+      },
+      "expected_status": "not_found",
+      "expected_ids": []
+    },
+    {
+      "query": "Vincnet",
+      "reader": {
+        "channel": "whatsapp",
+        "chat_id": "4915000000099@s.whatsapp.net",
+        "principal_id": "whatsapp:4915000000099",
+        "kind": "owner_dm",
+        "at_ms": 300
+      },
+      "expected_status": "not_found",
+      "expected_ids": []
+    },
+    {
+      "query": "Hidden Alias",
+      "reader": {
+        "channel": "whatsapp",
+        "chat_id": "4915000000099@s.whatsapp.net",
+        "principal_id": "whatsapp:4915000000099",
+        "kind": "owner_dm",
+        "at_ms": 300
+      },
+      "expected_status": "not_found",
+      "expected_ids": []
+    },
+    {
+      "query": "Quiet Person",
+      "reader": {
+        "channel": "whatsapp",
+        "chat_id": "g1@g.us",
+        "principal_id": "whatsapp:4915000000011",
+        "kind": "group",
+        "at_ms": 300
+      },
+      "expected_status": "resolved",
+      "expected_ids": [
+        6
+      ]
+    },
+    {
+      "query": "Qui",
+      "reader": {
+        "channel": "whatsapp",
+        "chat_id": "g1@g.us",
+        "principal_id": "whatsapp:4915000000011",
+        "kind": "group",
+        "at_ms": 300
+      },
+      "expected_status": "not_found",
+      "expected_ids": []
+    },
+    {
+      "query": "4915000000012@s.whatsapp.net.evil",
+      "reader": {
+        "channel": "whatsapp",
+        "chat_id": "4915000000099@s.whatsapp.net",
+        "principal_id": "whatsapp:4915000000099",
+        "kind": "owner_dm",
+        "at_ms": 300
+      },
+      "expected_status": "not_found",
+      "expected_ids": []
+    },
+    {
+      "query": "ＡＬＥＸ—Müller!!",
+      "reader": {
+        "channel": "whatsapp",
+        "chat_id": "4915000000099@s.whatsapp.net",
+        "principal_id": "whatsapp:4915000000099",
+        "kind": "owner_dm",
+        "at_ms": 300
+      },
+      "expected_status": "resolved",
+      "expected_ids": [
+        3
+      ]
+    },
+    {
+      "query": "telegram:1234567",
+      "reader": {
+        "channel": "telegram",
+        "chat_id": "1234567",
+        "principal_id": "telegram:1234567",
+        "kind": "other_dm",
+        "at_ms": 300
+      },
+      "expected_status": "resolved",
+      "expected_ids": [
+        11
+      ]
+    },
+    {
+      "query": "@synthetic_user",
+      "reader": {
+        "channel": "telegram",
+        "chat_id": "1234567",
+        "principal_id": "telegram:1234567",
+        "kind": "other_dm",
+        "at_ms": 300
+      },
+      "expected_status": "resolved",
+      "expected_ids": [
+        11
+      ]
+    }
+  ]
+}

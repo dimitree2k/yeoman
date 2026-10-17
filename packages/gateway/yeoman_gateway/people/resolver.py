@@ -119,7 +119,51 @@ class _State:
     inode: tuple[int, int]
     version: int | None = None
     index: _Index | None = None
+    schema_version: int | None = None
+    watermark: int = 0
+    audit_complete: bool = False
     memo: OrderedDict = field(default_factory=OrderedDict)
+
+
+_INDEX_TABLES = frozenset({"persons", "person_ids", "person_names", "person_decisions"})
+_IGNORED_TABLES = frozenset({"suggestions"})
+_SEEN_COLUMNS = frozenset({"first_seen_ms", "last_seen_ms"})
+
+
+def _invalid_json_constant(value):
+    raise ValueError("invalid_audit_json")
+
+
+def _irrelevant_changes(rows) -> bool:
+    for row in rows:
+        if row["tbl"] not in _INDEX_TABLES | _IGNORED_TABLES:
+            return False
+        try:
+            old = (
+                json.loads(row["old"], parse_constant=_invalid_json_constant)
+                if row["old"] is not None
+                else None
+            )
+            new = (
+                json.loads(row["new"], parse_constant=_invalid_json_constant)
+                if row["new"] is not None
+                else None
+            )
+        except TypeError, ValueError:
+            return False
+        if any(value is not None and not isinstance(value, dict) for value in (old, new)):
+            return False
+        if row["tbl"] in _IGNORED_TABLES:
+            if row["op"] not in ("insert", "update", "delete"):
+                return False
+            continue
+        if row["op"] != "update" or not isinstance(old, dict) or not isinstance(new, dict):
+            return False
+        if {key: value for key, value in old.items() if key not in _SEEN_COLUMNS} != {
+            key: value for key, value in new.items() if key not in _SEEN_COLUMNS
+        }:
+            return False
+    return True
 
 
 @dataclass(frozen=True, slots=True)
@@ -185,6 +229,13 @@ class PeopleResolver:
         if hasattr(self._local, "owner_codes"):
             del self._local.owner_codes
 
+    def refresh(self) -> None:
+        """Warm this thread after sync; unavailable directory remains an optional dependency."""
+        try:
+            self._index()
+        except PeopleUnavailable:
+            pass
+
     def _index(self) -> _Index:
         try:
             info = self.db_path.stat()
@@ -203,26 +254,64 @@ class PeopleResolver:
             if state.index is None or state.version != version:
                 conn.execute("BEGIN")
                 try:
-                    persons = {
-                        r["id"]: r
-                        for r in conn.execute(
-                            "SELECT id,preferred_name,home_city,address,birthday,relation,preferred_language,notes,merged_into,is_owner,effective_level FROM persons_v"
-                        )
-                    }
-                    names = tuple(
-                        r
-                        for r in conn.execute(
-                            "SELECT person_id,name,source,hidden FROM person_names"
-                        )
-                    )
-                    identifiers = tuple(
-                        r
-                        for r in conn.execute(
-                            "SELECT person_id,kind,value,valid_from_ms,valid_until_ms,hidden FROM person_ids"
+                    schema_version = conn.execute("PRAGMA schema_version").fetchone()[0]
+                    watermark = conn.execute(
+                        "SELECT coalesce(max(id),0) FROM change_log"
+                    ).fetchone()[0]
+                    reuse = (
+                        state.index is not None
+                        and state.schema_version == schema_version
+                        and state.audit_complete
+                        and watermark >= state.watermark
+                        and _irrelevant_changes(
+                            conn.execute(
+                                "SELECT tbl,op,old,new FROM change_log WHERE id > ? ORDER BY id",
+                                (state.watermark,),
+                            )
                         )
                     )
+                    if not reuse:
+                        triggers = {
+                            (row["name"], row["tbl_name"])
+                            for row in conn.execute(
+                                "SELECT name,tbl_name FROM sqlite_master WHERE type='trigger'"
+                            )
+                        }
+                        state.audit_complete = all(
+                            (f"{table}_audit_{op}", table) in triggers
+                            for table in _INDEX_TABLES
+                            for op in ("insert", "update", "delete")
+                        )
+                        persons = {
+                            r["id"]: r
+                            for r in conn.execute(
+                                "SELECT id,preferred_name,home_city,address,birthday,relation,"
+                                "preferred_language,notes,merged_into,is_owner,effective_level "
+                                "FROM persons_v"
+                            )
+                        }
+                        names = tuple(
+                            r
+                            for r in conn.execute(
+                                "SELECT person_id,name,source,hidden FROM person_names"
+                            )
+                        )
+                        identifiers = tuple(
+                            r
+                            for r in conn.execute(
+                                "SELECT person_id,kind,value,valid_from_ms,valid_until_ms,hidden "
+                                "FROM person_ids"
+                            )
+                        )
                 finally:
                     conn.execute("ROLLBACK")
+                state.schema_version = schema_version
+                state.watermark = watermark
+                if reuse:
+                    assert state.index is not None
+                    after = conn.execute("PRAGMA data_version").fetchone()[0]
+                    state.version = version if after == version else None
+                    return state.index
                 terminals = {}
                 for person in persons:
                     current, visited = person, set()
