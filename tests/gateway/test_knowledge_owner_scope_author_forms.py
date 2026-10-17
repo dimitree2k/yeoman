@@ -6,10 +6,13 @@ number without suffix (16), bare LID number (6) and bare phone (3). These tests 
 that shape synthetically on the real v3 service, so the gate - not a mock - decides.
 """
 
+from uuid import uuid4
+
 import pytest
 from yeoman_gateway.adapters.responder_llm import LLMResponder
 from yeoman_gateway.knowledge.models import (
     RecallQuery,
+    SourceRef,
     StatementCandidate,
     TrustedCaptureContext,
     TrustedReadContext,
@@ -162,6 +165,119 @@ def test_non_owner_read_is_unchanged_and_gains_nothing_from_owner_spellings(owne
                                is_direct=True),
         )
         assert result.statement_ids == (own,)
+
+
+def legacy_source(service, statement_id):
+    """Rewrite one captured source into the shape the legacy cutover leaves behind.
+
+    The live store carries thousands of such rows: ``legacy-node:`` sources whose
+    audience was never reconciled, so their status stays ``unknown`` and their stored
+    audience is empty - the store's own representation of an author-only observation.
+    """
+    service._store.execute(
+        "UPDATE knowledge_statement_sources SET event_id=?, status='unknown',"
+        " source_audience_json=NULL, snapshot_id=? WHERE statement_id=?",
+        (f"legacy-node:{uuid4()}", "legacy-reconciliation:synthetic", statement_id),
+    )
+
+
+def test_owner_read_reaches_an_unreconciled_legacy_row_of_its_own_chat(owner_case):
+    """Live shape: 174 of the 204 statements carry an unreconciled legacy source.
+
+    158 phone-form rows and 16 LID-digit rows were captured before the cutover and their
+    audience was never reconciled, so their source status stayed ``unknown`` - which
+    closed them to every reader, their own author included, even though the node
+    verifies and its author-only audience proves out. The IPC ``knowledge_read`` shape
+    is a query that matches nothing with ``require_match=False`` and limit 50.
+    """
+    service, q, sources, db = owner_case
+    with service.history_scope(q, sources):
+        statement_id = own_statement(service, sources, db, "legacy-phone",
+                                     "Synthetic legacy phone", "whatsapp:10002")
+        legacy_source(service, statement_id)
+        result = service.recall(RecallQuery("zzqqxxvbb", limit=50), context=owner_read())
+        assert statement_id in result.statement_ids
+        matched = service.recall(RecallQuery("Synthetic legacy phone", limit=50),
+                                 context=owner_read())
+        assert matched.statement_ids == (statement_id,)
+
+
+def test_owner_read_reaches_a_bare_author_spelling(owner_case):
+    """Live shape: 9 statements store the author without a channel qualifier."""
+    service, q, sources, db = owner_case
+    with service.history_scope(q, sources):
+        bare = {
+            form: own_statement(service, sources, db, f"bare-{index}", content, form)
+            for index, (form, content) in enumerate((
+                ("10002", "Synthetic bare phone"),
+                ("20002", "Synthetic bare lid"),
+            ))
+        }
+        result = service.recall(RecallQuery("zzqqxxvbb", limit=50), context=owner_read())
+    assert set(bare.values()) <= set(result.statement_ids)
+
+
+def aliased_source(sources, q, *, message_id, chat, author):
+    """Issue a source the way the legacy cutover left it: unqualified author, no audience."""
+    from dataclasses import asdict
+
+    from yeoman_gateway.knowledge._history_sources import build_history_source_aliases
+
+    issued = SourceRef(f"legacy-{uuid4().hex[:12]}", 7, "whatsapp", chat, author, 100)
+    row = {
+        **asdict(issued), "author_contact_id": "b",
+        "content_fingerprint": q.content_fingerprint(message_id),
+        "source_audience_json": None, "status": "active", "native_id": None,
+    }
+    aliases, counts = build_history_source_aliases(
+        queries=q, legacy_rows=[row], locators={issued.key: (message_id,)})
+    assert counts["mapped"] == 1, counts
+    sources.ledger.persist_aliases(aliases)
+    sources.compatibility = aliases
+    return aliases[issued.key].issued
+
+
+def test_owner_read_reaches_a_source_whose_author_is_unqualified(owner_case):
+    """Live shape: 9 rows store the *source* author without a channel qualifier.
+
+    ``permits_principal`` refuses a bare principal outright, so the proof has to run over
+    the same spellings the read already authorizes - one identifier, several exact forms.
+    """
+    service, q, sources, db = owner_case
+    with service.history_scope(q, sources):
+        message(db, "bare-msg", chat=DM_CHAT, sender="b",
+                identifier="10002@s.whatsapp.net", text="Synthetic bare")
+        source = aliased_source(sources, q, message_id="bare-msg", chat=DM_CHAT, author="10002")
+        statement_id = capture(service, source, "Synthetic bare author")
+        result = service.recall(RecallQuery("zzqqxxvbb", limit=50), context=owner_read())
+    assert statement_id in result.statement_ids
+
+
+def test_unreconciled_legacy_row_stays_closed_to_a_non_owner_and_cross_chat(owner_case):
+    """The legacy reopening is bounded to an owner read of the owner's own direct chat."""
+    service, q, sources, db = owner_case
+    with service.history_scope(q, sources):
+        statement_id = capture(
+            service,
+            stored_source(db, sources, "legacy-group", chat="g@g.us", text="Synthetic group"),
+            "Synthetic group",
+        )
+        service._store.execute(
+            "UPDATE knowledge_statements SET visibility_scope='author_only'"
+            " WHERE statement_id=?", (statement_id,))
+        legacy_source(service, statement_id)
+        # Its own author, reading the group where it was written: still closed.
+        assert not service.recall(
+            RecallQuery("Synthetic group", limit=50),
+            context=owner_read(principal="whatsapp:10002", chat="g@g.us", is_direct=False,
+                               owner=False),
+        ).statement_ids
+        # The owner reading it from the owner DM as an explicit target: cross-chat rights
+        # require a proven shared audience, which an unreconciled row does not have.
+        assert not service.recall(
+            RecallQuery("Synthetic group", limit=50),
+            context=owner_read(owner_lookup_chat_ids=("g@g.us",)),
+        ).statement_ids
 
 
 @pytest.fixture

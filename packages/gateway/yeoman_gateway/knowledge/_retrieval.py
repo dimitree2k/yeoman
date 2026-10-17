@@ -585,11 +585,23 @@ class RetrievalEngine:
             return not owner_scope
         sources = self._statements.sources_of(statement_id)
         if owner_scope:
+            from yeoman_gateway.knowledge._history_sources import is_legacy_node
+
             def permits_owner_lookup(source: SourceRef, status: str) -> bool:
-                if status != "active" or source.channel != "whatsapp" or not scope.sources.verify_source(source):
+                if source.channel != "whatsapp" or not scope.sources.verify_source(source):
+                    return False
+                audience = scope.sources.evidence_audience(source, basis="")
+                # A legacy row the cutover never reconciled keeps its author-only shape: no
+                # audience was ever proven for it, so it is closed to every reader, its own
+                # author included. Owner scope may open it, but only through the author-only,
+                # same-chat proof below - never through a proven shared audience.
+                unreconciled_legacy = (
+                    status == "unknown" and is_legacy_node(source.event_id)
+                    and audience is not None and audience.status == "author_only"
+                )
+                if status != "active" and not unreconciled_legacy:
                     return False
                 # Owner lookup requires source-time and current proof for the same contact.
-                audience = scope.sources.evidence_audience(source, basis="")
                 current = scope.queries.members(chat_id=source.chat_id, at_ms=context.now_ms)
                 viewer_contact = scope.queries.principal_contact(context.principal_id, context.now_ms)
                 if scope.queries.is_owner_direct_chat(
@@ -612,9 +624,13 @@ class RetrievalEngine:
                         )
                     else:
                         same_chat_principals = set()
-                    return any(scope.sources.permits_principal(
-                        source, principal, now_ms=context.now_ms
-                    ) for principal in same_chat_principals)
+                    # The proof runs over the same spellings the read authorizes: a stored
+                    # author string without a channel qualifier still names one identifier.
+                    return any(
+                        scope.sources.permits_principal(source, spelling, now_ms=context.now_ms)
+                        for principal in same_chat_principals
+                        for spelling in principal_spellings(principal)
+                    )
 
                 # Cross-chat rights require both source-time audience and current roster proof.
                 audience_contacts = (
