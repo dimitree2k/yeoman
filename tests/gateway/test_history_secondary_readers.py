@@ -427,7 +427,8 @@ def test_selected_direct_tool_context_preserves_trusted_origin(case, monkeypatch
     monkeypatch.setattr(service._policy, 'admin_actor', lambda: AUTHOR)
     responder = SimpleNamespace(tools=SimpleNamespace(get=lambda _: None), knowledge=service,
         _history_secondary_selected=True, _history_tools_selected=False,
-        _trusted_turn_binding=lambda: SimpleNamespace(turn=SimpleNamespace(principal=origin)))
+        _trusted_turn_binding=lambda: SimpleNamespace(turn=SimpleNamespace(principal=origin)),
+        _knowledge_read_context=lambda **_: None)
     token = set_tool_context(None)
     try:
         LLMResponder._set_tool_context(responder, channel=channel, chat_id='direct' if channel == 'cli' else 'g@g.us', session_key=session, is_owner=owner)

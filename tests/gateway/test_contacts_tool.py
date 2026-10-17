@@ -19,8 +19,6 @@ from tests.gateway.history_test_helpers import (
 _OWNER = "4915000000000@s.whatsapp.net"
 
 
-
-
 @pytest.fixture
 def tool() -> ContactsTool:
     t = ContactsTool(knowledge=None)
@@ -45,12 +43,18 @@ def selected_history(tmp_path: Path):
 
     source = v2(tmp_path / "contacts-v2.db")
     with sqlite3.connect(source) as db:
-        db.execute("INSERT INTO contacts (id, display_name, created_at, updated_at) "
-                   "VALUES ('private-fixture', 'Frank Taeger', 'date', 'date')")
-        db.execute("INSERT INTO contact_fields (contact_id, kind, value, created_at, updated_at) "
-                   "VALUES ('private-fixture', 'note', 'sensitive personal note', 'date', 'date')")
-        db.execute("INSERT INTO contact_identifiers (channel, identifier, contact_id, kind) "
-                   "VALUES ('whatsapp', '4917632625469@s.whatsapp.net', 'private-fixture', 'phone_jid')")
+        db.execute(
+            "INSERT INTO contacts (id, display_name, created_at, updated_at) "
+            "VALUES ('private-fixture', 'Frank Taeger', 'date', 'date')"
+        )
+        db.execute(
+            "INSERT INTO contact_fields (contact_id, kind, value, created_at, updated_at) "
+            "VALUES ('private-fixture', 'note', 'sensitive personal note', 'date', 'date')"
+        )
+        db.execute(
+            "INSERT INTO contact_identifiers (channel, identifier, contact_id, kind) "
+            "VALUES ('whatsapp', '4917632625469@s.whatsapp.net', 'private-fixture', 'phone_jid')"
+        )
     db.close()
     target = tmp_path / "contacts-v3.db"
     upgrade_history_knowledge(source=source, target=target)
@@ -76,9 +80,13 @@ async def _execute_with_history(history: ProjectedHistory, tool: object, **kwarg
     )
 
     async with history.turn() as snapshot:
-        token = set_tool_context(ToolInvocationContext(
-            channel="whatsapp", chat_id="test@g.us", history_snapshot=snapshot,
-        ))
+        token = set_tool_context(
+            ToolInvocationContext(
+                channel="whatsapp",
+                chat_id="test@g.us",
+                history_snapshot=snapshot,
+            )
+        )
         try:
             return await tool.execute(**kwargs)
         finally:
@@ -89,21 +97,43 @@ async def _execute_selected(
     history: ProjectedHistory, knowledge: object, tool: object, **kwargs: object
 ) -> str:
     from yeoman_gateway.history.context import history_knowledge_scope
+    from yeoman_gateway.knowledge.models import TrustedReadContext
     from yeoman_gateway.processing.tool_context import (
         ToolInvocationContext,
         reset_tool_context,
         set_tool_context,
     )
 
+    from tests.gateway.people.resolver_fixtures import synced_directory
+
     async with history.turn() as snapshot:
+        directory = synced_directory(snapshot, history.root / "contacts-directory")
+        tool._people = directory
         with history_knowledge_scope(snapshot, knowledge):
-            token = set_tool_context(ToolInvocationContext(
-                channel="whatsapp", chat_id="test@g.us", history_snapshot=snapshot,
-            ))
+            token = set_tool_context(
+                ToolInvocationContext(
+                    channel="whatsapp",
+                    chat_id="test@g.us",
+                    canonical_user_id=f"whatsapp:{_OWNER}",
+                    history_snapshot=snapshot,
+                    knowledge_read_context=TrustedReadContext(
+                        principal_id=f"whatsapp:{_OWNER}",
+                        channel="whatsapp",
+                        chat_id="test@g.us",
+                        recipient_principals=frozenset({f"whatsapp:{_OWNER}"}),
+                        owner=False,
+                        membership_revision="synthetic",
+                        policy_revision=knowledge.policy_revision,
+                        now_ms=time.time_ns() // 1_000_000,
+                        purpose="reply",
+                    ),
+                )
+            )
             try:
                 return await tool.execute(**kwargs)
             finally:
                 reset_tool_context(token)
+                directory.close()
 
 
 def _add_contacts_tool_person(
@@ -111,9 +141,13 @@ def _add_contacts_tool_person(
 ) -> None:
     timestamp = time.time_ns() // 1_000_000 - 1000
     history.add_contact(identifiers=[phone], name=name, timestamp=timestamp)
+    history.add_contact(identifiers=[_OWNER], name="Synthetic Owner", timestamp=timestamp)
+    history.add_group(chat_id="test@g.us", participants=[_OWNER, phone], timestamp=timestamp)
 
 
-def _add_person(history: ProjectedHistory, *, phone: str, name: str, lid: str | None = None) -> None:
+def _add_person(
+    history: ProjectedHistory, *, phone: str, name: str, lid: str | None = None
+) -> None:
     timestamp = time.time_ns() // 1_000_000 - 1000
     history.add_contact(identifiers=[_OWNER], name="Synthetic owner", timestamp=timestamp)
     identifiers = [phone, *([lid] if lid else [])]
@@ -127,7 +161,9 @@ def _add_person(history: ProjectedHistory, *, phone: str, name: str, lid: str | 
     )
 
 
-async def _resolve(history: ProjectedHistory, knowledge: object, resolver: ResolveContactTool, query: str) -> str:
+async def _resolve(
+    history: ProjectedHistory, knowledge: object, resolver: ResolveContactTool, query: str
+) -> str:
     from yeoman_gateway.history.context import history_knowledge_scope
     from yeoman_gateway.processing.tool_context import (
         ToolInvocationContext,
@@ -135,20 +171,28 @@ async def _resolve(history: ProjectedHistory, knowledge: object, resolver: Resol
         set_tool_context,
     )
 
+    from tests.gateway.people.resolver_fixtures import synced_directory
+
     async with history.turn() as snapshot:
+        directory = synced_directory(snapshot, history.root / "delivery-directory")
+        resolver._people = directory
         with history_knowledge_scope(snapshot, knowledge):
-            token = set_tool_context(ToolInvocationContext(
-                channel="whatsapp", chat_id="finance@g.us", history_snapshot=snapshot,
-            ))
+            token = set_tool_context(
+                ToolInvocationContext(
+                    channel="whatsapp",
+                    chat_id="finance@g.us",
+                    canonical_user_id=f"whatsapp:{_OWNER}",
+                    history_snapshot=snapshot,
+                )
+            )
             try:
                 return await resolver.execute(query=query)
             finally:
                 reset_tool_context(token)
+                directory.close()
 
 
 class TestContactsTool:
-
-
     @pytest.mark.asyncio
     async def test_search(self, selected_history) -> None:
         history, knowledge = selected_history
@@ -169,7 +213,6 @@ class TestContactsTool:
         result = await _execute_selected(history, knowledge, tool, action="get", name="Alex")
         assert "Alex" in result
 
-
     @pytest.mark.asyncio
     async def test_tool_schema(self, tool: ContactsTool) -> None:
         schema = tool.to_schema()
@@ -179,13 +222,15 @@ class TestContactsTool:
 
 class TestResolveContactTool:
     def test_resolver_without_knowledge_fails_closed(self) -> None:
-        assert resolve_contact_reference(
-
-            knowledge=None,
-            reference="Alex",
-            channel="whatsapp",
-            chat_id="test@g.us",
-        ) is None
+        assert (
+            resolve_contact_reference(
+                knowledge=None,
+                reference="Alex",
+                channel="whatsapp",
+                chat_id="test@g.us",
+            )
+            is None
+        )
 
     @pytest.mark.asyncio
     async def test_resolves_partial_name_without_disclosing_fields(
@@ -208,7 +253,8 @@ class TestResolveContactTool:
 
     @pytest.mark.asyncio
     async def test_group_resolution_requires_current_projected_roster_membership(
-        self, selected_history,
+        self,
+        selected_history,
     ) -> None:
         history, knowledge = selected_history
         member = "4917632625469@s.whatsapp.net"
@@ -230,12 +276,8 @@ class TestResolveContactTool:
         resolver = ResolveContactTool(knowledge=knowledge)
         resolver.set_context(channel="whatsapp", chat_id="finance@g.us")
 
-        member_result = json.loads(
-            await _resolve(history, knowledge, resolver, "Current Member")
-        )
-        outsider_name = json.loads(
-            await _resolve(history, knowledge, resolver, "Former Member")
-        )
+        member_result = json.loads(await _resolve(history, knowledge, resolver, "Current Member"))
+        outsider_name = json.loads(await _resolve(history, knowledge, resolver, "Former Member"))
         outsider_mention = json.loads(
             await _resolve(history, knowledge, resolver, "@4917000000000")
         )
@@ -252,13 +294,14 @@ class TestResolveContactTool:
         self,
         selected_history,
     ) -> None:
-        """Knowledge is the sole authority: the legacy cache is not a second opinion.
-
-        The WhatsApp resolver never falls back to the legacy cache when Knowledge is wired.
-        """
+        """Directory recognition never turns an unproven frozen identifier into an endpoint."""
         history, knowledge = selected_history
-        assert knowledge._store.scalar("SELECT count(*) FROM contact_identifiers "
-                                       "WHERE contact_id='private-fixture'") == 1
+        assert (
+            knowledge._store.scalar(
+                "SELECT count(*) FROM contact_identifiers WHERE contact_id='private-fixture'"
+            )
+            == 1
+        )
         resolver = ResolveContactTool(knowledge=knowledge)
         resolver.set_context(channel="whatsapp", chat_id="finance@g.us")
 
@@ -288,7 +331,8 @@ class TestResolveContactTool:
 
     @pytest.mark.asyncio
     async def test_name_resolution_does_not_use_substring_only_match(
-        self, selected_history,
+        self,
+        selected_history,
     ) -> None:
         history, knowledge = selected_history
         phone = "4917000000000@s.whatsapp.net"

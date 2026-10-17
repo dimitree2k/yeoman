@@ -1,0 +1,20 @@
+name: Person Resolver
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+
+jobs:
+  gold-and-disclosure:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: astral-sh/setup-uv@v7
+        with:
+          python-version: "3.14"
+      - run: uv sync
+      - name: Gate synthetic accuracy and disclosure
+        run: |
+          ulimit -Sn 1024
+          uv run python -m pytest tests/gateway/people/test_resolver_gold.py tests/gateway/people/test_disclosure.py -n 4 --dist worksteal -q

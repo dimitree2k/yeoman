@@ -2,7 +2,12 @@
 
 from __future__ import annotations
 
-from typing import Any
+import time
+from typing import TYPE_CHECKING, Any
+
+if TYPE_CHECKING:
+    from yeoman_gateway.knowledge.models import TrustedReadContext
+    from yeoman_gateway.people.resolver import PeopleResolver, ReaderContext
 
 from yeoman_gateway.agent.tools.base import Tool
 from yeoman_gateway.history.live import HistoryPaused
@@ -11,10 +16,13 @@ from yeoman_gateway.history.live import HistoryPaused
 class ContactsTool(Tool):
     """Person lookup and source-backed contact information."""
 
-    def __init__(self, knowledge: object | None = None) -> None:
+    def __init__(
+        self, knowledge: object | None = None, *, people: PeopleResolver | None = None
+    ) -> None:
         #: Public person-knowledge facade.  Identifier lookups go through it so this
         #: tool never reads the contacts cache directly.
         self._knowledge = knowledge
+        self._people = people
         self._channel = ""
         self._chat_id = ""
 
@@ -25,7 +33,10 @@ class ContactsTool(Tool):
     @property
     def _channel(self) -> str:
         from yeoman_gateway.processing.tool_context import tool_target
-        return tool_target(default_channel=self._default_channel, default_chat_id=self._default_chat_id)[0]
+
+        return tool_target(
+            default_channel=self._default_channel, default_chat_id=self._default_chat_id
+        )[0]
 
     @_channel.setter
     def _channel(self, value: str) -> None:
@@ -34,7 +45,10 @@ class ContactsTool(Tool):
     @property
     def _chat_id(self) -> str:
         from yeoman_gateway.processing.tool_context import tool_target
-        return tool_target(default_channel=self._default_channel, default_chat_id=self._default_chat_id)[1]
+
+        return tool_target(
+            default_channel=self._default_channel, default_chat_id=self._default_chat_id
+        )[1]
 
     @_chat_id.setter
     def _chat_id(self, value: str) -> None:
@@ -88,153 +102,159 @@ class ContactsTool(Tool):
         }
 
     async def execute(self, **kwargs: Any) -> str:
-        from yeoman_gateway.processing.tool_context import tool_history_snapshot
-        snapshot = tool_history_snapshot()
-        if snapshot is not None and self._knowledge is None:
-            from yeoman_gateway.history.live import HistoryPaused
-            raise HistoryPaused('history_knowledge_required')
-        action = kwargs.get("action", "")
-        match action:
-            case "search":
-                return self._search(kwargs.get("query", ""))
-            case "get":
-                return self._get(kwargs.get("name", ""))
-            case "add_field":
-                return self._add_field(
-                    kwargs.get("name", ""),
-                    kwargs.get("kind", ""),
-                    kwargs.get("value", ""),
-                    kwargs.get("label"),
-                )
-            case "remove_field":
-                return self._remove_field(
-                    kwargs.get("name", ""),
-                    kwargs.get("kind", ""),
-                    kwargs.get("value", ""),
-                )
-            case _:
-                return f"Unknown action: {action}"
+        from yeoman_gateway.people.disclosure import reader_context
+        from yeoman_gateway.people.resolver import PeopleUnavailable
+        from yeoman_gateway.processing.tool_context import (
+            current_tool_context,
+            tool_history_snapshot,
+        )
 
-    def _search(self, query: str) -> str:
+        snapshot = tool_history_snapshot()
+        context = current_tool_context()
+        if self._people is None or context is None:
+            return "Error: directory is unavailable"
+        try:
+            reader = reader_context(
+                self._people,
+                channel=context.channel,
+                chat_id=context.chat_id,
+                principal_id=context.canonical_user_id,
+                is_owner=context.is_owner,
+                at_ms=int(time.time() * 1000),
+                history=snapshot,
+            )
+            action = kwargs.get("action", "")
+            if action == "search":
+                return self._search(kwargs.get("query", ""), reader=reader)
+            if action == "get":
+                return self._get(kwargs.get("name", ""), reader, context.knowledge_read_context)
+            if action in ("add_field", "remove_field"):
+                return self._mutate(reader, **kwargs)
+            return f"Unknown action: {action}"
+        except PeopleUnavailable:
+            return "Error: directory is unavailable"
+
+    def _search(self, query: str, *, reader: ReaderContext | None = None) -> str:
+        from yeoman_gateway.people.disclosure import render_person
+        from yeoman_gateway.people.resolver import resolve_person
+
         if not query:
             return (
                 "Error: search needs a query (a name, nickname or phone number); "
                 "listing all contacts is not supported. Retry once with the person's name, "
                 "or ask the user who they mean."
             )
-        if self._knowledge is None:
-            return "Error: knowledge is unavailable"
-        found = self._knowledge.search_people_with_policy(
-            query, channel=self._channel or "whatsapp", chat_id=self._chat_id or "cli"
+        if reader is None:
+            return "Error: directory is unavailable"
+        found = resolve_person(query, reader)
+        ids = (
+            (found.person_id,)
+            if found.person_id is not None
+            else tuple(candidate.person_id for candidate in found.candidates)
         )
-        if not found:
+        if not ids:
             return f"No people found matching '{query}'"
+        cards = [render_person(person, reader) for person in ids[:8]]
+        cards.sort(key=lambda card: (card.display_name.casefold(), card.person_id))
         lines = []
-        for person in found:
-            identifiers = self._knowledge.person_identifiers(person.person_id)
-            ident_str = ", ".join(f"{item.channel}:{item.value}" for item in identifiers)
-            lines.append(f"- {person.display_name or person.person_id} ({ident_str})")
+        for card in cards:
+            identifiers = ", ".join(f"{kind}:{value}" for kind, value in card.identifiers)
+            groups = ", ".join(card.shared_chat_names)
+            suffix = f"; groups: {groups}" if groups else ""
+            lines.append(f"- {card.display_name} ({identifiers}{suffix})")
+        if len(ids) > 8:
+            lines.append("Candidate list truncated; use a more specific name.")
         return "Found people:\n" + "\n".join(lines)
 
-    def _get(self, name: str) -> str:
+    def _one_person(self, name: str, reader: ReaderContext) -> tuple[int | None, str]:
+        from yeoman_gateway.people.resolver import resolve_person
+
         if not name:
-            return "Error: name is required"
-        if self._knowledge is None:
-            return "Error: knowledge is unavailable"
-        found = self._knowledge.search_people_with_policy(
-            name, channel=self._channel or "whatsapp", chat_id=self._chat_id or "cli"
-        )
-        if not found:
-            return f"No person found with name '{name}'"
-        if len(found) > 1:
-            # Two people with one name must never resolve to "the first one".
-            return (
-                f"Error: '{name}' matches {len(found)} people; use an exact person id"
-            )
-        person = found[0]
-        # Every content read uses the one shared read contract through an owner-issued
-        # context; a tool argument never becomes a read authorization.
-        context = self._knowledge.owner_read_context(
-            channel=self._channel or "whatsapp", chat_id=self._chat_id or "cli"
-        )
-        identifiers = self._knowledge.person_identifiers(person.person_id)
-        aliases = self._knowledge.alias_names(person.person_id)
-        profile = self._knowledge.person_profile(person.person_id, context=context)
-        lines = [
-            f"Name: {person.display_name or person.person_id}",
-            f"Person: {person.person_id}",
-        ]
-        if identifiers:
-            lines.append(
-                "Identifiers: " + ", ".join(f"{item.kind}={item.value}" for item in identifiers)
-            )
-        if aliases:
-            lines.append("Observed names: " + ", ".join(aliases))
-        for line in profile.card.splitlines():
-            if line.startswith(("name:", "aliases:", "contact:")):
-                continue
-            lines.append(line)
-        return "\n".join(lines)
+            return None, "Error: name is required"
+        found = resolve_person(name, reader)
+        if found.status == "ambiguous":
+            return None, f"Error: '{name}' matches {len(found.candidates)} people; be more specific"
+        if found.person_id is None:
+            return None, f"No person found with name '{name}'"
+        return found.person_id, ""
 
-
-    def _add_field(self, name: str, kind: str, value: str, label: str | None) -> str:
-        if not name or not kind or not value:
-            return "Error: name, kind, and value are required"
+    def _subjects(self, person: int, reader: ReaderContext) -> tuple[str, ...]:
         if self._knowledge is None:
-            return "Error: knowledge is unavailable"
-        person, error = self._one_person(name)
+            return ()
+        return self._knowledge.directory_subject_ids(person, reader=reader)
+
+    def _get(self, name: str, reader: ReaderContext, context: TrustedReadContext | None) -> str:
+        from yeoman_gateway.people.disclosure import render_person
+
+        person, error = self._one_person(name, reader)
         if error:
             return error
         assert person is not None
-        try:
-            receipt = self._knowledge.record_note(
-                person.person_id,
-                content=value,
-                label=label or kind,
-                channel=self._channel or "whatsapp",
-                chat_id=self._chat_id or "cli",
+        card = render_person(person, reader)
+        subjects = self._subjects(person, reader)
+        lines = [f"Name: {card.display_name}"]
+        if len(subjects) == 1:
+            lines.append(f"Person: {subjects[0]}")
+        if card.identifiers:
+            lines.append(
+                "Identifiers: " + ", ".join(f"{kind}={value}" for kind, value in card.identifiers)
             )
+        if card.names:
+            lines.append("Observed names: " + ", ".join(card.names))
+        lines.extend(f"{key}: {value}" for key, value in card.owner_details)
+        if not subjects or context is None:
+            lines.append("Knowledge content unavailable.")
+        else:
+            seen = set()
+            for subject in subjects:
+                profile = self._knowledge.person_profile(subject, context=context)
+                if profile.reason != "ok":
+                    if "Knowledge content unavailable." not in seen:
+                        lines.append("Knowledge content unavailable.")
+                        seen.add("Knowledge content unavailable.")
+                    continue
+                for line in profile.card.splitlines():
+                    if line.startswith(("name:", "aliases:", "contact:")) or line in seen:
+                        continue
+                    seen.add(line)
+                    lines.append(line)
+        return "\n".join(lines)
+
+    def _mutate(self, reader: ReaderContext, *, action: str, **kwargs: Any) -> str:
+        from yeoman_gateway.people.disclosure import render_person
+
+        name, kind, value = (kwargs.get(key, "") for key in ("name", "kind", "value"))
+        if not name or not kind or not value:
+            return "Error: name, kind, and value are required"
+        person, error = self._one_person(name, reader)
+        if error:
+            return error
+        assert person is not None
+        subjects = self._subjects(person, reader)
+        if not subjects:
+            return "Error: Knowledge content unavailable"
+        if len(subjects) != 1:
+            return "Error: ambiguous Knowledge subjects; mutation refused"
+        display = render_person(person, reader).display_name
+        subject = subjects[0]
+        try:
+            if action == "add_field":
+                label = kwargs.get("label")
+                receipt = self._knowledge.record_note(
+                    subject,
+                    content=value,
+                    label=label or kind,
+                    channel=reader.channel,
+                    chat_id=reader.chat_id,
+                )
+                label_str = f" ({label})" if label else ""
+                statement = receipt.changed_ids[0] if receipt.changed_ids else "n/a"
+                return f"Added {kind}{label_str}: {value} to {display} [statement {statement}]"
+            erased = self._knowledge.erase_matching_statements(
+                subject, contains=value, reason="contacts_tool_remove_field"
+            )
+            return f"Removed {kind}: {value} from {display} ({erased} statements)"
         except HistoryPaused:
             raise
         except Exception as exc:  # domain errors are reported, never swallowed
             return f"Error: {exc}"
-        label_str = f" ({label})" if label else ""
-        return (
-            f"Added {kind}{label_str}: {value} to {person.display_name or person.person_id}"
-            f" [statement {receipt.changed_ids[0] if receipt.changed_ids else 'n/a'}]"
-        )
-
-    def _remove_field(self, name: str, kind: str, value: str) -> str:
-        if not name or not kind or not value:
-            return "Error: name, kind, and value are required"
-        if self._knowledge is None:
-            return "Error: knowledge is unavailable"
-        person, error = self._one_person(name)
-        if error:
-            return error
-        assert person is not None
-        # ID-based, bounded maintenance: the old broad LIKE erase is gone from this path,
-        # because "delete every statement containing X" is not a correction of a fact.
-        erased = self._knowledge.erase_matching_statements(
-            person.person_id, contains=value, reason="contacts_tool_remove_field"
-        )
-        return (
-            f"Removed {kind}: {value} from {person.display_name or person.person_id}"
-            f" ({erased} statements)"
-        )
-
-    def _one_person(self, name: str):
-        """Resolve a name to exactly one person, or an explicit error string."""
-        if self._knowledge is None:
-            return None, "Error: knowledge is unavailable"
-        found = self._knowledge.search_people_with_policy(
-            name, channel=self._channel or "whatsapp", chat_id=self._chat_id or "cli"
-        )
-        if not found:
-            return None, f"Error: no person found with name '{name}'"
-        if len(found) > 1:
-            return None, (
-                f"Error: '{name}' matches {len(found)} people; use an exact person id"
-            )
-        return found[0], ""
-

@@ -10,7 +10,10 @@ import time
 from collections.abc import Callable
 from datetime import datetime
 from pathlib import Path
-from typing import Any
+from typing import TYPE_CHECKING, Any
+
+if TYPE_CHECKING:
+    from .resolver import PeopleResolver
 
 from loguru import logger
 
@@ -38,9 +41,17 @@ def _is_lock_error(exc: sqlite3.OperationalError) -> bool:
 
 
 class PeopleSyncService:
-    def __init__(self, *, projector: Any, db_path: Path, interval_seconds: float = 300,
-                 contact_group_max_members: int = 100, clock: Callable[[], int] = _now_ms,
-                 backup_dir: Path | None = None) -> None:
+    def __init__(
+        self,
+        *,
+        projector: Any,
+        db_path: Path,
+        interval_seconds: float = 300,
+        contact_group_max_members: int = 100,
+        clock: Callable[[], int] = _now_ms,
+        backup_dir: Path | None = None,
+        people: PeopleResolver | None = None,
+    ) -> None:
         if interval_seconds <= 0:
             raise ValueError("interval_seconds must be positive")
         self.projector, self.db_path = projector, db_path
@@ -48,6 +59,7 @@ class PeopleSyncService:
         self.contact_group_max_members = contact_group_max_members
         self.clock = clock
         self.backup_dir = backup_dir
+        self.people = people
         self._lock = threading.Lock()
         self._task: asyncio.Task[None] | None = None
 
@@ -62,6 +74,8 @@ class PeopleSyncService:
             return None
         report = await asyncio.to_thread(self._apply, observed)
         if report is not None:
+            if self.people is not None:
+                self.people.refresh()
             logger.info("people sync {}", report.as_dict())
         return report
 

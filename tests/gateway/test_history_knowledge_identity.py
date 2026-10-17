@@ -27,6 +27,40 @@ def case(source_case):  # noqa: F811 - pytest fixture dependency
     return source_case
 
 
+DIRECTORY_AUTHOR = "whatsapp:4915000000001"
+DIRECTORY_MEMBER = "whatsapp:4915000000002"
+
+
+@pytest.fixture
+def directory_identity_case(case):
+    service, q, sources, db = case
+    for table, columns in (
+        ("identifier_history", ("value",)),
+        ("messages", ("sender_identifier", "chat_id")),
+        ("message_events", ("payload_json",)),
+    ):
+        for column in columns:
+            for old, new in (("10001", "4915000000001"), ("10002", "4915000000002")):
+                db.execute(f"UPDATE {table} SET {column}=replace({column},?,?)", (old, new))
+    return case
+
+
+def install_directory(case, root):
+    from tests.gateway.people.resolver_fixtures import synced_directory
+
+    service, q, _, _ = case
+    directory = synced_directory(q.snapshot, root / "directory")
+    import sqlite3
+
+    with sqlite3.connect(directory.db_path) as db:
+        db.execute(
+            "UPDATE persons SET is_owner=1 WHERE id IN "
+            "(SELECT person_id FROM person_ids WHERE kind='history_contact' AND value='b')"
+        )
+    service.people = directory
+    return directory
+
+
 def capture(service, source, *, attributes=False):
     context = TrustedCaptureContext('synthetic', 1, 'native', (source,))
     candidate = StatementCandidate('Synthetic statement', (source,), people=(
@@ -159,26 +193,43 @@ def test_permission_cache_does_not_survive_history_generation(case):
         assert not service.recall(RecallQuery('Synthetic'), context=read()).statement_ids
 
 
-def test_history_identity_read_surface_and_frozen_store_guard(case):
+def test_history_identity_read_surface_and_frozen_store_guard(directory_identity_case, tmp_path):
     from yeoman_gateway.knowledge._history_identity import HistoryIdentityEngine
+
+    case = directory_identity_case
     service, q, sources, _ = case
-    ident = Identifier('whatsapp', 'phone_jid', '10001@s.whatsapp.net', namespace='whatsapp')
+    ident = Identifier(
+        "whatsapp", "phone_jid", "4915000000001@s.whatsapp.net", namespace="whatsapp"
+    )
+    directory = install_directory(case, tmp_path)
     with service.history_scope(q, sources):
-        engine = HistoryIdentityEngine(service._store, queries=q, authority=sources, policy=service._policy)
-        assert engine.binding_at(ident, 100).person_id == 'a'
-        assert engine.binding_for(ident).person_id == 'a'
-        assert engine.get_person('a').person_id == 'a'
-        assert engine.require_person('a').display_name == 'a'
-        assert engine.resolve_endpoint('a', 'whatsapp', at_ms=100).identifier == ident
-        assert engine.eligible_people_for_context(read()) == (('a', 'a'),)
-        assert engine.search_mention_name_candidates('a', person_ids=('a',), context=read())[0].person_id == 'a'
-        assert engine.search_mention_text_candidates('a', person_ids=('a',), context=read())[0].person_id == 'a'
-        assert engine.aliases_of_many(('a',))['a'][0].name == 'a'
+        engine = HistoryIdentityEngine(
+            service._store, queries=q, authority=sources, policy=service._policy
+        )
+        assert engine.binding_at(ident, 100).person_id == "a"
+        assert engine.binding_for(ident).person_id == "a"
+        assert engine.get_person("a").person_id == "a"
+        assert engine.require_person("a").display_name == "a"
+        assert engine.resolve_endpoint("a", "whatsapp", at_ms=100).identifier == ident
+        assert engine.eligible_people_for_context(read(DIRECTORY_AUTHOR)) == (("a", "a"),)
+        assert (
+            service.search_mention_name_candidates("a", context=read(DIRECTORY_AUTHOR))[0].person_id
+            == "a"
+        )
+        assert (
+            service.search_mention_text_candidates("a", context=read(DIRECTORY_AUTHOR))[0].person_id
+            == "a"
+        )
+        assert engine.aliases_of_many(("a",))["a"][0].name == "a"
         # An observed name has no global address-release proof.
-        assert engine.delivery_identifiers_for_alias('a', channel='whatsapp', scope_key='global') == ()
+        assert (
+            engine.delivery_identifiers_for_alias("a", channel="whatsapp", scope_key="global") == ()
+        )
         with pytest.raises(KnowledgeError):
             with service._store.transaction():
                 service._store.execute("UPDATE contacts SET display_name='changed'")
+
+    directory.close()
 
 
 def test_history_alias_delivery_preserves_frozen_release_controls(case):
@@ -260,11 +311,21 @@ def test_owner_lookup_keeps_an_author_only_statement_from_the_owner_dm(case, pri
 
 
 @pytest.mark.asyncio
-@pytest.mark.parametrize('principal', [
-    'whatsapp:10002', 'whatsapp:10002@s.whatsapp.net', 'whatsapp:20002@lid',
-    '10002', '20002', '10002@s.whatsapp.net', '20002@lid',
-])
-async def test_responder_handoff_uses_frozen_lid_principal_when_sender_canonicalization_is_empty(case, monkeypatch, principal):
+@pytest.mark.parametrize(
+    "principal",
+    [
+        "whatsapp:4915000000002",
+        "whatsapp:4915000000002@s.whatsapp.net",
+        "whatsapp:20002@lid",
+        "4915000000002",
+        "20002",
+        "4915000000002@s.whatsapp.net",
+        "20002@lid",
+    ],
+)
+async def test_responder_handoff_uses_frozen_lid_principal_when_sender_canonicalization_is_empty(
+    directory_identity_case, monkeypatch, tmp_path, principal
+):
     from types import SimpleNamespace
     from unittest.mock import Mock
 
@@ -274,14 +335,16 @@ async def test_responder_handoff_uses_frozen_lid_principal_when_sender_canonical
     from yeoman_gateway.processing.dispatch import CURRENT_PRINCIPAL, CURRENT_TURN
     from yeoman_gateway.processing.models import StoredTurn, TurnBinding
 
+    case = directory_identity_case
     service, q, sources, db = case
-    identifier(db, 'b', '20002@lid', start=1)
+    identifier(db, "b", "20002@lid", start=1)
     assert canonical_user_id("whatsapp", "20002@lid", {}) == ""
     responder = object.__new__(LLMResponder)
     session = SimpleNamespace(operational_store=None, messages=[])
     session.add_message = Mock()
     responder.sessions = SimpleNamespace(
-        get_or_create=Mock(return_value=session), save=Mock(),
+        get_or_create=Mock(return_value=session),
+        save=Mock(),
     )
     responder._model_for_profile = lambda profile: "test-model"
     responder._session_user_metadata = lambda *args, **kwargs: {}
@@ -303,9 +366,17 @@ async def test_responder_handoff_uses_frozen_lid_principal_when_sender_canonical
         with service.history_scope(q, sources):
             with pytest.raises(HandoffReachedError):
                 await responder._generate_locked(
-                    session_key="whatsapp:20002@lid", channel="whatsapp", chat_id="20002@lid",
-                    content="Was weißt du?", sender_id="20002@lid", media=(), metadata={},
-                    allowed_tools=set(), persona_text=None, is_owner=True, history_snapshot=q.snapshot,
+                    session_key="whatsapp:20002@lid",
+                    channel="whatsapp",
+                    chat_id="20002@lid",
+                    content="Was weißt du?",
+                    sender_id="20002@lid",
+                    media=(),
+                    metadata={},
+                    allowed_tools=set(),
+                    persona_text=None,
+                    is_owner=True,
+                    history_snapshot=q.snapshot,
                 )
     finally:
         CURRENT_PRINCIPAL.reset(principal_token)
@@ -321,28 +392,47 @@ async def test_responder_handoff_uses_frozen_lid_principal_when_sender_canonical
 
     db.execute("UPDATE contacts SET display_name='Alex' WHERE contact_id='a'")
     responder.knowledge = service
-    monkeypatch.setattr("yeoman_gateway.history.context.current_history_snapshot", lambda: q.snapshot)
+    responder.people = install_directory(case, tmp_path)
+    monkeypatch.setattr(
+        "yeoman_gateway.history.context.current_history_snapshot", lambda: q.snapshot
+    )
     with service.history_scope(q, sources):
-        sid, _ = capture(service, sources.issue('m'))
-        service._store.execute("UPDATE knowledge_statements SET visibility_scope='author_only' WHERE statement_id=?", (sid,))
-        token = set_tool_context(ToolInvocationContext(
-            channel=handed_off['channel'], chat_id=handed_off['chat_id'],
-            canonical_user_id=handed_off['canonical_user_id'], is_owner=handed_off['is_owner'],
-            history_snapshot=q.snapshot,
-        ))
+        sid, _ = capture(service, sources.issue("m"))
+        service._store.execute(
+            "UPDATE knowledge_statements SET visibility_scope='author_only' WHERE statement_id=?",
+            (sid,),
+        )
+        token = set_tool_context(
+            ToolInvocationContext(
+                channel=handed_off["channel"],
+                chat_id=handed_off["chat_id"],
+                canonical_user_id=handed_off["canonical_user_id"],
+                is_owner=handed_off["is_owner"],
+                history_snapshot=q.snapshot,
+            )
+        )
         try:
-            text = await RecallConversationTool(None).execute(person='Alex', query='Synthetic')
-            assert 'Synthetic A' in text
+            text = await RecallConversationTool(None, people=responder.people).execute(
+                person="Alex", query="Synthetic"
+            )
+            assert "Synthetic A" in text
         finally:
             reset_tool_context(token)
         recall = Mock(wraps=service.recall)
-        monkeypatch.setattr(service, 'recall', recall)
-        assert responder._knowledge_statement_context(
-            query="Was weißt du über Alex' Aktien?", channel=handed_off['channel'],
-            chat_id=handed_off['chat_id'], principal=handed_off['canonical_user_id'],
-            is_owner=handed_off['is_owner'],
-        ) == 'Synthetic statement (Alex)'
-        assert recall.call_args.args[0].person_ids == ('a',)
+        monkeypatch.setattr(service, "recall", recall)
+        assert (
+            responder._knowledge_statement_context(
+                query="Was weißt du über Alex' Aktien?",
+                channel=handed_off["channel"],
+                chat_id=handed_off["chat_id"],
+                principal=handed_off["canonical_user_id"],
+                is_owner=handed_off["is_owner"],
+            )
+            == "Synthetic statement (Alex)"
+        )
+        assert recall.call_args.args[0].person_ids == ("a",)
+
+    responder.people.close()
 
 
 def test_owner_local_dm_does_not_read_author_only_statement_by_another_contact(case):
@@ -368,17 +458,25 @@ def test_owner_local_dm_does_not_read_author_only_statement_by_another_contact(c
         assert not service.recall(RecallQuery('Other person private note'), context=owner_dm).statement_ids
 
 
-@pytest.mark.parametrize(("principal", "chat"), [
-    (MEMBER, "10002@s.whatsapp.net"), ("whatsapp:20002@lid", "10002@s.whatsapp.net"),
-    (MEMBER, "20002@lid"), ("whatsapp:20002@lid", "20002@lid"),
-])
-def test_owner_german_person_question_retrieves_real_v3_statement(case, monkeypatch, principal, chat):
+@pytest.mark.parametrize(
+    ("principal", "chat"),
+    [
+        (DIRECTORY_MEMBER, "4915000000002@s.whatsapp.net"),
+        ("whatsapp:20002@lid", "4915000000002@s.whatsapp.net"),
+        (DIRECTORY_MEMBER, "20002@lid"),
+        ("whatsapp:20002@lid", "20002@lid"),
+    ],
+)
+def test_owner_german_person_question_retrieves_real_v3_statement(
+    directory_identity_case, monkeypatch, tmp_path, principal, chat
+):
     from yeoman_gateway.adapters.responder_llm import LLMResponder
 
+    case = directory_identity_case
     service, q, sources, db = case
     if principal.endswith("@lid") or chat.endswith("@lid"):
-        identifier(db, 'b', '20002@lid', start=1)
-    source = sources.issue('m')
+        identifier(db, "b", "20002@lid", start=1)
+    source = sources.issue("m")
     db.execute("UPDATE contacts SET display_name='Alex' WHERE contact_id='a'")
     with service.history_scope(q, sources):
         sid, _ = capture(service, source)
@@ -388,72 +486,114 @@ def test_owner_german_person_question_retrieves_real_v3_statement(case, monkeypa
         )
         responder = object.__new__(LLMResponder)
         responder.knowledge = service
+        responder.people = install_directory(case, tmp_path)
         monkeypatch.setattr(
             "yeoman_gateway.history.context.current_history_snapshot", lambda: q.snapshot
         )
         text = responder._knowledge_statement_context(
-            query="Was weißt du über Alex' Aktien?", channel='whatsapp',
-            chat_id=chat, principal=principal, is_owner=True,
+            query="Was weißt du über Alex' Aktien?",
+            channel="whatsapp",
+            chat_id=chat,
+            principal=principal,
+            is_owner=True,
         )
-        assert text == 'Synthetic statement (Alex)'
+        assert text == "Synthetic statement (Alex)"
         assert not responder._knowledge_statement_context(
-            query="Wie wird das Wetter?", channel='whatsapp',
-            chat_id='10002@s.whatsapp.net', principal=MEMBER, is_owner=True,
+            query="Wie wird das Wetter?",
+            channel="whatsapp",
+            chat_id="4915000000002@s.whatsapp.net",
+            principal=DIRECTORY_MEMBER,
+            is_owner=True,
         )
         assert not responder._knowledge_statement_context(
-            query="Was weißt du über Alex' Aktien?", channel='whatsapp',
-            chat_id='10001@s.whatsapp.net', principal=AUTHOR, is_owner=False,
+            query="Was weißt du über Alex' Aktien?",
+            channel="whatsapp",
+            chat_id="4915000000001@s.whatsapp.net",
+            principal=DIRECTORY_AUTHOR,
+            is_owner=False,
         )
         assert not responder._knowledge_statement_context(
-            query="Was weißt du über Alex' Aktien?", channel='whatsapp',
-            chat_id=source.chat_id, principal=MEMBER, is_owner=True,
+            query="Was weißt du über Alex' Aktien?",
+            channel="whatsapp",
+            chat_id=source.chat_id,
+            principal=DIRECTORY_MEMBER,
+            is_owner=True,
         )
 
+    responder.people.close()
 
-@pytest.mark.parametrize(("principal", "chat"), [
-    (MEMBER, "10002@s.whatsapp.net"), ("whatsapp:20002@lid", "10002@s.whatsapp.net"),
-    (MEMBER, "20002@lid"), ("whatsapp:20002@lid", "20002@lid"),
-])
-def test_owner_german_natural_prefix_preserves_display_name_in_real_v3_result(case, monkeypatch, principal, chat):
+
+@pytest.mark.parametrize(
+    ("principal", "chat"),
+    [
+        (DIRECTORY_MEMBER, "4915000000002@s.whatsapp.net"),
+        ("whatsapp:20002@lid", "4915000000002@s.whatsapp.net"),
+        (DIRECTORY_MEMBER, "20002@lid"),
+        ("whatsapp:20002@lid", "20002@lid"),
+    ],
+)
+def test_owner_german_natural_prefix_preserves_display_name_in_real_v3_result(
+    directory_identity_case, monkeypatch, tmp_path, principal, chat
+):
     from yeoman_gateway.adapters.responder_llm import LLMResponder
 
+    case = directory_identity_case
     service, q, sources, db = case
     if principal.endswith("@lid") or chat.endswith("@lid"):
-        identifier(db, 'b', '20002@lid', start=1)
-    source = sources.issue('m')
+        identifier(db, "b", "20002@lid", start=1)
+    source = sources.issue("m")
     db.execute("UPDATE contacts SET display_name='AlexGrrrrr😈' WHERE contact_id='a'")
     with service.history_scope(q, sources):
         capture(service, source)
         responder = object.__new__(LLMResponder)
         responder.knowledge = service
+        responder.people = install_directory(case, tmp_path)
         monkeypatch.setattr(
             "yeoman_gateway.history.context.current_history_snapshot", lambda: q.snapshot
         )
-        assert responder._knowledge_statement_context(
-            query="Was weißt du über Alex' Aktien?", channel='whatsapp',
-            chat_id=chat, principal=principal, is_owner=True,
-        ) == 'Synthetic statement (AlexGrrrrr😈)'
+        assert (
+            responder._knowledge_statement_context(
+                query="Was weißt du über Alex' Aktien?",
+                channel="whatsapp",
+                chat_id=chat,
+                principal=principal,
+                is_owner=True,
+            )
+            == "Synthetic statement (AlexGrrrrr😈)"
+        )
+
+    responder.people.close()
 
 
-@pytest.mark.parametrize(("principal", "chat"), [
-    (MEMBER, "10002@s.whatsapp.net"), ("whatsapp:20002@lid", "10002@s.whatsapp.net"),
-    (MEMBER, "20002@lid"), ("whatsapp:20002@lid", "20002@lid"),
-])
-def test_owner_ambiguous_natural_prefix_has_no_knowledge_person_targets_or_results(case, monkeypatch, principal, chat):
+@pytest.mark.parametrize(
+    ("principal", "chat"),
+    [
+        (DIRECTORY_MEMBER, "4915000000002@s.whatsapp.net"),
+        ("whatsapp:20002@lid", "4915000000002@s.whatsapp.net"),
+        (DIRECTORY_MEMBER, "20002@lid"),
+        ("whatsapp:20002@lid", "20002@lid"),
+    ],
+)
+def test_owner_ambiguous_natural_prefix_has_no_knowledge_person_targets_or_results(
+    directory_identity_case, monkeypatch, tmp_path, principal, chat
+):
     from yeoman_gateway.adapters.responder_llm import LLMResponder
 
+    case = directory_identity_case
     service, q, sources, db = case
     if principal.endswith("@lid") or chat.endswith("@lid"):
-        identifier(db, 'b', '20002@lid', start=1)
-    source = sources.issue('m')
+        identifier(db, "b", "20002@lid", start=1)
+    source = sources.issue("m")
     db.execute("UPDATE contacts SET display_name='Alexander Müller' WHERE contact_id='a'")
     db.execute("UPDATE contacts SET display_name='Alexa Weber' WHERE contact_id='b'")
     with service.history_scope(q, sources):
         capture(service, source)
-        capture_context = TrustedCaptureContext('synthetic', 1, 'native', (source,))
-        candidate = StatementCandidate('Other synthetic statement', (source,), people=(
-            PersonLinkCandidate('b', 'subject', source, 'explicit'),
-        ))
+        capture_context = TrustedCaptureContext("synthetic", 1, "native", (source,))
+        candidate = StatementCandidate(
+            "Other synthetic statement",
+            (source,),
+            people=(PersonLinkCandidate("b", "subject", source, "explicit"),),
+        )
         assert service.capture(candidate, context=capture_context).statement_ids
 
         recalled = []
@@ -463,18 +603,24 @@ def test_owner_ambiguous_natural_prefix_has_no_knowledge_person_targets_or_resul
             recalled.append(query)
             return recall(query, **kwargs)
 
-        monkeypatch.setattr(service, 'recall', record_recall)
+        monkeypatch.setattr(service, "recall", record_recall)
         responder = object.__new__(LLMResponder)
         responder.knowledge = service
+        responder.people = install_directory(case, tmp_path)
         monkeypatch.setattr(
             "yeoman_gateway.history.context.current_history_snapshot", lambda: q.snapshot
         )
         assert not responder._knowledge_statement_context(
-            query='Was weißt du über Alex?', channel='whatsapp',
-            chat_id=chat, principal=principal, is_owner=True,
+            query="Was weißt du über Alex?",
+            channel="whatsapp",
+            chat_id=chat,
+            principal=principal,
+            is_owner=True,
         )
         assert len(recalled) == 1
         assert recalled[0].person_ids == ()
+
+    responder.people.close()
 
 
 @pytest.mark.parametrize(("principal", "chat"), [

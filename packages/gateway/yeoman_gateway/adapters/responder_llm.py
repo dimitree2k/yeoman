@@ -84,6 +84,7 @@ if TYPE_CHECKING:
     from yeoman_gateway.media.lazy_resolver import LazyMediaResolver
     from yeoman_gateway.media.router import ModelRouter
     from yeoman_gateway.media.tts import TTSSynthesizer
+    from yeoman_gateway.people.resolver import PeopleResolver, ReaderContext
     from yeoman_gateway.storage.private_handoff import PrivateHandoffStore
 
 
@@ -664,6 +665,7 @@ class LLMResponder(ResponderPort):
         session_manager: SessionManager | None = None,
         effect_router: object | None = None,
         knowledge: object | None = None,
+        people: PeopleResolver | None = None,
         knowledge_sources: object | None = None,
         telemetry: TelemetryPort | None = None,
         security: SecurityPort | None = None,
@@ -703,6 +705,7 @@ class LLMResponder(ResponderPort):
         self._history_projector: Any = None
         self._history_knowledge: Any = None
         self.knowledge = knowledge
+        self.people = people
         #: Proof owner for archived turn sources.  Retained for the compositions that
         #: still inject it; registration itself goes through the public facade so the
         #: responder never needs the module's private authority types.
@@ -853,10 +856,10 @@ class LLMResponder(ResponderPort):
             self.tools.register(cron_tool)
 
         if self.knowledge is not None:
-            contacts_tool = ContactsTool(knowledge=self.knowledge)
+            contacts_tool = ContactsTool(knowledge=self.knowledge, people=self.people)
             self.tools.register(contacts_tool)
             self.tools.register(
-                ResolveContactTool(knowledge=self.knowledge)
+                ResolveContactTool(knowledge=self.knowledge, people=self.people)
             )
 
         # Calendar — only if CalDAV credentials are configured
@@ -882,7 +885,7 @@ class LLMResponder(ResponderPort):
         from yeoman_gateway.agent.tools.recall_conversation import RecallConversationTool
 
         self._recall_tool = RecallConversationTool(
-            session_manager=self.sessions, group_resolver=self._resolve_group_reference
+            session_manager=self.sessions, group_resolver=self._resolve_group_reference, people=self.people
         )
         self.tools.register(self._recall_tool)
 
@@ -928,13 +931,20 @@ class LLMResponder(ResponderPort):
             ToolInvocationContext,
             set_tool_context,
         )
-        if channel in {'whatsapp', 'cli', 'system'}:
-            if channel == 'system' and not canonical_user_id:
+
+        if channel in {"whatsapp", "cli", "system"}:
+            if channel == "system" and not canonical_user_id:
                 binding = self._trusted_turn_binding()
-                canonical_user_id = str(getattr(getattr(binding, 'turn', None), 'principal', '') or '')
-            elif channel == 'cli' and chat_id == 'direct' and (session_key.startswith('cli:') or is_owner):
-                knowledge: Any = getattr(self, 'knowledge', None)
-                canonical_user_id = knowledge._policy.admin_actor() if knowledge is not None else ''
+                canonical_user_id = str(
+                    getattr(getattr(binding, "turn", None), "principal", "") or ""
+                )
+            elif (
+                channel == "cli"
+                and chat_id == "direct"
+                and (session_key.startswith("cli:") or is_owner)
+            ):
+                knowledge: Any = getattr(self, "knowledge", None)
+                canonical_user_id = knowledge._policy.admin_actor() if knowledge is not None else ""
         set_tool_context(
             ToolInvocationContext(
                 channel=channel,
@@ -944,7 +954,15 @@ class LLMResponder(ResponderPort):
                 is_owner=is_owner,
                 reply_to_message_id=reply_to_message_id,
                 request_text=request_text,
-                history_snapshot=(current_history_snapshot() if channel in {'whatsapp', 'cli', 'system'} else None),
+                knowledge_read_context=self._knowledge_read_context(
+                    channel=channel,
+                    chat_id=chat_id,
+                    principal=canonical_user_id,
+                    is_owner=is_owner,
+                ),
+                history_snapshot=(
+                    current_history_snapshot() if channel in {"whatsapp", "cli", "system"} else None
+                ),
             )
         )
         message_tool = self.tools.get("message")
@@ -1377,6 +1395,32 @@ class LLMResponder(ResponderPort):
             if value is not None and str(value).strip()
         }
 
+    def _delivery_reader(self, channel: str, chat_id: str) -> ReaderContext | None:
+        from yeoman_gateway.people.disclosure import reader_context
+        from yeoman_gateway.people.resolver import PeopleUnavailable
+        from yeoman_gateway.processing.tool_context import current_tool_context
+
+        people = getattr(self, "people", None)
+        context = current_tool_context()
+        if (
+            people is None
+            or context is None
+            or (channel, chat_id) != (context.channel, context.chat_id)
+        ):
+            return None
+        try:
+            return reader_context(
+                people,
+                channel=channel,
+                chat_id=chat_id,
+                principal_id=context.canonical_user_id,
+                is_owner=context.is_owner,
+                at_ms=int(time.time() * 1000),
+                history=context.history_snapshot,
+            )
+        except PeopleUnavailable:
+            return None
+
     def _seed_pending_delivery(
         self,
         *,
@@ -1397,11 +1441,14 @@ class LLMResponder(ResponderPort):
         if not target_names:
             return
         target_name = target_names[-1]
-        if self.knowledge is not None:
+        reader = self._delivery_reader(channel, chat_id)
+        if reader is not None:
             resolved_targets: dict[str, str] = {}
             for candidate in target_names:
                 resolution = resolve_contact_reference(
                     knowledge=self.knowledge,
+                    people=getattr(self, "people", None),
+                    reader=reader,
                     reference=candidate,
                     channel=channel,
                     chat_id=chat_id,
@@ -1467,13 +1514,16 @@ class LLMResponder(ResponderPort):
         channel: str,
         chat_id: str,
     ) -> str | None:
-        if self.knowledge is None:
+        reader = self._delivery_reader(channel, chat_id)
+        if reader is None:
             return None
         target_name = str(pending.get("target_name") or "").strip()
         if not target_name:
             return None
         expected = resolve_contact_reference(
             knowledge=self.knowledge,
+            people=getattr(self, "people", None),
+            reader=reader,
             reference=target_name,
             channel=channel,
             chat_id=chat_id,
@@ -1481,6 +1531,8 @@ class LLMResponder(ResponderPort):
         for mention in self._pending_delivery_mentions(content=content, metadata=metadata):
             resolution = resolve_contact_reference(
                 knowledge=self.knowledge,
+                people=getattr(self, "people", None),
+                reader=reader,
                 reference=mention,
                 channel=channel,
                 chat_id=chat_id,
@@ -1493,6 +1545,8 @@ class LLMResponder(ResponderPort):
                 return expected.jid
             if expected is None and contact_resolution_matches_reference(
                 knowledge=self.knowledge,
+                people=getattr(self, "people", None),
+                reader=reader,
                 reference=target_name,
                 resolution=resolution,
             ):
@@ -3047,14 +3101,23 @@ class LLMResponder(ResponderPort):
 
         snapshot = current_history_snapshot()
         now_ms = int(time.time() * 1000)
-        owner_direct = bool(snapshot is not None and channel == "whatsapp" and is_owner
+        owner_direct = bool(
+            snapshot is not None
+            and channel == "whatsapp"
+            and is_owner
             and HistoryQueries(snapshot).is_owner_direct_chat(
-            principal, chat_id, now_ms, is_owner=bool(is_owner), channel=channel,
-        ))
+                principal,
+                chat_id,
+                now_ms,
+                is_owner=bool(is_owner),
+                channel=channel,
+            )
+        )
         members = None
         if members is None and is_direct:
-            members = (frozenset({principal}) if owner_direct
-                       else frozenset({principal, str(chat_id)}))
+            members = (
+                frozenset({principal}) if owner_direct else frozenset({principal, str(chat_id)})
+            )
         return TrustedReadContext(
             principal_id=str(principal),
             channel=str(channel),
@@ -3069,8 +3132,14 @@ class LLMResponder(ResponderPort):
         )
 
     def _knowledge_statement_context(
-        self, *, query: str, channel: str, chat_id: str, principal: str,
-        is_owner: bool, purpose: str = "reply",
+        self,
+        *,
+        query: str,
+        channel: str,
+        chat_id: str,
+        principal: str,
+        is_owner: bool,
+        purpose: str = "reply",
     ) -> str:
         from dataclasses import replace
 
@@ -3078,48 +3147,94 @@ class LLMResponder(ResponderPort):
         from yeoman_gateway.history.queries import HistoryQueries
         from yeoman_gateway.knowledge.models import RecallQuery
 
+        snapshot = current_history_snapshot()
+        if snapshot is not None and channel == "whatsapp":
+            snapshot.assert_current(snapshot.generation)
         context = self._knowledge_read_context(
-            channel=channel, chat_id=chat_id, principal=principal,
-            is_owner=is_owner, purpose=purpose,
+            channel=channel,
+            chat_id=chat_id,
+            principal=principal,
+            is_owner=is_owner,
+            purpose=purpose,
         )
         if context is None:
             return ""
         person_ids: tuple[str, ...] = ()
         chat_ids: tuple[str, ...] = ()
-        explicit_request = "?" in query or bool(re.match(
-            r"\s*(?:was|wer|wie|wo|wann|welche\w*|what|who|how|where|when|"
-            r"erzähl|erzähle|sag|zeige|tell|show|recall|remember)\b", query, re.IGNORECASE,
-        ))
-        snapshot = current_history_snapshot()
-        if (context.owner and purpose == "reply" and channel == "whatsapp" and explicit_request
-                and snapshot is not None
-                and HistoryQueries(snapshot).is_owner_direct_chat(
-                    principal, chat_id, context.now_ms, is_owner=is_owner, channel=channel
-                )):
+        explicit_request = "?" in query or bool(
+            re.match(
+                r"\s*(?:was|wer|wie|wo|wann|welche\w*|what|who|how|where|when|"
+                r"erzähl|erzähle|sag|zeige|tell|show|recall|remember)\b",
+                query,
+                re.IGNORECASE,
+            )
+        )
+        if (
+            context.owner
+            and purpose == "reply"
+            and channel == "whatsapp"
+            and explicit_request
+            and snapshot is not None
+            and HistoryQueries(snapshot).is_owner_direct_chat(
+                principal, chat_id, context.now_ms, is_owner=is_owner, channel=channel
+            )
+        ):
             queries = HistoryQueries(snapshot)
             member_chats = queries.owner_member_chat_ids(principal, context.now_ms)
-            named_chats = tuple(dict.fromkeys(
-                str(row["chat_id"]) for row in queries.chats()
-                if any(name and re.search(r"(?<!\w)" + re.escape(str(name)) + r"(?!\w)",
-                                          query, re.IGNORECASE)
-                       for name in (row.get("subject"), row["chat_id"]))
-            ))
+            named_chats = tuple(
+                dict.fromkeys(
+                    str(row["chat_id"])
+                    for row in queries.chats()
+                    if any(
+                        name
+                        and re.search(
+                            r"(?<!\w)" + re.escape(str(name)) + r"(?!\w)", query, re.IGNORECASE
+                        )
+                        for name in (row.get("subject"), row["chat_id"])
+                    )
+                )
+            )
             if named_chats and not set(named_chats) <= set(member_chats):
                 return ""
             chat_ids = named_chats
-            # Exact names and current aliases resolve to identities; a whole question is not a person filter.
-            person_ids = tuple(dict.fromkeys(
-                person for _, person in queries.resolve_people_in_text(
-                    query, chat_ids=chat_ids or member_chats, at_ms=context.now_ms
-                )
-            ))
+            from yeoman_gateway.people.disclosure import reader_context
+            from yeoman_gateway.people.resolver import PeopleUnavailable, resolve_people_in_text
+
+            people: PeopleResolver | None = getattr(self, "people", None)
+            if people is not None:
+                try:
+                    reader = reader_context(
+                        people,
+                        channel=channel,
+                        chat_id=chat_id,
+                        principal_id=principal,
+                        is_owner=is_owner,
+                        at_ms=context.now_ms,
+                        history=snapshot,
+                    )
+                    if reader.kind == "owner_dm":
+                        person_ids = tuple(
+                            sorted(
+                                {
+                                    subject
+                                    for _, person_id in resolve_people_in_text(query, reader)
+                                    for subject in cast(Any, self.knowledge).directory_subject_ids(
+                                        person_id, reader=reader
+                                    )
+                                }
+                            )
+                        )
+                except PeopleUnavailable:
+                    person_ids = ()
             if person_ids or chat_ids:
-                context = replace(context, owner_lookup_person_ids=person_ids,
-                                  owner_lookup_chat_ids=chat_ids)
+                context = replace(
+                    context, owner_lookup_person_ids=person_ids, owner_lookup_chat_ids=chat_ids
+                )
         lookup = bool(person_ids or chat_ids)
         result = cast(Any, self.knowledge).recall(
             RecallQuery(text=query, person_ids=person_ids, limit=20 if lookup else 5),
-            context=context, require_match=not lookup,
+            context=context,
+            require_match=not lookup,
         )
         return str(result.text)
 
