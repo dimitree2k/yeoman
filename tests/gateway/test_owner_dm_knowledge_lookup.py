@@ -134,7 +134,7 @@ def test_d2_maps_directory_id_to_legacy_subject(responder, monkeypatch):
     def poisoned(*args, **kwargs):
         raise AssertionError("retired name resolver")
 
-    monkeypatch.setattr(HistoryQueries, "resolve_people_in_text", poisoned)
+    monkeypatch.setattr(HistoryQueries, "resolve_people_in_text", poisoned, raising=False)
     recall(responder, "Was weißt du über Owner Nickname?")
     call = responder.knowledge.recall.call_args
     assert call.args[0].person_ids == ("alex-person",)

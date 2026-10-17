@@ -49,6 +49,7 @@ from yeoman_gateway.media.router import ModelRouter
 from yeoman_gateway.media.storage import MediaStorage
 from yeoman_gateway.media.tts import TTSSynthesizer
 from yeoman_gateway.media.vision import VisionDescriber
+from yeoman_gateway.people.resolver import PeopleResolver
 from yeoman_gateway.people.schema import people_db_path
 from yeoman_gateway.people.service import PeopleSyncService
 from yeoman_gateway.persona_evolution import (
@@ -467,6 +468,7 @@ class GatewayRuntime:
     startup_hook: Callable[[], Awaitable[None]] | None = None
     source_catchup: ObservedSourceCatchup | None = None
     people_sync: PeopleSyncService | None = None
+    people: PeopleResolver | None = None
 
     async def _start_processing_services(self) -> None:
         """Plan 04 start order: recover and reconcile before any channel consumes input.
@@ -594,6 +596,8 @@ class GatewayRuntime:
                 await attempt_async(self.people_sync.stop)
             if self.processing is not None:
                 attempt_sync(self.processing.close)
+            if self.people is not None:
+                attempt_sync(self.people.close)
             await attempt_async(self.history_projector.stop)
             await attempt_async(tracing.shutdown)
 
@@ -2470,6 +2474,7 @@ def build_gateway_runtime(
         ),
         capture_actors=frozenset(),
     )
+    people = PeopleResolver(people_db_path(create=False))
     knowledge_sources = RuntimeKnowledgeSources(processing_store=processing_store)
     try:
         knowledge_service = open_knowledge_store(
@@ -2477,6 +2482,7 @@ def build_gateway_runtime(
             workspace_id=workspace_id_for(workspace),
             source_authority=knowledge_sources,
             policy_authority=knowledge_policy,
+            people=people,
             legacy_sources=tuple(
                 Path(item).expanduser()
                 for item in (
@@ -2677,6 +2683,7 @@ def build_gateway_runtime(
         a2a_delivery=service_effects,
         processing_store=processing_store,
         knowledge=knowledge_service,
+        people=people,
         knowledge_sources=knowledge_sources,
         telemetry=telemetry,
         security=security,
@@ -4097,6 +4104,7 @@ def build_gateway_runtime(
             processing=processing_store, knowledge=knowledge_service,
             registrar=observed_sources, projector=history_projector,
         ) if observed_sources is not None else None),
+        people=people,
         people_sync=(PeopleSyncService(projector=history_projector, db_path=people_db_path())
                      if history_projector is not None else None),
     )

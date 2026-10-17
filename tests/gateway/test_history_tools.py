@@ -36,30 +36,56 @@ def directory_reader_factory(tmp_path, request):
     return build
 
 
-async def test_concurrent_tool_turns_keep_snapshot_and_chat_separate():
+async def test_concurrent_tool_turns_keep_snapshot_and_chat_separate(tmp_path):
     from yeoman_gateway.history.context import history_turn
     p = Projector()
     p.add('a', text='synthetic alpha')
     p.add('b', chat='b@g.us', text='synthetic beta')
+    from yeoman_gateway.agent.tools.contacts import ContactsTool
+
+    from tests.gateway.convhist.test_hist_queries import contact, event, identifier
+    from tests.gateway.people.resolver_fixtures import synced_directory
+
+    for person, phone, label in (
+        ('reader', '4915000000009', 'Reader'),
+        ('alpha', '4915000000001', 'Synthetic Alpha'),
+        ('beta', '4915000000002', 'Synthetic Beta'),
+    ):
+        contact(p.db, person)
+        p.db.execute("UPDATE contacts SET display_name=? WHERE contact_id=?", (label, person))
+        identifier(p.db, person, phone + '@s.whatsapp.net')
+    for chat, phone in (('a@g.us', '4915000000001'), ('b@g.us', '4915000000002')):
+        event(p.db, chat, 'member_snapshot', 1, {'complete': True, 'participants': [
+            ['4915000000009@s.whatsapp.net'], [phone + '@s.whatsapp.net']]}, chat=chat)
+    p.db.commit()
+    initial = await p.read_turn()
+    directory = synced_directory(initial, tmp_path / 'directory')
+    initial.close()
+    contacts_tool = ContactsTool(people=directory)
     tool = RecallConversationTool(SimpleNamespace(get_or_create=Mock(side_effect=AssertionError('legacy'))))
     both = asyncio.Event()
     entered = 0
     async def run(chat):
         nonlocal entered
         async with history_turn(p) as snapshot:
-            token = set_tool_context(ToolInvocationContext(channel='whatsapp', chat_id=chat, history_snapshot=snapshot))
+            token = set_tool_context(ToolInvocationContext(channel='whatsapp', chat_id=chat,
+                canonical_user_id='whatsapp:4915000000009', history_snapshot=snapshot))
             entered += 1
             if entered == 2:
                 both.set()
             try:
                 await asyncio.wait_for(both.wait(), 30)
-                return id(snapshot), await tool.execute(query='synthetic')
+                return (id(snapshot), await tool.execute(query='synthetic'),
+                        await contacts_tool.execute(action='search', query='Synthetic'))
             finally:
                 reset_tool_context(token)
     a, b = await asyncio.gather(run('a@g.us'), run('b@g.us'))
     assert a[0] != b[0]
     assert 'alpha' in a[1] and 'beta' not in a[1]
     assert 'beta' in b[1] and 'alpha' not in b[1]
+    assert 'Alpha' in a[2] and 'Beta' not in a[2]
+    assert 'Beta' in b[2] and 'Alpha' not in b[2]
+    directory.close()
     assert p.live_snapshot_count == 0
     p.close()
 

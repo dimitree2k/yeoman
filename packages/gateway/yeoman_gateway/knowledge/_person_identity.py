@@ -3,7 +3,6 @@
 
 from __future__ import annotations
 
-import re
 from dataclasses import dataclass
 from typing import Any
 
@@ -14,10 +13,6 @@ from yeoman_gateway.knowledge.models import (
     IdentifierBinding,
     KnowledgeError,
     NameObservation,
-    PersonResolution,
-    TrustedReadContext,
-    normalize_alias_value,
-    validate_name,
 )
 
 
@@ -143,109 +138,10 @@ class IdentityEngine:
         return tuple(sorted(out, key=lambda item: (not item.is_preferred, item.name)))
 
 
-    def search_mention_name_candidates(
-        self,
-        name_token: str,
-        *,
-        person_ids: tuple[str, ...],
-        context: TrustedReadContext,
-    ) -> tuple[PersonResolution, ...]:
-        """Find name candidates only among offered people and visible scoped aliases."""
-        token = normalize_alias_value(validate_name(name_token, "mention name token"))
-        if not token:
-            return ()
-        allowed_scopes = {GLOBAL_SCOPE_KEY, context.scope_key()}
-        results: list[PersonResolution] = []
-        for person_id in sorted({self.canonical_id(item) for item in person_ids}):
-            person = self.get_person(person_id)
-            if person is None or person.status != "active":
-                continue
-            names = [
-                alias
-                for member_id in self.merged_member_ids(person_id)
-                for alias in self.aliases_of(member_id)
-                if alias.status in ("observed", "confirmed")
-                and alias.findable
-                and alias.scope_key in allowed_scopes
-                and (alias.visibility == "public" or context.is_direct)
-                and (alias.valid_until_ms is None or alias.valid_until_ms > context.now_ms)
-            ]
-            matching = [
-                alias.name
-                for alias in names
-                if token in normalize_alias_value(alias.name)
-            ]
-            if not matching:
-                continue
-            matched_name = min(
-                matching,
-                key=lambda name: (
-                    normalize_alias_value(name) != token,
-                    len(normalize_alias_value(name)),
-                    normalize_alias_value(name),
-                ),
-            )
-            results.append(
-                PersonResolution(
-                    status="ambiguous",
-                    person_id=person_id,
-                    display_name=matched_name,
-                    identity_revision=self._store.identity_revision,
-                    reason="name_candidate_requires_confirmation",
-                )
-            )
-        return tuple(results)
 
 
-    def search_mention_text_candidates(
-        self,
-        content: str,
-        *,
-        person_ids: tuple[str, ...],
-        context: TrustedReadContext,
-    ) -> tuple[PersonResolution, ...]:
-        """Match complete visible aliases in ordinary text, without resolving identity."""
-        text = " ".join(content.casefold().split())
-        if not text:
-            return ()
-        allowed_scopes = {GLOBAL_SCOPE_KEY, context.scope_key()}
-        results: list[PersonResolution] = []
-        for person_id in sorted({self.canonical_id(item) for item in person_ids}):
-            person = self.get_person(person_id)
-            if person is None or person.status != "active":
-                continue
-            eligible_names = {
-                normalize_alias_value(alias.name)
-                for member_id in self.merged_member_ids(person_id)
-                for alias in self.aliases_of(member_id)
-                if alias.status in ("observed", "confirmed")
-                and alias.findable
-                and alias.scope_key in allowed_scopes
-                and (alias.visibility == "public" or context.is_direct)
-                and (alias.valid_until_ms is None or alias.valid_until_ms > context.now_ms)
-            }
-            matches = sorted(
-                name
-                for name in eligible_names
-                if re.search(rf"(?<!\w){re.escape(name)}(?!\w)", text)
-            )
-            if not matches:
-                continue
-            results.append(
-                PersonResolution(
-                    status="ambiguous",
-                    person_id=person_id,
-                    display_name=matches[0],
-                    identity_revision=self._store.identity_revision,
-                    reason="name_candidate_requires_confirmation",
-                )
-            )
-        return tuple(results)
 
 
-    def person_by_display_or_alias(self, name: str) -> tuple[str, ...]:
-        results = self.search_by_name(name, context=None, limit=50)
-        return tuple(item.person_id for item in results if item.person_id)
 
 
     @staticmethod

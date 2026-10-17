@@ -56,7 +56,7 @@ async def test_missing_directory_never_uses_retired_recognition(directory_case, 
     def poisoned(*args, **kwargs):
         raise AssertionError("old resolver")
 
-    monkeypatch.setattr(HistoryQueries, "resolve_person", poisoned)
+    monkeypatch.setattr(HistoryQueries, "resolve_person", poisoned, raising=False)
     assert "unavailable" in await execute(
         c, RecallConversationTool(None), query="holdings", person="Anything"
     )
