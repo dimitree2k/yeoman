@@ -8,12 +8,32 @@ from history_turn_fixtures import FileProjector, Projector
 from test_a2a_invoke import _AliasPolicy, _input, _invoke
 from yeoman_gateway.agent.tools.recall_conversation import RecallConversationTool
 from yeoman_gateway.ipc.a2a_invoke import resolve_whatsapp_recipient
+from yeoman_gateway.people.bridges import history_person
+from yeoman_gateway.people.resolver import resolve_person
 from yeoman_gateway.processing.tool_context import (
     ToolInvocationContext,
     reset_tool_context,
     set_tool_context,
     tool_history_snapshot,
 )
+
+
+@pytest.fixture
+def directory_reader_factory(tmp_path, request):
+    from yeoman_gateway.people.disclosure import reader_context
+
+    from tests.gateway.people.resolver_fixtures import synced_directory
+
+    sequence = 0
+    def build(snapshot, *, kind='owner_dm'):
+        nonlocal sequence
+        sequence += 1
+        directory = synced_directory(snapshot, tmp_path / str(sequence))
+        request.addfinalizer(directory.close)
+        return reader_context(directory,channel='whatsapp',chat_id='family@g.us' if kind=='group' else '491000000001@s.whatsapp.net',
+                              principal_id='whatsapp:491000000001',is_owner=True,
+                              at_ms=__import__('time').time_ns()//1_000_000,history=snapshot)
+    return build
 
 
 async def test_concurrent_tool_turns_keep_snapshot_and_chat_separate():
@@ -131,7 +151,7 @@ async def test_owner_direct_chat_uses_temporal_terminal_identity(principal, chat
     ('990000000099@lid', True, False),
     ('990000000001@lid', False, False),
 ])
-async def test_recall_owner_alias_direct_turns(principal, chat, is_owner, allowed):
+async def test_recall_owner_alias_direct_turns(principal, chat, is_owner, allowed, directory_reader_factory):
     from yeoman_gateway.history.context import history_turn
 
     p, phone = _person_lookup_projector()
@@ -141,6 +161,8 @@ async def test_recall_owner_alias_direct_turns(principal, chat, is_owner, allowe
     p.db.commit()
     tool = RecallConversationTool(None)
     async with history_turn(p) as snapshot:
+        reader = directory_reader_factory(snapshot)
+        tool._people = reader.directory
         token = set_tool_context(ToolInvocationContext(channel='whatsapp', chat_id=chat,
             canonical_user_id=principal, is_owner=is_owner, history_snapshot=snapshot))
         try:
@@ -212,58 +234,57 @@ def _add_named_author(p, contact_id, display_name, phone):
 
 
 def test_person_name_normalization_splits_digits_and_drops_symbols():
-    from yeoman_gateway.history.queries import _name_tokens
+    from yeoman_gateway.people.resolver import name_tokens as _name_tokens
 
     assert _name_tokens('𝐀𝐋𝐄𝐗42😈') == ('alex', '42')
     assert _name_tokens('ＡＬＥＸ—Mu\u0308ller!!') == ('alex', 'müller')
     assert _name_tokens('😈!!!') == ()
 
 
-async def test_person_resolver_prefix_ambiguity_exact_multword_and_unmatchable_names():
-    import time
+async def test_person_resolver_prefix_ambiguity_exact_multword_and_unmatchable_names(directory_reader_factory):
 
     from yeoman_gateway.history.context import history_turn
-    from yeoman_gateway.history.queries import HistoryQueries
+    from yeoman_gateway.people.disclosure import render_person
+    from yeoman_gateway.people.resolver import resolve_person
 
     p, _ = _person_lookup_projector()
     p.db.execute("UPDATE contacts SET display_name='Zed' WHERE contact_id IN ('alex','alex-alias')")
     p.db.commit()
     _add_named_author(p, 'alexgr', 'AlexGrrrrr😈', '491000000005@s.whatsapp.net')
     async with history_turn(p) as snapshot:
-        result = HistoryQueries(snapshot).resolve_person('Alex', ('family@g.us',), time.time_ns() // 1_000_000)
-        assert result.status == 'resolved' and result.person_id == 'alexgr'
+        reader = directory_reader_factory(snapshot)
+        result = resolve_person('Alex', reader)
+        assert result.status == 'resolved' and render_person(result.person_id,reader).display_name == 'AlexGrrrrr😈'
     # Prefixes can be ambiguous while a distinctive multiword prefix still resolves.
     _add_named_author(p, 'alexander', 'Alexander Müller', '491000000003@s.whatsapp.net')
     _add_named_author(p, 'alexa', 'Alexa Weber', '491000000004@s.whatsapp.net')
     async with history_turn(p) as snapshot:
-        queries = HistoryQueries(snapshot)
-        now_ms = time.time_ns() // 1_000_000
-        result = queries.resolve_person('Alex', ('family@g.us',), now_ms)
+        reader = directory_reader_factory(snapshot)
+        result = resolve_person('Alex', reader)
         assert result.status == 'ambiguous'
-        assert {candidate.display_name for candidate in result.candidates} >= {
+        assert {render_person(candidate.person_id,reader).display_name for candidate in result.candidates} >= {
             'Alexander Müller', 'Alexa Weber', 'AlexGrrrrr😈'}
-        assert all(candidate.group_names == ('Family',) for candidate in result.candidates)
-        assert queries.resolve_person('Alex Müller', ('family@g.us',), now_ms).person_id == 'alexander'
-        assert queries.resolve_person('Alexander Müller', ('family@g.us',), now_ms).person_id == 'alexander'
-        assert queries.resolve_person('Alp', ('family@g.us',), now_ms).status == 'not_found'
-        assert queries.resolve_person('😈', ('family@g.us',), now_ms).status == 'not_found'
-        assert queries.resolve_person('!!!', ('family@g.us',), now_ms).status == 'not_found'
+        assert all(render_person(candidate.person_id,reader).shared_chat_names == ('Family',) for candidate in result.candidates)
+        assert render_person(resolve_person('Alex Müller', reader).person_id, reader).display_name == 'Alexander Müller'
+        assert render_person(resolve_person('Alexander Müller', reader).person_id, reader).display_name == 'Alexander Müller'
+        assert resolve_person('Alp', reader).status == 'not_found'
+        assert resolve_person('😈', reader).status == 'not_found'
+        assert resolve_person('!!!', reader).status == 'not_found'
     _add_named_author(p, 'alex-mueller', 'Alex Müller', '491000000006@s.whatsapp.net')
     async with history_turn(p) as snapshot:
-        queries = HistoryQueries(snapshot)
-        now_ms = time.time_ns() // 1_000_000
-        assert queries.resolve_person('Alex Müller', ('family@g.us',), now_ms).person_id == 'alex-mueller'
-        assert queries.resolve_person('Al', ('family@g.us',), now_ms).status == 'not_found'
+        reader = directory_reader_factory(snapshot)
+        assert render_person(resolve_person('Alex Müller', reader).person_id,reader).display_name == 'Alex Müller'
+        assert resolve_person('Al', reader).status == 'not_found'
     _add_named_author(p, 'al', 'Al', '491000000007@s.whatsapp.net')
     async with history_turn(p) as snapshot:
-        result = HistoryQueries(snapshot).resolve_person('Al', ('family@g.us',), time.time_ns() // 1_000_000)
-        assert result.status == 'resolved' and result.person_id == 'al'
+        reader = directory_reader_factory(snapshot)
+        result = resolve_person('Al',reader)
+        assert result.status == 'resolved' and render_person(result.person_id,reader).display_name == 'Al'
     p.close()
 
 
 @pytest.mark.parametrize('owner_chat', ['phone', 'lid', 'second_phone'])
-async def test_recall_person_scope_requires_owner_dm_and_current_membership(owner_chat):
-    import time
+async def test_recall_person_scope_requires_owner_dm_and_current_membership(owner_chat, directory_reader_factory):
 
     from yeoman_gateway.history.context import history_turn
 
@@ -272,10 +293,10 @@ async def test_recall_person_scope_requires_owner_dm_and_current_membership(owne
     tool = RecallConversationTool(None, group_resolver=lambda ref: (
         {'family': 'family@g.us', 'other': 'other@g.us'}.get(ref), None))
     async with history_turn(p) as snapshot:
-        from yeoman_gateway.history.queries import HistoryQueries
-        resolution = HistoryQueries(snapshot).resolve_person(
-            'Lex', ('family@g.us',), time.time_ns() // 1_000_000)
-        assert resolution.status == 'resolved' and resolution.person_id == 'alex'
+        reader = directory_reader_factory(snapshot)
+        resolution = resolve_person('Lex',reader)
+        assert resolution.status == 'resolved'
+        tool._people = reader.directory
         token = set_tool_context(ToolInvocationContext(
             channel='whatsapp', chat_id=owner_phone, canonical_user_id='whatsapp:491000000001',
             is_owner=True, history_snapshot=snapshot))
@@ -289,6 +310,8 @@ async def test_recall_person_scope_requires_owner_dm_and_current_membership(owne
         finally:
             reset_tool_context(token)
     async with history_turn(p) as snapshot:
+        reader = directory_reader_factory(snapshot)
+        tool._people = reader.directory
         token = set_tool_context(ToolInvocationContext(
             channel='whatsapp', chat_id=owner_phone, canonical_user_id='whatsapp:491000000001',
             is_owner=False, history_snapshot=snapshot))
@@ -297,6 +320,8 @@ async def test_recall_person_scope_requires_owner_dm_and_current_membership(owne
         finally:
             reset_tool_context(token)
     async with history_turn(p) as snapshot:
+        reader = directory_reader_factory(snapshot)
+        tool._people = reader.directory
         token = set_tool_context(ToolInvocationContext(
             channel='whatsapp', chat_id='family@g.us', canonical_user_id='whatsapp:491000000001',
             is_owner=True, history_snapshot=snapshot))
@@ -307,7 +332,7 @@ async def test_recall_person_scope_requires_owner_dm_and_current_membership(owne
     p.close()
 
 
-async def test_recall_person_alias_ambiguity_and_non_whatsapp_refusal_do_not_use_legacy():
+async def test_recall_person_alias_ambiguity_and_non_whatsapp_refusal_do_not_use_legacy(directory_reader_factory):
     from yeoman_gateway.history.context import history_turn
 
     p, owner_phone = _person_lookup_projector()
@@ -321,6 +346,8 @@ async def test_recall_person_alias_ambiguity_and_non_whatsapp_refusal_do_not_use
     p.db.commit()
     tool = RecallConversationTool(SimpleNamespace(get_or_create=Mock(side_effect=AssertionError('legacy'))))
     async with history_turn(p) as snapshot:
+        reader = directory_reader_factory(snapshot)
+        tool._people = reader.directory
         token = set_tool_context(ToolInvocationContext(
             channel='whatsapp', chat_id=owner_phone, canonical_user_id='whatsapp:491000000001',
             is_owner=True, history_snapshot=snapshot))
@@ -347,7 +374,7 @@ async def test_recall_person_alias_ambiguity_and_non_whatsapp_refusal_do_not_use
     p.close()
 
 
-async def test_history_person_search_keeps_older_indexed_match_past_unrelated_rows():
+async def test_history_person_search_keeps_older_indexed_match_past_unrelated_rows(directory_reader_factory):
     import time
 
     from yeoman_gateway.history.context import history_turn
@@ -368,22 +395,21 @@ async def test_history_person_search_keeps_older_indexed_match_past_unrelated_ro
         'yeoman_gateway.history.schema', fromlist=['FTS_ROWS']).FTS_ROWS)
     p.db.commit()
     async with history_turn(p) as snapshot:
+        reader = directory_reader_factory(snapshot)
         queries = HistoryQueries(snapshot)
         now_ms = time.time_ns() // 1_000_000
-        person = queries.resolve_person('Alexandra', ('family@g.us',), now_ms)
-        assert person.status == 'resolved' and person.person_id == 'alex'
-        rows = queries.search_person(chat_ids=('family@g.us',), contact_id=person.person_id,
+        person = resolve_person('Alexandra',reader)
+        assert person.status == 'resolved'
+        rows = queries.search_person(chat_ids=('family@g.us',), person=history_person(person.person_id,reader),
                                      at_ms=now_ms, limit=10, query='holdings')
         assert 'zz-old' in {row['message_id'] for row in rows}
     p.close()
 
 
 @pytest.mark.parametrize('owner_chat', ['phone', 'lid', 'second_phone'])
-async def test_person_recall_excludes_weakly_attributed_authorship(owner_chat):
-    import time
+async def test_person_recall_excludes_weakly_attributed_authorship(owner_chat, directory_reader_factory):
 
     from yeoman_gateway.history.context import history_turn
-    from yeoman_gateway.history.queries import HistoryQueries
 
     p, owner_phone = _person_lookup_projector()
     owner_phone = _owner_test_chat(p, owner_phone, owner_chat)
@@ -394,6 +420,8 @@ async def test_person_recall_excludes_weakly_attributed_authorship(owner_chat):
     p.db.commit()
     tool = RecallConversationTool(None)
     async with history_turn(p) as snapshot:
+        reader = directory_reader_factory(snapshot)
+        tool._people = reader.directory
         token = set_tool_context(ToolInvocationContext(
             channel='whatsapp', chat_id=owner_phone, canonical_user_id='whatsapp:491000000001',
             is_owner=True, history_snapshot=snapshot))
@@ -404,16 +432,15 @@ async def test_person_recall_excludes_weakly_attributed_authorship(owner_chat):
             assert any('sender=Alexandra' in line and 'synthetic author note' in line for line in result.splitlines())
             assert any('sender=unverified' in line and 'unattributed message' in line for line in result.splitlines())
             snapshot.connection.execute("UPDATE messages SET sender_basis='push_name' WHERE message_id='authored'")
-            assert HistoryQueries(snapshot).resolve_person(
-                'Alex', ('family@g.us',), time.time_ns() // 1_000_000
-            ).status == 'not_found'
+            group_reader = directory_reader_factory(snapshot,kind='group')
+            assert resolve_person('Alex',group_reader).status == 'not_found'
         finally:
             reset_tool_context(token)
     p.close()
 
 
 @pytest.mark.parametrize('owner_chat', ['phone', 'lid', 'second_phone'])
-async def test_person_search_ranks_query_prefix_matches_and_warns_when_query_matches_none(owner_chat):
+async def test_person_search_ranks_query_prefix_matches_and_warns_when_query_matches_none(owner_chat, directory_reader_factory):
     import time
 
     from yeoman_gateway.history.context import history_turn
@@ -422,16 +449,19 @@ async def test_person_search_ranks_query_prefix_matches_and_warns_when_query_mat
     p, owner_phone = _person_lookup_projector()
     owner_phone = _owner_test_chat(p, owner_phone, owner_chat)
     async with history_turn(p) as snapshot:
+        reader = directory_reader_factory(snapshot)
         queries = HistoryQueries(snapshot)
         now_ms = time.time_ns() // 1_000_000
-        person = queries.resolve_person('Alex', ('family@g.us',), now_ms)
+        person = resolve_person('Alex',reader)
         assert person.status == 'resolved'
-        rows = queries.search_person(chat_ids=('family@g.us',), contact_id=person.person_id,
+        rows = queries.search_person(chat_ids=('family@g.us',), person=history_person(person.person_id,reader),
                                      at_ms=now_ms, limit=10, query='Aktie')
         assert rows[0]['message_id'] == 'quoted'
         assert rows[0]['query_match_count'] == 1
     tool = RecallConversationTool(None)
     async with history_turn(p) as snapshot:
+        reader = directory_reader_factory(snapshot)
+        tool._people = reader.directory
         token = set_tool_context(ToolInvocationContext(
             channel='whatsapp', chat_id=owner_phone, canonical_user_id='whatsapp:491000000001',
             is_owner=True, history_snapshot=snapshot))

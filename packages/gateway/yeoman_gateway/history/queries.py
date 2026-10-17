@@ -7,7 +7,7 @@ import json
 import re
 import unicodedata
 from dataclasses import dataclass
-from typing import Any, Literal
+from typing import TYPE_CHECKING, Any, Literal
 
 from yeoman_gateway.knowledge import EvidenceAudience
 from yeoman_gateway.policy.identity import canonical_user_id
@@ -16,6 +16,9 @@ from .ids import classify
 from .live import HistoryPaused
 from .reader import HistorySnapshot
 from .resolve import _compatible
+
+if TYPE_CHECKING:
+    from yeoman_gateway.people.bridges import HistoryPerson
 
 Row = dict[str, Any]
 _ORDER = "sent_ms, message_id"
@@ -78,7 +81,7 @@ class HistoryQueries:
         self._person_names_cache: dict[tuple[tuple[str, ...], int], dict[str, set[str]]] = {}
         self._person_names_state = self._audience_state
 
-    def _rows(self, sql: str, parameters: tuple[Any, ...] = ()) -> list[Row]:
+    def _rows(self, sql: str, parameters: tuple[Any, ...] | dict[str, Any] = ()) -> list[Row]:
         self.snapshot.assert_current(self.snapshot.generation)
         cursor = self.snapshot.connection.execute(sql, parameters)
         columns = [item[0] for item in cursor.description]
@@ -250,6 +253,20 @@ class HistoryQueries:
         owner = self.principal_contact(principal_id, now_ms)
         if owner is None:
             return ()
+        identifiers = self._rows(
+            "WITH RECURSIVE aliases(contact_id) AS (SELECT ? UNION"
+            " SELECT c.contact_id FROM contacts c JOIN aliases a ON c.merged_into=a.contact_id)"
+            " SELECT kind,value,valid_from_ms,valid_until_ms FROM identifier_history"
+            " WHERE channel='whatsapp' AND strength='strong' AND kind IN ('pn_jid','lid')"
+            " AND contact_id IN (SELECT contact_id FROM aliases)", (owner,))
+        candidates = set()
+        for row in identifiers:
+            if _compatible(row['valid_from_ms'],row['valid_until_ms'],now_ms,'native'):
+                value = str(row['value'])
+                candidates.add('whatsapp:' + value)
+                if row['kind'] == 'pn_jid':
+                    candidates.add('whatsapp:' + value.split('@')[0])
+        owned = {candidate for candidate in candidates if self.principal_contact(candidate,now_ms) == owner}
         result = []
         for row in self.chats():
             chat_id = str(row['chat_id'])
@@ -257,9 +274,7 @@ class HistoryQueries:
             if ident is None or ident.kind != 'group':
                 continue
             audience = self.members(chat_id=chat_id, at_ms=now_ms)
-            if audience.status == 'known' and any(
-                self.principal_contact(member, now_ms) == owner for member in audience.members
-            ):
+            if audience.status == 'known' and owned.intersection(audience.members):
                 result.append(chat_id)
         return tuple(result)
 
@@ -429,68 +444,79 @@ class HistoryQueries:
                      if _compatible(row['valid_from_ms'], row['valid_until_ms'], at_ms, 'native'))
         return tuple(sorted(names, key=str.casefold))
 
-    def search_person(self, *, chat_ids: tuple[str, ...], contact_id: str,
+    def search_person(self, *, chat_ids: tuple[str, ...], person: HistoryPerson,
                       at_ms: int, limit: int, query: str = '') -> list[Row]:
-        """Find messages by or explicitly naming one resolved contact in selected chats."""
+        """Select temporal authors/mentions in SQL; materialize only the ranked result limit."""
         _limit(limit)
         _time(at_ms)
-        terminal = self.terminal(contact_id)
-        names = self.person_names(contact_id, at_ms)
-        if not chat_ids or terminal is None:
+        self.snapshot.assert_current(self.snapshot.generation)
+        if not chat_ids:
             return []
-        # Apostrophes and possessives remain valid name boundaries (e.g. "Alex' Aktien").
+        identifiers = json.dumps([(r.value, r.valid_from_ms, r.valid_until_ms) for r in person.identifiers])
+        contacts = json.dumps([(r.value, r.valid_from_ms, r.valid_until_ms) for r in person.contact_intervals])
         patterns = [re.compile(rf"(?<![\w]){re.escape(name)}(?![\w])", re.IGNORECASE)
-                    for name in names if name.strip()]
-        authors = self._rows(
-            "WITH RECURSIVE aliases(contact_id) AS (SELECT ? UNION"
-            " SELECT c.contact_id FROM contacts c JOIN aliases a ON c.merged_into=a.contact_id)"
-            f" SELECT m.* FROM messages_current m WHERE {_VISIBLE}"
-            f" AND m.chat_id IN ({','.join('?' for _ in chat_ids)})"
-            " AND m.sender_basis IN ('native_identifier','owner_attested')"
-            " AND m.sender_contact_id IN (SELECT contact_id FROM aliases)",
-            (terminal, *chat_ids),
-        )
-        name_terms = [re.findall(r"[^\W_]+", name, re.UNICODE) for name in names]
-        name_terms = [terms for terms in name_terms if terms]
-        mentioned = []
-        if name_terms:
-            fts_query = ' OR '.join('(' + ' '.join(f'"{term}"*' for term in terms) + ')'
-                                    for terms in name_terms)
-            mentioned = self._rows(
-                "SELECT m.* FROM messages_fts JOIN messages_current m"
-                " ON m.message_id=messages_fts.message_id"
-                f" WHERE {_VISIBLE} AND m.chat_id IN ({','.join('?' for _ in chat_ids)})"
-                " AND messages_fts MATCH ?",
-                (*chat_ids, fts_query),
-            )
-        mention_ids = self._rows(
-            f"SELECT * FROM messages_current WHERE {_VISIBLE}"
-            f" AND chat_id IN ({','.join('?' for _ in chat_ids)}) AND mentions_json IS NOT NULL",
-            chat_ids,
-        )
-        by_id = {str(row['message_id']): row for row in (*authors, *mentioned, *mention_ids)}
-        matches = []
+                    for name in person.names if name.strip()]
         terms = _name_tokens(query)
-        for row in by_id.values():
-            author = (self.terminal(str(row['sender_contact_id']))
-                      if row['sender_contact_id'] and row['sender_basis'] in ('native_identifier', 'owner_attested')
-                      else None)
-            mentioned = any(pattern.search(str(row['current_text'] or '')) for pattern in patterns)
-            if not mentioned:
-                try:
-                    mention_values = json.loads(row['mentions_json'] or '[]')
-                except (TypeError, ValueError):
-                    mention_values = []
-                mentioned = any(isinstance(value, str) and self.resolve_identifier(
-                    value, at_ms=row['sent_ms'], time_basis=row['time_certainty']) == terminal
-                    for value in mention_values) if row['sent_ms'] is not None else False
-            if author == terminal or mentioned:
-                tokens = _name_tokens(str(row['current_text'] or ''))
-                score = sum(any(token.startswith(term) for token in tokens) for term in terms)
-                row['query_match_count'] = score
-                matches.append((score, row))
-        matches.sort(key=lambda item: (-item[0], -(item[1]['sent_ms'] or 0), item[1]['message_id']))
-        return [row for _, row in matches[:limit]]
+        # These functions do text matching/ranking only. Identity and temporal proof stay in SQL.
+        def named(text: str | None) -> bool:
+            return any(pattern.search(text or '') for pattern in patterns)
+
+        def score(text: str | None) -> int:
+            tokens = _name_tokens(text or '')
+            return sum(any(token.startswith(term) for token in tokens) for term in terms)
+
+        connection = self.snapshot.connection
+        connection.create_function('_person_named', 1, named, deterministic=True)
+        connection.create_function('_person_score', 1, score, deterministic=True)
+        name_terms = [re.findall(r'[^\W_]+', name, re.UNICODE) for name in person.names]
+        fts = ' OR '.join('(' + ' '.join(f'"{word}"*' for word in words) + ')'
+                          for words in name_terms if words)
+        source = "m.channel='whatsapp' AND m.deleted=0 AND m.chat_id IN (SELECT value FROM json_each(:chats)) AND (m.sent_ms IS NULL OR m.sent_ms<=:at_ms)"
+        named_sql = ("SELECT m.message_id FROM messages_fts JOIN messages_current m"
+                     " ON m.message_id=messages_fts.message_id WHERE messages_fts MATCH :fts"
+                     " AND _person_named(m.current_text) AND " + source) if fts else "SELECT NULL AS message_id WHERE 0"
+        # Unknown/derived times cannot place a bounded identifier; unbounded ownership is safe.
+        valid_author = """((i.start IS NULL AND i.end IS NULL) OR
+             (m.sent_ms IS NOT NULL AND m.time_certainty IN ('native','provider_timestamp')
+              AND (i.start IS NULL OR i.start<=m.sent_ms) AND (i.end IS NULL OR m.sent_ms<i.end)))"""
+        sql = f"""
+          WITH ids(value,start,end) AS (
+            SELECT json_extract(value,'$[0]'),json_extract(value,'$[1]'),json_extract(value,'$[2]') FROM json_each(:identifiers)),
+          contacts(value,start,end) AS (
+            SELECT json_extract(value,'$[0]'),json_extract(value,'$[1]'),json_extract(value,'$[2]') FROM json_each(:contacts)),
+          authored(message_id) AS (
+            SELECT m.message_id FROM ids i JOIN messages_current m ON m.sender_identifier=i.value
+            WHERE {source} AND m.sender_basis IN ('native_identifier','owner_attested') AND {valid_author}
+            UNION
+            SELECT m.message_id FROM contacts i JOIN messages_current m ON m.sender_contact_id=i.value
+            WHERE {source} AND m.sender_basis='owner_attested' AND coalesce(m.sender_identifier,'')='' AND {valid_author}),
+          named(message_id) AS ({named_sql}),
+          mention_values(message_id,value,sent_ms,time_certainty) AS (
+            SELECT m.message_id,ltrim(mention.value,'@'),m.sent_ms,m.time_certainty
+            FROM messages_current m JOIN json_each(m.mentions_json) mention
+            WHERE {source} AND json_type(m.mentions_json)='array' AND typeof(mention.value)='text'
+              AND m.sent_ms IS NOT NULL AND m.time_certainty IN ('native','provider_timestamp')),
+          explicit(message_id) AS (
+            SELECT m.message_id FROM mention_values m JOIN ids i ON
+              (m.value=i.value OR
+               (instr(m.value,':')>0 AND instr(m.value,'@')>instr(m.value,':')+1
+                AND substr(m.value,1,instr(m.value,':')-1)=substr(i.value,1,instr(i.value,'@')-1)
+                AND substr(m.value,instr(m.value,'@'))=substr(i.value,instr(i.value,'@'))
+                AND substr(m.value,instr(m.value,':')+1,instr(m.value,'@')-instr(m.value,':')-1) NOT GLOB '*[^0-9]*'))
+            WHERE (i.start IS NULL OR i.start<=m.sent_ms) AND (i.end IS NULL OR m.sent_ms<i.end)),
+          candidates(message_id) AS (SELECT message_id FROM authored UNION SELECT message_id FROM named UNION SELECT message_id FROM explicit)
+          SELECT m.*, (m.message_id IN (SELECT message_id FROM authored)) AS person_authored,
+                 _person_score(m.current_text) AS query_match_count
+          FROM candidates c JOIN messages_current m ON m.message_id=c.message_id
+          WHERE m.channel='whatsapp' AND m.deleted=0
+            AND m.chat_id IN (SELECT value FROM json_each(:chats))
+            AND (m.sent_ms IS NULL OR m.sent_ms<=:at_ms)
+          ORDER BY query_match_count DESC, m.sent_ms DESC, m.message_id LIMIT :limit
+        """
+        result = self._rows(sql, {'identifiers': identifiers, 'contacts': contacts, 'fts': fts,
+                                  'chats': json.dumps(chat_ids), 'at_ms': at_ms, 'limit': limit})
+        self.snapshot.assert_current(self.snapshot.generation)
+        return result
 
     def media(self, *, chat_id: str, limit: int, native_id: str | None = None) -> list[Row]:
         _limit(limit)

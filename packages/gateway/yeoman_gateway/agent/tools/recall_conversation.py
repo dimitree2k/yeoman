@@ -7,6 +7,7 @@ from typing import TYPE_CHECKING, Any, Callable
 from yeoman_gateway.agent.tools.base import Tool
 
 if TYPE_CHECKING:
+    from yeoman_gateway.people.resolver import PeopleResolver
     from yeoman_gateway.session.manager import SessionManager
 
 
@@ -14,9 +15,11 @@ class RecallConversationTool(Tool):
     """Search conversation history for messages matching a query."""
 
     def __init__(self, session_manager: "SessionManager",
-                 group_resolver: Callable[[str], tuple[str | None, str | None]] | None = None) -> None:
+                 group_resolver: Callable[[str], tuple[str | None, str | None]] | None = None,
+                 *, people: PeopleResolver | None = None) -> None:
         self._session_manager = session_manager
         self._group_resolver = group_resolver
+        self._people = people
         self._channel = ""
         self._chat_id = ""
         self._is_owner = False
@@ -160,18 +163,30 @@ class RecallConversationTool(Tool):
                 else:
                     chat_ids = member_chats
                 if person:
-                    resolution = queries.resolve_person(person, chat_ids, now_ms)
-                    if resolution.status == 'ambiguous':
-                        candidates = '; '.join(
-                            f"{candidate.display_name} (groups: {', '.join(candidate.group_names)})"
-                            for candidate in resolution.candidates
-                        )
-                        return (f"Several people match '{person}': {candidates}. "
-                                "Please re-call with a fuller name.")
-                    if resolution.status != 'resolved' or resolution.person_id is None:
-                        return f"No person matching '{person}' was found in those chats."
-                    rows = queries.search_person(chat_ids=chat_ids, contact_id=resolution.person_id,
-                                                at_ms=now_ms, limit=max_messages, query=query)
+                    from yeoman_gateway.people.bridges import history_person
+                    from yeoman_gateway.people.disclosure import reader_context, render_person
+                    from yeoman_gateway.people.resolver import PeopleUnavailable, resolve_person
+
+                    if self._people is None:
+                        return "Person lookup is unavailable."
+                    try:
+                        reader = reader_context(self._people,channel=self._channel,chat_id=self._chat_id,
+                                                principal_id=principal,is_owner=self._is_owner,
+                                                at_ms=now_ms,history=snapshot)
+                        resolution = resolve_person(person,reader)
+                        if resolution.status == 'ambiguous':
+                            cards = [render_person(candidate.person_id,reader) for candidate in resolution.candidates[:8]]
+                            candidates = '; '.join(f"{card.display_name} (groups: {', '.join(card.shared_chat_names)})" for card in cards)
+                            truncated = ' (candidate list truncated)' if len(resolution.candidates)>8 else ''
+                            return (f"Several people match '{person}': {candidates}{truncated}. "
+                                    "Please re-call with a fuller name.")
+                        if resolution.status != 'resolved' or resolution.person_id is None:
+                            return f"No person matching '{person}' was found in those chats."
+                        card = render_person(resolution.person_id,reader)
+                        target = history_person(resolution.person_id,reader)
+                        rows = queries.search_person(chat_ids=chat_ids,person=target,at_ms=now_ms,limit=max_messages,query=query)
+                    except PeopleUnavailable:
+                        return "Person lookup is unavailable."
                 else:
                     rows = queries.search(chat_ids=chat_ids, query=query, limit=max_messages)
             else:
@@ -182,15 +197,22 @@ class RecallConversationTool(Tool):
                 f"No messages matched the query terms '{query}'.\n"
                 if person and all(row['query_match_count'] == 0 for row in rows) else ""
             )
+            author_names = {}
+            if person or target_ref:
+                for contact in {str(row['sender_contact_id']) for row in rows if row['sender_contact_id'] and row['sender_basis'] in ('native_identifier','owner_attested')}:
+                    author = queries.contact(contact)
+                    author_names[contact] = author.get('display_name') if author else None
             lines = []
             for row in rows:
                 role = 'assistant' if row['direction'] == 'out' else 'user'
                 attribution = ''
                 if person or target_ref:
-                    author = None
-                    if row['sender_contact_id'] and row['sender_basis'] in ('native_identifier', 'owner_attested'):
-                        author = queries.contact(str(row['sender_contact_id']))
-                    name = (author.get('display_name') or row['sender_identifier']) if author else 'unverified'
+                    if person and row.get('person_authored'):
+                        name = card.display_name
+                    elif row['sender_contact_id'] and row['sender_basis'] in ('native_identifier','owner_attested'):
+                        name = author_names.get(str(row['sender_contact_id'])) or row['sender_identifier'] or 'unverified'
+                    else:
+                        name = 'unverified'
                     attribution = f" [chat={row['chat_id']}; sender={name}]"
                 lines.append(f"[{row['sent_ms']}] [{role}]{attribution}: {history_text(row)}")
             return query_warning + f"Found {len(lines)} matching message(s):\n" + '\n'.join(lines)

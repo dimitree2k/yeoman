@@ -84,6 +84,7 @@ if TYPE_CHECKING:
     from yeoman_gateway.media.lazy_resolver import LazyMediaResolver
     from yeoman_gateway.media.router import ModelRouter
     from yeoman_gateway.media.tts import TTSSynthesizer
+    from yeoman_gateway.people.resolver import PeopleResolver
     from yeoman_gateway.storage.private_handoff import PrivateHandoffStore
 
 
@@ -664,6 +665,7 @@ class LLMResponder(ResponderPort):
         session_manager: SessionManager | None = None,
         effect_router: object | None = None,
         knowledge: object | None = None,
+        people: PeopleResolver | None = None,
         knowledge_sources: object | None = None,
         telemetry: TelemetryPort | None = None,
         security: SecurityPort | None = None,
@@ -703,6 +705,7 @@ class LLMResponder(ResponderPort):
         self._history_projector: Any = None
         self._history_knowledge: Any = None
         self.knowledge = knowledge
+        self.people = people
         #: Proof owner for archived turn sources.  Retained for the compositions that
         #: still inject it; registration itself goes through the public facade so the
         #: responder never needs the module's private authority types.
@@ -882,7 +885,7 @@ class LLMResponder(ResponderPort):
         from yeoman_gateway.agent.tools.recall_conversation import RecallConversationTool
 
         self._recall_tool = RecallConversationTool(
-            session_manager=self.sessions, group_resolver=self._resolve_group_reference
+            session_manager=self.sessions, group_resolver=self._resolve_group_reference, people=self.people
         )
         self.tools.register(self._recall_tool)
 
@@ -3078,6 +3081,9 @@ class LLMResponder(ResponderPort):
         from yeoman_gateway.history.queries import HistoryQueries
         from yeoman_gateway.knowledge.models import RecallQuery
 
+        snapshot = current_history_snapshot()
+        if snapshot is not None and channel == 'whatsapp':
+            snapshot.assert_current(snapshot.generation)
         context = self._knowledge_read_context(
             channel=channel, chat_id=chat_id, principal=principal,
             is_owner=is_owner, purpose=purpose,
@@ -3090,7 +3096,6 @@ class LLMResponder(ResponderPort):
             r"\s*(?:was|wer|wie|wo|wann|welche\w*|what|who|how|where|when|"
             r"erzähl|erzähle|sag|zeige|tell|show|recall|remember)\b", query, re.IGNORECASE,
         ))
-        snapshot = current_history_snapshot()
         if (context.owner and purpose == "reply" and channel == "whatsapp" and explicit_request
                 and snapshot is not None
                 and HistoryQueries(snapshot).is_owner_direct_chat(
@@ -3107,12 +3112,22 @@ class LLMResponder(ResponderPort):
             if named_chats and not set(named_chats) <= set(member_chats):
                 return ""
             chat_ids = named_chats
-            # Exact names and current aliases resolve to identities; a whole question is not a person filter.
-            person_ids = tuple(dict.fromkeys(
-                person for _, person in queries.resolve_people_in_text(
-                    query, chat_ids=chat_ids or member_chats, at_ms=context.now_ms
-                )
-            ))
+            from yeoman_gateway.people.bridges import knowledge_person_ids
+            from yeoman_gateway.people.disclosure import reader_context
+            from yeoman_gateway.people.resolver import PeopleUnavailable, resolve_people_in_text
+
+            people: PeopleResolver | None = getattr(self,'people',None)
+            if people is not None:
+                try:
+                    reader = reader_context(people,channel=channel,chat_id=chat_id,
+                                            principal_id=principal,is_owner=is_owner,
+                                            at_ms=context.now_ms,history=snapshot)
+                    if reader.kind == 'owner_dm':
+                        person_ids = tuple(sorted({subject
+                            for _, person_id in resolve_people_in_text(query,reader)
+                            for subject in knowledge_person_ids(person_id,reader)}))
+                except PeopleUnavailable:
+                    person_ids = ()
             if person_ids or chat_ids:
                 context = replace(context, owner_lookup_person_ids=person_ids,
                                   owner_lookup_chat_ids=chat_ids)

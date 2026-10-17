@@ -128,3 +128,71 @@ class DirectoryCase:
 
     def changed_reader(self, **kwargs):
         return replace(self.reader(), **kwargs)
+
+    def add_message(
+        self,
+        message_id,
+        *,
+        sender_person,
+        identifier,
+        at_ms,
+        basis="native_identifier",
+        text="note",
+        chat="g@g.us",
+        mentions=(),
+        time_basis=None,
+    ):
+        from yeoman_gateway.history.schema import FTS_ROWS
+
+        self.hdb.execute(
+            "INSERT INTO messages(message_id,channel,chat_id,native_message_id,sender_contact_id,sender_identifier,sender_basis,direction,sent_ms,time_certainty,text,mentions_json,provenance,source_refs) VALUES (?,'whatsapp',?,?,?,?,?,'in',?,?,?,?,'native','[]')",
+            (
+                message_id,
+                chat,
+                message_id,
+                str(sender_person) if sender_person is not None else None,
+                identifier,
+                basis,
+                at_ms,
+                time_basis or ("native" if at_ms is not None else "unknown"),
+                text,
+                json.dumps(mentions),
+            ),
+        )
+        self.hdb.execute("DELETE FROM messages_fts")
+        self.hdb.execute("INSERT INTO messages_fts(message_id,chat_id,text) " + FTS_ROWS)
+
+
+def synced_directory(snapshot, root):
+    """Seed P1 from synthetic projected history; caller owns the returned directory."""
+    from yeoman_gateway.people.history_source import read_observed_persons
+    from yeoman_gateway.people.resolver import PeopleResolver
+    from yeoman_gateway.people.store import PeopleStore
+    from yeoman_gateway.people.sync import sync_from_history
+
+    path = root / "people.db"
+    writer = open_people_db(path)
+    store = PeopleStore(writer)
+    with store.transaction("sync"):
+        observed = read_observed_persons(snapshot.connection)
+        sync_from_history(store, observed, 1700000000100)
+    # Test owner contacts are explicit contacts even when observed only as former authors.
+    writer.execute("UPDATE persons SET level='contact'")
+    for person in observed:
+        row = writer.execute(
+            "SELECT person_id FROM person_ids WHERE kind='history_contact' AND value=?",
+            (person.history_terminal,),
+        ).fetchone()
+        if row is None:
+            continue
+        display = snapshot.connection.execute(
+            "SELECT display_name FROM contacts WHERE contact_id=?", (person.history_terminal,)
+        ).fetchone()[0]
+        writer.execute("UPDATE persons SET preferred_name=? WHERE id=?", (display, row[0]))
+        for name, kind in person.names:
+            writer.execute(
+                "INSERT OR IGNORE INTO person_names(person_id,name,kind,source) VALUES (?,?,?,'owner')",
+                (row[0], name, kind),
+            )
+    writer.close()
+    return PeopleResolver(path)
