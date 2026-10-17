@@ -21,6 +21,7 @@ if TYPE_CHECKING:
         HistoryKnowledgeSources,
         HistorySourceLedger,
     )
+    from yeoman_gateway.people.resolver import PeopleResolver, ReaderContext
 
 import hashlib
 import sqlite3
@@ -247,6 +248,7 @@ def open_knowledge_store(
     create: bool = True,
     retention_ms: int | None = None,
     legacy_sources: Iterable[Path] = (),
+    people: PeopleResolver | None = None,
 ) -> "KnowledgeService":
     """Open an existing verified schema-3 knowledge store and return the public service.
 
@@ -312,6 +314,7 @@ def open_knowledge_store(
         policy_authority=policy_authority,
         clock=clock,
         retention_ms=retention_ms,
+        people=people,
     )
 
 
@@ -428,12 +431,14 @@ class KnowledgeService:
         policy_authority: PolicyAuthority,
         clock: Any | None = None,
         retention_ms: int | None = None,
+        people: PeopleResolver | None = None,
     ) -> None:
         # S4 identity/memory/contact mutation delegates remain guarded as retired.
         if store.schema_version != 3:
             from yeoman_gateway.history.live import HistoryPaused
             raise HistoryPaused("retired_knowledge_requires_history_schema")
         self._store = store
+        self.people = people
         self._embedder: Any | None = None
         # One wrapper so administrative sources registered later are visible to the
         # statement engine through the very same object.
@@ -543,7 +548,82 @@ class KnowledgeService:
         """Search by name.  Several people may legitimately share a name."""
         checked = self._read_context(context)
         self._retrieval.require_read(checked)
-        return self._identity.search_by_name(name, context=checked)
+        return self._directory_candidates(name, checked)
+
+    def person_reader(self, context: TrustedReadContext) -> ReaderContext:
+        """Build directory scope from the selected lease and authenticated read context."""
+        from yeoman_gateway.knowledge._history_identity import current_history_scope
+        from yeoman_gateway.people.disclosure import reader_context
+        from yeoman_gateway.people.resolver import PeopleUnavailable
+
+        checked = self._read_context(context)
+        if self.people is None:
+            raise PeopleUnavailable()
+        scope = current_history_scope(self._store)
+        return reader_context(
+            self.people,
+            channel=checked.channel,
+            chat_id=checked.chat_id,
+            principal_id=checked.principal_id,
+            is_owner=checked.owner,
+            at_ms=checked.now_ms,
+            history=scope.queries.snapshot if scope is not None else None,
+        )
+
+    def _directory_candidates(
+        self,
+        content: str,
+        context: TrustedReadContext,
+        *,
+        text: bool = False,
+        offered: tuple[str, ...] | None = None,
+    ) -> tuple[PersonResolution, ...]:
+        from yeoman_gateway.people.disclosure import render_person
+        from yeoman_gateway.people.resolver import (
+            PeopleUnavailable,
+            resolve_people_in_text,
+            resolve_person,
+        )
+
+        try:
+            reader = self.person_reader(context)
+            if text:
+                ids = tuple(dict.fromkeys(p for _, p in resolve_people_in_text(content, reader)))
+                ambiguous = False
+            else:
+                found = resolve_person(content, reader)
+                ids = (
+                    (found.person_id,)
+                    if found.person_id is not None
+                    else tuple(c.person_id for c in found.candidates)
+                )
+                ambiguous = found.status == "ambiguous"
+            result = []
+            for person in ids:
+                subjects = self.directory_subject_ids(person, reader=reader)
+                status = (
+                    "ambiguous"
+                    if ambiguous or len(subjects) != 1 or offered is not None
+                    else "resolved"
+                )
+                display = render_person(person, reader).display_name
+                for subject in subjects:
+                    if offered is not None and subject not in offered:
+                        continue
+                    result.append(
+                        PersonResolution(
+                            status=status,
+                            person_id=subject,
+                            display_name=display,
+                            identity_revision=self._store.identity_revision,
+                            reason="name_candidate_requires_confirmation"
+                            if offered is not None
+                            else "directory_recognition",
+                        )
+                    )
+            return tuple(result)
+        except PeopleUnavailable:
+            return ()
 
     def resolve_mentions(
         self,
@@ -684,11 +764,7 @@ class KnowledgeService:
                 if (person_id := self._identity.person_id_for_principal(principal)) is not None
             )
         )
-        return self._identity.search_mention_name_candidates(
-            name_token,
-            person_ids=offered_people,
-            context=checked,
-        )
+        return self._directory_candidates(name_token, checked, offered=offered_people)
 
     def search_mention_text_candidates(
         self, content: str, *, context: TrustedReadContext
@@ -707,12 +783,7 @@ class KnowledgeService:
                 if (person_id := self._identity.person_id_for_principal(principal)) is not None
             )
         )
-        return self._identity.search_mention_text_candidates(
-            content,
-            person_ids=offered_people,
-            context=checked,
-        )
-
+        return self._directory_candidates(content, checked, text=True, offered=offered_people)
 
 
     def resolve_endpoint(
@@ -1766,6 +1837,72 @@ class KnowledgeService:
             alias, channel=str(channel), scope_key=scope_key
         )
 
+    def directory_subject_ids(self, person_id: int, *, reader: ReaderContext) -> tuple[str, ...]:
+        """Map a directory terminal to existing subjects without changing either store."""
+        from yeoman_gateway.people.bridges import _selected, _visible, knowledge_person_ids
+        from yeoman_gateway.people.knowledge_import import seed_identifiers
+
+        index, terminal = _selected(person_id, reader)
+        subjects = set(knowledge_person_ids(terminal, reader))
+        keys = set()
+        for row in _visible(index, terminal):
+            kind, value = row["kind"], row["value"]
+            if kind == "phone":
+                keys.update(
+                    ("whatsapp", v)
+                    for v in (value, "+" + value, "00" + value, value + "@s.whatsapp.net")
+                )
+            elif kind == "wa_lid":
+                keys.update(("whatsapp", v) for v in (value, value + "@lid"))
+            elif kind == "telegram_id":
+                keys.update(("telegram", v) for v in (value, "telegram:" + value))
+        # Restrict frozen lookup to exact identifiers and existing provenance subjects.
+        clauses, params = [], []
+        for channel, value in sorted(keys):
+            clauses.append("(channel=? AND identifier=?)")
+            params.extend((channel, value))
+            if channel == "telegram":
+                clauses.append("(channel=? AND identifier LIKE ?)")
+                params.extend((channel, value + "|%"))
+        if subjects:
+            clauses.append("contact_id IN (" + ",".join("?" for _ in subjects) + ")")
+            params.extend(sorted(subjects))
+        if not clauses:
+            return tuple(sorted(subjects))
+        candidates = self._store.query(
+            "SELECT DISTINCT contact_id FROM contact_identifiers WHERE " + " OR ".join(clauses),
+            tuple(params),
+        )
+        ids = tuple(str(row["contact_id"]) for row in candidates)
+        if not ids:
+            return tuple(sorted(subjects))
+        rows = self._store.query(
+            "SELECT contact_id,kind,identifier FROM contact_identifiers WHERE contact_id IN ("
+            + ",".join("?" for _ in ids)
+            + ")",
+            ids,
+        )
+        evidence = {}
+        visible = {}
+        for row in rows:
+            holders = evidence.setdefault(str(row["contact_id"]), set())
+            for ident in seed_identifiers(str(row["kind"]), str(row["identifier"])):
+                for binding in index.identifier_rows.get((ident.kind, ident.value), ()):
+                    owner = index.terminal(binding["person_id"])
+                    if owner not in visible:
+                        visible[owner] = _visible(index, owner)
+                    if binding in visible[owner]:
+                        holders.add(owner)
+        for subject, holders in evidence.items():
+            if holders and holders != {terminal}:
+                subjects.discard(subject)
+                reader.directory._local.mapping_unavailable = (
+                    getattr(reader.directory._local, "mapping_unavailable", 0) + 1
+                )
+            elif holders == {terminal}:
+                subjects.add(subject)
+        return tuple(sorted(subjects))
+
     def person_identifiers(self, person_id: str) -> tuple[Identifier, ...]:
         """Proven identifier bindings of a person, for diagnostics and tools."""
         return tuple(item.identifier for item in self._identity.active_bindings_of(person_id))
@@ -1985,10 +2122,12 @@ class KnowledgeService:
         purpose: str = "admin",
     ) -> tuple[PersonResolution, ...]:
         """Name lookup for authorized surfaces; several people may share a name."""
-        context = self.owner_read_context(
-            channel=channel, chat_id=chat_id, purpose=purpose
-        )
-        return self._identity.search_by_name(name, context=context)
+        from yeoman_gateway.processing.tool_context import current_tool_context
+
+        turn = current_tool_context()
+        if turn is None or turn.knowledge_read_context is None:
+            return ()
+        return self.search_people(name, context=turn.knowledge_read_context)
 
     def person_facts(
         self,

@@ -19,7 +19,6 @@ from yeoman_gateway.knowledge.models import (
     IdentifierBinding,
     KnowledgeError,
     NameObservation,
-    PersonResolution,
     StatementCandidate,
     TrustedCaptureContext,
     TrustedReadContext,
@@ -61,8 +60,6 @@ class HistoryIdentityEngine(IdentityEngine):
     _inherited_reads = frozenset({
         'require_person', 'canonical_ids', 'people_for_statement', 'person_ids_for_statements',
         'active_bindings_of', 'searchable_aliases_of', 'address_aliases_of', 'neutral_address',
-        'search_mention_name_candidates', 'search_mention_text_candidates',
-        'person_by_display_or_alias',
     })
 
     def __init__(self, store: KnowledgeStore, *, queries: HistoryQueries,
@@ -213,12 +210,6 @@ class HistoryIdentityEngine(IdentityEngine):
     def alias_by_id(self, alias_id: int) -> NameObservation | None:
         return None
 
-    def search_by_name(self, name: str, *, context: TrustedReadContext | None = None,
-                       limit: int = 25) -> tuple[PersonResolution, ...]:
-        if context is None:
-            return ()
-        people = tuple(person for person, _ in self.eligible_people_for_context(context))
-        return self.search_mention_name_candidates(name, person_ids=people, context=context)[:limit]
 
     def eligible_people_for_context(self, context: TrustedReadContext, *,
                                     limit: int = 200) -> tuple[tuple[str, str | None], ...]:

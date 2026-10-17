@@ -27,27 +27,72 @@ def case(source_case):  # noqa: F811 - pytest fixture dependency
     return source_case
 
 
+DIRECTORY_AUTHOR = "whatsapp:4915000000001"
+DIRECTORY_MEMBER = "whatsapp:4915000000002"
+
+
+@pytest.fixture
+def directory_identity_case(case):
+    service, q, sources, db = case
+    for table, columns in (
+        ("identifier_history", ("value",)),
+        ("messages", ("sender_identifier", "chat_id")),
+        ("message_events", ("payload_json",)),
+    ):
+        for column in columns:
+            for old, new in (("10001", "4915000000001"), ("10002", "4915000000002")):
+                db.execute(f"UPDATE {table} SET {column}=replace({column},?,?)", (old, new))
+    return case
+
+
+def install_directory(case, root):
+    from tests.gateway.people.resolver_fixtures import synced_directory
+
+    service, q, _, _ = case
+    directory = synced_directory(q.snapshot, root / "directory")
+    import sqlite3
+
+    with sqlite3.connect(directory.db_path) as db:
+        db.execute(
+            "UPDATE persons SET is_owner=1 WHERE id IN "
+            "(SELECT person_id FROM person_ids WHERE kind='history_contact' AND value='b')"
+        )
+    service.people = directory
+    return directory
+
+
 def capture(service, source, *, attributes=False):
-    context = TrustedCaptureContext('synthetic', 1, 'native', (source,))
-    candidate = StatementCandidate('Synthetic statement', (source,), people=(
-        PersonLinkCandidate('a', 'subject', source, 'explicit'),), attributes=(
-            AttributeCandidate('a', 'description', AttributeValue('engineer')),
-        ) if attributes else ())
+    context = TrustedCaptureContext("synthetic", 1, "native", (source,))
+    candidate = StatementCandidate(
+        "Synthetic statement",
+        (source,),
+        people=(PersonLinkCandidate("a", "subject", source, "explicit"),),
+        attributes=(AttributeCandidate("a", "description", AttributeValue("engineer")),)
+        if attributes
+        else (),
+    )
     result = service.capture(candidate, context=context)
     assert result.statement_ids
     return result.statement_ids[0], context
 
 
-def owner_dm_statement(service, sources, db, *,
-                       chat="10002@s.whatsapp.net", message_id="owner-dm"):
+def owner_dm_statement(
+    service, sources, db, *, chat="4915000000002@s.whatsapp.net", message_id="owner-dm"
+):
     """Capture one ``author_only`` statement the *owner* authored in the owner's chat.
 
     Change 2 narrowed owner scope to the owner's own material: another contact's
     ``author_only`` statement no longer reaches an owner read, so the responder tests
     below build the statement the owner actually wrote instead.
     """
-    message(db, message_id, chat=chat, sender='b',
-            identifier='10002@s.whatsapp.net', text='Synthetic A')
+    message(
+        db,
+        message_id,
+        chat=chat,
+        sender="b",
+        identifier="4915000000002@s.whatsapp.net",
+        text="Synthetic A",
+    )
     statement_id, _ = capture(service, sources.issue(message_id))
     service._store.execute(
         "UPDATE knowledge_statements SET visibility_scope='author_only' WHERE statement_id=?",
@@ -57,80 +102,130 @@ def owner_dm_statement(service, sources, db, *,
 
 
 def read(principal=AUTHOR, *, now=150, chat_id="g@g.us", is_direct=False):
-    return TrustedReadContext(principal, 'whatsapp', chat_id, frozenset({principal}), None, 1,
-                              'reply', now, is_direct=is_direct)
+    return TrustedReadContext(
+        principal,
+        "whatsapp",
+        chat_id,
+        frozenset({principal}),
+        None,
+        1,
+        "reply",
+        now,
+        is_direct=is_direct,
+    )
 
 
 def frozen(service):
-    return {name: digest(service._store.connection, name) for name in (
-        'contacts', 'contact_identifiers', 'contact_aliases', 'contact_fields',
-        'knowledge_identifier_bindings', 'knowledge_identity_redirects', 'knowledge_identity_ops')}
+    return {
+        name: digest(service._store.connection, name)
+        for name in (
+            "contacts",
+            "contact_identifiers",
+            "contact_aliases",
+            "contact_fields",
+            "knowledge_identifier_bindings",
+            "knowledge_identity_redirects",
+            "knowledge_identity_ops",
+        )
+    }
 
 
 def test_statement_capture_new_history_contact_needs_no_legacy_identity_row(case):
     service, q, sources, _ = case
     before = frozen(service)
-    source = sources.issue('m')
+    source = sources.issue("m")
     with service.history_scope(q, sources):
         sid, _ = capture(service, source, attributes=True)
-        assert service.person_for_principal(AUTHOR) == 'a'
-        assert service.display_name('a') == 'a'
-        assert service.resolve_identifier(Identifier('whatsapp', 'phone_jid', '10001@s.whatsapp.net', namespace='whatsapp'), at_ms=100).person_id == 'a'
-        assert service.recall(RecallQuery('Synthetic'), context=read()).statement_ids == (sid,)
+        assert service.person_for_principal(AUTHOR) == "a"
+        assert service.display_name("a") == "a"
+        assert (
+            service.resolve_identifier(
+                Identifier("whatsapp", "phone_jid", "10001@s.whatsapp.net", namespace="whatsapp"),
+                at_ms=100,
+            ).person_id
+            == "a"
+        )
+        assert service.recall(RecallQuery("Synthetic"), context=read()).statement_ids == (sid,)
     assert frozen(service) == before
     assert service._store.query_one("SELECT 1 FROM contacts WHERE id='a'") is None
     assert service._store.query("PRAGMA foreign_key_check") == []
-    assert service._store.scalar("SELECT count(*) FROM knowledge_person_attributes WHERE person_id='a'") == 1
+    assert (
+        service._store.scalar(
+            "SELECT count(*) FROM knowledge_person_attributes WHERE person_id='a'"
+        )
+        == 1
+    )
     with pytest.raises(HistoryPaused):
         service.person_for_principal(AUTHOR)
 
 
-@pytest.mark.parametrize('old', [False, True])
-@pytest.mark.parametrize('author_only', [False, True])
-@pytest.mark.parametrize('redirect', [False, True])
-def test_channel_principals_authorize_old_and_new_sources_without_redirect_expansion(case, old, author_only, redirect):
+@pytest.mark.parametrize("old", [False, True])
+@pytest.mark.parametrize("author_only", [False, True])
+@pytest.mark.parametrize("redirect", [False, True])
+def test_channel_principals_authorize_old_and_new_sources_without_redirect_expansion(
+    case, old, author_only, redirect
+):
     service, q, sources, db = case
     if author_only:
         db.execute("UPDATE messages SET chat_id='10001@s.whatsapp.net' WHERE message_id='m'")
-    source = old_alias(case)[0] if old else sources.issue('m')
+    source = old_alias(case)[0] if old else sources.issue("m")
+
     def reader(principal=AUTHOR, *, now=150):
         return read(principal, now=now, chat_id=source.chat_id, is_direct=author_only)
+
     before = frozen(service)
     with service.history_scope(q, sources):
         sid, ctx = capture(service, source)
         if redirect:
             for i in range(12, -1, -1):
-                contact(db, f'chain{i}', redirect=f'chain{i+1}' if i < 12 else None)
+                contact(db, f"chain{i}", redirect=f"chain{i + 1}" if i < 12 else None)
             db.execute("UPDATE contacts SET merged_into='chain0' WHERE contact_id='a'")
-        assert service.recall(RecallQuery('Synthetic'), context=reader()).statement_ids == (sid,)
-        assert bool(service.recall(RecallQuery('Synthetic'), context=reader(MEMBER)).statement_ids) is (not author_only)
-        assert not service.recall(RecallQuery('Synthetic'), context=reader('whatsapp:10003')).statement_ids
+        assert service.recall(RecallQuery("Synthetic"), context=reader()).statement_ids == (sid,)
+        assert bool(
+            service.recall(RecallQuery("Synthetic"), context=reader(MEMBER)).statement_ids
+        ) is (not author_only)
+        assert not service.recall(
+            RecallQuery("Synthetic"), context=reader("whatsapp:10003")
+        ).statement_ids
         if redirect:
-            assert service.recall(RecallQuery('', person_ids=('chain12',)), context=reader()).statement_ids == (sid,)
+            assert service.recall(
+                RecallQuery("", person_ids=("chain12",)), context=reader()
+            ).statement_ids == (sid,)
         # Reused principal string does not transfer source ownership.
         db.execute("UPDATE identifier_history SET valid_until_ms=200 WHERE contact_id='a'")
-        contact(db, 'new-holder')
-        identifier(db, 'new-holder', '10001@s.whatsapp.net', start=200)
-        assert not service.recall(RecallQuery('Synthetic'), context=reader(now=250)).statement_ids
-        event(db, 'removed', 'member_remove', 260, {'participants': [['10002@s.whatsapp.net']]})
-        assert not service.recall(RecallQuery('Synthetic'), context=reader(MEMBER, now=300)).statement_ids
+        contact(db, "new-holder")
+        identifier(db, "new-holder", "10001@s.whatsapp.net", start=200)
+        assert not service.recall(RecallQuery("Synthetic"), context=reader(now=250)).statement_ids
+        event(db, "removed", "member_remove", 260, {"participants": [["10002@s.whatsapp.net"]]})
+        assert not service.recall(
+            RecallQuery("Synthetic"), context=reader(MEMBER, now=300)
+        ).statement_ids
         assert frozen(service) == before
-        assert service._store.query_one('SELECT event_id FROM knowledge_statement_sources WHERE statement_id=?', (sid,))[0] == source.event_id
+        assert (
+            service._store.query_one(
+                "SELECT event_id FROM knowledge_statement_sources WHERE statement_id=?", (sid,)
+            )[0]
+            == source.event_id
+        )
 
 
 def test_history_identity_mutations_refused_but_statement_curation_continues(case):
     service, q, sources, _ = case
     before = frozen(service)
-    source = sources.issue('m')
+    source = sources.issue("m")
     with service.history_scope(q, sources):
         sid, context = capture(service, source)
-        for method in ('set_preferred_name', 'merge_people', 'bind_identifier'):
+        for method in ("set_preferred_name", "merge_people", "bind_identifier"):
             assert not hasattr(service, method)
-        receipt = service.correct_statement(sid, StatementCandidate('Curated replacement', (source,)),
-                                            expected_source=source, context=context)
+        receipt = service.correct_statement(
+            sid,
+            StatementCandidate("Curated replacement", (source,)),
+            expected_source=source,
+            context=context,
+        )
         assert receipt.changed_ids
     assert frozen(service) == before
-    assert service._store.scalar('SELECT count(*) FROM knowledge_statement_audit') > 1
+    assert service._store.scalar("SELECT count(*) FROM knowledge_statement_audit") > 1
 
 
 @pytest.mark.asyncio
@@ -141,23 +236,26 @@ async def test_identity_scope_isolated_between_concurrent_turns(case):
     from yeoman_gateway.history.reader import HistorySnapshot
     from yeoman_gateway.history.schema import create
     from yeoman_gateway.knowledge._history_sources import HistoryKnowledgeSources
+
     service, q, sources, _ = case
-    other_db = sqlite3.connect(':memory:')
+    other_db = sqlite3.connect(":memory:")
     create(other_db)
-    contact(other_db, 'other')
-    identifier(other_db, 'other', '10001@s.whatsapp.net', start=1)
+    contact(other_db, "other")
+    identifier(other_db, "other", "10001@s.whatsapp.net", start=1)
     other_snapshot = HistorySnapshot(2, (), other_db)
     other_q = HistoryQueries(other_snapshot)
     other_sources = HistoryKnowledgeSources(other_q, {}, sources.ledger, sources.legacy_authority)
+
     async def turn(queries, adapter, expected):
         with service.history_scope(queries, adapter):
             await asyncio.sleep(0)
             assert service.person_for_principal(AUTHOR) == expected
             with service.history_scope(q, sources):
-                assert service.person_for_principal(AUTHOR) == 'a'
+                assert service.person_for_principal(AUTHOR) == "a"
             assert service.person_for_principal(AUTHOR) == expected
+
     try:
-        await asyncio.gather(turn(q, sources, 'a'), turn(other_q, other_sources, 'other'))
+        await asyncio.gather(turn(q, sources, "a"), turn(other_q, other_sources, "other"))
         with pytest.raises(HistoryPaused):
             service.person_for_principal(AUTHOR)
     finally:
@@ -166,57 +264,83 @@ async def test_identity_scope_isolated_between_concurrent_turns(case):
 
 def test_permission_cache_does_not_survive_history_generation(case):
     service, q, sources, _ = case
-    source = sources.issue('m')
+    source = sources.issue("m")
     with service.history_scope(q, sources):
         sid, _ = capture(service, source)
-        result = service.recall(RecallQuery('Synthetic'), context=read())
+        result = service.recall(RecallQuery("Synthetic"), context=read())
         assert result.statement_ids == (sid,)
         q.snapshot.generation += 1
         assert not service.revalidate(result, context=read()).statement_ids
         service._policy.policy_revision = 2
-        assert not service.recall(RecallQuery('Synthetic'), context=read()).statement_ids
+        assert not service.recall(RecallQuery("Synthetic"), context=read()).statement_ids
 
 
-def test_history_identity_read_surface_and_frozen_store_guard(case):
+def test_history_identity_read_surface_and_frozen_store_guard(directory_identity_case, tmp_path):
     from yeoman_gateway.knowledge._history_identity import HistoryIdentityEngine
+
+    case = directory_identity_case
     service, q, sources, _ = case
-    ident = Identifier('whatsapp', 'phone_jid', '10001@s.whatsapp.net', namespace='whatsapp')
+    ident = Identifier(
+        "whatsapp", "phone_jid", "4915000000001@s.whatsapp.net", namespace="whatsapp"
+    )
+    directory = install_directory(case, tmp_path)
     with service.history_scope(q, sources):
-        engine = HistoryIdentityEngine(service._store, queries=q, authority=sources, policy=service._policy)
-        assert engine.binding_at(ident, 100).person_id == 'a'
-        assert engine.binding_for(ident).person_id == 'a'
-        assert engine.get_person('a').person_id == 'a'
-        assert engine.require_person('a').display_name == 'a'
-        assert engine.resolve_endpoint('a', 'whatsapp', at_ms=100).identifier == ident
-        assert engine.eligible_people_for_context(read()) == (('a', 'a'),)
-        assert engine.search_mention_name_candidates('a', person_ids=('a',), context=read())[0].person_id == 'a'
-        assert engine.search_mention_text_candidates('a', person_ids=('a',), context=read())[0].person_id == 'a'
-        assert engine.aliases_of_many(('a',))['a'][0].name == 'a'
+        engine = HistoryIdentityEngine(
+            service._store, queries=q, authority=sources, policy=service._policy
+        )
+        assert engine.binding_at(ident, 100).person_id == "a"
+        assert engine.binding_for(ident).person_id == "a"
+        assert engine.get_person("a").person_id == "a"
+        assert engine.require_person("a").display_name == "a"
+        assert engine.resolve_endpoint("a", "whatsapp", at_ms=100).identifier == ident
+        assert engine.eligible_people_for_context(read(DIRECTORY_AUTHOR)) == (("a", "a"),)
+        assert (
+            service.search_mention_name_candidates("a", context=read(DIRECTORY_AUTHOR))[0].person_id
+            == "a"
+        )
+        assert (
+            service.search_mention_text_candidates("a", context=read(DIRECTORY_AUTHOR))[0].person_id
+            == "a"
+        )
+        assert engine.aliases_of_many(("a",))["a"][0].name == "a"
         # An observed name has no global address-release proof.
-        assert engine.delivery_identifiers_for_alias('a', channel='whatsapp', scope_key='global') == ()
+        assert (
+            engine.delivery_identifiers_for_alias("a", channel="whatsapp", scope_key="global") == ()
+        )
         with pytest.raises(KnowledgeError):
             with service._store.transaction():
                 service._store.execute("UPDATE contacts SET display_name='changed'")
 
+    directory.close()
+
 
 def test_history_alias_delivery_preserves_frozen_release_controls(case):
     from yeoman_gateway.knowledge._history_identity import HistoryIdentityEngine
+
     service, q, sources, db = case
     before = frozen(service)
-    contact(db, 'curated')
+    contact(db, "curated")
     db.execute("UPDATE contacts SET display_name='Synthetic' WHERE contact_id='curated'")
-    identifier(db, 'curated', '10009@s.whatsapp.net', start=1)
+    identifier(db, "curated", "10009@s.whatsapp.net", start=1)
     with service.history_scope(q, sources):
-        engine = HistoryIdentityEngine(service._store, queries=q, authority=sources, policy=service._policy)
-        expected = Identifier('whatsapp', 'phone_jid', '10009@s.whatsapp.net', namespace='whatsapp')
-        assert engine.delivery_identifiers_for_alias('Synthetic', channel='whatsapp', scope_key='global') == (expected,)
-        assert service.identifier_for_name('Synthetic', channel='whatsapp') == expected
-        assert not engine.delivery_identifiers_for_alias('a', channel='whatsapp', scope_key='global')
+        engine = HistoryIdentityEngine(
+            service._store, queries=q, authority=sources, policy=service._policy
+        )
+        expected = Identifier("whatsapp", "phone_jid", "10009@s.whatsapp.net", namespace="whatsapp")
+        assert engine.delivery_identifiers_for_alias(
+            "Synthetic", channel="whatsapp", scope_key="global"
+        ) == (expected,)
+        assert service.identifier_for_name("Synthetic", channel="whatsapp") == expected
+        assert not engine.delivery_identifiers_for_alias(
+            "a", channel="whatsapp", scope_key="global"
+        )
         # Current history, rather than a frozen cache match, determines ownership.
         db.execute("UPDATE identifier_history SET valid_until_ms=200 WHERE contact_id='curated'")
-        contact(db, 'replacement')
-        identifier(db, 'replacement', '10009@s.whatsapp.net', start=200)
-        assert not engine.delivery_identifiers_for_alias('Synthetic', channel='whatsapp', scope_key='global')
+        contact(db, "replacement")
+        identifier(db, "replacement", "10009@s.whatsapp.net", start=200)
+        assert not engine.delivery_identifiers_for_alias(
+            "Synthetic", channel="whatsapp", scope_key="global"
+        )
     assert frozen(service) == before
 
 
@@ -232,46 +356,88 @@ def test_owner_dm_does_not_read_another_authors_author_only_statement(case, prin
     """
     service, q, sources, db = case
     if principal.endswith("@lid"):
-        identifier(db, 'b', '20002@lid', start=1)
-    source = sources.issue('m')
+        identifier(db, "b", "20002@lid", start=1)
+    source = sources.issue("m")
     with service.history_scope(q, sources):
         sid, _ = capture(service, source)
-        service._store.execute("UPDATE knowledge_statements SET visibility_scope='author_only' WHERE statement_id=?", (sid,))
-        owner_dm = TrustedReadContext(
-            principal, 'whatsapp', '10002@s.whatsapp.net', frozenset({principal}), None, 1,
-            'reply', 150, is_direct=True, owner=True, owner_lookup_person_ids=('a',),
+        service._store.execute(
+            "UPDATE knowledge_statements SET visibility_scope='author_only' WHERE statement_id=?",
+            (sid,),
         )
-        assert not service.recall(RecallQuery('Synthetic'), context=owner_dm).statement_ids
+        owner_dm = TrustedReadContext(
+            principal,
+            "whatsapp",
+            "10002@s.whatsapp.net",
+            frozenset({principal}),
+            None,
+            1,
+            "reply",
+            150,
+            is_direct=True,
+            owner=True,
+            owner_lookup_person_ids=("a",),
+        )
+        assert not service.recall(RecallQuery("Synthetic"), context=owner_dm).statement_ids
 
         normal_dm = TrustedReadContext(
-            principal, 'whatsapp', '10002@s.whatsapp.net', frozenset({principal}), None, 1,
-            'reply', 150, is_direct=True,
+            principal,
+            "whatsapp",
+            "10002@s.whatsapp.net",
+            frozenset({principal}),
+            None,
+            1,
+            "reply",
+            150,
+            is_direct=True,
         )
-        assert not service.recall(RecallQuery('Synthetic'), context=normal_dm).statement_ids
+        assert not service.recall(RecallQuery("Synthetic"), context=normal_dm).statement_ids
         group = TrustedReadContext(
-            MEMBER, 'whatsapp', source.chat_id, frozenset({MEMBER}), None, 1,
-            'reply', 150, owner=True, owner_lookup_person_ids=('a',),
+            MEMBER,
+            "whatsapp",
+            source.chat_id,
+            frozenset({MEMBER}),
+            None,
+            1,
+            "reply",
+            150,
+            owner=True,
+            owner_lookup_person_ids=("a",),
         )
-        assert not service.recall(RecallQuery('Synthetic'), context=group).statement_ids
+        assert not service.recall(RecallQuery("Synthetic"), context=group).statement_ids
 
-        event(db, 'owner-left', 'member_remove', 120, {'participants': [['10002@s.whatsapp.net']]})
-        assert not service.recall(RecallQuery('Synthetic'), context=owner_dm).statement_ids
+        event(db, "owner-left", "member_remove", 120, {"participants": [["10002@s.whatsapp.net"]]})
+        assert not service.recall(RecallQuery("Synthetic"), context=owner_dm).statement_ids
 
         proactive = TrustedReadContext(
-            MEMBER, 'whatsapp', '10002@s.whatsapp.net', frozenset({MEMBER}), None, 1,
-            'proactive', 150, is_direct=True, owner=True, owner_lookup_person_ids=('a',),
+            MEMBER,
+            "whatsapp",
+            "10002@s.whatsapp.net",
+            frozenset({MEMBER}),
+            None,
+            1,
+            "proactive",
+            150,
+            is_direct=True,
+            owner=True,
+            owner_lookup_person_ids=("a",),
         )
-        assert not service.recall(RecallQuery('Synthetic'), context=proactive).statement_ids
+        assert not service.recall(RecallQuery("Synthetic"), context=proactive).statement_ids
 
 
 @pytest.mark.parametrize("principal", [MEMBER, "whatsapp:20002@lid"])
 def test_owner_cross_chat_read_still_requires_the_history_audience_proof(case, principal):
     """The source-time proof is still the layer that decides a cross-chat owner read."""
     service, q, sources, db = case
-    identifier(db, 'b', '20002@lid', start=1)
-    message(db, 'owner-cross', chat='g@g.us', sender='b', identifier='20002@lid',
-            text='Synthetic owner note')
-    source = sources.issue('owner-cross')
+    identifier(db, "b", "20002@lid", start=1)
+    message(
+        db,
+        "owner-cross",
+        chat="g@g.us",
+        sender="b",
+        identifier="20002@lid",
+        text="Synthetic owner note",
+    )
+    source = sources.issue("owner-cross")
     with service.history_scope(q, sources):
         sid, _ = capture(service, source)
         service._store.execute(
@@ -279,23 +445,37 @@ def test_owner_cross_chat_read_still_requires_the_history_audience_proof(case, p
             (sid,),
         )
         context = TrustedReadContext(
-            principal, 'whatsapp', '10002@s.whatsapp.net', frozenset({principal}), None, 1,
-            'reply', 150, is_direct=True, owner=True,
-            owner_lookup_chat_ids=('g@g.us',),
+            principal,
+            "whatsapp",
+            "10002@s.whatsapp.net",
+            frozenset({principal}),
+            None,
+            1,
+            "reply",
+            150,
+            is_direct=True,
+            owner=True,
+            owner_lookup_chat_ids=("g@g.us",),
         )
-        assert service.recall(RecallQuery('Synthetic'), context=context).statement_ids == (sid,)
-        event(db, 'owner-left', 'member_remove', 120, {'participants': [['10002@s.whatsapp.net']]})
-        assert not service.recall(RecallQuery('Synthetic'), context=context).statement_ids
+        assert service.recall(RecallQuery("Synthetic"), context=context).statement_ids == (sid,)
+        event(db, "owner-left", "member_remove", 120, {"participants": [["10002@s.whatsapp.net"]]})
+        assert not service.recall(RecallQuery("Synthetic"), context=context).statement_ids
 
 
 @pytest.mark.parametrize("principal", [MEMBER, "whatsapp:20002@lid"])
 def test_owner_lookup_keeps_an_author_only_statement_from_the_owner_dm(case, principal):
     service, q, sources, db = case
     if principal.endswith("@lid"):
-        identifier(db, 'b', '20002@lid', start=1)
-    message(db, 'owner-dm', chat='10002@s.whatsapp.net', sender='b',
-            identifier='10002@s.whatsapp.net', text='Synthetic local note')
-    source = sources.issue('owner-dm')
+        identifier(db, "b", "20002@lid", start=1)
+    message(
+        db,
+        "owner-dm",
+        chat="10002@s.whatsapp.net",
+        sender="b",
+        identifier="10002@s.whatsapp.net",
+        text="Synthetic local note",
+    )
+    source = sources.issue("owner-dm")
     with service.history_scope(q, sources):
         sid, _ = capture(service, source)
         service._store.execute(
@@ -303,18 +483,39 @@ def test_owner_lookup_keeps_an_author_only_statement_from_the_owner_dm(case, pri
             (sid,),
         )
         context = TrustedReadContext(
-            principal, 'whatsapp', '10002@s.whatsapp.net', frozenset({principal}), None, 1,
-            'reply', 150, is_direct=True, owner=True, owner_lookup_person_ids=('a',),
+            principal,
+            "whatsapp",
+            "10002@s.whatsapp.net",
+            frozenset({principal}),
+            None,
+            1,
+            "reply",
+            150,
+            is_direct=True,
+            owner=True,
+            owner_lookup_person_ids=("a",),
         )
-        assert service.recall(RecallQuery('Synthetic', person_ids=('a',)), context=context).statement_ids == (sid,)
+        assert service.recall(
+            RecallQuery("Synthetic", person_ids=("a",)), context=context
+        ).statement_ids == (sid,)
 
 
 @pytest.mark.asyncio
-@pytest.mark.parametrize('principal', [
-    'whatsapp:10002', 'whatsapp:10002@s.whatsapp.net', 'whatsapp:20002@lid',
-    '10002', '20002', '10002@s.whatsapp.net', '20002@lid',
-])
-async def test_responder_handoff_uses_frozen_lid_principal_when_sender_canonicalization_is_empty(case, monkeypatch, principal):
+@pytest.mark.parametrize(
+    "principal",
+    [
+        "whatsapp:4915000000002",
+        "whatsapp:4915000000002@s.whatsapp.net",
+        "whatsapp:20002@lid",
+        "4915000000002",
+        "20002",
+        "4915000000002@s.whatsapp.net",
+        "20002@lid",
+    ],
+)
+async def test_responder_handoff_uses_frozen_lid_principal_when_sender_canonicalization_is_empty(
+    directory_identity_case, monkeypatch, tmp_path, principal
+):
     from types import SimpleNamespace
     from unittest.mock import Mock
 
@@ -324,14 +525,16 @@ async def test_responder_handoff_uses_frozen_lid_principal_when_sender_canonical
     from yeoman_gateway.processing.dispatch import CURRENT_PRINCIPAL, CURRENT_TURN
     from yeoman_gateway.processing.models import StoredTurn, TurnBinding
 
+    case = directory_identity_case
     service, q, sources, db = case
-    identifier(db, 'b', '20002@lid', start=1)
+    identifier(db, "b", "20002@lid", start=1)
     assert canonical_user_id("whatsapp", "20002@lid", {}) == ""
     responder = object.__new__(LLMResponder)
     session = SimpleNamespace(operational_store=None, messages=[])
     session.add_message = Mock()
     responder.sessions = SimpleNamespace(
-        get_or_create=Mock(return_value=session), save=Mock(),
+        get_or_create=Mock(return_value=session),
+        save=Mock(),
     )
     responder._model_for_profile = lambda profile: "test-model"
     responder._session_user_metadata = lambda *args, **kwargs: {}
@@ -353,9 +556,17 @@ async def test_responder_handoff_uses_frozen_lid_principal_when_sender_canonical
         with service.history_scope(q, sources):
             with pytest.raises(HandoffReachedError):
                 await responder._generate_locked(
-                    session_key="whatsapp:20002@lid", channel="whatsapp", chat_id="20002@lid",
-                    content="Was weißt du?", sender_id="20002@lid", media=(), metadata={},
-                    allowed_tools=set(), persona_text=None, is_owner=True, history_snapshot=q.snapshot,
+                    session_key="whatsapp:20002@lid",
+                    channel="whatsapp",
+                    chat_id="20002@lid",
+                    content="Was weißt du?",
+                    sender_id="20002@lid",
+                    media=(),
+                    metadata={},
+                    allowed_tools=set(),
+                    persona_text=None,
+                    is_owner=True,
+                    history_snapshot=q.snapshot,
                 )
     finally:
         CURRENT_PRINCIPAL.reset(principal_token)
@@ -371,40 +582,64 @@ async def test_responder_handoff_uses_frozen_lid_principal_when_sender_canonical
 
     db.execute("UPDATE contacts SET display_name='Alex' WHERE contact_id='a'")
     responder.knowledge = service
-    monkeypatch.setattr("yeoman_gateway.history.context.current_history_snapshot", lambda: q.snapshot)
+    responder.people = install_directory(case, tmp_path)
+    monkeypatch.setattr(
+        "yeoman_gateway.history.context.current_history_snapshot", lambda: q.snapshot
+    )
     with service.history_scope(q, sources):
         owner_dm_statement(service, sources, db)
-        token = set_tool_context(ToolInvocationContext(
-            channel=handed_off['channel'], chat_id=handed_off['chat_id'],
-            canonical_user_id=handed_off['canonical_user_id'], is_owner=handed_off['is_owner'],
-            history_snapshot=q.snapshot,
-        ))
+        token = set_tool_context(
+            ToolInvocationContext(
+                channel=handed_off["channel"],
+                chat_id=handed_off["chat_id"],
+                canonical_user_id=handed_off["canonical_user_id"],
+                is_owner=handed_off["is_owner"],
+                history_snapshot=q.snapshot,
+            )
+        )
         try:
-            text = await RecallConversationTool(None).execute(person='Alex', query='Synthetic')
-            assert 'Synthetic A' in text
+            text = await RecallConversationTool(None, people=responder.people).execute(
+                person="Alex", query="Synthetic"
+            )
+            assert "Synthetic A" in text
         finally:
             reset_tool_context(token)
         recall = Mock(wraps=service.recall)
-        monkeypatch.setattr(service, 'recall', recall)
+        monkeypatch.setattr(service, "recall", recall)
         # Relevance now decides what reaches the prompt, so a content-free synthetic
         # statement needs one token the question shares with it.
-        assert responder._knowledge_statement_context(
-            query="Synthetic: was weißt du über Alex' Aktien?", channel=handed_off['channel'],
-            chat_id=handed_off['chat_id'], principal=handed_off['canonical_user_id'],
-            is_owner=handed_off['is_owner'],
-        ) == 'Synthetic statement (Alex, b)'
-        assert recall.call_args.args[0].person_ids == ('a',)
+        assert (
+            responder._knowledge_statement_context(
+                query="Synthetic: was weißt du über Alex' Aktien?",
+                channel=handed_off["channel"],
+                chat_id=handed_off["chat_id"],
+                principal=handed_off["canonical_user_id"],
+                is_owner=handed_off["is_owner"],
+            )
+            == "Synthetic statement (Alex, b)"
+        )
+        assert recall.call_args.args[0].person_ids == ("a",)
+
+    responder.people.close()
 
 
 def test_owner_local_dm_does_not_read_author_only_statement_by_another_contact(case):
     service, q, sources, db = case
-    identifier(db, 'b', '20002@lid', start=1)
+    identifier(db, "b", "20002@lid", start=1)
     # This phone DM belonged to the other person at source time, then changed hands.
-    db.execute("UPDATE identifier_history SET valid_until_ms=120 WHERE value='10001@s.whatsapp.net'")
-    identifier(db, 'b', '10001@s.whatsapp.net', start=120)
-    message(db, 'other-author-dm', chat='10001@s.whatsapp.net', sender='a',
-            identifier='10001@s.whatsapp.net', text='Other person private note')
-    source = sources.issue('other-author-dm')
+    db.execute(
+        "UPDATE identifier_history SET valid_until_ms=120 WHERE value='10001@s.whatsapp.net'"
+    )
+    identifier(db, "b", "10001@s.whatsapp.net", start=120)
+    message(
+        db,
+        "other-author-dm",
+        chat="10001@s.whatsapp.net",
+        sender="a",
+        identifier="10001@s.whatsapp.net",
+        text="Other person private note",
+    )
+    source = sources.issue("other-author-dm")
     with service.history_scope(q, sources):
         sid, _ = capture(service, source)
         service._store.execute(
@@ -412,94 +647,154 @@ def test_owner_local_dm_does_not_read_author_only_statement_by_another_contact(c
             (sid,),
         )
         owner_dm = TrustedReadContext(
-            'whatsapp:20002@lid', 'whatsapp', '10001@s.whatsapp.net',
-            frozenset({'whatsapp:20002@lid'}), None, 1, 'reply', 150,
-            is_direct=True, owner=True, owner_lookup_person_ids=('a',),
+            "whatsapp:20002@lid",
+            "whatsapp",
+            "10001@s.whatsapp.net",
+            frozenset({"whatsapp:20002@lid"}),
+            None,
+            1,
+            "reply",
+            150,
+            is_direct=True,
+            owner=True,
+            owner_lookup_person_ids=("a",),
         )
-        assert not service.recall(RecallQuery('Other person private note'), context=owner_dm).statement_ids
+        assert not service.recall(
+            RecallQuery("Other person private note"), context=owner_dm
+        ).statement_ids
 
 
-@pytest.mark.parametrize(("principal", "chat"), [
-    (MEMBER, "10002@s.whatsapp.net"), ("whatsapp:20002@lid", "10002@s.whatsapp.net"),
-    (MEMBER, "20002@lid"), ("whatsapp:20002@lid", "20002@lid"),
-])
-def test_owner_german_person_question_retrieves_real_v3_statement(case, monkeypatch, principal, chat):
+@pytest.mark.parametrize(
+    ("principal", "chat"),
+    [
+        (DIRECTORY_MEMBER, "4915000000002@s.whatsapp.net"),
+        ("whatsapp:20002@lid", "4915000000002@s.whatsapp.net"),
+        (DIRECTORY_MEMBER, "20002@lid"),
+        ("whatsapp:20002@lid", "20002@lid"),
+    ],
+)
+def test_owner_german_person_question_retrieves_real_v3_statement(
+    directory_identity_case, monkeypatch, tmp_path, principal, chat
+):
     from yeoman_gateway.adapters.responder_llm import LLMResponder
 
+    case = directory_identity_case
     service, q, sources, db = case
     if principal.endswith("@lid") or chat.endswith("@lid"):
-        identifier(db, 'b', '20002@lid', start=1)
-    source = sources.issue('m')
+        identifier(db, "b", "20002@lid", start=1)
+    source = sources.issue("m")
     db.execute("UPDATE contacts SET display_name='Alex' WHERE contact_id='a'")
     with service.history_scope(q, sources):
         owner_dm_statement(service, sources, db)
         responder = object.__new__(LLMResponder)
         responder.knowledge = service
+        responder.people = install_directory(case, tmp_path)
         monkeypatch.setattr(
             "yeoman_gateway.history.context.current_history_snapshot", lambda: q.snapshot
         )
         text = responder._knowledge_statement_context(
-            query="Synthetic: Was weißt du über Alex' Aktien?", channel='whatsapp',
-            chat_id=chat, principal=principal, is_owner=True,
+            query="Synthetic: Was weißt du über Alex' Aktien?",
+            channel="whatsapp",
+            chat_id=chat,
+            principal=principal,
+            is_owner=True,
         )
-        assert text == 'Synthetic statement (Alex, b)'
+        assert text == "Synthetic statement (Alex, b)"
         assert not responder._knowledge_statement_context(
-            query="Wie wird das Wetter?", channel='whatsapp',
-            chat_id='10002@s.whatsapp.net', principal=MEMBER, is_owner=True,
+            query="Wie wird das Wetter?",
+            channel="whatsapp",
+            chat_id="4915000000002@s.whatsapp.net",
+            principal=DIRECTORY_MEMBER,
+            is_owner=True,
         )
         assert not responder._knowledge_statement_context(
-            query="Was weißt du über Alex' Aktien?", channel='whatsapp',
-            chat_id='10001@s.whatsapp.net', principal=AUTHOR, is_owner=False,
+            query="Was weißt du über Alex' Aktien?",
+            channel="whatsapp",
+            chat_id="4915000000001@s.whatsapp.net",
+            principal=DIRECTORY_AUTHOR,
+            is_owner=False,
         )
         assert not responder._knowledge_statement_context(
-            query="Was weißt du über Alex' Aktien?", channel='whatsapp',
-            chat_id=source.chat_id, principal=MEMBER, is_owner=True,
+            query="Was weißt du über Alex' Aktien?",
+            channel="whatsapp",
+            chat_id=source.chat_id,
+            principal=DIRECTORY_MEMBER,
+            is_owner=True,
         )
 
+    responder.people.close()
 
-@pytest.mark.parametrize(("principal", "chat"), [
-    (MEMBER, "10002@s.whatsapp.net"), ("whatsapp:20002@lid", "10002@s.whatsapp.net"),
-    (MEMBER, "20002@lid"), ("whatsapp:20002@lid", "20002@lid"),
-])
-def test_owner_german_natural_prefix_preserves_display_name_in_real_v3_result(case, monkeypatch, principal, chat):
+
+@pytest.mark.parametrize(
+    ("principal", "chat"),
+    [
+        (DIRECTORY_MEMBER, "4915000000002@s.whatsapp.net"),
+        ("whatsapp:20002@lid", "4915000000002@s.whatsapp.net"),
+        (DIRECTORY_MEMBER, "20002@lid"),
+        ("whatsapp:20002@lid", "20002@lid"),
+    ],
+)
+def test_owner_german_natural_prefix_preserves_display_name_in_real_v3_result(
+    directory_identity_case, monkeypatch, tmp_path, principal, chat
+):
     from yeoman_gateway.adapters.responder_llm import LLMResponder
 
+    case = directory_identity_case
     service, q, sources, db = case
     if principal.endswith("@lid") or chat.endswith("@lid"):
-        identifier(db, 'b', '20002@lid', start=1)
+        identifier(db, "b", "20002@lid", start=1)
     db.execute("UPDATE contacts SET display_name='AlexGrrrrr😈' WHERE contact_id='a'")
     with service.history_scope(q, sources):
         owner_dm_statement(service, sources, db)
         responder = object.__new__(LLMResponder)
         responder.knowledge = service
+        responder.people = install_directory(case, tmp_path)
         monkeypatch.setattr(
             "yeoman_gateway.history.context.current_history_snapshot", lambda: q.snapshot
         )
-        assert responder._knowledge_statement_context(
-            query="Synthetic: Was weißt du über Alex' Aktien?", channel='whatsapp',
-            chat_id=chat, principal=principal, is_owner=True,
-        ) == 'Synthetic statement (AlexGrrrrr😈, b)'
+        assert (
+            responder._knowledge_statement_context(
+                query="Synthetic: Was weißt du über Alex' Aktien?",
+                channel="whatsapp",
+                chat_id=chat,
+                principal=principal,
+                is_owner=True,
+            )
+            == "Synthetic statement (AlexGrrrrr😈, b)"
+        )
+
+    responder.people.close()
 
 
-@pytest.mark.parametrize(("principal", "chat"), [
-    (MEMBER, "10002@s.whatsapp.net"), ("whatsapp:20002@lid", "10002@s.whatsapp.net"),
-    (MEMBER, "20002@lid"), ("whatsapp:20002@lid", "20002@lid"),
-])
-def test_owner_ambiguous_natural_prefix_has_no_knowledge_person_targets_or_results(case, monkeypatch, principal, chat):
+@pytest.mark.parametrize(
+    ("principal", "chat"),
+    [
+        (DIRECTORY_MEMBER, "4915000000002@s.whatsapp.net"),
+        ("whatsapp:20002@lid", "4915000000002@s.whatsapp.net"),
+        (DIRECTORY_MEMBER, "20002@lid"),
+        ("whatsapp:20002@lid", "20002@lid"),
+    ],
+)
+def test_owner_ambiguous_natural_prefix_has_no_knowledge_person_targets_or_results(
+    directory_identity_case, monkeypatch, tmp_path, principal, chat
+):
     from yeoman_gateway.adapters.responder_llm import LLMResponder
 
+    case = directory_identity_case
     service, q, sources, db = case
     if principal.endswith("@lid") or chat.endswith("@lid"):
-        identifier(db, 'b', '20002@lid', start=1)
-    source = sources.issue('m')
+        identifier(db, "b", "20002@lid", start=1)
+    source = sources.issue("m")
     db.execute("UPDATE contacts SET display_name='Alexander Müller' WHERE contact_id='a'")
     db.execute("UPDATE contacts SET display_name='Alexa Weber' WHERE contact_id='b'")
     with service.history_scope(q, sources):
         capture(service, source)
-        capture_context = TrustedCaptureContext('synthetic', 1, 'native', (source,))
-        candidate = StatementCandidate('Other synthetic statement', (source,), people=(
-            PersonLinkCandidate('b', 'subject', source, 'explicit'),
-        ))
+        capture_context = TrustedCaptureContext("synthetic", 1, "native", (source,))
+        candidate = StatementCandidate(
+            "Other synthetic statement",
+            (source,),
+            people=(PersonLinkCandidate("b", "subject", source, "explicit"),),
+        )
         assert service.capture(candidate, context=capture_context).statement_ids
 
         recalled = []
@@ -509,36 +804,50 @@ def test_owner_ambiguous_natural_prefix_has_no_knowledge_person_targets_or_resul
             recalled.append(query)
             return recall(query, **kwargs)
 
-        monkeypatch.setattr(service, 'recall', record_recall)
+        monkeypatch.setattr(service, "recall", record_recall)
         responder = object.__new__(LLMResponder)
         responder.knowledge = service
+        responder.people = install_directory(case, tmp_path)
         monkeypatch.setattr(
             "yeoman_gateway.history.context.current_history_snapshot", lambda: q.snapshot
         )
         assert not responder._knowledge_statement_context(
-            query='Was weißt du über Alex?', channel='whatsapp',
-            chat_id=chat, principal=principal, is_owner=True,
+            query="Was weißt du über Alex?",
+            channel="whatsapp",
+            chat_id=chat,
+            principal=principal,
+            is_owner=True,
         )
         assert len(recalled) == 1
         assert recalled[0].person_ids == ()
 
+    responder.people.close()
 
-@pytest.mark.parametrize(("principal", "chat"), [
-    (MEMBER, "10002@s.whatsapp.net"), ("whatsapp:20002@lid", "10002@s.whatsapp.net"),
-    (MEMBER, "20002@lid"), ("whatsapp:20002@lid", "20002@lid"),
-])
-def test_owner_lookup_denies_late_joiner_even_when_currently_in_group(case, monkeypatch, principal, chat):
+
+@pytest.mark.parametrize(
+    ("principal", "chat"),
+    [
+        (MEMBER, "10002@s.whatsapp.net"),
+        ("whatsapp:20002@lid", "10002@s.whatsapp.net"),
+        (MEMBER, "20002@lid"),
+        ("whatsapp:20002@lid", "20002@lid"),
+    ],
+)
+def test_owner_lookup_denies_late_joiner_even_when_currently_in_group(
+    case, monkeypatch, principal, chat
+):
     from yeoman_gateway.adapters.responder_llm import LLMResponder
 
     service, q, sources, db = case
     if principal.endswith("@lid") or chat.endswith("@lid"):
-        identifier(db, 'b', '20002@lid', start=1)
-    db.execute("UPDATE message_events SET payload_json=? WHERE event_id='roster'",
-               ('{"complete":true,"participants":[["10001@s.whatsapp.net"]]}',))
-    event(db, 'owner-joined-later', 'member_add', 120,
-          {'participants': [['10002@s.whatsapp.net']]})
+        identifier(db, "b", "20002@lid", start=1)
+    db.execute(
+        "UPDATE message_events SET payload_json=? WHERE event_id='roster'",
+        ('{"complete":true,"participants":[["10001@s.whatsapp.net"]]}',),
+    )
+    event(db, "owner-joined-later", "member_add", 120, {"participants": [["10002@s.whatsapp.net"]]})
     db.execute("UPDATE contacts SET display_name='Alex' WHERE contact_id='a'")
-    source = sources.issue('m')
+    source = sources.issue("m")
     with service.history_scope(q, sources):
         sid, _ = capture(service, source)
         service._store.execute(
@@ -551,20 +860,29 @@ def test_owner_lookup_denies_late_joiner_even_when_currently_in_group(case, monk
             "yeoman_gateway.history.context.current_history_snapshot", lambda: q.snapshot
         )
         assert not responder._knowledge_statement_context(
-            query="Was weißt du über Alex' Aktien?", channel='whatsapp',
-            chat_id=chat, principal=principal, is_owner=True,
+            query="Was weißt du über Alex' Aktien?",
+            channel="whatsapp",
+            chat_id=chat,
+            principal=principal,
+            is_owner=True,
         )
 
 
 def test_owner_cross_chat_lookup_denies_reassigned_original_audience_identifier(case):
     service, q, sources, db = case
-    identifier(db, 'b', '20002@lid', start=1)
+    identifier(db, "b", "20002@lid", start=1)
     # The statement is the owner's own, so the narrow author gate admits it and the
     # temporal source proof is the layer that has to refuse it once the audience
     # identifier changes hands.
-    message(db, 'owner-cross', chat='g@g.us', sender='b', identifier='20002@lid',
-            text='Synthetic owner note')
-    source = sources.issue('owner-cross')
+    message(
+        db,
+        "owner-cross",
+        chat="g@g.us",
+        sender="b",
+        identifier="20002@lid",
+        text="Synthetic owner note",
+    )
+    source = sources.issue("owner-cross")
     with service.history_scope(q, sources):
         sid, _ = capture(service, source)
         service._store.execute(
@@ -572,15 +890,26 @@ def test_owner_cross_chat_lookup_denies_reassigned_original_audience_identifier(
             (sid,),
         )
         owner_dm = TrustedReadContext(
-            'whatsapp:20002@lid', 'whatsapp', '20002@lid',
-            frozenset({'whatsapp:20002@lid'}), None, 1, 'reply', 150,
-            is_direct=True, owner=True, owner_lookup_chat_ids=('g@g.us',),
+            "whatsapp:20002@lid",
+            "whatsapp",
+            "20002@lid",
+            frozenset({"whatsapp:20002@lid"}),
+            None,
+            1,
+            "reply",
+            150,
+            is_direct=True,
+            owner=True,
+            owner_lookup_chat_ids=("g@g.us",),
         )
-        assert service.recall(RecallQuery('Synthetic'), context=owner_dm).statement_ids == (sid,)
-        db.execute("UPDATE identifier_history SET valid_until_ms=160 WHERE contact_id='b' AND value='10002@s.whatsapp.net'")
-        contact(db, 'reassigned')
-        identifier(db, 'reassigned', '10002@s.whatsapp.net', start=160)
+        assert service.recall(RecallQuery("Synthetic"), context=owner_dm).statement_ids == (sid,)
+        db.execute(
+            "UPDATE identifier_history SET valid_until_ms=160 WHERE contact_id='b' AND value='10002@s.whatsapp.net'"
+        )
+        contact(db, "reassigned")
+        identifier(db, "reassigned", "10002@s.whatsapp.net", start=160)
         from dataclasses import replace
+
         assert not service.recall(
-            RecallQuery('Synthetic'), context=replace(owner_dm, now_ms=170)
+            RecallQuery("Synthetic"), context=replace(owner_dm, now_ms=170)
         ).statement_ids

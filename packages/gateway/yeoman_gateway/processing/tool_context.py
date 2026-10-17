@@ -19,6 +19,7 @@ from typing import TYPE_CHECKING
 
 if TYPE_CHECKING:
     from yeoman_gateway.history.reader import HistorySnapshot
+    from yeoman_gateway.knowledge.models import TrustedReadContext
 
 
 @dataclass(frozen=True, slots=True)
@@ -36,6 +37,7 @@ class ToolInvocationContext:
     canonical_user_id: str = ""
     request_text: str = ""
     history_snapshot: HistorySnapshot | None = None
+    knowledge_read_context: TrustedReadContext | None = None
 
 
 CURRENT_TOOL_CONTEXT: ContextVar[ToolInvocationContext | None] = ContextVar(
