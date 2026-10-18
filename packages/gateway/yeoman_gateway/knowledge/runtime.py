@@ -81,18 +81,38 @@ class RuntimeKnowledgePolicy:
                              group, False, False)
         return PolicyEngine(policy, Path(".")).evaluate(actor, set()).accept_message
 
-    def admin_actor(self) -> str:
-        """The principal the runtime accepts as an owner actor, if Policy names one."""
-        if self.admin_principals:
-            return sorted(self.admin_principals)[0]
-        owners = getattr(self.engine, "owners", None)
-        if isinstance(owners, Mapping):
-            for channel in sorted(owners):
-                for candidate in owners[channel] or ():
-                    token = str(candidate or "").strip()
-                    if token:
-                        return f"{channel}:{token}"
-        return ""
+    def admin_principals_for(self, channel: str) -> tuple[str, ...]:
+        """Declared admin principals on one channel, in a stable order."""
+        prefix = f"{channel}:"
+        return tuple(
+            sorted(item for item in self.admin_principals if str(item).startswith(prefix))
+        )
+
+    def admin_actor(self, *, channel: str = "", chat_id: str = "") -> str:
+        """The principal the runtime accepts as an owner actor, if Policy names one.
+
+        Called without arguments this is the first declared admin principal, or the
+        owners-derived fallback - the historical behaviour, kept for its existing
+        callers. ``channel`` restricts the answer to that channel, and ``chat_id``
+        prefers the identifier form that the chat itself names, so a LID chat resolves
+        to the owner's LID principal and author-only statements recorded under that
+        form stay readable.
+        """
+        declared = (
+            self.admin_principals_for(channel)
+            if channel
+            else tuple(sorted(self.admin_principals))
+        )
+        if not declared:
+            owners = getattr(self.engine, "owners", None)
+            if isinstance(owners, Mapping):
+                names = [channel] if channel else sorted(owners)
+                for name in names:
+                    for candidate in owners.get(name, ()) or ():
+                        token = str(candidate or "").strip()
+                        if token:
+                            declared += (f"{name}:{token}",)
+        return select_owner_principal(declared, chat_id)
 
     def require_admin(self, context: TrustedAdminContext) -> str:
         if not context.owner:
@@ -147,11 +167,43 @@ class RuntimeKnowledgePolicy:
                     owner = scope.queries.resolve_identifier(value, at_ms=context.now_ms, time_basis='native') if value else None
                     if owner is None or context.chat_id != value:
                         return None
-                return PolicyMembership(frozenset({context.principal_id}), str(scope.queries.snapshot.generation))
+                # An owner read carries every proven identifier form of the owner, so
+                # owner membership has to name that same set; otherwise the read is
+                # refused as recipient_not_a_member. Only the forms the read context
+                # already proved are added, and only for an owner context - a non-owner
+                # direct chat keeps its exact previous membership.
+                members = frozenset({context.principal_id})
+                if context.owner:
+                    members |= frozenset(context.recipient_principals or ())
+                return PolicyMembership(members, str(scope.queries.snapshot.generation))
             if audience.status != 'known':
                 return None
             return PolicyMembership(audience.members, f"history:{scope.queries.snapshot.generation}:{audience.snapshot_id}")
         return None
+
+
+def select_owner_principal(principals: Iterable[str], chat_id: str = "") -> str:
+    """Pick one owner principal out of an already proven set.
+
+    Resolution order, applied to the set the caller has already proven:
+    1. the principal whose identifier value equals the chat identifier, so a chat
+       resolves to the same identifier space the archive stored its author under;
+    2. a non-LID (phone) form, because the canonical phone principal is the dominant
+       stored form when the chat names no identifier of its own;
+    3. lexicographic order, so the answer never depends on set iteration.
+    """
+    ordered = sorted({str(item).strip() for item in principals if str(item).strip()})
+    if not ordered:
+        return ""
+    chat = str(chat_id or "").strip()
+    if chat:
+        for principal in ordered:
+            if principal.partition(":")[2] == chat:
+                return principal
+    for principal in ordered:
+        if not principal.partition(":")[2].endswith("@lid"):
+            return principal
+    return ordered[0]
 
 
 def _principal_candidates(principal: str) -> tuple[str, ...]:

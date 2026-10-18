@@ -3161,24 +3161,9 @@ class LLMResponder(ResponderPort):
             return ""
         person_ids: tuple[str, ...] = ()
         chat_ids: tuple[str, ...] = ()
-        explicit_request = "?" in query or bool(
-            re.match(
-                r"\s*(?:was|wer|wie|wo|wann|welche\w*|what|who|how|where|when|"
-                r"erzähl|erzähle|sag|zeige|tell|show|recall|remember)\b",
-                query,
-                re.IGNORECASE,
-            )
-        )
-        if (
-            context.owner
-            and purpose == "reply"
-            and channel == "whatsapp"
-            and explicit_request
-            and snapshot is not None
-            and HistoryQueries(snapshot).is_owner_direct_chat(
-                principal, chat_id, context.now_ms, is_owner=is_owner, channel=channel
-            )
-        ):
+        owner_scope = self._knowledge_owner_scope(context)
+        snapshot = current_history_snapshot()
+        if owner_scope and snapshot is not None:
             queries = HistoryQueries(snapshot)
             member_chats = queries.owner_member_chat_ids(principal, context.now_ms)
             named_chats = tuple(
@@ -3230,13 +3215,37 @@ class LLMResponder(ResponderPort):
                 context = replace(
                     context, owner_lookup_person_ids=person_ids, owner_lookup_chat_ids=chat_ids
                 )
-        lookup = bool(person_ids or chat_ids)
+        # Relevance alone decides what reaches the prompt: a proven owner scope widens the
+        # candidate set, never the relevance bar.  A message that matches nothing injects
+        # nothing, and no phrasing is needed to earn the owner's own reach.
         result = cast(Any, self.knowledge).recall(
-            RecallQuery(text=query, person_ids=person_ids, limit=20 if lookup else 5),
+            RecallQuery(text=query, person_ids=person_ids, limit=20 if owner_scope else 5),
             context=context,
-            require_match=not lookup,
+            require_match=True,
         )
         return str(result.text)
+
+    def _knowledge_owner_scope(self, context: Any) -> bool:
+        """Whether this reply may resolve owner targets and widen the candidate set.
+
+        Authorization here is deterministic: a verified owner, a direct reply, and an
+        archive proof that this chat is the owner's own. The request text is not an input,
+        so no message can switch owner scope on or off. Retrieval re-derives the same
+        decision from the trusted context before it builds a clause.
+        """
+        if not (context.owner and context.is_direct and context.purpose == "reply"
+                and context.channel == "whatsapp"):
+            return False
+        from yeoman_gateway.history.context import current_history_snapshot
+        from yeoman_gateway.history.queries import HistoryQueries
+
+        snapshot = current_history_snapshot()
+        if snapshot is None:
+            return False
+        return bool(HistoryQueries(snapshot).is_owner_direct_chat(
+            context.principal_id, context.chat_id, context.now_ms,
+            is_owner=True, channel=context.channel,
+        ))
 
     def _knowledge_policy_revision(self) -> int:
         revision = getattr(self.knowledge, "policy_revision", None)
