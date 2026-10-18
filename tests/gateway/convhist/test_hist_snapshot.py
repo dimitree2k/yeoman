@@ -157,6 +157,33 @@ async def test_clean_restart_uses_snapshot_and_catches_tail(tmp_path):
             await second.stop()
 
 
+async def test_stop_after_live_catch_up_saves_a_snapshot_the_next_start_loads(tmp_path):
+    # Catch-up stores boundaries in raw-subdir order (whatsapp before backfill), while
+    # projector_state reads back sorted by path; the stop-time save must not refuse that.
+    root, db, archive = fixture(tmp_path)
+    (root / 'backfill').mkdir(exist_ok=True)
+    append_line(root / 'backfill/2026-09.jsonl', json.dumps(observation(native_id='OLD')))
+    first = HistoryProjector(root, db, archive)
+    await start_ready(first)
+    append_line(root / 'whatsapp/2026-10.jsonl', json.dumps(observation(native_id='LIVE')))
+    await first.catch_up(first._index.target(root))
+    await first.stop()
+    with closing(sqlite3.connect(db)) as conn:
+        stored = conn.execute("SELECT file, lines FROM projector_state WHERE file <> '@runtime' "
+                              "ORDER BY file").fetchall()
+    header = json.loads(snapshot_path(db).read_bytes().split(b'\n', 1)[0])
+    assert [row[0] for row in stored] == [
+        'backfill/2026-09.jsonl', 'derived/contact-ids.jsonl', 'whatsapp/2026-10.jsonl']
+    assert [[b[0], b[1]] for b in header['boundaries']] == [list(row) for row in stored]
+    second = HistoryProjector(root, db, archive)
+    with patch.object(ProjectionIndex, 'from_prefix', side_effect=AssertionError('unexpected rebuild')):
+        try:
+            await start_ready(second)
+            assert second.health()['status'] == 'ready', second.health()
+        finally:
+            await second.stop()
+
+
 async def test_projector_does_not_save_uncommitted_or_staged_state(tmp_path):
     root, db, archive = fixture(tmp_path)
     p = HistoryProjector(root, db, archive)

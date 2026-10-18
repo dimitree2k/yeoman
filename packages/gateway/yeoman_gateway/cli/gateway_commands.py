@@ -3,7 +3,9 @@
 from __future__ import annotations
 
 import asyncio
+from collections.abc import Coroutine
 from pathlib import Path
+from typing import Any
 
 import typer
 from yeoman_shared.utils.process import command_for_pid, pid_alive, read_pid_file, signal_pid
@@ -153,7 +155,9 @@ def _find_gateway_pids(port: int) -> list[int]:
     return sorted(pids)
 
 
-def _stop_gateway_processes(port: int, timeout_s: float = 10.0) -> int:
+# The graceful shutdown saves a ~140 MiB history index snapshot (about 14 s on the Pi);
+# stay under systemd's 90 s stop timeout.
+def _stop_gateway_processes(port: int, timeout_s: float = 60.0) -> int:
     import signal
     import time
 
@@ -288,6 +292,46 @@ def _setup_daemon_logging(log_path: Path) -> None:
     )
 
 
+async def _run_until_stopped(main: Coroutine[Any, Any, None]) -> None:
+    """Run ``main``, turning SIGTERM and SIGINT into a cancellation so its cleanup runs.
+
+    Python's default SIGTERM action ends the process at once, so a systemd stop or
+    ``yeoman gateway restart`` used to skip the runtime's whole shutdown, including the
+    history projector's index snapshot.
+    """
+    import signal
+
+    from loguru import logger
+
+    loop = asyncio.get_running_loop()
+    task = asyncio.ensure_future(main)
+    stopping = False
+
+    def request_stop(sig: signal.Signals) -> None:
+        nonlocal stopping
+        if stopping:
+            return
+        stopping = True
+        logger.info("Gateway stopping signal={}", sig.name)
+        task.cancel()
+
+    installed: list[signal.Signals] = []
+    for sig in (signal.SIGTERM, signal.SIGINT):
+        try:
+            loop.add_signal_handler(sig, request_stop, sig)
+        except (NotImplementedError, RuntimeError):
+            continue
+        installed.append(sig)
+    try:
+        await task
+    except asyncio.CancelledError:
+        if not stopping:
+            raise
+    finally:
+        for sig in installed:
+            loop.remove_signal_handler(sig)
+
+
 def _run_gateway_foreground(port: int, verbose: bool, ensure_whatsapp: bool = True) -> None:
     """Start the yeoman gateway in foreground."""
     from loguru import logger
@@ -344,13 +388,7 @@ def _run_gateway_foreground(port: int, verbose: bool, ensure_whatsapp: bool = Tr
 
     async def run() -> None:
         try:
-            await runtime.run()
-        except KeyboardInterrupt:
-            console.print("\nShutting down...")
-            runtime.heartbeat.stop()
-            runtime.cron.stop()
-            runtime.orchestrator.stop()
-            await runtime.channels.stop_all()
+            await _run_until_stopped(runtime.run())
         except Exception:
             logger.exception("Gateway crashed")
             raise
