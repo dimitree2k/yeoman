@@ -206,7 +206,7 @@ def history_read(
     if os.environ.get('YEOMAN_HISTORY_TOOL_TURN') == '1':
         raise typer.BadParameter('standalone history read forbidden in selected tool turn; use history_read')
     try:
-        _emit(asyncio.run(request_history_read(Path(load_config().ipc.gateway_socket_path).expanduser(),
+        _emit(asyncio.run(request_history_read(load_config().ipc.resolved_gateway_socket_path,
               dict(chat_ids=chat_ids, after_ms=after_ms, limit=limit, aggregate=not content))))
     except (OSError, ValueError, TimeoutError):
         raise typer.BadParameter('Gateway history read unavailable') from None
@@ -220,6 +220,6 @@ def history_projection_status() -> None:
 
     from yeoman_gateway.history.control import request_history_control
     try:
-        _emit(asyncio.run(request_history_control(Path(load_config().ipc.gateway_socket_path).expanduser(), 'status', {})))
+        _emit(asyncio.run(request_history_control(load_config().ipc.resolved_gateway_socket_path, 'status', {})))
     except (OSError, ValueError, TimeoutError):
         raise typer.BadParameter('Gateway history control unavailable') from None

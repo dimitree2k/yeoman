@@ -1,6 +1,6 @@
-import { homedir } from 'node:os';
 import { join } from 'node:path';
+import { yeomanHome } from './runtime_paths.js';
 
 export function defaultMediaDir(): string {
-  return join(homedir(), '.yeoman', 'var', 'media');
+  return join(yeomanHome(), 'var', 'media');
 }

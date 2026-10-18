@@ -3,7 +3,7 @@
 set -u -o pipefail
 
 YEOMAN_BIN="${YEOMAN_BIN:-yeoman}"
-YEOMAN_HOME="${YEOMAN_HOME:-$HOME/.yeoman}"
+export YEOMAN_HOME="${YEOMAN_HOME:-$HOME/.yeoman}"
 CONFIG_PATH="${CONFIG_PATH:-$YEOMAN_HOME/config.json}"
 POLICY_PATH="${POLICY_PATH:-$YEOMAN_HOME/policy.json}"
 ENV_PATH="${ENV_PATH:-$YEOMAN_HOME/.env}"
@@ -238,12 +238,12 @@ values = {
     "memory_enabled": str(bool(pick(memory, "enabled", default=True))).lower(),
     "memory_embedding_enabled": str(bool(pick(memory_embedding, "enabled", default=True))).lower(),
     "memory_wal_enabled": str(bool(pick(memory_wal, "enabled", default=True))).lower(),
-    "memory_db_path": str(Path(str(pick(memory, "dbPath", "db_path", default="~/.yeoman/data/memory/memory.db"))).expanduser()),
+    "memory_db_path": str(Path(str(pick(memory, "dbPath", "db_path", default=Path(os.environ["YEOMAN_HOME"]) / "data/memory/memory.db"))).expanduser()),
     "telegram_enabled": str(bool(pick(telegram, "enabled", default=False))).lower(),
     "telegram_token_present": str(telegram_token_present).lower(),
     "whatsapp_enabled": str(bool(pick(whatsapp, "enabled", default=False))).lower(),
     "whatsapp_bridge_token_present": str(whatsapp_token_present).lower(),
-    "whatsapp_auth_dir": str(Path(str(pick(whatsapp, "authDir", "auth_dir", default="~/.yeoman/secrets/whatsapp-auth"))).expanduser()),
+    "whatsapp_auth_dir": str(Path(str(pick(whatsapp, "authDir", "auth_dir", default=Path(os.environ["YEOMAN_HOME"]) / "secrets/whatsapp-auth"))).expanduser()),
     "bridge_host": str(pick(whatsapp, "bridgeHost", "bridge_host", default="127.0.0.1") or "127.0.0.1"),
     "bridge_port": str(pick(whatsapp, "bridgePort", "bridge_port", default=3001) or 3001),
     "gateway_host": str(pick(gateway, "host", default="0.0.0.0") or "0.0.0.0"),

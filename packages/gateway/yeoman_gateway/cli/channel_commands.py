@@ -131,7 +131,7 @@ def whatsapp_repair_sender(
         raise typer.Exit(1)
 
     config = load_config()
-    auth_dir = Path(config.channels.whatsapp.auth_dir).expanduser()
+    auth_dir = config.channels.whatsapp.resolved_auth_dir
     if not auth_dir.exists():
         console.print(f"[red]Auth dir not found:[/red] {auth_dir}")
         raise typer.Exit(1)
@@ -274,7 +274,7 @@ def channels_login() -> None:
         env["BRIDGE_PORT"] = str(wa.bridge_port or wa.resolved_bridge_port)
         env["BRIDGE_HOST"] = wa.bridge_host
         env["BRIDGE_TOKEN"] = token
-        env["AUTH_DIR"] = str(Path(wa.auth_dir).expanduser())
+        env["AUTH_DIR"] = str(wa.resolved_auth_dir)
         from yeoman_shared.utils.helpers import set_bridge_message_reference_dir
 
         set_bridge_message_reference_dir(env)

@@ -4,6 +4,7 @@ import os
 from collections.abc import MutableMapping
 from datetime import datetime
 from pathlib import Path
+from typing import Any
 
 OPERATIONAL_STORE_PATHS = {
     "session_metadata": "ops/session-metadata.db",
@@ -31,15 +32,34 @@ def ensure_dir(path: Path) -> Path:
     return path
 
 
+def get_yeoman_home() -> Path:
+    """Return YEOMAN_HOME, or the legacy ~/.yeoman runtime directory."""
+    yeoman_home = os.environ.get("YEOMAN_HOME", "").strip()
+    return Path(yeoman_home).expanduser() if yeoman_home else Path.home() / ".yeoman"
+
+
+def resolve_yeoman_path(path: str | Path, *, is_default: bool = False) -> Path:
+    """Expand a legacy ~/.yeoman default through YEOMAN_HOME when provenance says default."""
+    value = str(path)
+    prefix = "~/.yeoman"
+    if is_default and (value == prefix or value.startswith(prefix + "/")):
+        return get_yeoman_home() / value[len(prefix) :].lstrip("/")
+    return Path(path).expanduser()
+
+
+def resolve_config_path(config: Any, name: str) -> Path:
+    """Resolve a path field, honoring the legacy default only when it was omitted."""
+    return resolve_yeoman_path(
+        getattr(config, name), is_default=name not in config.model_fields_set
+    )
+
+
 def get_data_path() -> Path:
     """Get the yeoman data directory.
 
     Respects YEOMAN_HOME environment variable; falls back to ~/.yeoman.
     """
-    yeoman_home = os.environ.get("YEOMAN_HOME", "").strip()
-    if yeoman_home:
-        return ensure_dir(Path(yeoman_home))
-    return ensure_dir(Path.home() / ".yeoman")
+    return ensure_dir(get_yeoman_home())
 
 
 def get_var_path() -> Path:
@@ -74,9 +94,7 @@ def get_run_path() -> Path:
 
 def get_session_state_path() -> Path:
     """Return the frozen legacy session-state path without creating it."""
-    yeoman_home = os.environ.get("YEOMAN_HOME", "").strip()
-    root = Path(yeoman_home) if yeoman_home else Path.home() / ".yeoman"
-    return root / "data" / "memory" / "session-state"
+    return get_yeoman_home() / "data" / "memory" / "session-state"
 
 
 def get_operational_store_path(
@@ -92,9 +110,7 @@ def get_operational_store_path(
     elif create:
         base = get_operational_data_path()
     else:
-        yeoman_home = os.environ.get("YEOMAN_HOME", "").strip()
-        root = Path(yeoman_home) if yeoman_home else Path.home() / ".yeoman"
-        base = root / "data"
+        base = get_yeoman_home() / "data"
     return base / relative
 
 
@@ -132,9 +148,7 @@ def get_sessions_path(*, create: bool = True) -> Path:
     """Get the session history directory (~/.yeoman/data/inbound)."""
     if create:
         return ensure_dir(get_operational_data_path() / "inbound")
-    yeoman_home = os.environ.get("YEOMAN_HOME", "").strip()
-    root = Path(yeoman_home) if yeoman_home else Path.home() / ".yeoman"
-    return root / "data" / "inbound"
+    return get_yeoman_home() / "data" / "inbound"
 
 
 def get_memory_path(workspace: Path | None = None) -> Path:

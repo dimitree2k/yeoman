@@ -191,7 +191,7 @@ def cli_secondary_request(command: str, args: dict[str, Any]) -> dict[str, Any]:
         writer = None
         try:
             async with asyncio.timeout(30):
-                reader, writer = await asyncio.open_unix_connection(str(Path(load_config().ipc.gateway_socket_path).expanduser()), limit=1024 * 1024)
+                reader, writer = await asyncio.open_unix_connection(str(load_config().ipc.resolved_gateway_socket_path), limit=1024 * 1024)
                 writer.write(json.dumps({'cmd': command, 'args': args}).encode() + b'\n')
                 await writer.drain()
                 result = json.loads(await reader.readline())

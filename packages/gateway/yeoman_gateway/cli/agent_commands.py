@@ -74,7 +74,7 @@ def agent(
     """Interact with the agent directly."""
     from yeoman_shared.config.loader import load_config
 
-    socket_path = Path(load_config().ipc.gateway_socket_path).expanduser()
+    socket_path = load_config().ipc.resolved_gateway_socket_path
     if message:
         response = asyncio.run(_request_agent_turn(socket_path, message, session_id))
         console.print(f"\n{__logo__} {response}")

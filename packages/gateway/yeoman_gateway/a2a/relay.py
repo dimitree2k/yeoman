@@ -22,7 +22,7 @@ from pathlib import Path
 from typing import Any, Iterator
 from urllib.parse import urlparse
 
-from yeoman_shared.utils.helpers import get_operational_store_path
+from yeoman_shared.utils.helpers import get_operational_store_path, resolve_yeoman_path
 
 from yeoman_gateway.a2a.contracts import (
     CONTRACT_RELEASE,
@@ -149,6 +149,7 @@ class RelayConfig:
         if not bind_host:
             raise RelayConfigurationError("YEOMAN_A2A_BIND_HOST is required")
         port = _integer("YEOMAN_A2A_PORT", 9900)
+        configured_socket = _setting("YEOMAN_A2A_SOCKET_PATH", "YEOMAN_A2A_SOCKET")
         return cls(
             bind_host=bind_host,
             port=port,
@@ -157,13 +158,10 @@ class RelayConfig:
             ),
             peer_id=_required("YEOMAN_A2A_PEER_ID"),
             bearer_secret=_setting("YEOMAN_A2A_BEARER_SECRET", "YEOMAN_A2A_TOKEN"),
-            socket_path=Path(
-                _setting(
-                    "YEOMAN_A2A_SOCKET_PATH",
-                    "YEOMAN_A2A_SOCKET",
-                    "~/.yeoman/run/gateway.sock",
-                )
-            ).expanduser(),
+            socket_path=resolve_yeoman_path(
+                configured_socket or "~/.yeoman/run/gateway.sock",
+                is_default=not configured_socket,
+            ),
             state_path=get_operational_store_path("a2a"),
             public_url=_required("YEOMAN_A2A_PUBLIC_URL").rstrip("/"),
             whatsapp_enabled=_boolean("YEOMAN_A2A_WHATSAPP_ENABLED", False),

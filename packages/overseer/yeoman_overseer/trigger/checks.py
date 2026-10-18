@@ -78,7 +78,9 @@ def check_gateway_healthy(*, target: str) -> CheckResult:
     active = check_systemd_active(target=target)
     if not active.value:
         return active
-    home = Path(os.environ.get("YEOMAN_HOME") or Path.home() / ".yeoman")
+    from yeoman_shared.utils.helpers import get_yeoman_home
+
+    home = get_yeoman_home()
     try:
         with socket.socket(socket.AF_UNIX, socket.SOCK_STREAM) as client:
             client.settimeout(5.0)

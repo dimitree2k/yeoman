@@ -7,6 +7,8 @@ import shutil
 import sys
 from pathlib import Path
 
+from yeoman_shared.utils.helpers import get_yeoman_home
+
 from .core import app, console
 
 
@@ -32,7 +34,7 @@ def env() -> None:
     repo_wrapper = repo_root / "bin" / "yeoman"
     repo_python = repo_root / ".venv" / "bin" / "python3"
     package_root = Path(__file__).resolve().parents[1]
-    workspace_root = Path.home() / ".yeoman"
+    workspace_root = get_yeoman_home()
     invoked_via = os.environ.get("YEOMAN_LAUNCHER_PATH")
     launcher_kind = os.environ.get("YEOMAN_LAUNCHER_KIND")
 

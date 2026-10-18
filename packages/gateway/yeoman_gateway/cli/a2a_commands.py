@@ -6,7 +6,7 @@ from pathlib import Path
 
 import typer
 from dotenv import load_dotenv
-from yeoman_shared.utils.helpers import get_data_path, get_operational_store_path
+from yeoman_shared.utils.helpers import get_data_path, get_operational_store_path, get_yeoman_home
 
 from yeoman_gateway.cli.core import app
 
@@ -15,11 +15,11 @@ app.add_typer(a2a_app, name="a2a")
 
 
 def _a2a_env_path() -> Path:
-    return Path.home() / ".yeoman" / "secrets" / "a2a.env"
+    return get_yeoman_home() / "secrets" / "a2a.env"
 
 
 def _a2a_capabilities_env_path() -> Path:
-    return Path.home() / ".yeoman" / "a2a-capabilities.env"
+    return get_yeoman_home() / "a2a-capabilities.env"
 
 
 @a2a_app.command()

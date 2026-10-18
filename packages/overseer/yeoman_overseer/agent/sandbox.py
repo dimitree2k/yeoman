@@ -6,6 +6,8 @@ import subprocess
 import uuid
 from pathlib import Path
 
+from yeoman_shared.utils.helpers import get_yeoman_home
+
 
 class SandboxUnavailableError(RuntimeError):
     """Raised when bwrap is not available on PATH."""
@@ -34,7 +36,7 @@ class Sandbox:
         """Run cmd inside bubblewrap. Returns {stdout, stderr, exit_code}."""
         bwrap = self._find_bwrap()
 
-        yeoman_home = Path.home() / ".yeoman"
+        yeoman_home = get_yeoman_home()
         source_dir = source_root or (Path.home() / "Documents" / "yeoman")
         writable_yeoman_dirs = [
             yeoman_home / "var" / "cache",

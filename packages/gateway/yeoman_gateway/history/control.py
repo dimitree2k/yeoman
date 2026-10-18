@@ -176,7 +176,7 @@ def cli_control(operation: str, args: Mapping[str, Any]) -> dict[str, Any]:
     import typer
     from yeoman_shared.config.loader import load_config
     try:
-        response = asyncio.run(request_history_control(Path(load_config().ipc.gateway_socket_path).expanduser(), operation, args))
+        response = asyncio.run(request_history_control(load_config().ipc.resolved_gateway_socket_path, operation, args))
     except (OSError, ValueError, TimeoutError):
         raise typer.BadParameter('Gateway history control unavailable; no direct mutation attempted') from None
     if response.get('status') != 'ok':

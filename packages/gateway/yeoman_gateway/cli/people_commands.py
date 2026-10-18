@@ -156,7 +156,7 @@ def people_import_knowledge(
     if knowledge_db is None:
         from yeoman_shared.config.loader import load_config
 
-        knowledge_db = Path(load_config().knowledge.db_path)
+        knowledge_db = load_config().knowledge.resolved_db_path
     knowledge_db = knowledge_db.expanduser()
     if not knowledge_db.is_file():
         typer.echo("Knowledge database not found.", err=True)

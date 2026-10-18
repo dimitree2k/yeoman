@@ -7,7 +7,7 @@ import subprocess
 from pathlib import Path
 
 import typer
-from yeoman_shared.utils.helpers import get_operational_store_path
+from yeoman_shared.utils.helpers import get_operational_store_path, get_yeoman_home
 
 from .core import app, console
 
@@ -17,7 +17,7 @@ def _builtin_doctor_script() -> Path:
 
 
 def _workspace_doctor_script() -> Path:
-    return Path.home() / ".yeoman" / "workspace" / "skills" / "agent-doctor" / "scripts" / "doctor.sh"
+    return get_yeoman_home() / "workspace" / "skills" / "agent-doctor" / "scripts" / "doctor.sh"
 
 
 @app.command("doctor")

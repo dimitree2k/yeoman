@@ -11,8 +11,8 @@ import {
   writeFile,
 } from 'node:fs/promises';
 import type { Stats } from 'node:fs';
-import { homedir } from 'node:os';
 import { join } from 'node:path';
+import { yeomanHome } from './runtime_paths.js';
 
 import { proto } from '@whiskeysockets/baileys/WAProto/index.js';
 
@@ -29,7 +29,7 @@ export function defaultMessageReferenceDir(): string {
   // means "unset", never "the working directory".
   const override = (process.env.BRIDGE_MESSAGE_REFERENCE_DIR || '').trim();
   if (override) return override;
-  return join(homedir(), '.yeoman', 'data', 'ops', 'bridge-message-references');
+  return join(yeomanHome(), 'data', 'ops', 'bridge-message-references');
 }
 
 type StoredReference = {
