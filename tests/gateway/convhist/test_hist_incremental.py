@@ -910,8 +910,11 @@ def test_incremental_reaction_to_named_message_does_not_expand_whole_chat(engine
     engine.parity()
 
 
-def test_benchmark_statistics_and_budget_use_peak_barrier_samples(tmp_path):
+def test_benchmark_statistics_and_budget_use_peak_barrier_samples(tmp_path, monkeypatch):
+    import history_live_benchmark
     from history_live_benchmark import prepare_output, summarize
+
+    monkeypatch.setattr(history_live_benchmark, 'SHORT_CACHE', tmp_path)
 
     report = summarize(
         incremental=[1, 2, 3],
