@@ -2,6 +2,8 @@
 
 from __future__ import annotations
 
+import re
+from datetime import date, datetime, timedelta
 from typing import TYPE_CHECKING, Any, Callable
 
 from yeoman_gateway.agent.tools.base import Tool
@@ -9,6 +11,51 @@ from yeoman_gateway.agent.tools.base import Tool
 if TYPE_CHECKING:
     from yeoman_gateway.people.resolver import PeopleResolver
     from yeoman_gateway.session.manager import SessionManager
+
+
+_RELATIVE_PERIOD = re.compile(r"^(?:last_)?(\d{1,3})([hd])$")
+_PERIOD_HELP = (
+    "Error: period must be 'today', 'yesterday', a date like '2026-10-18', "
+    "or a span like '6h' or '3d'."
+)
+
+
+def period_bounds(period: str, now_ms: int) -> tuple[int, int] | None:
+    """Return the local-time window ``[start_ms, end_ms)`` that ``period`` names.
+
+    Days follow the gateway's local timezone (DST included), the same clock the
+    prompt shows as "Current local datetime", so "today" means the owner's today.
+    """
+    value = period.strip().lower()
+    now = datetime.fromtimestamp(now_ms / 1000)
+    midnight = now.replace(hour=0, minute=0, second=0, microsecond=0)
+    relative = _RELATIVE_PERIOD.match(value)
+    if value == "today":
+        start, end = midnight, now
+    elif value == "yesterday":
+        start, end = midnight - timedelta(days=1), midnight
+    elif relative:
+        amount = int(relative[1])
+        if amount < 1:
+            return None
+        span = timedelta(hours=amount) if relative[2] == "h" else timedelta(days=amount)
+        start, end = now - span, now
+    else:
+        try:
+            day = date.fromisoformat(value)
+        except ValueError:
+            return None
+        start = datetime(day.year, day.month, day.day)
+        end = start + timedelta(days=1)
+    # The window's end is exclusive; "today" and relative spans include this moment.
+    end_ms = now_ms + 1 if end is now else int(end.timestamp() * 1000)
+    return int(start.timestamp() * 1000), end_ms
+
+
+def _local_time(sent_ms: Any) -> str:
+    if not isinstance(sent_ms, int):
+        return "time unknown"
+    return datetime.fromtimestamp(sent_ms / 1000).strftime("%Y-%m-%d %H:%M")
 
 
 class RecallConversationTool(Tool):
@@ -83,7 +130,12 @@ class RecallConversationTool(Tool):
             "for questions such as 'what did Alex say?' or 'what does Alex hold?', "
             "or group/chat for a named group. These parameters search only chats "
             "whose current membership includes the owner and are refused elsewhere. "
-            "Person names can be partial; if multiple people match, use a fuller name."
+            "Person names can be partial; if multiple people match, use a fuller name. "
+            "For questions about a time span ('what happened today in the group?', "
+            "'how did people react to my messages yesterday?'), set period and leave "
+            "query out: that lists the messages of that span in order, including your "
+            "own (role assistant), with their current emoji reactions. A query searches "
+            "keywords only and misses messages that do not contain the words."
         )
 
     @property
@@ -93,8 +145,17 @@ class RecallConversationTool(Tool):
             "properties": {
                 "query": {
                     "type": "string",
-                    "description": "Search term to match against message content.",
-                    "minLength": 1,
+                    "description": (
+                        "Keywords to match against message content. Optional when "
+                        "period is set; then the whole span is listed."
+                    ),
+                },
+                "period": {
+                    "type": "string",
+                    "description": (
+                        "Optional time span in local time: 'today', 'yesterday', a date "
+                        "('2026-10-18'), or the last hours/days ('6h', '3d')."
+                    ),
                 },
                 "max_messages": {
                     "type": "integer",
@@ -115,7 +176,6 @@ class RecallConversationTool(Tool):
                     "description": "Optional exact person name; available only in the owner’s direct chat.",
                 },
             },
-            "required": ["query"],
         }
 
     async def execute(self, **kwargs: Any) -> str:
@@ -123,11 +183,19 @@ class RecallConversationTool(Tool):
             return "Error: no chat context set."
 
         query = str(kwargs.get("query") or "").strip().lower()
-        if not query:
-            return "Error: query cannot be empty."
+        period = str(kwargs.get("period") or "").strip()
+        if not query and not period:
+            return "Error: supply a query, a period, or both."
 
         max_messages = int(kwargs.get("max_messages") or 30)
         max_messages = max(1, min(50, max_messages))
+        now_ms = __import__("time").time_ns() // 1_000_000
+        bounds = period_bounds(period, now_ms) if period else None
+        if period and bounds is None:
+            return _PERIOD_HELP
+        # Query helpers take exclusive bounds on both ends.
+        after_ms = bounds[0] - 1 if bounds else None
+        before_ms = bounds[1] if bounds else None
 
         from yeoman_gateway.processing.tool_context import (
             current_tool_context,
@@ -149,7 +217,6 @@ class RecallConversationTool(Tool):
             if context is None or context.history_snapshot is None:
                 return "Owner history lookup is unavailable in this context."
             principal = context.canonical_user_id
-            now_ms = __import__("time").time_ns() // 1_000_000
             if not HistoryQueries(context.history_snapshot).is_owner_direct_chat(
                 principal, self._chat_id, now_ms, is_owner=self._is_owner, channel=self._channel
             ):
@@ -162,7 +229,6 @@ class RecallConversationTool(Tool):
             queries = HistoryQueries(snapshot)
             if person or target_ref:
                 principal = context.canonical_user_id if context is not None else ""
-                now_ms = __import__("time").time_ns() // 1_000_000
                 member_chats = queries.owner_member_chat_ids(principal, now_ms)
                 if target_ref:
                     if self._group_resolver is None:
@@ -218,22 +284,35 @@ class RecallConversationTool(Tool):
                         rows = queries.search_person(
                             chat_ids=chat_ids,
                             person=target,
-                            at_ms=now_ms,
+                            at_ms=min(now_ms, before_ms - 1) if before_ms else now_ms,
                             limit=max_messages,
                             query=query,
+                            after_ms=after_ms,
                         )
                     except PeopleUnavailable:
                         return "Person lookup is unavailable."
                 else:
-                    rows = queries.search(chat_ids=chat_ids, query=query, limit=max_messages)
+                    rows = self._read(queries, chat_ids, query, max_messages, after_ms, before_ms)
             else:
-                rows = queries.search(chat_ids=(self._chat_id,), query=query, limit=max_messages)
+                rows = self._read(
+                    queries, (self._chat_id,), query, max_messages, after_ms, before_ms
+                )
             if not rows:
-                return f"No matching messages found for '{query}'."
+                if not query:
+                    return f"No messages found for period '{period}'."
+                scope = f" in period '{period}'" if period else ""
+                return f"No matching messages found for '{query}'{scope}."
             query_warning = (
                 f"No messages matched the query terms '{query}'.\n"
-                if person and all(row["query_match_count"] == 0 for row in rows)
+                if person and query and all(row["query_match_count"] == 0 for row in rows)
                 else ""
+            )
+            from yeoman_gateway.history.conversations import current_reactions
+
+            reactions = current_reactions(
+                queries.reactions(
+                    message_ids=tuple(str(row["message_id"]) for row in rows), until_ms=now_ms
+                )
             )
             author_names = {}
             if person or target_ref:
@@ -264,8 +343,25 @@ class RecallConversationTool(Tool):
                     else:
                         name = "unverified"
                     attribution = f" [chat={row['chat_id']}; sender={name}]"
-                lines.append(f"[{row['sent_ms']}] [{role}]{attribution}: {history_text(row)}")
-            return query_warning + f"Found {len(lines)} matching message(s):\n" + "\n".join(lines)
+                emojis = reactions.get(str(row["message_id"]))
+                reacted = f" [reactions: {' '.join(emojis)}]" if emojis else ""
+                lines.append(
+                    f"[{_local_time(row['sent_ms'])}] [{role}]{attribution}: "
+                    f"{history_text(row)}{reacted}"
+                )
+            if query:
+                header = f"Found {len(lines)} matching message(s):\n"
+            else:
+                header = f"Found {len(lines)} message(s) for period '{period}', oldest first:\n"
+                if len(lines) >= max_messages:
+                    header += (
+                        f"Showing only the latest {max_messages}; earlier messages of this "
+                        "period were left out.\n"
+                    )
+            return query_warning + header + "\n".join(lines)
+
+        if not query or period:
+            return "Error: period is available only for WhatsApp history; use a query here."
 
         session_key = f"{self._channel}:{self._chat_id}"
         session = self._session_manager.get_or_create(session_key)
@@ -288,3 +384,29 @@ class RecallConversationTool(Tool):
 
         header = f"Found {len(matches)} matching message(s):\n"
         return header + "\n".join(matches)
+
+    @staticmethod
+    def _read(
+        queries: Any,
+        chat_ids: tuple[str, ...],
+        query: str,
+        limit: int,
+        after_ms: int | None,
+        before_ms: int | None,
+    ) -> list[Any]:
+        """Keyword search, or, without a query, one chat's latest messages of the period."""
+        if query:
+            return queries.search(
+                chat_ids=chat_ids, query=query, limit=limit, after_ms=after_ms, before_ms=before_ms
+            )
+        rows: list[Any] = []
+        for chat_id in chat_ids:
+            rows.extend(
+                queries.recent(
+                    chat_id=chat_id,
+                    limit=limit,
+                    after_ms=after_ms,
+                    until_ms=before_ms - 1 if before_ms is not None else None,
+                )
+            )
+        return rows
