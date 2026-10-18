@@ -137,6 +137,17 @@ HISTORIC_STATEMENT_SQL: str = (
 DIAGNOSIS_STATEMENT_SQL: str = "s.status <> 'revoked' AND s.revoked_at_ms IS NULL"
 
 
+# Migrated legacy group-notes batches are verbatim chat excerpts ("[group_notes_batch]
+# [<sender>] text [<sender>] text ..."). Reconciliation linked each whole excerpt as
+# ``speaker`` to the sender of its *last* line, while about half of the lines were said
+# by others (measured 2026-10-18: 6,380 of 14,233). Their speaker link therefore does not
+# make an excerpt that person's statement; topic search still finds them, and history
+# holds every line as a native message with its real author.
+_BATCH_EXCERPT_IDS_SQL = (
+    "SELECT n.id FROM memory2_nodes n WHERE ltrim(n.content) LIKE '[group_notes_batch]%'"
+)
+
+
 def _person_statement_clause(placeholders: str, role_sql: str) -> str:
     """Statements linked to one of the given people through an *active* role.
 
@@ -148,7 +159,8 @@ def _person_statement_clause(placeholders: str, role_sql: str) -> str:
     """
     return (
         "s.statement_id IN (SELECT kp.statement_id FROM knowledge_statement_people kp"
-        f" WHERE kp.person_id IN ({placeholders}) AND kp.status = 'active'{role_sql})"
+        f" WHERE kp.person_id IN ({placeholders}) AND kp.status = 'active'{role_sql}"
+        f" AND NOT (kp.role = 'speaker' AND kp.statement_id IN ({_BATCH_EXCERPT_IDS_SQL})))"
     )
 
 
