@@ -96,9 +96,14 @@ async def test_daily_backup_once_per_day(tmp_path, projected_history):
 async def test_start_stop_loop(tmp_path, projected_history):
     service = service_for(tmp_path, projected_history, interval_seconds=3600)
     await service.start()
-    for _ in range(100):
-        if service.db_path.exists() and count_persons(service.db_path) > 0:
-            break
+    # The file appears before its schema; under parallel load the first pass can take seconds.
+    deadline = time.monotonic() + 30
+    while time.monotonic() < deadline:
+        try:
+            if service.db_path.exists() and count_persons(service.db_path) > 0:
+                break
+        except sqlite3.OperationalError:
+            pass
         await asyncio.sleep(0.05)
     await service.stop()
     assert count_persons(service.db_path) == 8

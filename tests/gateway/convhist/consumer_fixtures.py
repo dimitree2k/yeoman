@@ -1,6 +1,7 @@
 # ruff: noqa: F811
 """Shared synthetic integrated consumer fixtures (Task 11)."""
 # Reuse Task 6's isolated v3 store, policy and deterministic extractor, not its tests.
+import asyncio
 import json
 from contextlib import contextmanager
 from datetime import UTC, datetime
@@ -28,6 +29,7 @@ from yeoman_gateway.knowledge.models import (
     TrustedCaptureContext,
     TrustedReadContext,
 )
+from yeoman_shared.config.schema import IpcConfig
 from yeoman_shared.raw_archive.records import append_line, append_owner_record, dumps
 from yeoman_shared.raw_archive.writer import RawArchive, RawEvent
 
@@ -721,7 +723,7 @@ class ConsumerCase(IntegratedCase):
         # Only the address comes from a fixture; CLI, peer check, IPC and export are real.
         with pytest.MonkeyPatch.context() as patch:
             patch.setattr(loader, 'load_config', lambda: SimpleNamespace(
-                ipc=SimpleNamespace(gateway_socket_path=str(server.path))))
+                ipc=IpcConfig(gateway_socket_path=str(server.path))))
             result = await asyncio.to_thread(CliRunner().invoke, history_app,
                 ['read', '--chat', GROUP, '--after-ms', '0', '--limit', '10', '--content'])
         assert result.exit_code == 0, (result.output, result.exception)
@@ -788,6 +790,12 @@ class ConsumerCase(IntegratedCase):
             self.archive.status = lambda: replace(original(), spooled=1)
 
     async def run_paused(self, family):
+        if family == 'admission' and self.projector._status == 'rebuilding':
+            # While history rebuilds, intake holds the ACK until history is ready (the
+            # Bridge redelivers if the Gateway stops); it neither admits nor drops.
+            with pytest.raises(TimeoutError):
+                await asyncio.wait_for(self.run_admission(), timeout=1.0)
+            return 'history_paused'
         try:
             result = await getattr(self, 'run_' + family)()
         except HistoryPaused:
