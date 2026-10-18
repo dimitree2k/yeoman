@@ -113,3 +113,23 @@ async def test_period_narrows_a_keyword_search_and_needs_query_or_period():
     assert 'gestern war Ruhe' in anytime
     assert missing == 'Error: supply a query, a period, or both.'
     assert invalid.startswith('Error: period must be')
+
+
+def test_owner_dm_keeps_its_recent_messages_apart_from_a_named_group(tmp_path):
+    from yeoman_gateway.agent.context import ContextBuilder
+
+    builder = ContextBuilder(tmp_path)
+    system = builder.build_system_prompt(
+        channel='whatsapp', chat_id='990000000001@lid', is_owner=True)
+    assert 'When the owner names a group, call `recall_conversation` with that `group`' in system
+    assert 'say so plainly instead of searching other groups' in system
+    messages = builder.build_messages(
+        history=[],
+        current_message='Was geht gerade in der Ente?',
+        current_metadata={'ambient_context_window': ['[Owner] Was weißt du über Frank?']},
+        channel='whatsapp',
+        chat_id='990000000001@lid',
+    )
+    user_text = str(messages[-1]['content'])
+    assert 'recent_messages come from this chat only' in user_text
+    assert user_text.index('this chat only') < user_text.index('recent_messages:')
