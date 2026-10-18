@@ -396,6 +396,29 @@ def _scope_of(sources: tuple[SourceRef, ...] | list[SourceRef]) -> str:
     return f"channel:{first.channel}:chat:{first.chat_id}"
 
 
+def _principal_form(channel: str, value: str) -> str:
+    """The canonical principal string for one stored identifier value.
+
+    Lexical only, and deliberately narrow: a leading ``+`` is dropped from a phone
+    token, a ``@lid`` value keeps its suffix, and a phone JID loses its ``@`` domain.
+    No prefix, substring or fuzzy matching happens here - whether two values name the
+    same human is decided by stored bindings, never by spelling.
+    """
+    token = str(value or "").strip()
+    if not token:
+        return ""
+    token = token.removeprefix("+")
+    if channel == "whatsapp":
+        if token.endswith("@lid"):
+            return f"whatsapp:{token}"
+        from yeoman_gateway.policy.identity import canonical_user_id
+
+        canonical = canonical_user_id("whatsapp", metadata={"sender_phone_jid": token})
+        if canonical:
+            return canonical
+    return f"{channel}:{token}"
+
+
 class KnowledgeService:
     """The public facade.  One instance per gateway process, owned by bootstrap."""
 
@@ -2004,15 +2027,20 @@ class KnowledgeService:
         The public twin of :meth:`admin_context_for`, needed because a profile read is a
         *read*: it must go through the one shared read contract instead of being handed
         raw rows.  Runtime surfaces (tools, CLI) ask here; Policy decides who the actor is.
+
+        The recipient set is the owner's *expanded* principal set for ``channel``: every
+        declared ``admin_principals`` entry on that channel, widened by the configured
+        owner person's other active identifier bindings.  Expansion is proof-based; an
+        identity that cannot be proven contributes only its declared form.
         """
-        actor = self._policy.admin_actor() if hasattr(self._policy, "admin_actor") else ""
+        actor, recipients = self._owner_principals(channel=channel, chat_id=chat_id)
         if not actor:
             raise KnowledgeError("unauthorized", "no owner actor is available from policy")
         return TrustedReadContext(
             principal_id=str(actor),
             channel=str(channel),
             chat_id=str(chat_id),
-            recipient_principals=frozenset({str(actor)}),
+            recipient_principals=frozenset(recipients),
             membership_revision="owner",
             policy_revision=self.policy_revision,
             purpose=purpose if purpose in READ_PURPOSES else "admin",
@@ -2020,6 +2048,70 @@ class KnowledgeService:
             is_direct=True,
             owner=True,
         )
+
+    def _owner_principals(self, *, channel: str, chat_id: str) -> tuple[str, frozenset[str]]:
+        """The owner's proven principal forms on one channel, and the actor among them.
+
+        Resolution order, and nothing beyond it:
+        1. declared ``admin_principals`` on this channel are canonicalised lexically;
+        2. each declared principal is mapped to a person through stored bindings, and
+           that person's other *active* bindings on the same channel add their forms;
+        3. the actor is chosen from the resulting set, preferring the form that matches
+           the chat's own identifier (see :func:`select_owner_principal`).
+
+        If step 2 proves nothing, the declared forms stand alone: an unproven identity
+        never widens the set.
+        """
+        from yeoman_gateway.knowledge.runtime import select_owner_principal
+
+        declared = getattr(self._policy, "admin_principals_for", None)
+        configured = declared(channel) if callable(declared) else ()
+        forms: set[str] = set()
+        person_id: str | None = None
+        for principal in configured:
+            name, _, value = str(principal).partition(":")
+            form = _principal_form(name or channel, value)
+            if not form:
+                continue
+            forms.add(form)
+            if person_id is None:
+                person_id = self._owner_person(form)
+        if person_id is not None:
+            for identifier in self._owner_identifiers(person_id, channel):
+                form = _principal_form(channel, str(identifier.value))
+                if form:
+                    forms.add(form)
+        if not forms:
+            # No admin_principals declaration: keep the historical single-principal actor.
+            fallback = self._policy.admin_actor() if hasattr(self._policy, "admin_actor") else ""
+            form = _principal_form(channel, str(fallback).partition(":")[2])
+            if form:
+                forms.add(form)
+        return select_owner_principal(forms, chat_id), frozenset(forms)
+
+    def _owner_person(self, principal: str) -> str | None:
+        """The person behind one principal, or ``None`` when no binding proves it."""
+        from yeoman_gateway.history.live import HistoryPaused
+
+        try:
+            return self.person_for_principal(principal)
+        except (HistoryPaused, KnowledgeError):
+            # An unavailable identity layer proves nothing. The caller then keeps the
+            # declared form alone instead of failing the read outright.
+            return None
+
+    def _owner_identifiers(self, person_id: str, channel: str) -> tuple[Any, ...]:
+        """Proven identifier bindings of the owner person on one channel."""
+        from yeoman_gateway.history.live import HistoryPaused
+
+        try:
+            return tuple(
+                item
+                for item in self.person_identifiers(person_id)
+                if str(item.channel) == channel
+            )
+        except (HistoryPaused, KnowledgeError):
+            return ()
 
     def search_people_with_policy(
         self,

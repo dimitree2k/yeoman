@@ -546,6 +546,11 @@ class PolicyConfig(PolicyModel):
 
     version: int = 2
     owners: dict[str, list[str]] = Field(default_factory=_default_owners)
+    # Fully qualified owner principals ("channel:value"). Declaring them replaces the
+    # owners-derived fallback used by the Knowledge admin/owner paths; an absent key
+    # stays empty so a policy file without it behaves exactly as before. Values are
+    # stored verbatim: normalization happens at the resolution site, not here.
+    admin_principals: list[str] = Field(default_factory=list)
     runtime: RuntimePolicy = Field(default_factory=RuntimePolicy)
     defaults: ChatPolicy = Field(default_factory=_default_policy_defaults)
     channels: dict[str, ChannelPolicy] = Field(default_factory=_default_channels)
@@ -553,6 +558,23 @@ class PolicyConfig(PolicyModel):
     capability_quotas: dict[str, CapabilityQuotaPolicy] = Field(
         default_factory=dict, alias="capabilityQuotas"
     )
+
+    @field_validator("admin_principals")
+    @classmethod
+    def _validate_admin_principals(cls, values: list[str]) -> list[str]:
+        """Each entry names one channel-qualified principal, exactly once."""
+        seen: set[str] = set()
+        for value in values:
+            token = str(value).strip()
+            channel, separator, rest = token.partition(":")
+            if not separator or not channel.strip() or not rest.strip():
+                raise ValueError(
+                    f"admin_principals entry must be 'channel:value': {value!r}"
+                )
+            if token in seen:
+                raise ValueError(f"duplicate admin_principals entry: {token}")
+            seen.add(token)
+        return values
 
     @field_validator("capability_quotas")
     @classmethod

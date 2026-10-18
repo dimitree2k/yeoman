@@ -1,4 +1,13 @@
-"""Owner questions widen recall only through an explicit, resolved target."""
+"""Owner scope is deterministic; request text only narrows the target set.
+
+Change 2 turned owner scope into a property of the trusted context - a verified owner
+reading a direct reply - instead of a property of the question. The two question-shaped
+tests here asserted the old text gate: a German question form switched the owner lookup
+on and, in the same step, dropped the relevance bar to "whatever is in scope". They are
+rewritten rather than deleted, because the invariant they guard still holds in the new
+shape: the same forms resolve the same identities, but no phrasing is needed to earn
+owner scope and relevance still decides what reaches the prompt.
+"""
 
 from types import SimpleNamespace
 from unittest.mock import Mock
@@ -11,6 +20,16 @@ OWNER_ENDPOINTS = (
     ("whatsapp:900000000099@lid", "4915000000099@s.whatsapp.net"),
     ("whatsapp:4915000000099", "900000000099@lid"),
     ("whatsapp:900000000099@lid", "900000000099@lid"),
+)
+
+#: Phrasings that used to decide authorization: a question mark or a German/English
+#: interrogative at the start of the message. None of them may decide it any more.
+MESSAGES = (
+    "Was weißt du über Alex' Aktien?",
+    "Alex hält Aktien",
+    "Was weis ich über Alex' Aktien",  # typo
+    "Tell me about Alex",  # not German
+    "Alex",  # no phrasing at all
 )
 
 
@@ -66,6 +85,19 @@ def recall(
     )
 
 
+def read_context(
+    responder,
+    *,
+    owner=True,
+    principal="whatsapp:4915000000099",
+    chat="4915000000099@s.whatsapp.net",
+    purpose="reply",
+):
+    return responder._knowledge_read_context(
+        channel="whatsapp", chat_id=chat, principal=principal, is_owner=owner, purpose=purpose
+    )
+
+
 def test_selected_direct_context_has_only_canonical_recipient(responder):
     context = responder._knowledge_read_context(
         channel="whatsapp",
@@ -85,61 +117,66 @@ def test_selected_direct_context_has_only_canonical_recipient(responder):
     )
 
 
-@pytest.mark.parametrize(
-    "question", ["Was weißt du über Alex' Aktien?", "Was hält Alex", "Erzähl mir von Alex"]
-)
+@pytest.mark.parametrize("message", MESSAGES)
 @pytest.mark.parametrize(("principal", "chat"), OWNER_ENDPOINTS)
-def test_explicit_german_person_question_recalls_by_identity(responder, question, principal, chat):
+def test_owner_scope_holds_for_every_message_form(responder, message, principal, chat):
+    context = read_context(responder, principal=principal, chat=chat)
+    assert responder._knowledge_owner_scope(context) is True
+
+
+@pytest.mark.parametrize("question", MESSAGES)
+@pytest.mark.parametrize(("principal", "chat"), OWNER_ENDPOINTS)
+def test_owner_question_still_recalls_by_identity_at_the_same_relevance_bar(
+    responder, question, principal, chat
+):
     assert recall(responder, question, principal=principal, chat=chat) == "Alex holds shares"
     call = responder.knowledge.recall.call_args
     assert call.args[0].person_ids == ("alex-person",)
     assert call.kwargs["context"].owner_lookup_person_ids == ("alex-person",)
-    assert call.kwargs["require_match"] is False
+    # A named target widens the candidate set; it never lowers the relevance bar.
+    assert call.kwargs["require_match"] is True
 
 
 @pytest.mark.parametrize(("principal", "chat"), OWNER_ENDPOINTS)
-def test_explicit_chat_question_targets_known_chat(responder, principal, chat):
+def test_named_chat_is_a_target_not_an_authorization_switch(responder, principal, chat):
     recall(responder, "Was wurde in Aktienrunde besprochen?", principal=principal, chat=chat)
-    assert responder.knowledge.recall.call_args.kwargs["context"].owner_lookup_chat_ids == (
-        "stocks@g.us",
-    )
+    call = responder.knowledge.recall.call_args
+    assert call.kwargs["context"].owner_lookup_chat_ids == ("stocks@g.us",)
+    assert call.kwargs["require_match"] is True
 
 
 @pytest.mark.parametrize(
     "text,owner,chat,purpose",
     [
-        ("Alex hält Aktien", True, "4915000000099@s.whatsapp.net", "reply"),
+        ("Alex hält Aktien", False, "4915000000099@s.whatsapp.net", "reply"),
         ("Was weißt du über Alex?", False, "4915000000099@s.whatsapp.net", "reply"),
         ("Was weißt du über Alex?", True, "stocks@g.us", "reply"),
         ("Was weißt du über Alex?", True, "4915000000098@s.whatsapp.net", "reply"),
         ("Was weißt du über Alex?", True, "4915000000099@s.whatsapp.net", "proactive"),
-        ("Wie wird das Wetter?", True, "4915000000099@s.whatsapp.net", "reply"),
     ],
 )
-def test_other_contexts_do_not_enable_owner_lookup(responder, text, owner, chat, purpose):
+def test_other_contexts_never_get_owner_scope(responder, text, owner, chat, purpose):
+    context = read_context(responder, owner=owner, chat=chat, purpose=purpose)
+    assert responder._knowledge_owner_scope(context) is False
     recall(responder, text, owner=owner, chat=chat, purpose=purpose)
     call = responder.knowledge.recall.call_args
-    context = call.kwargs["context"]
-    assert not context.owner_lookup_person_ids
-    assert not context.owner_lookup_chat_ids
+    assert not call.kwargs["context"].owner_lookup_person_ids
+    assert not call.kwargs["context"].owner_lookup_chat_ids
     assert call.kwargs["require_match"] is True
 
 
-def test_d2_maps_directory_id_to_legacy_subject(responder, monkeypatch):
+def test_d2_maps_directory_id_to_legacy_subject(responder):
     from yeoman_gateway.history.queries import HistoryQueries
 
     c = responder._test_case
     c.add_name(responder._test_person, "Owner Nickname", source="owner")
 
-    def poisoned(*args, **kwargs):
-        raise AssertionError("retired name resolver")
-
-    monkeypatch.setattr(HistoryQueries, "resolve_people_in_text", poisoned, raising=False)
+    assert not hasattr(HistoryQueries, "resolve_people_in_text")
     recall(responder, "Was weißt du über Owner Nickname?")
     call = responder.knowledge.recall.call_args
     assert call.args[0].person_ids == ("alex-person",)
     assert call.kwargs["context"].owner_lookup_person_ids == ("alex-person",)
-    assert call.kwargs["require_match"] is False
+    assert call.kwargs["require_match"] is True
 
 
 def test_d2_ambiguous_span_never_widens(responder):
@@ -194,13 +231,12 @@ def test_nonmember_named_chat_is_still_refused(responder):
     responder.knowledge.recall.assert_not_called()
 
 
-def test_no_question_never_scans_directory(responder, monkeypatch):
-    def poisoned(*args, **kwargs):
-        raise AssertionError("not a question")
-
-    monkeypatch.setattr("yeoman_gateway.people.resolver.resolve_people_in_text", poisoned)
+def test_statement_resolves_directory_target_without_lowering_relevance(responder):
     recall(responder, "Alex hält Aktien")
-    assert responder.knowledge.recall.call_args.kwargs["require_match"] is True
+    call = responder.knowledge.recall.call_args
+    assert call.args[0].person_ids == ("alex-person",)
+    assert call.kwargs["context"].owner_lookup_person_ids == ("alex-person",)
+    assert call.kwargs["require_match"] is True
 
 
 def test_d2_includes_exact_frozen_subject(responder):
