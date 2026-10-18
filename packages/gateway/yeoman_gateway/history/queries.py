@@ -269,10 +269,12 @@ class HistoryQueries:
 
 
     def search_person(self, *, chat_ids: tuple[str, ...], person: HistoryPerson,
-                      at_ms: int, limit: int, query: str = '') -> list[Row]:
+                      at_ms: int, limit: int, query: str = '',
+                      after_ms: int | None = None) -> list[Row]:
         """Select temporal authors/mentions in SQL; materialize only the ranked result limit."""
         _limit(limit)
         _time(at_ms)
+        _time(after_ms)
         self.snapshot.assert_current(self.snapshot.generation)
         if not chat_ids:
             return []
@@ -335,10 +337,12 @@ class HistoryQueries:
           WHERE m.channel='whatsapp' AND m.deleted=0
             AND m.chat_id IN (SELECT value FROM json_each(:chats))
             AND (m.sent_ms IS NULL OR m.sent_ms<=:at_ms)
+            AND (:after_ms IS NULL OR m.sent_ms>:after_ms)
           ORDER BY query_match_count DESC, m.sent_ms DESC, m.message_id LIMIT :limit
         """
         result = self._rows(sql, {'identifiers': identifiers, 'contacts': contacts, 'fts': fts,
-                                  'chats': json.dumps(chat_ids), 'at_ms': at_ms, 'limit': limit})
+                                  'chats': json.dumps(chat_ids), 'at_ms': at_ms, 'after_ms': after_ms,
+                                  'limit': limit})
         self.snapshot.assert_current(self.snapshot.generation)
         return result
 

@@ -132,7 +132,7 @@ def segment(
             groups.append([])
         groups[-1].append(row)
 
-    reaction_state = _current_reactions(reactions)
+    reaction_state = current_reactions(reactions)
     registry = {str(item) for item in registry_ids if str(item)}
     return [
         _conversation(
@@ -248,7 +248,7 @@ def _sender_key(row: Mapping[str, Any]) -> str:
     )
 
 
-def _current_reactions(reactions: Iterable[Mapping[str, Any]]) -> dict[str, list[str]]:
+def current_reactions(reactions: Iterable[Mapping[str, Any]]) -> dict[str, list[str]]:
     """Current emojis per target message: the latest event per message and actor wins."""
     latest: dict[tuple[str, str], tuple[tuple[int, str], Mapping[str, Any]]] = {}
     for event in reactions:

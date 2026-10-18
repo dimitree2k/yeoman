@@ -367,6 +367,8 @@ Skills with available="false" need dependencies installed first - you can try in
         cross_chat_history_guidance = (
             "\n\n## Cross-chat history (owner DM only)\n"
             "When the owner asks in a DM about messages from another group or about a specific person, use `recall_conversation` with the `group` parameter (group name, alias, or chat id) or the `person` parameter (name or nickname). This only works in owner DMs — never from groups or for non-owners.\n"
+            "For questions about a time span (\"what happened today in the group?\", \"how did people react to you?\"), call `recall_conversation` with `period` (for example `today`) and no `query`: it lists that span's messages in order, your own included, with their emoji reactions. Keyword queries miss messages that do not contain the words.\n"
+            "When the owner names a group, call `recall_conversation` with that `group` before answering, and answer only from what it returns for that group. Do not fill the answer with this DM's recent messages, what you know about people, or other groups. If that group has nothing that answers the question (for example you did not post there today), say so plainly instead of searching other groups, and offer to look elsewhere.\n"
             "When the owner asks in a DM about previously shared images, screenshots, PDFs, or documents from another group, use `media_history` with the `group` parameter. Set `extract=true` only when the owner asks what the file contains or asks you to analyze it."
             if expose_cross_chat_history
             else "\n\n## Visible Chat Boundary\n"
@@ -962,6 +964,10 @@ When a user asks you to send, create, or reply with a voice message / Sprachnach
             for index, line in enumerate(window_lines, 1):
                 lines.append(f"{index}. {line}")
         if ambient_lines:
+            lines.append(
+                "usage: recent_messages come from this chat only. They are not another "
+                "group's messages; never present them as what happened in another group."
+            )
             lines.append("recent_messages:")
             for index, line in enumerate(ambient_lines, 1):
                 lines.append(f"{index}. {line}")
