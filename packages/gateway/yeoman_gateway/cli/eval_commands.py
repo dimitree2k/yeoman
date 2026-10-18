@@ -649,7 +649,7 @@ def eval_participation_groupnotes(
             runner_for=_digest_runner_for(config, history),
             client=digest_client,
             generate=not no_judge,
-            stored=stored_note_reader(Path(config.knowledge.db_path).expanduser()),
+            stored=stored_note_reader(config.knowledge.resolved_db_path),
             use_stored=use_stored,
             seeded=read_notes(source_dir / NOTES_FILE) if source_dir is not None else None,
         )
@@ -677,6 +677,115 @@ def eval_participation_groupnotes(
         f"digest_calls={summary['notes']['digest_calls']} "
         f"agreement={summary.get('agreement_rate')} report: {directory}"
     )
+
+
+@eval_app.command("participation-outcomes")
+def eval_participation_outcomes(
+    switch: str = typer.Option(..., "--switch", help="ISO 8601 timestamp including timezone"),
+    days: int = typer.Option(14, "--days", min=1, max=365),
+    chats: list[str] | None = typer.Option(None, "--chat", help="Chat id or exact group subject; repeatable"),
+    output_dir: Path | None = typer.Option(None, "--output-dir"),
+) -> None:
+    """Compare recorded Participation outcomes in equal windows around a switch time."""
+    import json
+    import sqlite3
+    from datetime import UTC, datetime
+
+    from yeoman_shared.config.defaults import DEFAULT_PROCESSING_DB_PATH
+    from yeoman_shared.config.loader import convert_keys
+    from yeoman_shared.config.schema import Config
+    from yeoman_shared.utils.helpers import (
+        OPERATIONAL_STORE_PATHS,
+        get_yeoman_home,
+        resolve_yeoman_path,
+    )
+
+    from yeoman_gateway.evaluation.participation_context_ab import (
+        looks_like_chat_id,
+        resolve_chat,
+    )
+    from yeoman_gateway.evaluation.participation_outcomes import (
+        evaluate,
+        render_markdown,
+        write_outputs,
+    )
+    from yeoman_gateway.history.live import HistoryBoundary, HistoryPaused
+    from yeoman_gateway.history.queries import HistoryQueries
+    from yeoman_gateway.history.reader import HistoryReader
+
+    try:
+        moment = datetime.fromisoformat(switch.replace("Z", "+00:00"))
+        if moment.tzinfo is None or moment.utcoffset() is None:
+            raise ValueError("timezone required")
+    except ValueError as exc:
+        typer.echo(f"error: --switch must be an ISO timestamp with timezone: {exc}")
+        raise typer.Exit(2) from exc
+    root = get_yeoman_home()
+    data = root / "data"
+    config_path = root / "config.json"
+    config = Config.model_validate(convert_keys(json.loads(config_path.read_text(encoding="utf-8")))) \
+        if config_path.is_file() else Config()
+    history_db = data / "history" / "history.db"
+    processing_value = config.processing.db_path
+    if processing_value in {DEFAULT_PROCESSING_DB_PATH, "data/processing/processing.db"}:
+        processing_db = data / OPERATIONAL_STORE_PATHS["processing"]
+    else:
+        configured_path = resolve_yeoman_path(processing_value)
+        processing_db = configured_path if configured_path.is_absolute() else root / configured_path
+    speakups_db = data / OPERATIONAL_STORE_PATHS["speakups"]
+    if not all(path.is_file() for path in (history_db, processing_db, speakups_db)):
+        typer.echo("error: history.db, processing.db, or speakups.db not found")
+        raise typer.Exit(2)
+
+    chat_ids: set[str] | None = None
+    if chats:
+        chat_ids = set()
+        subjects: dict[str, str] = {}
+        if not all(looks_like_chat_id(value) for value in chats):
+            reader = HistoryReader(history_db)
+            try:
+                conn = sqlite3.connect(
+                    f"{history_db.resolve().as_uri()}?mode=ro", uri=True
+                )
+                try:
+                    row = conn.execute(
+                        "SELECT state_json FROM projector_state WHERE file='@runtime'"
+                    ).fetchone()
+                finally:
+                    conn.close()
+                state = json.loads(row[0]) if row else None
+                if not isinstance(state, dict) or not isinstance(state.get("generation"), int):
+                    raise HistoryPaused("reader_unavailable")
+                snapshot = reader.open_snapshot(HistoryBoundary(state["generation"], ()))
+                try:
+                    subjects = {str(row["chat_id"]): str(row["subject"])
+                                for row in HistoryQueries(snapshot).chats() if row.get("subject")}
+                finally:
+                    snapshot.close()
+            finally:
+                reader.close()
+        try:
+            chat_ids = {resolve_chat(value, subjects) for value in chats}
+        except ValueError as exc:
+            typer.echo(f"error: --chat: {exc}")
+            raise typer.Exit(2) from exc
+
+    directory = output_dir.expanduser() if output_dir is not None else (
+        root / "var" / "eval" / "participation-outcomes" /
+        datetime.now(UTC).strftime("%Y%m%dT%H%M%SZ")
+    )
+    try:
+        summary = evaluate(
+            history_db=history_db, processing_db=processing_db, speakups_db=speakups_db,
+            switch=moment, days=days,
+            lull_minutes=int(config.consciousness.lull_silence_minutes), chats=chat_ids,
+        )
+        write_outputs(directory, summary)
+    except (OSError, sqlite3.Error, ValueError, HistoryPaused) as exc:
+        typer.echo(f"error: participation outcomes: {exc}")
+        raise typer.Exit(2) from exc
+    typer.echo(render_markdown(summary))
+    typer.echo(f"partial={summary['partial']} report: {directory}")
 
 
 @eval_app.command("participation-groupnotes-review")

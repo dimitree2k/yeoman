@@ -15,6 +15,7 @@ from dataclasses import dataclass
 from pathlib import Path
 from typing import TYPE_CHECKING, Any, TypeVar
 
+from loguru import logger
 from yeoman_shared.raw_archive.records import (
     CommittedLine,
     SourceBoundary,
@@ -30,6 +31,7 @@ from yeoman_shared.utils.helpers import get_operational_data_path
 
 from .incremental import ProjectionIndex, RebuildRequired, apply_committed
 from .schema import PROJECTOR_VERSION, SCHEMA_VERSION
+from .snapshot import invalidate_snapshot, load_snapshot, save_snapshot, snapshot_path
 from .verify import verify_rebuild_candidate
 
 if TYPE_CHECKING:
@@ -161,7 +163,10 @@ class HistoryProjector:
         if runtime_state.get('admission', runtime_state.get('status')) != 'ready':
             raise RebuildRequired('interrupted rebuild requires repair')
         boundaries = tuple(SourceBoundary(*row[:4]) for row in states if row[0] != '@runtime')
-        self._index = ProjectionIndex.from_prefix(self.raw_root, boundaries)
+        self._index = load_snapshot(snapshot_path(self.db_path), self.raw_root, boundaries, self._generation)
+        rebuilt = self._index is None
+        if rebuilt:
+            self._index = ProjectionIndex.from_prefix(self.raw_root, boundaries)
         if any(item.contact_id not in self._index._reserved_ids
                for item in self._index._resolution.generated_ids):
             raise RebuildRequired('unpublished generated IDs require fenced repair')
@@ -176,6 +181,8 @@ class HistoryProjector:
         self._connection.execute("UPDATE projector_state SET state_json=? WHERE file='@runtime'", (json.dumps(state, sort_keys=True),))
         self._connection.commit()
         self._generation = state['generation']
+        if rebuilt:
+            self._save_snapshot()
 
     def notify_committed(self, line: CommittedLine) -> None:
         if Path(line.relative_path).parts[:1] not in [('whatsapp',), ('backfill',), ('derived',), ('owner',)]:
@@ -439,6 +446,7 @@ class HistoryProjector:
         self._connection.commit()
 
     def _persist_fence(self) -> None:
+        invalidate_snapshot(self.db_path)
         if self.db_path.exists():
             # A compatible installed DB retains the interrupted admission state across restart.
             with closing(sqlite3.connect(f'{self.db_path.as_uri()}?mode=ro', uri=True)) as conn:
@@ -473,6 +481,7 @@ class HistoryProjector:
         self._runtime_status('ready')
 
     def _build_replace_release(self) -> dict[str, Any]:
+        invalidate_snapshot(self.db_path)
         self.db_path.parent.mkdir(mode=0o700, parents=True, exist_ok=True)
         while True:
             with tempfile.TemporaryDirectory(prefix='.history-rebuild-', dir=self.db_path.parent) as stage:
@@ -527,6 +536,7 @@ class HistoryProjector:
                         self._runtime_status('rebuilding')
                         if self._index.target(self.raw_root) == self._index._boundaries:
                             self._release_tail()
+                            self._save_snapshot()
                             return result
                 except RebuildRequired:
                     self._runtime_status('rebuilding')
@@ -535,6 +545,25 @@ class HistoryProjector:
     async def control(self, operation: str, args: Mapping[str, Any]) -> dict[str, Any]:
         from .control import control_projector
         return await control_projector(self, operation, args)
+
+    def _save_snapshot(self) -> None:
+        # Only the sole executor, under operation ownership, may serialize committed state.
+        index, conn = self._index, self._connection
+        if index is None or conn is None or conn.in_transaction or index._staged is not None:
+            return
+        try:
+            states = conn.execute('SELECT file, lines, end_offset, sha256, projector_version, state_json FROM projector_state').fetchall()
+            boundaries = tuple(sorted((SourceBoundary(*row[:4]) for row in states
+                                       if row[0] != '@runtime'), key=lambda b: b.relative_path))
+            runtime = [json.loads(row[5]) for row in states if row[0] == '@runtime']
+            if (boundaries != index._boundaries or len(runtime) != 1
+                    or runtime[0]['generation'] != self._generation
+                    or runtime[0].get('admission', runtime[0].get('status')) != 'ready'
+                    or any(row[4] != PROJECTOR_VERSION for row in states)):
+                return
+            save_snapshot(snapshot_path(self.db_path), index, self._generation)
+        except Exception:
+            logger.warning('Projection index snapshot skipped reason=write_failed')
 
     def _close_writer(self) -> None:
         if self._connection is not None:
@@ -565,6 +594,7 @@ class HistoryProjector:
                 self._reader.close()
                 self._reader = None
             if self._executor is not None:
+                await self._submit(self._save_snapshot)
                 await self._submit(self._close_writer)
                 self._executor.shutdown(wait=True)
                 self._executor = None

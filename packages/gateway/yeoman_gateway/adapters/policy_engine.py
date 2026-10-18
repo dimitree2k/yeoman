@@ -12,7 +12,7 @@ from typing import TYPE_CHECKING, Any, Literal, override
 
 from loguru import logger
 from yeoman_shared.config.loader import load_config
-from yeoman_shared.utils.helpers import get_operational_store_path
+from yeoman_shared.utils.helpers import get_operational_store_path, get_yeoman_home
 
 from yeoman_gateway.core.admin_commands import (
     AdminCommandContext,
@@ -140,7 +140,7 @@ class EnginePolicyAdapter(PolicyPort):
         elif self._engine is not None:
             self._workspace = self._engine.workspace
         else:
-            self._workspace = (Path.home() / ".yeoman" / "workspace").resolve()
+            self._workspace = (get_yeoman_home() / "workspace").resolve()
         self._policy_admin_service: PolicyAdminService | None = None
         self._admin_router = AdminCommandRouter(
             [
@@ -185,7 +185,7 @@ class EnginePolicyAdapter(PolicyPort):
             workspace = (
                 self._engine.workspace
                 if self._engine is not None
-                else Path.home() / ".yeoman" / "workspace"
+                else get_yeoman_home() / "workspace"
             )
             apply_channels = (
                 self._engine.apply_channels

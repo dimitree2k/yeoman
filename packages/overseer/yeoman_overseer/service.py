@@ -147,9 +147,9 @@ class OverseerService:
 
         # Load .env, config, and policy
         # data_dir is ~/.yeoman/data/overseer — yeoman_home is two levels up
-        import os as _os
-        _yeoman_home_env = _os.environ.get("YEOMAN_HOME", "").strip()
-        yeoman_home = Path(_yeoman_home_env) if _yeoman_home_env else Path.home() / ".yeoman"
+        from yeoman_shared.utils.helpers import get_yeoman_home
+
+        yeoman_home = get_yeoman_home()
         self._load_dotenv()
         import json as _json
         config_path = yeoman_home / "config.json"
@@ -248,8 +248,10 @@ class OverseerService:
     def _load_dotenv() -> None:
         """Load ~/.yeoman/.env into os.environ (same logic as gateway config loader)."""
         import os
-        yeoman_home = os.environ.get("YEOMAN_HOME", "").strip()
-        base = Path(yeoman_home) if yeoman_home else Path.home() / ".yeoman"
+
+        from yeoman_shared.utils.helpers import get_yeoman_home
+
+        base = get_yeoman_home()
         env_file = base / ".env"
         if not env_file.is_file():
             return

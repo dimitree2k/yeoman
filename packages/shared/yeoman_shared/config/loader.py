@@ -36,8 +36,9 @@ def _load_dotenv() -> None:
     Existing environment variables are never overwritten — real env vars
     always take priority over the .env file.
     """
-    yeoman_home = os.environ.get("YEOMAN_HOME", "").strip()
-    base = Path(yeoman_home) if yeoman_home else Path.home() / ".yeoman"
+    from yeoman_shared.utils.helpers import get_yeoman_home
+
+    base = get_yeoman_home()
     env_file = base / ".env"
     if not env_file.exists():
         return
@@ -128,9 +129,11 @@ def load_config(config_path: Path | None = None) -> Config:
             with open(path) as f:
                 raw = json.load(f)
 
+            original = convert_keys(raw)
             migrated_raw, _changed = _migrate_config_with_change(raw)
             validated = Config.model_validate(convert_keys(migrated_raw))
-            persisted = convert_to_camel(validated.model_dump())
+            _restore_path_default_provenance(validated, original)
+            persisted = _config_payload(validated)
             if raw != persisted:
                 _backup_config(path)
                 _atomic_write_config(path, validated)
@@ -162,6 +165,35 @@ def _migrate_config(data: dict[str, Any]) -> dict[str, Any]:
     """Backward-compatible migration helper returning migrated payload only."""
     migrated, _ = _migrate_config_with_change(data)
     return migrated
+
+
+def _restore_path_default_provenance(config: Config, original: Any) -> None:
+    """Undo migration's inserted path defaults so runtime can distinguish omissions."""
+    root = original if isinstance(original, dict) else {}
+    channels = root.get("channels") if isinstance(root.get("channels"), dict) else {}
+    whatsapp = channels.get("whatsapp") if isinstance(channels.get("whatsapp"), dict) else {}
+    agents = root.get("agents") if isinstance(root.get("agents"), dict) else {}
+    agent_defaults = agents.get("defaults") if isinstance(agents.get("defaults"), dict) else {}
+    memory = root.get("memory") if isinstance(root.get("memory"), dict) else {}
+    if "db_path" not in memory:
+        legacy_memory = root.get("memory2")
+        if isinstance(legacy_memory, dict) and "db_path" in legacy_memory:
+            memory = {**memory, "db_path": legacy_memory["db_path"]}
+    knowledge = root.get("knowledge") if isinstance(root.get("knowledge"), dict) else {}
+    ipc = root.get("ipc") if isinstance(root.get("ipc"), dict) else {}
+
+    for model, source, fields in (
+        (config.channels.whatsapp, whatsapp, ("auth_dir",)),
+        (config.channels.whatsapp.media, whatsapp.get("media", {}), ("incoming_dir", "outgoing_dir")),
+        (config.agents.defaults, agent_defaults, ("workspace",)),
+        (config.memory, memory, ("db_path",)),
+        (config.memory.wal, memory.get("wal", {}), ("state_dir",)),
+        (config.knowledge, knowledge, ("db_path", "legacy_contacts_paths", "legacy_memory_paths")),
+        (config.ipc, ipc, ("gateway_socket_path", "overseer_socket_path")),
+    ):
+        for field in fields:
+            if not isinstance(source, dict) or field not in source:
+                model.__pydantic_fields_set__.discard(field)
 
 
 def _migrate_config_with_change(data: dict[str, Any]) -> tuple[dict[str, Any], bool]:
@@ -296,7 +328,7 @@ def _backup_config(path: Path) -> None:
 def _atomic_write_config(path: Path, config: Config) -> None:
     """Atomically write config as camelCase JSON with secure permissions."""
     path.parent.mkdir(parents=True, exist_ok=True)
-    data = convert_to_camel(config.model_dump())
+    data = _config_payload(config)
     fd, tmp_raw = tempfile.mkstemp(prefix=f".{path.name}.tmp-", dir=str(path.parent), text=True)
     tmp_path = Path(tmp_raw)
     try:
@@ -321,6 +353,33 @@ def _atomic_write_config(path: Path, config: Config) -> None:
         except OSError:
             pass
         raise
+
+
+def _config_payload(config: Config) -> dict[str, Any]:
+    """Omit unset home paths so serialized defaults retain their provenance."""
+    data = config.model_dump()
+    path_fields = (
+        (config.channels.whatsapp, data["channels"]["whatsapp"], ("auth_dir",)),
+        (
+            config.channels.whatsapp.media,
+            data["channels"]["whatsapp"]["media"],
+            ("incoming_dir", "outgoing_dir"),
+        ),
+        (config.agents.defaults, data["agents"]["defaults"], ("workspace",)),
+        (config.memory, data["memory"], ("db_path",)),
+        (config.memory.wal, data["memory"]["wal"], ("state_dir",)),
+        (
+            config.knowledge,
+            data["knowledge"],
+            ("db_path", "legacy_contacts_paths", "legacy_memory_paths"),
+        ),
+        (config.ipc, data["ipc"], ("gateway_socket_path", "overseer_socket_path")),
+    )
+    for model, payload, fields in path_fields:
+        for field in fields:
+            if field not in model.model_fields_set:
+                payload.pop(field, None)
+    return convert_to_camel(data)
 
 
 def convert_keys(data: Any) -> Any:

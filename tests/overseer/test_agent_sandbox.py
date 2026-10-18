@@ -82,8 +82,10 @@ def test_cleanup_paths_are_writable_inside_sandbox(tmp_path):
         Sandbox().run(["true"])
 
     args = list(captured_args)
-    cache_path = str(Path.home() / ".yeoman" / "var" / "cache")
-    incoming_path = str(Path.home() / ".yeoman" / "var" / "media" / "incoming")
+    from yeoman_shared.utils.helpers import get_yeoman_home
+
+    cache_path = str(get_yeoman_home() / "var" / "cache")
+    incoming_path = str(get_yeoman_home() / "var" / "media" / "incoming")
 
     assert "--bind-try" in args
     assert cache_path in args

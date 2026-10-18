@@ -9,6 +9,7 @@ from test_hist_incremental import PN, T0
 from test_hist_live import oracle_parity, projector_fixture, start_ready
 from yeoman_gateway.history.attestations import make
 from yeoman_gateway.ipc.gateway_socket import GatewaySocket
+from yeoman_shared.config.schema import IpcConfig
 
 
 def package(tmp_path, min_bytes=0):
@@ -296,7 +297,7 @@ async def test_cli_active_attest_routes_one_locator_over_real_socket(tmp_path, m
     from yeoman_shared.raw_archive import paths
     async with server_fixture(tmp_path) as (root, db, p, server):
         monkeypatch.setattr(paths, 'raw_root', lambda: root)
-        monkeypatch.setattr(loader, 'load_config', lambda: SimpleNamespace(ipc=SimpleNamespace(gateway_socket_path=str(server.path))))
+        monkeypatch.setattr(loader, 'load_config', lambda: SimpleNamespace(ipc=IpcConfig(gateway_socket_path=str(server.path))))
         path, _, _ = package(tmp_path, 65537)
         generation = p.health()['generation']
         result = await asyncio.to_thread(CliRunner().invoke, app, ['history', 'attest', '--file', str(path), '--confirm'])

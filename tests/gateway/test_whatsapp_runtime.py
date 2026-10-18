@@ -70,6 +70,7 @@ def test_start_bridge_replaces_blank_reference_dir_with_yeoman_home_default(
         bridge_url="ws://127.0.0.1:3001",
         bridge_host="127.0.0.1",
         auth_dir=tmp_path / "auth",
+        resolved_auth_dir=tmp_path / "auth",
         read_receipts=False,
         accept_from_me=False,
         media=SimpleNamespace(
@@ -125,6 +126,7 @@ def test_channels_login_replaces_blank_reference_dir_with_yeoman_home_default(
         resolved_bridge_port=3001,
         bridge_host="127.0.0.1",
         auth_dir=tmp_path / "auth",
+        resolved_auth_dir=tmp_path / "auth",
     )
     config = SimpleNamespace(channels=SimpleNamespace(whatsapp=whatsapp))
     monkeypatch.setattr("yeoman_shared.config.loader.load_config", lambda: config)

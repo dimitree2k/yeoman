@@ -11,8 +11,8 @@ import {
   lstat,
 } from 'node:fs/promises';
 import type { Stats } from 'node:fs';
-import { homedir } from 'node:os';
 import { join } from 'node:path';
+import { yeomanHome } from './runtime_paths.js';
 
 import {
   MAX_BRIDGE_FRAME_BYTES,
@@ -76,7 +76,7 @@ const VOLATILE_PROVIDER_FIELDS = new Set([
 ]);
 
 export function defaultBridgeOutboxDir(): string {
-  return join(homedir(), '.yeoman', 'data', 'bridge', 'whatsapp-outbox');
+  return join(yeomanHome(), 'data', 'bridge', 'whatsapp-outbox');
 }
 
 export function isReplayableEventType(type: string): type is ReplayableEventType {

@@ -2329,7 +2329,7 @@ def _validate_history_readiness(config: "Config") -> None:
         raise HistoryPaused("writer_retirement_replacements_required")
     if config.knowledge.enabled is not True:
         raise HistoryPaused("writer_retirement_knowledge_required")
-    path = Path(config.knowledge.db_path).expanduser().resolve()
+    path = config.knowledge.resolved_db_path.resolve()
     connection = None
     try:
         connection = sqlite3.connect(path.as_uri() + "?mode=ro", uri=True)
@@ -2478,16 +2478,16 @@ def build_gateway_runtime(
     knowledge_sources = RuntimeKnowledgeSources(processing_store=processing_store)
     try:
         knowledge_service = open_knowledge_store(
-            Path(config.knowledge.db_path).expanduser(),
+            config.knowledge.resolved_db_path,
             workspace_id=workspace_id_for(workspace),
             source_authority=knowledge_sources,
             policy_authority=knowledge_policy,
             people=people,
             legacy_sources=tuple(
-                Path(item).expanduser()
+                item
                 for item in (
-                    list(config.knowledge.legacy_memory_paths)
-                    + list(config.knowledge.legacy_contacts_paths)
+                    config.knowledge.resolved_legacy_memory_paths
+                    + config.knowledge.resolved_legacy_contacts_paths
                 )
             ),
         )
@@ -3462,7 +3462,7 @@ def build_gateway_runtime(
     from yeoman_gateway.ipc.gateway_socket import GatewaySocket
 
     ipc_config = config.ipc
-    socket_path = Path(ipc_config.gateway_socket_path).expanduser()
+    socket_path = ipc_config.resolved_gateway_socket_path
 
     async def ipc_send_message(channel: str, chat_id: str, content: str) -> dict:
         if service_effects is not None:

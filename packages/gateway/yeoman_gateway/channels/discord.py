@@ -2,13 +2,13 @@
 
 import asyncio
 import json
-from pathlib import Path
 from typing import Any
 
 import httpx
 import websockets
 from loguru import logger
 from yeoman_shared.config.schema import DiscordConfig
+from yeoman_shared.utils.helpers import get_data_path
 
 from yeoman_gateway.bus.events import OutboundMessage
 from yeoman_gateway.bus.queue import MessageBus
@@ -198,7 +198,7 @@ class DiscordChannel(BaseChannel):
 
         content_parts = [content] if content else []
         media_paths: list[str] = []
-        media_dir = Path.home() / ".yeoman" / "media"
+        media_dir = get_data_path() / "media"
 
         for attachment in payload.get("attachments") or []:
             url = attachment.get("url")

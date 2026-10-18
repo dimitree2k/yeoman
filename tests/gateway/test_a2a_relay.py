@@ -1046,7 +1046,9 @@ def test_config_accepts_legacy_service_environment_names_needed_for_cutover(
     assert config.bind_host == "100.64.1.2"
     assert config.allowed_peer_ips == frozenset({"100.64.1.3"})
     assert config.bearer_secret == "legacy-secret"
-    assert config.socket_path == Path("~/.yeoman/run/gateway.sock").expanduser()
+    from yeoman_shared.utils.helpers import get_yeoman_home
+
+    assert config.socket_path == get_yeoman_home() / "run" / "gateway.sock"
     assert config.state_path == get_operational_store_path("a2a")
     assert config.public_url == "http://moltypython.example.ts.net:9900"
 

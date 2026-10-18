@@ -27,6 +27,7 @@ from yeoman_shared.raw_archive.writer import (
     append_async,
     append_with_media_async,
 )
+from yeoman_shared.utils.helpers import get_data_path
 
 from yeoman_gateway.bus.events import OutboundMessage
 from yeoman_gateway.bus.queue import MessageBus
@@ -519,9 +520,8 @@ class TelegramChannel(BaseChannel):
                 ext = self._get_extension(media_type, getattr(media_file, "mime_type", None))
 
                 # Save to workspace/media/
-                from pathlib import Path
 
-                media_dir = Path.home() / ".yeoman" / "media"
+                media_dir = get_data_path() / "media"
                 media_dir.mkdir(parents=True, exist_ok=True)
 
                 file_path = media_dir / f"{media_file.file_id[:16]}{ext}"

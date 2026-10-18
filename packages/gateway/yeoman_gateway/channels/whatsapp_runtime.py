@@ -403,7 +403,7 @@ class WhatsAppRuntimeManager:
             env["BRIDGE_PORT"] = str(resolved_port)
             env["BRIDGE_HOST"] = wa.bridge_host
             env["BRIDGE_TOKEN"] = token
-            env["AUTH_DIR"] = str(Path(wa.auth_dir).expanduser())
+            env["AUTH_DIR"] = str(wa.resolved_auth_dir)
             set_bridge_message_reference_dir(env)
             env["WHATSAPP_READ_RECEIPTS"] = "1" if wa.read_receipts else "0"
             env["WHATSAPP_ACCEPT_FROM_ME"] = "1" if wa.accept_from_me else "0"
@@ -411,8 +411,8 @@ class WhatsAppRuntimeManager:
             env["WHATSAPP_PERSIST_INBOUND_DOCUMENTS"] = (
                 "1" if wa.media.persist_incoming_documents else "0"
             )
-            incoming_media = wa.media.incoming_path.expanduser().resolve()
-            outgoing_media = wa.media.outgoing_path.expanduser().resolve()
+            incoming_media = wa.media.incoming_path.resolve()
+            outgoing_media = wa.media.outgoing_path.resolve()
             media_root = Path(
                 os.path.commonpath([str(incoming_media), str(outgoing_media)])
             )

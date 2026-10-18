@@ -120,11 +120,15 @@ class WhatsAppMediaConfig(BaseModel):
 
     @property
     def incoming_path(self) -> Path:
-        return Path(self.incoming_dir).expanduser()
+        from yeoman_shared.utils.helpers import resolve_config_path
+
+        return resolve_config_path(self, "incoming_dir")
 
     @property
     def outgoing_path(self) -> Path:
-        return Path(self.outgoing_dir).expanduser()
+        from yeoman_shared.utils.helpers import resolve_config_path
+
+        return resolve_config_path(self, "outgoing_dir")
 
 
 class WhatsAppConfig(BaseModel):
@@ -159,6 +163,12 @@ class WhatsAppConfig(BaseModel):
     session_history_limit: int = int(DEFAULT_WHATSAPP_REPLY_CONTEXT["session_history_limit"])
     session_history_limit_group: int = int(DEFAULT_WHATSAPP_REPLY_CONTEXT["session_history_limit_group"])
     media: WhatsAppMediaConfig = Field(default_factory=WhatsAppMediaConfig)
+
+    @property
+    def resolved_auth_dir(self) -> Path:
+        from yeoman_shared.utils.helpers import resolve_config_path
+
+        return resolve_config_path(self, "auth_dir")
 
     @property
     def resolved_bridge_port(self) -> int:
@@ -237,6 +247,12 @@ class AgentDefaults(BaseModel):
     max_tool_iterations: int = 20
     timing_logs_enabled: bool = False
     subagent_model: str | None = Field(default=None, alias="subagentModel")
+
+    @property
+    def resolved_workspace(self) -> Path:
+        from yeoman_shared.utils.helpers import resolve_config_path
+
+        return resolve_config_path(self, "workspace")
 
 
 class AgentsConfig(BaseModel):
@@ -442,6 +458,30 @@ class KnowledgeConfig(BaseModel):
     capture_max_waiting: int = 64
     capture_poll_seconds: float = 5.0
 
+    @property
+    def resolved_db_path(self) -> Path:
+        from yeoman_shared.utils.helpers import resolve_config_path
+
+        return resolve_config_path(self, "db_path")
+
+    @property
+    def resolved_legacy_contacts_paths(self) -> list[Path]:
+        from yeoman_shared.utils.helpers import resolve_yeoman_path
+
+        return [
+            resolve_yeoman_path(path, is_default="legacy_contacts_paths" not in self.model_fields_set)
+            for path in self.legacy_contacts_paths
+        ]
+
+    @property
+    def resolved_legacy_memory_paths(self) -> list[Path]:
+        from yeoman_shared.utils.helpers import resolve_yeoman_path
+
+        return [
+            resolve_yeoman_path(path, is_default="legacy_memory_paths" not in self.model_fields_set)
+            for path in self.legacy_memory_paths
+        ]
+
 
 class MemoryConfig(BaseModel):
     """Single active semantic memory system configuration."""
@@ -458,6 +498,12 @@ class MemoryConfig(BaseModel):
     scoring: MemoryScoringConfig = Field(default_factory=MemoryScoringConfig)
     acl: MemoryAclConfig = Field(default_factory=MemoryAclConfig)
     wal: MemoryWalConfig = Field(default_factory=MemoryWalConfig)
+
+    @property
+    def resolved_db_path(self) -> Path:
+        from yeoman_shared.utils.helpers import resolve_config_path
+
+        return resolve_config_path(self, "db_path")
 
 
 class ExecIsolationConfig(BaseModel):
@@ -541,6 +587,18 @@ class IpcConfig(BaseModel):
     gateway_socket_path: str = "~/.yeoman/run/gateway.sock"
     overseer_socket_path: str = "~/.yeoman/run/overseer.sock"
     command_rate_limit: int = 10  # max commands per second
+
+    @property
+    def resolved_gateway_socket_path(self) -> Path:
+        from yeoman_shared.utils.helpers import resolve_config_path
+
+        return resolve_config_path(self, "gateway_socket_path")
+
+    @property
+    def resolved_overseer_socket_path(self) -> Path:
+        from yeoman_shared.utils.helpers import resolve_config_path
+
+        return resolve_config_path(self, "overseer_socket_path")
 
 
 class WebhookSourceConfig(BaseModel):
@@ -1098,7 +1156,7 @@ class Config(BaseSettings):
         """Get expanded workspace path."""
         from yeoman_shared.utils.helpers import get_data_path
 
-        candidate = Path(self.agents.defaults.workspace).expanduser()
+        candidate = self.agents.defaults.resolved_workspace
         return candidate if candidate.is_absolute() else get_data_path() / candidate
 
     def get_provider(

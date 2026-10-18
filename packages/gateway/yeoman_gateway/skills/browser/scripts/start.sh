@@ -3,8 +3,9 @@
 
 set -euo pipefail
 
-PINCHTAB_BIN="$HOME/.yeoman/pinchtab/bin/pinchtab"
-DATA_DIR="$HOME/.yeoman/pinchtab/data"
+YEOMAN_HOME="${YEOMAN_HOME:-$HOME/.yeoman}"
+PINCHTAB_BIN="$YEOMAN_HOME/pinchtab/bin/pinchtab"
+DATA_DIR="$YEOMAN_HOME/pinchtab/data"
 SKILL_DIR="$(cd "$(dirname "$0")/.." && pwd)"
 TOKEN_FILE="$SKILL_DIR/state/bridge_token.txt"
 PORT="${BRIDGE_PORT:-9867}"

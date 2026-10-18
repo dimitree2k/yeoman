@@ -1046,10 +1046,14 @@ def capture_status(    target: Path = typer.Option(
     No statement content is printed, and nothing is written: the command opens the store
     read-only and reports what the promotion worker left behind.
     """
+    from yeoman_shared.utils.helpers import resolve_yeoman_path
+
     from yeoman_gateway.knowledge._statements import capture_status as read_capture_status
     from yeoman_gateway.knowledge._store import KnowledgeStore
 
-    path = target.expanduser()
+    path = resolve_yeoman_path(
+        target, is_default=target == Path("~/.yeoman/data/knowledge/knowledge.db")
+    )
     if not path.exists():
         _fail("source_error", f"knowledge database not found: {path}")
     store = KnowledgeStore(path, create=False)
@@ -1095,7 +1099,7 @@ def _open_capture_runtime() -> tuple[Any, Any, Any]:
     processing = ProcessingStore(_processing_store_path(config))
     sources = RuntimeKnowledgeSources(processing_store=processing)
     knowledge = open_knowledge_store(
-        Path(config.knowledge.db_path).expanduser(),
+        config.knowledge.resolved_db_path,
         workspace_id=workspace_id_for(config.workspace_path),
         source_authority=sources,
         policy_authority=RuntimeKnowledgePolicy(engine=None, policy_revision=1),
@@ -1382,9 +1386,13 @@ def embeddings_status(
     import sqlite3
     from contextlib import closing
 
+    from yeoman_shared.utils.helpers import resolve_yeoman_path
+
     from yeoman_gateway.knowledge._embeddings import embedding_status
 
-    path = target.expanduser().resolve()
+    path = resolve_yeoman_path(
+        target, is_default=target == Path("~/.yeoman/data/knowledge/knowledge.db")
+    ).resolve()
     try:
         with closing(sqlite3.connect(path.as_uri() + "?mode=ro", uri=True)) as conn:
             conn.execute("BEGIN")

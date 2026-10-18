@@ -9,6 +9,7 @@ from typing import Any
 
 import httpx
 from loguru import logger
+from yeoman_shared.utils.helpers import get_logs_path
 
 from yeoman_gateway.agent.tools.base import Tool
 
@@ -73,7 +74,7 @@ async def _try_autostart(base: str, headers: dict[str, str]) -> bool:
             return await _wait_for_health(base, headers, 1.0)
         _autostart_last_attempt = now
 
-        log_dir = Path.home() / ".yeoman" / "var" / "logs"
+        log_dir = get_logs_path()
         log_dir.mkdir(parents=True, exist_ok=True)
         log_path = log_dir / "pinchtab.log"
         logger.info("pinchtab autostart: launching {}", _START_SCRIPT)
@@ -197,7 +198,7 @@ class BrowseTool(Tool):
                     continue
                 return (
                     "Error: pinchtab is not reachable and autostart did not succeed. "
-                    f"Check {Path.home()}/.yeoman/var/logs/pinchtab.log for details, "
+                    f"Check {get_logs_path()}/pinchtab.log for details, "
                     f"or run: bash {_START_SCRIPT} &"
                 )
             except httpx.TimeoutException:

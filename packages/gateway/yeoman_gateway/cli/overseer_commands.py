@@ -11,7 +11,12 @@ import signal
 from pathlib import Path
 
 import typer
-from yeoman_shared.utils.helpers import get_logs_path, get_operational_store_path, get_run_path
+from yeoman_shared.utils.helpers import (
+    get_logs_path,
+    get_operational_store_path,
+    get_run_path,
+    get_yeoman_home,
+)
 
 from yeoman_gateway.cli.core import app
 
@@ -223,7 +228,6 @@ def trigger(
 
     async def _run() -> None:
         import json as _json
-        import os as _os
 
         from yeoman_overseer.agent.budget import BudgetTracker
         from yeoman_overseer.agent.loop import AgentLoop, BudgetExhaustedError
@@ -234,8 +238,7 @@ def trigger(
         from yeoman_overseer.service import OverseerConfig, OverseerService
         from yeoman_overseer.state import OverseerState
 
-        _yh = _os.environ.get("YEOMAN_HOME", "").strip()
-        yeoman_home = Path(_yh) if _yh else Path.home() / ".yeoman"
+        yeoman_home = get_yeoman_home()
         data_dir = _data_dir()
 
         # Load .env
@@ -263,7 +266,11 @@ def trigger(
             comms=comms,
             data_dir=data_dir,
             sandbox=sandbox,
-            memory_db=yeoman_home / "data" / "memory" / "memory.db",
+            memory_db=Path(
+                raw_config.get("memory", {}).get("dbPath")
+                or raw_config.get("memory", {}).get("db_path")
+                or yeoman_home / "data" / "memory" / "memory.db"
+            ).expanduser(),
             git=git,
             runbook_name=runbook.meta.name,
             domain=runbook.meta.domain,
