@@ -12,7 +12,7 @@ more than the shape of the result:
 
 The builder assembles a bounded, JSON-compatible dict and reports what it truncated.
 It performs no network research or long-term personal/contact memory recall.
-Knowledge retrieval is disabled in this builder.
+Knowledge comes only through the injected selector and its verified readers.
 """
 
 from __future__ import annotations
@@ -31,6 +31,10 @@ from yeoman_gateway.policy.engine import ParticipationSnapshot
 from yeoman_gateway.processing.participation import (
     ParticipationDecisionError,
     ParticipationOpportunity,
+)
+from yeoman_gateway.processing.participation_knowledge import (
+    ParticipationKnowledgeReaders,
+    readers_from_single,
 )
 
 #: Keys a stored message row may use for its identity.
@@ -128,6 +132,9 @@ class ParticipationContextBuilder:
         source_authorizer: Callable[[Mapping[str, Any]], bool] | None = None,
         thread_lookup: Callable[[str], object] | None = None,
         group_notes: Any | None = None,
+        knowledge_selector: Any | None = None,
+        knowledge_context_supplier: Callable[[ParticipationOpportunity, Mapping[str, Any]], Any]
+        | None = None,
     ) -> None:
         # Kept on the constructor for old object construction; decision inputs are the
         # sole source of trusted policy values during ``build``.
@@ -139,6 +146,10 @@ class ParticipationContextBuilder:
         self._thread_lookup = thread_lookup
         # Weekly group note reader (``GroupNotesReader``); same chat only, by mode.
         self._group_notes = group_notes
+        # Same-chat Knowledge for trigger authors proven on the current roster; both or
+        # neither, and absent means the judge and writer see no Knowledge at all.
+        self._knowledge_selector = knowledge_selector
+        self._knowledge_context_supplier = knowledge_context_supplier
         self._fallback_logged_ms: dict[tuple[str, str], int] = {}
 
     @property
@@ -365,6 +376,48 @@ class ParticipationContextBuilder:
         context["knowledge_selection_status"] = "disabled"
         context["knowledge_selected_count"] = 0
         context["knowledge_rendered_chars"] = 0
+        if self._knowledge_selector is not None and self._knowledge_context_supplier is not None:
+            try:
+                trusted = self._knowledge_context_supplier(opportunity, context)
+                readers = _knowledge_readers(trusted)
+                if isinstance(trusted, str):
+                    context["knowledge_selection_status"] = trusted
+                elif readers is not None:
+                    query = _knowledge_query(context, current_source_ids)
+                    selection = self._knowledge_selector.select_for_readers(
+                        query=query,
+                        readers=readers,
+                    )
+                    status = str(getattr(selection, "reason", "error"))
+                    context["knowledge_selection_status"] = (
+                        "no_hit" if status == "empty" and query else
+                        "empty" if status == "empty" else status
+                    )
+                    if selection.text:
+                        facts = selection.facts
+                        context["knowledge_selected_count"] = (
+                            len(selection.statements.statement_ids)
+                            + len(facts.used_source_refs)
+                        )
+                        context["knowledge_rendered_chars"] = len(selection.text)
+                    if selection.text:
+                        context["selected_knowledge_text"] = selection.text
+                    # Private controller handles: renderers consume only the text above.
+                    context["_knowledge_selection"] = selection
+                    context["_knowledge_readers"] = readers
+                    # Encode the bounded, versioned evidence here, where the real
+                    # selection exists, so the approval path can persist exactly what
+                    # influenced the draft. Undecodable evidence is simply absent.
+                    context["_knowledge_evidence"] = _encoded_knowledge_evidence(
+                        selection
+                    )
+                else:
+                    context["knowledge_selection_status"] = "denied"
+            except HistoryPaused:
+                raise
+            except Exception:
+                # Retrieval outages preserve the existing recent-chat-only path.
+                context["knowledge_selection_status"] = "error"
         context["knowledge_selection_elapsed_ms"] = int(
             (time.monotonic() - selection_started) * 1000
         )
@@ -748,6 +801,88 @@ def _now_ms() -> int:
     import time
 
     return int(time.time() * 1000)
+
+
+def _encoded_knowledge_evidence(selection: object) -> dict[str, Any] | None:
+    """Encode a selection as durable evidence, or ``None`` if it cannot be encoded.
+
+    A selection produced by anything other than the real selector (a test double, for
+    instance) has no encodable identity, so it yields no evidence rather than a
+    half-written snapshot.
+    """
+    from yeoman_gateway.processing.participation_knowledge import (
+        ParticipationKnowledgeEvidenceError,
+        selection_to_mapping,
+    )
+
+    try:
+        return selection_to_mapping(selection)
+    except ParticipationKnowledgeEvidenceError:
+        return None
+    except (AttributeError, KeyError, TypeError, ValueError):
+        return None
+
+
+def _knowledge_readers(trusted: object) -> ParticipationKnowledgeReaders | None:
+    """Accept the verified reader bundle, and a bare single reader pair for tests."""
+    if isinstance(trusted, ParticipationKnowledgeReaders):
+        return trusted
+    if isinstance(trusted, tuple) and len(trusted) == 2:
+        return readers_from_single(trusted[0], trusted[1])
+    return None
+
+
+def _bounded_query_prefix(entry: str, budget: int) -> str:
+    """Return at most ``budget`` characters from the start of ``entry``.
+
+    A trigger that cannot fit whole still has to contribute something: dropping it
+    would leave an otherwise authorized long trigger with no query at all. The whole
+    ``budget`` is always spent. The only shaping is dropping a trailing partial word:
+    when the prefix ends inside a word whose completed length also fits the budget,
+    that split word is removed rather than counted as a term, because a lexically
+    meaningful boundary is worth more to the selector than a truncated token.
+    """
+    prefix = entry[:budget]
+    clipped = prefix.rstrip(" ")
+    tail_start = clipped.rfind(" ") + 1
+    if tail_start > 0 and len(clipped) - tail_start <= budget:
+        return clipped
+    return prefix
+
+
+def _knowledge_query(context: Mapping[str, Any], source_ids: tuple[str, ...]) -> str:
+    rows = context.get("messages")
+    if not isinstance(rows, list):
+        return ""
+    source_set = set(source_ids)
+    required: list[str] = []
+    nearby: list[str] = []
+    for row in rows:
+        if not isinstance(row, Mapping):
+            continue
+        text = str(row.get("text") or row.get("media_summary") or "").strip()
+        if not text:
+            continue
+        message_id = _row_id(row)
+        normalized = " ".join(text.split())
+        if message_id in source_set:
+            required.append(normalized)
+        else:
+            nearby.append(normalized)
+    result: list[str] = []
+    used = 0
+    for entry in (*required, *nearby[-3:]):
+        separator = 1 if result else 0
+        budget = 600 - used - separator
+        if budget <= 0:
+            break
+        if len(entry) > budget:
+            entry = _bounded_query_prefix(entry, budget)
+            if not entry:
+                break
+        result.append(entry)
+        used += separator + len(entry)
+    return " ".join(result)
 
 
 __all__ = [

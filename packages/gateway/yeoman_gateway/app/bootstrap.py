@@ -1020,12 +1020,17 @@ def _build_participation_runtime(
         )
 
     group_notes, group_notes_shadow = build_group_notes_read_path(config, knowledge=knowledge)
+    knowledge_selector, knowledge_context_supplier, revalidate_knowledge = (
+        build_participation_knowledge(participation, knowledge=knowledge)
+    )
     context_builder = ParticipationContextBuilder(
         policy=policy_engine,
         anchors=anchors,
         source_authorizer=_source_authorized,
         thread_lookup=getattr(processing_store, "thread_for_message", None),
         group_notes=group_notes,
+        knowledge_selector=knowledge_selector,
+        knowledge_context_supplier=knowledge_context_supplier,
     )
 
     def _continuation_candidate(opportunity: object | None) -> bool:
@@ -1303,6 +1308,7 @@ def _build_participation_runtime(
         history_projector=getattr(responder, "_history_projector", None),
         history_knowledge=knowledge,
         group_notes_shadow=group_notes_shadow,
+        revalidate_knowledge=revalidate_knowledge,
     )
 
     async def _handle(opportunity: object) -> None:
@@ -1715,6 +1721,37 @@ def _build_participation_receipt_projection(
     return reconciler, _project
 
 
+def build_participation_knowledge(
+    participation: object, *, knowledge: object | None
+) -> tuple[object | None, Callable[..., Any] | None, Callable[..., Any] | None]:
+    """Selector, reader supplier and revalidation for same-chat group Knowledge.
+
+    Built only when ``knowledgeEnabled`` is on and a Knowledge store exists; otherwise
+    all three are ``None`` and the judge and writer see no Knowledge. Readers are the
+    trigger authors proven on the group's current history roster.
+    """
+    if knowledge is None or not bool(getattr(participation, "knowledge_enabled", False)):
+        return None, None, None
+    from yeoman_gateway.processing.participation_knowledge import (
+        ParticipationKnowledgeReaders,
+        ParticipationKnowledgeSelector,
+        history_participation_readers,
+    )
+
+    selector = ParticipationKnowledgeSelector(knowledge=knowledge)
+
+    def _readers(opportunity: object, context: Mapping[str, object]) -> Any:
+        return history_participation_readers(opportunity, context, knowledge=knowledge)
+
+    def _revalidate(opportunity: object, context: Mapping[str, object], selection: object) -> Any:
+        trusted = _readers(opportunity, context)
+        if not isinstance(trusted, ParticipationKnowledgeReaders):
+            raise RuntimeError("current knowledge authority unavailable")
+        return selector.revalidate_for_readers(selection, readers=trusted)  # type: ignore[arg-type]
+
+    return selector, _readers, _revalidate
+
+
 def build_group_digest_job(
     config: "Config",
     *,
@@ -1722,6 +1759,7 @@ def build_group_digest_job(
     history: object,
     thread_lookup: Callable[[str], object] | None,
     chats: Callable[[], Iterable[str]],
+    directory_terms: Callable[..., Any] | None = None,
 ):
     """The weekly group reaction digest job ticked by participation maintenance.
 
@@ -1749,6 +1787,7 @@ def build_group_digest_job(
         bounds=lambda: DigestBounds.from_config(config),
         client_factory=_client,
         thread_lookup=thread_lookup,
+        directory_terms=directory_terms,
     )
     return GroupDigestJob(runner=runner, knowledge=knowledge, chats=chats)
 
@@ -4029,6 +4068,7 @@ def build_gateway_runtime(
                 history=history_projector,
                 thread_lookup=getattr(processing_store, "thread_for_message", None),
                 chats=lambda: participation_group_chats(config, _participation_active),
+                directory_terms=people.deny_terms,
             )
         burst_observer = BurstObserver(
             config=config,

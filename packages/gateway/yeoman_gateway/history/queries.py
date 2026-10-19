@@ -424,6 +424,39 @@ class HistoryQueries:
         lids = {ident.value for ident in idents}
         return f"whatsapp:{next(iter(lids))}" if len(lids) == 1 else None
 
+    def member_principal(
+        self, identifier: str, members: frozenset[str], *, at_ms: int
+    ) -> str | None:
+        """The one roster principal a sender identifier belongs to, or ``None``.
+
+        A roster names a member by its phone form when it knows one, while a message can
+        arrive from the same member's LID. The sender's own form is tried first; otherwise
+        the strong history contact behind it must name exactly one member through its
+        other identifiers valid at ``at_ms``.
+        """
+        direct = self._participant([identifier], at_ms)
+        if direct is not None and direct in members:
+            return direct
+        contact = self.resolve_identifier(identifier, at_ms=at_ms, time_basis="native")
+        if contact is None:
+            return None
+        rows = self._rows(
+            "WITH RECURSIVE aliases(contact_id) AS (SELECT ? UNION"
+            " SELECT c.contact_id FROM contacts c JOIN aliases a ON c.merged_into=a.contact_id)"
+            " SELECT value FROM identifier_history WHERE channel='whatsapp'"
+            " AND kind IN ('lid','pn_jid') AND strength='strong'"
+            " AND contact_id IN (SELECT contact_id FROM aliases)"
+            " AND (valid_from_ms IS NULL OR valid_from_ms<=?)"
+            " AND (valid_until_ms IS NULL OR ?<valid_until_ms)",
+            (contact, at_ms, at_ms),
+        )
+        found = {
+            principal
+            for row in rows
+            if (principal := self._participant([str(row["value"])], at_ms)) in members
+        }
+        return next(iter(found)) if len(found) == 1 else None
+
     def members(self, *, chat_id: str, at_ms: int | None) -> EvidenceAudience:
         _time(at_ms)
         if at_ms is None:
@@ -645,6 +678,17 @@ class HistoryQueries:
         Senders, reaction actors and roster entries, resolved through every identifier
         history ever recorded for them. A deny list for generated text, never a roster.
         """
+        names, phones, _ = self.participant_deny_terms(chat_id=chat_id)
+        return names, phones
+
+    def participant_deny_terms(
+        self, *, chat_id: str
+    ) -> tuple[tuple[str, ...], tuple[str, ...], tuple[str, ...]]:
+        """:meth:`participant_terms` plus the participants' history contact ids.
+
+        The contact ids let a caller add what the person directory knows about the same
+        people (owner nicknames, preferred names) to the deny list.
+        """
         rows = self._rows(
             "SELECT sender_contact_id AS contact_id, sender_identifier AS identifier"
             " FROM messages WHERE channel='whatsapp' AND chat_id=? AND direction='in'"
@@ -696,6 +740,7 @@ class HistoryQueries:
         return (
             tuple(sorted((name for name in names if name), key=str.casefold)),
             tuple(sorted(phone for phone in phones if phone.isdigit())),
+            tuple(sorted(str(row["contact_id"]) for row in kept)),
         )
 
     def mention(self, value: str, *, chat_id: str, at_ms: int) -> str | None:
