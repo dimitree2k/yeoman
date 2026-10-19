@@ -424,6 +424,39 @@ class HistoryQueries:
         lids = {ident.value for ident in idents}
         return f"whatsapp:{next(iter(lids))}" if len(lids) == 1 else None
 
+    def member_principal(
+        self, identifier: str, members: frozenset[str], *, at_ms: int
+    ) -> str | None:
+        """The one roster principal a sender identifier belongs to, or ``None``.
+
+        A roster names a member by its phone form when it knows one, while a message can
+        arrive from the same member's LID. The sender's own form is tried first; otherwise
+        the strong history contact behind it must name exactly one member through its
+        other identifiers valid at ``at_ms``.
+        """
+        direct = self._participant([identifier], at_ms)
+        if direct is not None and direct in members:
+            return direct
+        contact = self.resolve_identifier(identifier, at_ms=at_ms, time_basis="native")
+        if contact is None:
+            return None
+        rows = self._rows(
+            "WITH RECURSIVE aliases(contact_id) AS (SELECT ? UNION"
+            " SELECT c.contact_id FROM contacts c JOIN aliases a ON c.merged_into=a.contact_id)"
+            " SELECT value FROM identifier_history WHERE channel='whatsapp'"
+            " AND kind IN ('lid','pn_jid') AND strength='strong'"
+            " AND contact_id IN (SELECT contact_id FROM aliases)"
+            " AND (valid_from_ms IS NULL OR valid_from_ms<=?)"
+            " AND (valid_until_ms IS NULL OR ?<valid_until_ms)",
+            (contact, at_ms, at_ms),
+        )
+        found = {
+            principal
+            for row in rows
+            if (principal := self._participant([str(row["value"])], at_ms)) in members
+        }
+        return next(iter(found)) if len(found) == 1 else None
+
     def members(self, *, chat_id: str, at_ms: int | None) -> EvidenceAudience:
         _time(at_ms)
         if at_ms is None:

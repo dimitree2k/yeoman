@@ -205,7 +205,13 @@ def readers_from_single(
 
 
 class ParticipationKnowledgeSelector:
-    def __init__(self, *, knowledge: Any, memory: Any) -> None:
+    """Knowledge statements for Participation; legacy shared facts only with ``memory``.
+
+    The legacy memory service was retired with the history cutover, so production passes
+    ``memory=None`` and every selection is built from Knowledge statements alone.
+    """
+
+    def __init__(self, *, knowledge: Any, memory: Any | None = None) -> None:
         self._knowledge = knowledge
         self._memory = memory
 
@@ -238,7 +244,7 @@ class ParticipationKnowledgeSelector:
                 0, MAX_TEXT_CHARS - len(statements.text) - (1 if statements.text else 0)
             )
             facts = FactRetrievalResult()
-            if remaining_entries and remaining_chars:
+            if self._memory is not None and remaining_entries and remaining_chars:
                 facts = self._memory.retrieve_for_context(
                     query=text,
                     read_context=scoped_fact_context,
@@ -365,7 +371,7 @@ class ParticipationKnowledgeSelector:
                             MAX_TEXT_CHARS - len(statements.text) - (1 if statements.text else 0),
                         ),
                     )
-                    if selection.facts.used_source_refs
+                    if self._memory is not None and selection.facts.used_source_refs
                     else FactRetrievalResult()
                 )
                 revalidated.append(
@@ -414,7 +420,7 @@ class ParticipationKnowledgeSelector:
                 read_context=scoped_fact_context,
                 max_chars=max(0, MAX_TEXT_CHARS - len(statements.text)),
             )
-            if selection.facts.used_source_refs
+            if self._memory is not None and selection.facts.used_source_refs
             else FactRetrievalResult()
         )
         return self._combine(statements, facts, read_context, fact_context, query=selection.query)
@@ -455,6 +461,84 @@ class ParticipationKnowledgeSelector:
             query=query,
             **_reader_prerequisites(read_context, fact_context),
         )
+
+
+def history_participation_readers(
+    opportunity: Any, context: Mapping[str, Any], *, knowledge: Any
+) -> ParticipationKnowledgeReaders | str:
+    """Verified trigger-author readers for one WhatsApp group, proven from history.
+
+    Every distinct trigger author gets its own protected read against the whole current
+    roster; the selector intersects them, so no author's rights are borrowed. The roster
+    must be ``known`` in the current history snapshot, and every author must be on it.
+    A string is a refusal reason; the caller renders no knowledge.
+    """
+    import time
+
+    from yeoman_gateway.history.context import current_history_snapshot
+    from yeoman_gateway.history.queries import HistoryQueries
+
+    channel = str(getattr(opportunity, "channel", ""))
+    chat_id = str(getattr(opportunity, "chat_id", ""))
+    if channel != "whatsapp" or not chat_id.endswith("@g.us"):
+        return "unsupported_chat_type"
+    snapshot = current_history_snapshot()
+    if snapshot is None:
+        raise HistoryPaused("history_scope_required")
+    source_ids = tuple(str(item) for item in (getattr(opportunity, "source_event_ids", ()) or ()))
+    messages = context.get("messages")
+    rows = {
+        str(row.get("event_id") or row.get("message_id") or ""): row
+        for row in messages if isinstance(row, Mapping)
+    } if isinstance(messages, list) else {}
+    senders = {str(rows.get(source_id, {}).get("sender_id") or "").strip() for source_id in source_ids}
+    if not source_ids or "" in senders:
+        return "source_unavailable"
+    if len(senders) > MAX_EVIDENCE_READERS:
+        return "too_many_authors"
+    now = int(time.time() * 1000)
+    queries = HistoryQueries(snapshot)
+    audience = queries.members(chat_id=chat_id, at_ms=now)
+    if audience.status != "known" or not audience.members:
+        return "unknown_membership"
+    members = frozenset(audience.members)
+    authors = set()
+    for sender in senders:
+        principal = queries.member_principal(sender, members, at_ms=now)
+        if principal is None:
+            # A trigger author who is not a current member fails the whole read closed.
+            return "denied"
+        authors.add(principal)
+    policy_revision = getattr(knowledge, "policy_revision", 0)
+    if isinstance(policy_revision, bool) or not isinstance(policy_revision, int) or policy_revision < 0:
+        return "error"
+    member_revision = hashlib.sha256("\0".join(sorted(members)).encode()).hexdigest()
+    readers = []
+    for principal in sorted(authors):
+        read_context = TrustedReadContext(
+            principal_id=principal,
+            channel=channel,
+            chat_id=chat_id,
+            recipient_principals=members,
+            membership_revision=member_revision,
+            policy_revision=policy_revision,
+            purpose="proactive",
+            now_ms=now,
+            is_direct=False,
+            owner=False,
+        )
+        readers.append(ParticipationKnowledgeReader(
+            read_context,
+            FactReadContext(
+                principal_id=principal,
+                chat_scope_key=read_context.scope_key(),
+                current_members=members,
+                now_ms=now,
+                owner=False,
+                group_wide=True,
+            ),
+        ))
+    return ParticipationKnowledgeReaders(readers=tuple(readers))
 
 
 # -- durable evidence ------------------------------------------------------------------
