@@ -645,6 +645,17 @@ class HistoryQueries:
         Senders, reaction actors and roster entries, resolved through every identifier
         history ever recorded for them. A deny list for generated text, never a roster.
         """
+        names, phones, _ = self.participant_deny_terms(chat_id=chat_id)
+        return names, phones
+
+    def participant_deny_terms(
+        self, *, chat_id: str
+    ) -> tuple[tuple[str, ...], tuple[str, ...], tuple[str, ...]]:
+        """:meth:`participant_terms` plus the participants' history contact ids.
+
+        The contact ids let a caller add what the person directory knows about the same
+        people (owner nicknames, preferred names) to the deny list.
+        """
         rows = self._rows(
             "SELECT sender_contact_id AS contact_id, sender_identifier AS identifier"
             " FROM messages WHERE channel='whatsapp' AND chat_id=? AND direction='in'"
@@ -696,6 +707,7 @@ class HistoryQueries:
         return (
             tuple(sorted((name for name in names if name), key=str.casefold)),
             tuple(sorted(phone for phone in phones if phone.isdigit())),
+            tuple(sorted(str(row["contact_id"]) for row in kept)),
         )
 
     def mention(self, value: str, *, chat_id: str, at_ms: int) -> str | None:

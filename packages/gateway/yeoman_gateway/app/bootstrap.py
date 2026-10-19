@@ -1722,6 +1722,7 @@ def build_group_digest_job(
     history: object,
     thread_lookup: Callable[[str], object] | None,
     chats: Callable[[], Iterable[str]],
+    directory_terms: Callable[..., Any] | None = None,
 ):
     """The weekly group reaction digest job ticked by participation maintenance.
 
@@ -1749,6 +1750,7 @@ def build_group_digest_job(
         bounds=lambda: DigestBounds.from_config(config),
         client_factory=_client,
         thread_lookup=thread_lookup,
+        directory_terms=directory_terms,
     )
     return GroupDigestJob(runner=runner, knowledge=knowledge, chats=chats)
 
@@ -4029,6 +4031,7 @@ def build_gateway_runtime(
                 history=history_projector,
                 thread_lookup=getattr(processing_store, "thread_for_message", None),
                 chats=lambda: participation_group_chats(config, _participation_active),
+                directory_terms=people.deny_terms,
             )
         burst_observer = BurstObserver(
             config=config,

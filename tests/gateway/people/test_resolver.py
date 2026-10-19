@@ -302,3 +302,21 @@ def test_invalid_redirect_chain_fails_closed(directory_case, shape):
             p = c.add_person("Link " + str(n), merged_into=p)
     with pytest.raises(PeopleUnavailable, match="^people_integrity$"):
         resolve_person("First", c.reader())
+
+
+def test_deny_terms_cover_every_directory_name_and_phone_of_the_contacts(directory_case):
+    c = directory_case
+    person = c.add_person("Synthetic Preferred", ids=(("phone", "4915000000011"),))
+    c.add_id(person, "history_contact", "hc-1")
+    c.add_name(person, "Nicky", source="owner")
+    c.add_name(person, "Hidden Alias", hidden=True)
+    merged = c.add_person("Synthetic Old Record", merged_into=person)
+    c.add_name(merged, "Oldname")
+    other = c.add_person("Synthetic Bystander", ids=(("phone", "4915000000022"),))
+    c.add_id(other, "history_contact", "hc-2")
+    names, phones = c.directory.deny_terms(["hc-1", "hc-unknown"])
+    assert set(names) == {
+        "Synthetic Preferred", "Nicky", "Hidden Alias", "Synthetic Old Record", "Oldname"
+    }
+    assert phones == ("4915000000011",)
+    assert c.directory.deny_terms([]) == ((), ())

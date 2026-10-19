@@ -402,6 +402,36 @@ class PeopleResolver:
             code = exc.code if isinstance(exc, PeopleUnavailable) else "people_unavailable"
             raise PeopleUnavailable(code) from None
 
+    def deny_terms(self, history_contacts) -> tuple[tuple[str, ...], tuple[str, ...]]:
+        """Directory names and phone numbers of the persons behind these history contacts.
+
+        A deny list for generated text: the preferred name and every recorded name, hidden
+        ones included (hidden from resolution is not permission to print), and every phone.
+        Assistant contacts never reach here; the caller passes participants only.
+        """
+        index = self._index()
+        persons = {
+            index.terminals[row["person_id"]]
+            for contact in history_contacts
+            for row in index.identifier_rows.get(("history_contact", str(contact)), ())
+        }
+        names = {
+            row["preferred_name"]
+            for person, row in index.persons.items()
+            if index.terminals[person] in persons
+        }
+        names.update(row["name"] for row in index.names if index.terminals[row["person_id"]] in persons)
+        phones = {
+            row["value"]
+            for p in persons
+            for row in index.identifiers_by_terminal.get(p, ())
+            if row["kind"] == "phone"
+        }
+        return (
+            tuple(sorted({str(n).strip() for n in names if n and str(n).strip()}, key=str.casefold)),
+            tuple(sorted({d for v in phones if (d := "".join(c for c in str(v) if c.isdigit()))})),
+        )
+
     def _memo(self, key, load):
         memo = self._local.state.memo
         if key in memo:

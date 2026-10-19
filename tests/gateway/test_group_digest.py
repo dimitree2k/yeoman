@@ -297,6 +297,36 @@ async def test_names_from_history_reject_the_note_and_store_nothing(h: Harness) 
 
 
 @pytest.mark.asyncio
+async def test_directory_names_reject_the_note(h: Harness) -> None:
+    _busy_week(h.history)
+    seen: list[tuple[str, ...]] = []
+
+    def directory(contacts):
+        seen.append(tuple(contacts))
+        return ("Bertie",), ("4917000000555",)
+
+    h.client = FakeClient(json.dumps({**GOOD, "engages": ["Bertie starts the rate debates"]}))
+    outcome = await h.runner(directory_terms=directory).run(CHAT, WEEK)
+    assert (outcome.state, outcome.reason) == ("failed", "names_participant")
+    assert seen and seen[0], "the participants' history contacts reach the directory"
+    assert h.knowledge.group_digests(chat_id=CHAT) == ()
+
+
+@pytest.mark.asyncio
+async def test_unavailable_directory_keeps_the_history_names(h: Harness) -> None:
+    _busy_week(h.history)
+
+    def directory(contacts):
+        raise RuntimeError("people_unavailable")
+
+    h.client = FakeClient(json.dumps({**GOOD, "engages": ["Bertram starts the rate debates"]}))
+    outcome = await h.runner(directory_terms=directory).run(CHAT, WEEK)
+    assert (outcome.state, outcome.reason) == ("failed", "names_participant")
+    h.client = FakeClient(json.dumps(GOOD))
+    assert (await h.runner(directory_terms=directory).run(CHAT, WEEK)).state == "done"
+
+
+@pytest.mark.asyncio
 async def test_too_long_note_gets_one_shortening_retry(h: Harness) -> None:
     _busy_week(h.history)
     long_note = json.dumps({**GOOD, "engages": ["y" * 150, "z" * 150, "w" * 150]})

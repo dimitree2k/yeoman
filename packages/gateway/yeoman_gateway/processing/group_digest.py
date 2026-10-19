@@ -387,6 +387,8 @@ class GroupDigestRunner:
         bounds: DigestBounds | Callable[[], DigestBounds],
         client_factory: Callable[[], Any],
         thread_lookup: Callable[[str], object] | None = None,
+        directory_terms: Callable[[Sequence[str]], tuple[Sequence[str], Sequence[str]]]
+        | None = None,
         tz: tzinfo | None = None,
         max_input_tokens: int = MAX_INPUT_TOKENS,
         max_output_tokens: int = MAX_OUTPUT_TOKENS,
@@ -397,6 +399,7 @@ class GroupDigestRunner:
         self._bounds = bounds
         self._client_factory = client_factory
         self._thread_lookup = thread_lookup
+        self._directory_terms = directory_terms
         self._tz = tz
         self._max_input_tokens = int(max_input_tokens)
         self._max_output_tokens = int(max_output_tokens)
@@ -424,7 +427,18 @@ class GroupDigestRunner:
                 queries, chat_id, week, lull_ms=bounds.lull_ms, burst_n=bounds.burst_n,
                 burst_ms=bounds.burst_ms, thread_lookup=self._thread_lookup, tz=self._tz,
             )
-            names, phones = queries.participant_terms(chat_id=chat_id)
+            names, phones, contacts = queries.participant_deny_terms(chat_id=chat_id)
+        if self._directory_terms is not None and contacts:
+            try:
+                extra_names, extra_phones = self._directory_terms(contacts)
+            except Exception as exc:  # noqa: BLE001 - history's own terms still apply
+                logger.warning(
+                    "group_digest_directory_terms_unavailable chat={} error_type={}",
+                    _short(chat_id), type(exc).__name__,
+                )
+            else:
+                names = tuple(sorted({*names, *extra_names}, key=str.casefold))
+                phones = tuple(sorted({*phones, *extra_phones}))
         return signals, names, phones
 
     async def run(
