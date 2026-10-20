@@ -21,6 +21,7 @@ OPERATIONAL_STORE_PATHS = {
     "a2a": "ops/a2a.db",
     "seen_chats": "ops/seen-chats.json",
     "overseer": "ops/overseer",
+    "trends": "ops/trends.db",
 }
 
 

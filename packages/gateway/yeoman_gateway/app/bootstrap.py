@@ -462,6 +462,7 @@ class GatewayRuntime:
     source_catchup: ObservedSourceCatchup | None = None
     people_sync: PeopleSyncService | None = None
     people: PeopleResolver | None = None
+    trends: Any | None = None
 
     async def _start_processing_services(self) -> None:
         """Plan 04 start order: recover and reconcile before any channel consumes input.
@@ -499,6 +500,8 @@ class GatewayRuntime:
                 await self.source_catchup.start()
             if self.people_sync is not None:
                 await self.people_sync.start()
+            if self.trends is not None:
+                await self.trends.start()
             self._resume_a2a_research()
             await self.cron.start()
             await self.heartbeat.start()
@@ -578,6 +581,8 @@ class GatewayRuntime:
                 await attempt_async(self.source_catchup.stop)
             if self.people_sync is not None:
                 await attempt_async(self.people_sync.stop)
+            if self.trends is not None:
+                await attempt_async(self.trends.stop)
             if self.processing is not None:
                 attempt_sync(self.processing.close)
             if self.people is not None:
@@ -591,6 +596,20 @@ class GatewayRuntime:
                 raise retention_error
             if cleanup_errors:
                 raise cleanup_errors[0]
+
+
+def _build_trends(config: Config) -> Any | None:
+    """The trends collector when enabled; a missing route disables it with a warning."""
+    if not config.trends.enabled:
+        return None
+    from yeoman_gateway.processing.model_route import RouteUnavailableError
+    from yeoman_gateway.trends.service import build_trends_service
+
+    try:
+        return build_trends_service(config)
+    except RouteUnavailableError as exc:
+        logger.warning("trends disabled: {}", exc)
+        return None
 
 
 class ProcessingStoreUnavailableError(RuntimeError):
@@ -3973,4 +3992,5 @@ def build_gateway_runtime(
             PeopleSyncService(projector=history_projector, db_path=people_db_path(), people=people)
             if history_projector is not None else None
         ),
+        trends=_build_trends(config),
     )
