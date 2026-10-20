@@ -126,7 +126,6 @@ _EXPECTED_SOURCES = (
     (_ops_path("pending_approvals"), "file", "operational", True, "speak-up approvals"),
     (_ops_path("cron"), "file", "operational", True, "scheduled jobs"),
     (_ops_path("response_pauses"), "file", "operational", True, "policy response pauses"),
-    (_ops_path("persona_evolution"), "tree", "operational", True, "persona evolution"),
     ("var/media", "tree", "media", False, "media cache"),
     ("data/bridge/whatsapp-outbox/quarantine", "tree", "operational", True, "outbound quarantine"),
     ("data/contacts/contacts.db", "live_sqlite", "identity", True, "legacy contacts"),
@@ -896,7 +895,7 @@ def _classify(relative: str) -> tuple[str, bool]:
         return "identity", True
     if (
         lower.startswith(
-            ("data/ops/", "data/consciousness/", "data/overseer/", "data/policy/", "data/cron/", "data/persona-evolution/")
+            ("data/ops/", "data/consciousness/", "data/overseer/", "data/policy/", "data/cron/")
         )
         or "speakups.db" in lower
         or "a2a-research.db" in lower

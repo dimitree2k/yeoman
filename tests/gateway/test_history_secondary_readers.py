@@ -285,65 +285,23 @@ async def test_exec_marker_is_child_only_and_cannot_enable_history(tmp_path, iso
         assert not manager.commands[1].startswith('(export')
 
 
-async def test_secondary_persona_and_policy_metadata_reopen_in_owned_scope(tmp_path):
-    from contextlib import contextmanager
-    from unittest.mock import AsyncMock
-
+async def test_secondary_policy_metadata_reopens_in_owned_scope(tmp_path):
     from yeoman_gateway.adapters.policy_engine import EnginePolicyAdapter
-    from yeoman_gateway.history.context import current_history_snapshot, history_turn
-    from yeoman_gateway.persona_evolution import collect_persona_evolution_evidence
-    from yeoman_gateway.policy.schema import PolicyConfig
+    from yeoman_gateway.history.context import history_turn
 
     from tests.gateway.convhist.test_hist_queries import event
     p = Projector()
-    config = SimpleNamespace()
-    persona = 'personas/synthetic.md'
-    (tmp_path / 'personas').mkdir()
-    (tmp_path / persona).write_text('# Synthetic persona')
-    policy = PolicyConfig.model_validate({'channels': {'whatsapp': {'chats': {'a@g.us': {'personaFile': persona}}}}})
-    memory = SimpleNamespace(learned_chat_taste=lambda **kwargs: [], recent_chat_preferences=Mock(side_effect=AssertionError('legacy preferences')))
-    log = SimpleNamespace(history=AsyncMock(return_value=[]))
-    legacy = SimpleNamespace(lookup_messages_in_range=Mock(side_effect=AssertionError('legacy archive')))
-    generations = []
-    class Knowledge:
-        history_source_ledger = SimpleNamespace()
-        _legacy_authority = SimpleNamespace()
-        @contextmanager
-        def history_scope(self, queries, sources):
-            assert queries.snapshot is current_history_snapshot()
-            yield
-        def owner_read_context(self, **kwargs):
-            return TrustedReadContext(
-                principal_id=AUTHOR,
-                channel=kwargs["channel"],
-                chat_id=kwargs["chat_id"],
-                recipient_principals=frozenset({AUTHOR}),
-                membership_revision="synthetic-membership-v1",
-                policy_revision=1,
-                purpose="proactive",
-                now_ms=1_800_000_000_000,
-            )
-        def recall(self, *args, **kwargs):
-            generations.append(current_history_snapshot().generation)
-            return SimpleNamespace(entry_texts=(f'Synthetic preference {p.generation}',))
     adapter = object.__new__(EnginePolicyAdapter)
-    adapter._history_config = config
+    adapter._history_config = SimpleNamespace()
     try:
         for generation in (1, 2):
             p.generation = generation
             p.add(f'm{generation}')
             event(p.db, f's{generation}', 'group_subject', generation, {'subject': f'Synthetic group {generation}'}, chat='a@g.us')
             p.db.commit()
-            evidence = await collect_persona_evolution_evidence(policy=policy, workspace=tmp_path, persona_file=persona,
-                 speakup_log=log,  since=datetime.fromtimestamp(0, UTC),
-                now=datetime.fromtimestamp(1800000000, UTC), history_projector=p, knowledge=Knowledge())
-            assert evidence.chats[0].recent_message_count == generation
-            assert evidence.chats[0].recent_preferences == [f'Synthetic preference {generation}']
             async with history_turn(p):
                 assert adapter._get_group_name('a@g.us') == f'Synthetic group {generation}'
-        assert generations == [1, 2] and p.live_snapshot_count == 0
-        memory.recent_chat_preferences.assert_not_called()
-        legacy.lookup_messages_in_range.assert_not_called()
+        assert p.live_snapshot_count == 0
     finally:
         p.close()
 

@@ -396,7 +396,7 @@ def test_real_bootstrap_keeps_existing_consumers_and_raw_instance(tmp_path, monk
 
     monkeypatch.setenv('YEOMAN_HOME', str(tmp_path))
     from tests.gateway.history_test_helpers import prepare_history_retirement_knowledge
-    settings = {'knowledge': {'enabled': True, 'db_path': str(prepare_history_retirement_knowledge(tmp_path)), 'capture_enabled': False}, 'personaEvolution': {'enabled': False}, 'security': {'enabled': False}}
+    settings = {'knowledge': {'enabled': True, 'db_path': str(prepare_history_retirement_knowledge(tmp_path)), 'capture_enabled': False}, 'security': {'enabled': False}}
     if explicit_history:
         settings['history'] = {'liveProjectionEnabled': True}
     config = Config.model_validate(settings)
@@ -661,7 +661,7 @@ async def test_projector_lock_contention_keeps_gateway_running(tmp_path, monkeyp
 
     monkeypatch.setenv('YEOMAN_HOME', str(tmp_path))
     from tests.gateway.history_test_helpers import prepare_history_retirement_knowledge
-    config = Config.model_validate({'history': {'liveProjectionEnabled': True}, 'knowledge': {'enabled': True, 'db_path': str(prepare_history_retirement_knowledge(tmp_path)), 'capture_enabled': False}, 'personaEvolution': {'enabled': False}, 'security': {'enabled': False}})
+    config = Config.model_validate({'history': {'liveProjectionEnabled': True}, 'knowledge': {'enabled': True, 'db_path': str(prepare_history_retirement_knowledge(tmp_path)), 'capture_enabled': False}, 'security': {'enabled': False}})
     runtime = bootstrap.build_gateway_runtime(config=config, provider=Provider(), policy_engine=PolicyEngine(PolicyConfig(), workspace=tmp_path), policy_path=None, workspace=tmp_path / 'workspace', bus=MessageBus())
     p = runtime.history_projector
     root, db = runtime.channels.raw_archive.root, history_db_path(create=True)
@@ -690,7 +690,6 @@ async def test_projector_lock_contention_keeps_gateway_running(tmp_path, monkeyp
     monkeypatch.setattr(runtime.channels, 'start_all', channels_start)
     runtime.bus = None
     runtime.gateway_socket = None
-    runtime.startup_hook = None
     try:
         assert await asyncio.to_thread(process.stdout.readline) == 'locked\n'
         await runtime.run()

@@ -91,7 +91,6 @@ def test_legacy_consciousness_flag_does_not_build_a_social_runtime(
         {
             "knowledge": _history_knowledge_config(tmp_path, "legacy-consciousness-knowledge"),
             "consciousness": {"enabled": True},
-            "personaEvolution": {"enabled": False},
             "processing": {"enabled": False, "participation": {"enabled": False}},
             "security": {"enabled": False},
         }
@@ -109,83 +108,6 @@ def test_legacy_consciousness_flag_does_not_build_a_social_runtime(
         assert runtime.speakup_log is None
         assert not hasattr(runtime, "consciousness")
     finally:
-        pass  # retired runtime fields are not lifecycle resources
-
-
-@pytest.mark.asyncio
-async def test_persona_evolution_lazily_reads_historical_speakup_log(
-    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
-) -> None:
-    """Historical social evidence stays readable after the old generator is removed."""
-
-    from yeoman_gateway.cron.types import CronJob, CronPayload
-    from yeoman_gateway.history.project import project
-
-    captured_logs: list[object] = []
-
-    async def fake_persona_evolution_cron(**kwargs: Any) -> str:
-        log = kwargs["speakup_log"]
-        assert await log.history("whatsapp", "group@g.us") == []
-        captured_logs.append(log)
-        return "persona_evolution no proposal: test"
-
-    monkeypatch.setattr(
-        "yeoman_gateway.app.bootstrap.run_persona_evolution_cron",
-        fake_persona_evolution_cron,
-    )
-
-    class _NeverProvider:
-        async def chat(self, *_args: Any, **_kwargs: Any) -> None:
-            raise AssertionError("opening historical evidence must not call an LLM")
-
-        def get_default_model(self) -> str:
-            return "test/provider"
-
-    monkeypatch.setenv("YEOMAN_HOME", str(tmp_path))
-    config = Config.model_validate(
-        {
-            "knowledge": _history_knowledge_config(tmp_path, "persona-knowledge"),
-            "consciousness": {"enabled": False},
-            "personaEvolution": {"enabled": True},
-            "processing": {"enabled": False, "participation": {"enabled": False}},
-            "security": {"enabled": False},
-        }
-    )
-    speakup_path = get_operational_store_path("speakups", data_dir=tmp_path / "data")
-    runtime = build_gateway_runtime(
-        config=config,
-        provider=_NeverProvider(),  # type: ignore[arg-type]
-        policy_engine=PolicyEngine(PolicyConfig(), workspace=tmp_path),
-        policy_path=None,
-        workspace=tmp_path / "workspace",
-        bus=MessageBus(),
-    )
-    raw_root = runtime.channels.raw_archive.root
-    project([raw_root], runtime.history_projector.db_path, publish_lineage_root=raw_root)
-    await runtime.history_projector.start()
-    if runtime.history_projector._startup_task is not None:
-        await runtime.history_projector._startup_task
-    try:
-        assert runtime.speakup_log is None
-        assert not speakup_path.exists()
-        assert runtime.cron.on_job is not None
-        result = await runtime.cron.on_job(
-            CronJob(
-                id="persona-evolution",
-                name="persona evolution",
-                payload=CronPayload(
-                    kind="persona_evolution",
-                    persona_file="personas/arvid.md",
-                ),
-            )
-        )
-        assert result == "persona_evolution no proposal: test"
-        assert speakup_path.exists()
-        assert len(captured_logs) == 1
-        with pytest.raises(sqlite3.ProgrammingError, match="closed database"):
-            await captured_logs[0].history("whatsapp", "group@g.us")
-    finally:
-        await runtime.history_projector.stop()
         pass  # retired runtime fields are not lifecycle resources
 
 
@@ -592,7 +514,6 @@ async def test_receipts_reconcile_with_learning_and_consciousness_disabled(
         runtime.heartbeat = idle  # type: ignore[assignment]
         runtime.bus = None
         runtime.gateway_socket = _Socket()  # type: ignore[assignment]
-        runtime.startup_hook = None
         await runtime.run()
         assert runtime.reconciliation.running is False
 
@@ -666,7 +587,6 @@ async def test_receipts_reconcile_with_learning_and_consciousness_disabled(
     log_only_runtime.heartbeat = idle  # type: ignore[assignment]
     log_only_runtime.bus = None
     log_only_runtime.gateway_socket = None
-    log_only_runtime.startup_hook = None
     await log_only_runtime.run()
     assert log_only_processing.exists()
     reopened_log_only = SpeakupLog(log_only_speakups)
@@ -705,7 +625,6 @@ async def test_receipts_reconcile_with_learning_and_consciousness_disabled(
     empty_runtime.heartbeat = idle  # type: ignore[assignment]
     empty_runtime.bus = None
     empty_runtime.gateway_socket = None
-    empty_runtime.startup_hook = None
     await empty_runtime.run()
     assert empty_processing.exists()
     assert not empty_speakups.exists()
@@ -2175,7 +2094,6 @@ async def test_production_participation_material_from_projected_history(
     config = Config.model_validate({
         "knowledge": _history_knowledge_config(tmp_path, "material-knowledge"),
         "security": {"enabled": False},
-        "personaEvolution": {"enabled": False},
         "processing": {"enabled": True, "chats": ["whatsapp:group@g.us"],
                        "participation": {"enabled": True, "shadow": False,
                                          "judgeRoute": "participation.judge"}},

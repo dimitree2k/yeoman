@@ -52,12 +52,6 @@ from yeoman_gateway.media.vision import VisionDescriber
 from yeoman_gateway.people.resolver import PeopleResolver
 from yeoman_gateway.people.schema import people_db_path
 from yeoman_gateway.people.service import PeopleSyncService
-from yeoman_gateway.persona_evolution import (
-    PersonaEvolutionLedger,
-    build_persona_evolution_approval_message,
-    persona_evolution_result_needs_notification,
-    run_persona_evolution_cron,
-)
 from yeoman_gateway.pipeline.responder import requested_report_length
 from yeoman_gateway.policy.capabilities import policy_known_tools
 from yeoman_gateway.policy.persona import load_persona_text
@@ -465,7 +459,6 @@ class GatewayRuntime:
     retention: object | None = None
     statement_capture: object | None = None
     knowledge_embeddings: Any | None = None
-    startup_hook: Callable[[], Awaitable[None]] | None = None
     source_catchup: ObservedSourceCatchup | None = None
     people_sync: PeopleSyncService | None = None
     people: PeopleResolver | None = None
@@ -529,15 +522,6 @@ class GatewayRuntime:
                 self.orchestrator.run(),
                 self.channels.start_all(),
             ]
-            if self.startup_hook is not None:
-                async def _run_startup_hook() -> None:
-                    await asyncio.sleep(2.0)
-                    try:
-                        await self.startup_hook()
-                    except Exception:
-                        logger.exception("Gateway startup hook failed")
-
-                tasks.append(_run_startup_hook())
             if self.bus:
                 tasks.append(self.bus.dispatch_events())
             await asyncio.gather(*tasks)
@@ -2848,7 +2832,6 @@ def build_gateway_runtime(
     workflow_state = WorkflowState(
         store_path=Path(workspace) / "data" / "cron" / "pending_approvals.json"
     )
-    persona_evolution_state_db_path = Path(workspace) / "persona-evolution" / "persona-evolution.db"
 
     async def _on_approval_expired(approval: PendingApproval) -> None:
         content = (
@@ -3006,8 +2989,6 @@ def build_gateway_runtime(
         speakup_approval_store=speakup_approval_store,
         speakup_log=speakup_log,
         speakup_tools=consciousness_tools,
-        persona_evolution_workspace=Path(workspace),
-        persona_evolution_state_db_path=persona_evolution_state_db_path,
         session_manager=session_manager,
         service_effects=service_effects,
         forward_target_resolver=policy_adapter.resolve_whatsapp_group,
@@ -3091,147 +3072,7 @@ def build_gateway_runtime(
             return fallback
         return cleaned
 
-    async def _notify_persona_evolution_review(
-        proposal: dict[str, object],
-        *,
-        approval_channel: str | None = None,
-    ) -> None:
-        if proposal.get("notified_at"):
-            return
-        channel = str(approval_channel or "telegram").strip() or "telegram"
-        if _is_globally_paused(channel) is not None:
-            # The owner fenced responses: defer the announcement without marking the
-            # proposal notified, so the next unpaused invocation announces it once.
-            logger.info(
-                "persona evolution review notification deferred (global pause active) proposal={}",
-                proposal.get("proposal_id"),
-            )
-            return
-        raw_targets = policy_adapter.owner_recipients(channel)
-        if not raw_targets:
-            logger.warning(
-                "Persona evolution proposal {} has no owner recipients for {}",
-                proposal.get("proposal_id"),
-                channel,
-            )
-            return
-        from yeoman_gateway.pipeline.new_chat import _normalize_owner_target
-
-        targets = sorted(
-            {
-                target
-                for raw in raw_targets
-                if (target := _normalize_owner_target(channel, str(raw)))
-            }
-        )
-        if not targets:
-            logger.warning(
-                "Persona evolution proposal {} had no valid owner targets for {}",
-                proposal.get("proposal_id"),
-                channel,
-            )
-            return
-        message = build_persona_evolution_approval_message(proposal)
-        for target in targets:
-            if service_effects is not None:
-                await service_effects.send(
-                    source="cron",
-                    operation_ref=(
-                        f"persona-evolution:{proposal.get('proposal_id')}:{target}"
-                    ),
-                    channel=channel,
-                    chat_id=target,
-                    content=message,
-                )
-                continue
-            await bus.publish_outbound(
-                OutboundMessage(channel=channel, chat_id=target, content=message)
-            )
-        ledger = PersonaEvolutionLedger(persona_evolution_state_db_path)
-        try:
-            ledger.mark_notified(
-                str(proposal["proposal_id"]),
-                channel=channel,
-                chat_id=",".join(targets),
-            )
-        finally:
-            ledger.close()
-
-    async def _notify_pending_persona_evolution_reviews() -> None:
-        ledger = PersonaEvolutionLedger(persona_evolution_state_db_path)
-        try:
-            proposals = ledger.pending_review_notifications(
-                global_pause_active=lambda: _is_globally_paused("telegram") is not None
-            )
-        finally:
-            ledger.close()
-        for proposal in proposals:
-            await _notify_persona_evolution_review(proposal)
-
     async def on_cron_job(job: CronJob) -> str | None:
-        if job.payload.kind == "persona_evolution":
-            if not config.persona_evolution.enabled:
-                return "persona_evolution no proposal: disabled"
-            persona_file = str(job.payload.persona_file or "").strip()
-            if not persona_file:
-                raise ValueError("persona_evolution job requires personaFile")
-            allowlist = {
-                str(item).strip()
-                for item in config.persona_evolution.personas_allowlist
-                if str(item).strip()
-            }
-            if allowlist and persona_file not in allowlist:
-                return f"persona_evolution no proposal: persona_not_allowed persona_file={persona_file}"
-            output_path = None
-            if str(job.payload.persona_output or "").strip():
-                output_path = Path(str(job.payload.persona_output).strip())
-            persona_speakup_log = speakup_log
-            close_persona_speakup_log = False
-            if persona_speakup_log is None:
-                from yeoman_gateway.consciousness.log import SpeakupLog
-
-                persona_speakup_log = SpeakupLog(speakup_path)
-                close_persona_speakup_log = True
-            try:
-                result = await run_persona_evolution_cron(
-                    history_projector=history_projector,
-                    knowledge=knowledge_service,
-                    policy=policy_engine.policy,
-                    workspace=Path(workspace),
-                    persona_file=persona_file,
-                            speakup_log=persona_speakup_log,
-
-                    window_days=max(1, int(job.payload.persona_window_days)),
-                    limit=max(1, int(job.payload.persona_limit)),
-                    output_path=output_path,
-                    min_meaningful_messages=max(
-                        0, int(job.payload.persona_min_meaningful_messages)
-                    ),
-                    min_signal_score=max(0.0, float(job.payload.persona_min_signal_score)),
-                    max_accumulation_days=max(
-                        1, int(job.payload.persona_max_accumulation_days)
-                    ),
-                    proposal_ttl_seconds=max(
-                        60, int(config.persona_evolution.proposal_ttl_seconds)
-                    ),
-                    proposal_mode=config.persona_evolution.mode,
-                )
-            finally:
-                if close_persona_speakup_log:
-                    persona_speakup_log.close()
-            if persona_evolution_result_needs_notification(result):
-                ledger = PersonaEvolutionLedger(persona_evolution_state_db_path)
-                try:
-                    proposal = ledger.pending_proposal(persona_file)
-                finally:
-                    ledger.close()
-                if proposal is not None:
-                    await _notify_persona_evolution_review(
-                        proposal,
-                        approval_channel=job.payload.approval_channel,
-                    )
-            return result
-
         if job.payload.kind == "voice_broadcast":
             phrases = [str(v).strip() for v in list(job.payload.voice_messages) if str(v).strip()]
             if not phrases and str(job.payload.message or "").strip():
@@ -3763,21 +3604,6 @@ def build_gateway_runtime(
                 return {'status': 'ready', 'counts': {('revoked' if row['revoked'] else 'issued'): row['total'] for row in rows},
                         'knowledge': asdict(secondary_knowledge.stats(context=context))}
 
-    async def ipc_persona_evolution_read(args: dict[str, Any]) -> dict[str, Any]:
-        from yeoman_gateway.persona_evolution import (
-            collect_persona_evolution_evidence,
-            render_persona_evolution_proposal,
-        )
-        if secondary_knowledge is None or speakup_log is None:
-            return {'status': 'paused'}
-        secondary_knowledge.owner_read_context()
-        evidence = await collect_persona_evolution_evidence(policy=policy_engine.policy,
-            workspace=Path(workspace), persona_file=args['persona_file'],
-            speakup_log=speakup_log,
-            window_days=args['window_days'], per_chat_limit=args['limit'],
-            history_projector=history_projector, knowledge=secondary_knowledge)
-        return {'status': 'ready', 'report': render_persona_evolution_proposal(evidence)}
-
     async def ipc_history_chats() -> dict[str, Any]:
         from yeoman_gateway.history.context import history_knowledge_scope, history_turn
         from yeoman_gateway.history.queries import HistoryQueries
@@ -3820,7 +3646,6 @@ def build_gateway_runtime(
         publish_event_handler=ipc_publish_event,
         knowledge_statements_handler=ipc_knowledge_statements,
         knowledge_accounting_handler=ipc_knowledge_accounting,
-        persona_evolution_read_handler=ipc_persona_evolution_read,
         history_chats_handler=ipc_history_chats,
         knowledge_read_handler=ipc_knowledge_read,
         history_read_handler=ipc_history_read,
@@ -4139,7 +3964,6 @@ def build_gateway_runtime(
         retention=build_retention_service(config, processing_store),
         statement_capture=statement_capture,
         knowledge_embeddings=knowledge_embeddings,
-        startup_hook=_notify_pending_persona_evolution_reviews,
         source_catchup=(ObservedSourceCatchup(
             processing=processing_store, knowledge=knowledge_service,
             registrar=observed_sources, projector=history_projector,

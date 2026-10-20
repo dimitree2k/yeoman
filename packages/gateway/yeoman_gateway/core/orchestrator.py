@@ -28,7 +28,6 @@ from yeoman_gateway.pipeline.implicit_address import ImplicitBotAddressMiddlewar
 from yeoman_gateway.pipeline.new_chat import NewChatNotifyMiddleware
 from yeoman_gateway.pipeline.normalize import NormalizationMiddleware
 from yeoman_gateway.pipeline.outbound import OutboundMiddleware
-from yeoman_gateway.pipeline.persona_evolution_approval import PersonaEvolutionApprovalMiddleware
 from yeoman_gateway.pipeline.policy import PolicyMiddleware
 from yeoman_gateway.pipeline.reply_budget import ReplyBudgetMiddleware
 from yeoman_gateway.pipeline.reply_context import ReplyContextMiddleware
@@ -108,8 +107,6 @@ class Orchestrator:
         speakup_approval_store: "SpeakupApprovalStore | None" = None,
         speakup_log: "SpeakupLog | None" = None,
         speakup_tools: "ConsciousnessTools | None" = None,
-        persona_evolution_workspace: Path | None = None,
-        persona_evolution_state_db_path: Path | None = None,
         session_manager: "SessionManager | None" = None,
         service_effects: object | None = None,
         forward_target_resolver: ForwardTargetResolver | None = None,
@@ -155,19 +152,6 @@ class Orchestrator:
                     security=security,
                     service_effects=service_effects,
                     tools=speakup_tools,
-                )
-            )
-        if (
-            bus is not None
-            and persona_evolution_workspace is not None
-            and persona_evolution_state_db_path is not None
-        ):
-            layers.append(
-                PersonaEvolutionApprovalMiddleware(
-                    workspace=persona_evolution_workspace,
-                    state_db_path=persona_evolution_state_db_path,
-                    bus=bus,
-                    service_effects=service_effects,
                 )
             )
         if workflow_state and approval_trigger:
