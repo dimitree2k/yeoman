@@ -597,7 +597,6 @@ def test_production_bootstrap_wires_the_weekly_digest_job(
         "knowledge": {"enabled": True, "capture_enabled": False,
                       "db_path": str(prepare_history_retirement_knowledge(tmp_path, "kb"))},
         "security": {"enabled": False},
-        "personaEvolution": {"enabled": False},
         "consciousness": {"lullSilenceMinutes": 31, "burstThresholdMessages": 5,
                           "burstWindowMinutes": 11},
         "processing": {"enabled": True, "chats": ["whatsapp:group@g.us", "whatsapp:4900@s.whatsapp.net"],

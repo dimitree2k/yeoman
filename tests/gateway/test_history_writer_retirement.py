@@ -146,8 +146,7 @@ def test_bootstrap_writer_routes_and_operational_exceptions(tmp_path, monkeypatc
                        (json.dumps({'version': 1, 'generation': 1, 'sources': [], 'pending': [], 'processed': [], 'legacy_boundary': [0, '']}),))
     config = Config(knowledge={'enabled': retired, 'db_path': str(target), 'capture_enabled': retired},
                     processing={'enabled': True}, security={'enabled': False},
-                    memory={'db_path': str(tmp_path / 'memory.db')},
-                    personaEvolution={'enabled': False})
+                    memory={'db_path': str(tmp_path / 'memory.db')})
     from yeoman_gateway.knowledge import _capture_worker
     monkeypatch.setattr(_capture_worker, 'StatementExtractor', lambda **kwargs: MagicMock())
     provider = MagicMock()

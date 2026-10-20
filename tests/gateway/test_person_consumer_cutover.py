@@ -452,7 +452,6 @@ def test_the_knowledge_composition_does_not_hand_the_legacy_cache_to_consumers(
                 "legacy_memory_paths": [str(tmp_path / "legacy-memory.db")],
                 "capture_enabled": False,
             },
-            "personaEvolution": {"enabled": False},
             "processing": {"enabled": False, "participation": {"enabled": False}},
             "security": {"enabled": False},
         }

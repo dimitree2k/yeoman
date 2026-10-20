@@ -57,7 +57,6 @@ def runtime(tmp_path: Path, monkeypatch: pytest.MonkeyPatch):
                 "legacy_contacts_paths": [str(tmp_path / "legacy-contacts.db")],
                 "legacy_memory_paths": [str(tmp_path / "legacy-memory.db")],
             },
-            "personaEvolution": {"enabled": False},
             "processing": {"enabled": False, "participation": {"enabled": False}},
             "security": {"enabled": False},
         }

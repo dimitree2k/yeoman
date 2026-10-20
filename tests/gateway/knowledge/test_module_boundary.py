@@ -61,8 +61,6 @@ PEOPLE_MODULES = (
     "agent/",
     "adapters/responder_llm.py",
     "ipc/a2a_invoke.py",
-    "cli/persona_evolution_commands.py",
-    "persona_evolution.py",
 )
 
 #: Consumers that were cut over to the public facade.  Each one answers from knowledge

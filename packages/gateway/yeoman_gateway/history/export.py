@@ -183,7 +183,7 @@ def cli_secondary_request(command: str, args: dict[str, Any]) -> dict[str, Any]:
     """Owner-local bounded endpoints, never a production database fallback."""
     import typer
     from yeoman_shared.config.loader import load_config
-    if command not in {'history_chats', 'persona_evolution_read', 'knowledge_read', 'knowledge_accounting', 'knowledge_statements'}:
+    if command not in {'history_chats', 'knowledge_read', 'knowledge_accounting', 'knowledge_statements'}:
         raise ValueError('unsupported secondary endpoint')
     if os.environ.get('YEOMAN_HISTORY_TOOL_TURN') == '1':
         raise HistoryPaused('standalone acquisition forbidden in selected tool turn')

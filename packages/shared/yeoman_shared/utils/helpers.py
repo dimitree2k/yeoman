@@ -17,7 +17,6 @@ OPERATIONAL_STORE_PATHS = {
     "cron": "ops/cron-jobs.json",
     "response_pauses": "ops/response-pauses.json",
     "policy_audit": "ops/policy-audit",
-    "persona_evolution": "ops/persona-evolution",
     "bridge_references": "ops/bridge-message-references",
     "a2a": "ops/a2a.db",
     "seen_chats": "ops/seen-chats.json",

@@ -46,7 +46,6 @@ def test_production_bootstrap_wires_the_group_notes_read_path(
         "knowledge": {"enabled": True, "capture_enabled": False,
                       "db_path": str(prepare_history_retirement_knowledge(tmp_path, "kb"))},
         "security": {"enabled": False},
-        "personaEvolution": {"enabled": False},
         "processing": {"enabled": True, "chats": ["whatsapp:group@g.us"],
                        "participation": {"enabled": True, "shadow": False,
                                          "judgeRoute": "participation.judge",

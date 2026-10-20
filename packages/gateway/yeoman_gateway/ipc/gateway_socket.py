@@ -37,7 +37,6 @@ class GatewaySocket:
     get_session_state_handler: Callable[..., Awaitable[dict]] | None = None
     knowledge_statements_handler: Callable[[dict[str, Any]], Awaitable[dict[str, Any]]] | None = None
     knowledge_accounting_handler: Callable[[], Awaitable[dict[str, Any]]] | None = None
-    persona_evolution_read_handler: Callable[[dict[str, Any]], Awaitable[dict[str, Any]]] | None = None
     history_chats_handler: Callable[[], Awaitable[dict[str, Any]]] | None = None
     knowledge_read_handler: Callable[[dict[str, Any]], Awaitable[dict[str, Any]]] | None = None
     history_read_handler: Callable[[dict[str, Any]], Awaitable[dict[str, Any]]] | None = None
@@ -100,7 +99,7 @@ class GatewaySocket:
                     if (not isinstance(request, dict) or not isinstance(request.get('cmd'), str) or
                             not isinstance(request.get('args', {}), dict)):
                         raise ValueError('invalid frame')
-                    if request['cmd'] in {'history_control', 'history_read', 'knowledge_read', 'history_chats', 'persona_evolution_read', 'knowledge_accounting', 'knowledge_statements'} and not self._peer_is_owner(writer):
+                    if request['cmd'] in {'history_control', 'history_read', 'knowledge_read', 'history_chats', 'knowledge_accounting', 'knowledge_statements'} and not self._peer_is_owner(writer):
                         response = {'status': 'error', 'code': 'OWNER_REQUIRED'}
                     elif not self._check_rate_limit():
                         response = {"status": "error", "message": "Rate limit exceeded"}
@@ -146,16 +145,6 @@ class GatewaySocket:
                 return await self.knowledge_accounting_handler()
             except Exception:
                 return {'status': 'paused', 'code': 'KNOWLEDGE_READ_UNAVAILABLE'}
-
-        if cmd == 'persona_evolution_read':
-            if set(request) != {'cmd', 'args'} or set(args) != {'persona_file', 'window_days', 'limit'} or not isinstance(args['persona_file'], str) or type(args['window_days']) is not int or not 1 <= args['window_days'] <= 90 or type(args['limit']) is not int or not 1 <= args['limit'] <= 100:
-                return {'status': 'error', 'code': 'INVALID_READ'}
-            if self.persona_evolution_read_handler is None:
-                return {'status': 'disabled'}
-            try:
-                return await self.persona_evolution_read_handler(args)
-            except Exception:
-                return {'status': 'paused', 'code': 'HISTORY_READ_UNAVAILABLE'}
 
         if cmd == 'history_chats':
             if set(request) != {'cmd', 'args'} or args:
