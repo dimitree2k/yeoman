@@ -625,6 +625,21 @@ class BusConfig(BaseModel):
     event_maxsize: int = 100
 
 
+class TrendsConfig(BaseModel):
+    """Collector for fresh, funny or absurd topics that speak-ups may later use."""
+
+    model_config = ConfigDict(extra="ignore", populate_by_name=True)
+
+    enabled: bool = False
+    interval_minutes: int = Field(default=180, alias="intervalMinutes", ge=15)
+    google_trends_geo: str = Field(default="DE", alias="googleTrendsGeo")
+    language: str = "de"
+    min_score: int = Field(default=7, alias="minScore", ge=0, le=10)
+    card_ttl_hours: int = Field(default=72, alias="cardTtlHours", ge=1)
+    max_items_per_run: int = Field(default=20, alias="maxItemsPerRun", ge=1, le=50)
+    route: str = "trends.score"
+
+
 class ConsciousnessConfig(BaseModel):
     """Global controls for proactive consciousness service behavior."""
 
@@ -1130,6 +1145,7 @@ class Config(BaseSettings):
     ipc: IpcConfig = Field(default_factory=IpcConfig)
     webhooks: WebhooksConfig = Field(default_factory=WebhooksConfig)
     consciousness: ConsciousnessConfig = Field(default_factory=ConsciousnessConfig)
+    trends: TrendsConfig = Field(default_factory=TrendsConfig)
     processing: ProcessingConfig = Field(default_factory=ProcessingConfig)
     raw: RawArchiveConfig = Field(default_factory=RawArchiveConfig)
 
