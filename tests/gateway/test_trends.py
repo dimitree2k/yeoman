@@ -164,7 +164,9 @@ async def test_service_scores_new_items_once_and_survives_a_broken_source(tmp_pa
     assert len(client.calls) == 1
     prompt = client.calls[0][1]["content"]
     assert "std headline" in prompt and "url=https://example.org/a" in prompt
-    assert "German" in client.calls[0][0]["content"]
+    system = client.calls[0][0]["content"]
+    assert "German" in system
+    assert "Sports are lame" in system and "women's competitions" in system
     await service.stop()
 
 
