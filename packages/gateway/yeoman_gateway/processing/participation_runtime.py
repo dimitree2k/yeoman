@@ -133,6 +133,7 @@ class ParticipationAdmission:
     #: Private: it is persisted with the admission, never rendered to a model and
     #: never part of the owner preview.
     knowledge_evidence: Mapping[str, Any] | None = field(default=None, repr=False)
+    knowledge_evidence_digest: str = ""
 
 
 @dataclass(frozen=True, slots=True)
@@ -2487,6 +2488,8 @@ def _knowledge_evidence_for_admission(
             pass
         else:
             evidence = dict(encoded)
+    if _selected_knowledge(context) and evidence is None:
+        return None
     snapshot = current_history_snapshot()
     if snapshot is not None:
         from yeoman_gateway.adapters.reply_archive_history import HistoryReplyArchiveAdapter

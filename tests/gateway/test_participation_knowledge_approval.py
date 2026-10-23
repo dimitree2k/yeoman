@@ -37,6 +37,7 @@ from yeoman_gateway.processing.models import (
     EffectTarget,
     PolicySnapshot,
     TextPayload,
+    canonical_hash,
     payload_hash,
 )
 from yeoman_gateway.processing.participation import (
@@ -556,6 +557,7 @@ def _admission(
         payload_hash=payload_hash,
         approval_revision=approval_revision,
         knowledge_evidence=knowledge_evidence,
+        knowledge_evidence_digest=canonical_hash(knowledge_evidence) if knowledge_evidence is not None else "",
     )
 
 
@@ -602,6 +604,7 @@ def test_persisted_admission_keeps_evidence_across_a_store_restart(tmp_path: Pat
 
     assert restored is not None
     assert restored.knowledge_evidence == evidence
+    assert restored.knowledge_evidence_digest == canonical_hash(evidence)
     assert restored.admission_id == "adm-1"
     assert restored.payload_hash == envelope.payload_hash
     assert restored.payload_hash == payload_hash(TextPayload(text="prepared draft"))
@@ -848,6 +851,7 @@ async def test_staging_persists_the_evidence_and_reconstructs_it_after_a_restart
     restarted, restarted_log, restarted_archive, _ = _build_tools(tmp_path)
     submission = _Submission()
     restarted.set_participation_submission(submission)
+    restarted.set_knowledge_decision_validator(lambda admission: (True, "allow"))
     try:
         outcome = await restarted.submit_proposal("opp-1")
     finally:
@@ -1315,3 +1319,202 @@ async def test_legacy_recent_only_proposal_still_queues_without_the_kwarg(
         assert submission.calls[0]["admission"].knowledge_evidence is None
     finally:
         runtime._ledger.close()
+
+# Production validator regressions: current native History authority, durable evidence.
+def _native_evidence(history, knowledge, *, chat=CHAT):
+    from yeoman_gateway.history.context import current_history_snapshot
+    from yeoman_gateway.history.queries import HistoryQueries
+    from yeoman_gateway.processing.participation_knowledge import history_participation_readers
+
+    source = {"event_id": "m1", "sender_id": "10001@s.whatsapp.net"}
+    readers = history_participation_readers(
+        _opportunity(chat), {"messages": [source]}, knowledge=knowledge
+    )
+    assert isinstance(readers, ParticipationKnowledgeReaders)
+    selection = ParticipationKnowledgeSelector(knowledge=knowledge).select_for_readers(
+        query="Stammtisch", readers=readers
+    )
+    evidence = selection_to_mapping(selection)
+    snapshot = current_history_snapshot()
+    queries = HistoryQueries(snapshot)
+    row = queries.native_message(chat_id=chat, native_id="m1")
+    evidence["history"] = {"generation": snapshot.generation,
+                           "revisions": {row["message_id"]: queries.content_fingerprint(row["message_id"])}}
+    return evidence
+
+
+def _native_fixture(history, *, chat=CHAT):
+    now = 1_790_000_000_000
+    history.add_group(chat_id=chat, participants=["10001@s.whatsapp.net", "10002@s.whatsapp.net"], timestamp=now)
+    history.add_message(chat_id=chat, message_id="m1", sender_id="10001@s.whatsapp.net", text="Stammtisch?", timestamp=now + 1)
+    source = SourceRef("ev-1", 1, CHANNEL, chat, "alice", now - 100)
+    knowledge = _Knowledge(KnowledgeContext(
+        text="Stammtisch donnerstags.", statement_ids=("stmt-1",),
+        entry_texts=("Stammtisch donnerstags.",), source_refs=(source,),
+        source_refs_by_statement=(("stmt-1", (source,)),), context_revision="r1",
+    ))
+    knowledge.policy_revision = 0
+    return knowledge
+
+
+def _change_native(case, history, knowledge, *, chat=CHAT):
+    result = knowledge.result
+    if case == "text":
+        knowledge.result = replace(result, text="Changed.", entry_texts=("Changed.",))
+    elif case == "revoked":
+        knowledge.result = KnowledgeContext()
+    elif case == "revision":
+        ref = replace(result.source_refs[0], revision=2)
+        knowledge.result = replace(result, source_refs=(ref,), source_refs_by_statement=(("stmt-1", (ref,)),))
+    elif case == "record_identity":
+        knowledge.result = replace(result, statement_ids=("stmt-2",), source_refs_by_statement=(("stmt-2", result.source_refs),))
+    elif case == "context_revision":
+        knowledge.result = replace(result, context_revision="r2")
+    elif case == "departed_author":
+        history.add_group(chat_id=chat, participants=["10002@s.whatsapp.net"], timestamp=int(time.time() * 1000) - 1)
+    elif case == "membership":
+        history.add_group(chat_id=chat, participants=["10001@s.whatsapp.net"], timestamp=int(time.time() * 1000) - 1)
+    elif case == "policy":
+        knowledge.policy_revision += 1
+
+
+@pytest.mark.parametrize("case", ["unchanged", "text", "revoked", "revision", "record_identity", "context_revision", "membership", "departed_author", "policy", "missing_store", "missing_validator"])
+@pytest.mark.parametrize("restart", [False, True])
+async def test_native_knowledge_approval_boundaries(tmp_path, case, restart):
+    from yeoman_gateway.app.bootstrap import build_participation_decision_validator
+
+    tools, log, history, _ = _build_tools(tmp_path)
+    knowledge = _native_fixture(history)
+    assert await log.reserve_delivery(
+        proposal_id="opp-1", effect_id=_effect_id(), channel=CHANNEL, chat_id=CHAT,
+        now_ms=int(FIXED_NOW.timestamp() * 1000), limits=(("comment", 3, 86_400_000),),
+        origin="participation",
+    )
+    async with history.turn():
+        evidence = _native_evidence(history, knowledge)
+        assert (await _stage(tools, knowledge_evidence=evidence))["status"] == "awaiting_approval"
+    snapshot = await _stored_snapshot(log)
+    await _claim(log, snapshot)
+    if restart:
+        log.close()
+        tools, log, history, _ = _build_tools(tmp_path)
+        knowledge = _native_fixture(history)
+    _change_native(case, history, knowledge)
+    submission = _Submission()
+    tools.set_participation_submission(submission)
+    if case != "missing_validator":
+        tools.set_knowledge_decision_validator(build_participation_decision_validator(
+            knowledge=None if case == "missing_store" else knowledge
+        ))
+    try:
+        outcome = await tools.submit_proposal("opp-1")
+        if case == "unchanged":
+            assert outcome["status"] == "submitted", outcome
+            assert submission.calls[0]["content"] == "the prepared draft"
+        else:
+            assert outcome["status"] == "rejected", outcome
+            assert submission.calls == []
+            row = log._delivery_row_for_effect(_effect_id())
+            assert row["attempt_state"] == "released"
+            assert row["delivery_state"] == "failed"
+    finally:
+        history.close()
+        log.close()
+
+
+async def test_native_validator_durable_digest_and_history_only(tmp_path):
+    from yeoman_gateway.app.bootstrap import build_participation_decision_validator
+    from yeoman_gateway.processing.models import canonical_hash
+
+    from tests.gateway.history_test_helpers import ProjectedHistory
+
+    history = ProjectedHistory(tmp_path)
+    knowledge = _native_fixture(history)
+    try:
+        async with history.turn():
+            evidence = _native_evidence(history, knowledge)
+            admission = replace(_admission(payload_hash="text-hash", knowledge_evidence=evidence),
+                                knowledge_evidence_digest=canonical_hash(evidence))
+            validator = build_participation_decision_validator(knowledge=knowledge)
+            assert validator(admission) == (True, "allow")
+            changed = dict(evidence, text="tampered")
+            assert not validator(replace(admission, knowledge_evidence=changed))[0]
+            assert not validator(replace(admission, knowledge_evidence=None))[0]
+            assert validator(_admission(payload_hash="text-hash", knowledge_evidence={"history": evidence["history"]})) == (True, "allow")
+    finally:
+        history.close()
+
+
+@pytest.mark.parametrize("case", ["unchanged", "text", "revoked", "revision", "context_revision", "membership", "departed_author", "missing_store", "missing_validator"])
+async def test_native_knowledge_dispatch_after_store_restart(tmp_path, case):
+    from yeoman_gateway.app.bootstrap import build_participation_decision_validator
+
+    from tests.gateway.history_test_helpers import ProjectedHistory
+
+    history = ProjectedHistory(tmp_path)
+    knowledge = _native_fixture(history, chat=GROUP)
+    async with history.turn():
+        evidence = _native_evidence(history, knowledge, chat=GROUP)
+    store = ProcessingStore(tmp_path / "processing.db")
+    try:
+        router, envelope, transport = _dispatch_router(
+            tmp_path, store=store, evidence=evidence,
+            validator=None if case == "missing_validator" else build_participation_decision_validator(knowledge=knowledge),
+        )
+        # The send is authorized from the reconstructed admission, with no retained selection.
+        store.close()
+        store = ProcessingStore(tmp_path / "processing.db")
+        router, envelope, transport = _dispatch_router(
+            tmp_path, store=store, evidence=evidence,
+            validator=None if case == "missing_validator" else build_participation_decision_validator(knowledge=knowledge),
+        )
+        _change_native(case, history, knowledge, chat=GROUP)
+        if case == "missing_store":
+            # The configured reader can also go down after approval.
+            knowledge.recall = lambda *a, **kw: (_ for _ in ()).throw(RuntimeError("offline"))
+        async with history.turn():
+            receipt = await router._gateway.execute_ready(envelope.effect_id)
+        if case == "unchanged":
+            assert receipt.state == "sent", receipt
+            assert len(transport) == 1
+        else:
+            assert receipt.state == "failed", receipt
+            assert transport == []
+        # Recovery uses the existing reconciler to release the durable hold.
+        from yeoman_gateway.consciousness.delivery import ParticipationReceiptReconciler
+        ledger = SpeakupLog(tmp_path / "dispatch-ledger.db")
+        try:
+            now = int(time.time() * 1000)
+            assert await ledger.reserve_delivery(
+                proposal_id="opp-1", effect_id=envelope.effect_id, channel=CHANNEL,
+                chat_id=GROUP, now_ms=now, limits=(("comment", 3, 86_400_000),),
+                origin="participation",
+            )
+            await ledger.record_send_attempt("opp-1", effect_id=envelope.effect_id, now_ms=now)
+            await ParticipationReceiptReconciler(log=ledger, store=store).reconcile(now_ms=now)
+            state = await ledger.delivery_state(proposal_id="opp-1", effect_id=envelope.effect_id)
+            assert state == ("transport_accepted" if case == "unchanged" else "failed")
+        finally:
+            ledger.close()
+        assert store.count_effects() == 1
+    finally:
+        history.close()
+        store.close()
+
+
+async def test_native_history_proof_cannot_replace_missing_selected_knowledge(tmp_path):
+    from tests.gateway.history_test_helpers import ProjectedHistory
+
+    history = ProjectedHistory(tmp_path)
+    _native_fixture(history)
+    runtime = _participation_runtime(tmp_path, _LegacyApprovalSubmission())
+    runtime._revalidate_knowledge = lambda opportunity, context, current: current
+    try:
+        async with history.turn():
+            outcome = await _submit_approval(runtime, context={
+                "_knowledge_selection": SimpleNamespace(text="selected fact", revision="r1")
+            })
+        assert outcome == {"status": "comment_skipped", "reason": "approval_knowledge_revalidation_unavailable"}
+    finally:
+        runtime._ledger.close()
+        history.close()
