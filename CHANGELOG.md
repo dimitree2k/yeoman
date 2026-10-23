@@ -2,6 +2,10 @@
 
 ## Unreleased
 
+- Added `yeoman people knowledge-mapping`: read-only counts of Knowledge person
+  references resolved through directory bridges, with JSON output and optional
+  private problem-id details. Knowledge ids and both database schemas stay unchanged.
+
 - WhatsApp media now retains images for 90 days and videos for 30 days, and sends
   supported video files to Gemini through OpenRouter for full-clip descriptions.
 - Added the standalone `yeoman a2a serve` relay command, contract conformance

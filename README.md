@@ -609,6 +609,10 @@ the protocol version.
 | `yeoman memory facts supersede <id> --by <ref>` | Mark a fact superseded by a replacement |
 | `yeoman memory facts jobs [--state queued]` | Extraction backlog and skip reasons |
 | `yeoman memory facts backfill --chat <id> --since <date>` | Extract facts from history — **dry-run** unless `--apply` |
+| **People** (owner) | |
+| `yeoman people status [--json]` | Directory counts and last sync, read-only |
+| `yeoman people check [--json]` | Directory integrity findings, read-only |
+| `yeoman people knowledge-mapping [--json] [--knowledge-db PATH] [--people-db PATH] [--details PATH]` | Read-only Knowledge-to-directory mapping counts; exit 1 for unmapped or ambiguous ids |
 | **Knowledge** (admin) | |
 | `yeoman knowledge migration inspect\|build\|verify` | Offline legacy snapshot inventory, build and verification |
 | `yeoman knowledge capture status` | Statement-promotion counters: job states, refusal reasons, oldest queued wait |
@@ -623,6 +627,21 @@ the protocol version.
 | **Cron** | |
 | `yeoman cron list\|add\|remove\|enable\|run` | Manage scheduled tasks |
 | `yeoman cron add-voice` | Schedule voice broadcast jobs |
+
+`people knowledge-mapping` uses `YEOMAN_HOME/data/{knowledge/knowledge.db,people/people.db}`
+(default `~/.yeoman`). Database overrides support isolated copies. Statements keep their
+Knowledge ids; active, visible `knowledge_person` bridges resolve through merge chains.
+The report counts distinct ids globally and per source (assertion speakers, all role
+rows grouped by role, all person attributes). Statement counts include only assertions
+referencing each outcome through any of these sources; categories can overlap. Missing
+or blank assertion speakers are counted separately. Fixed problem reasons are
+`no_active_bridge`, `multiple_terminals`, and `invalid_merge_chain`.
+`--details PATH` atomically writes only problem ids and reasons as JSON (0600).
+Use a dedicated owner-only parent directory (0700); a missing parent is created.
+Paths inside git work trees and paths aliasing either input database are refused.
+Exit 0 means all referenced ids map, 1 means mapping problems, and 2 means an input
+or details-file error. A concurrently changing checkpointed database is refused;
+retry the command or use isolated copies.
 
 ## Configuration Reference
 
