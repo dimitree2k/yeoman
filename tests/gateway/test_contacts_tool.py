@@ -377,10 +377,30 @@ class TestResolveContactTool:
         assert payload["error_code"] == "contact_not_resolved"
 
 
-def test_search_without_query_explains_how_to_recover():
+@pytest.mark.parametrize("query", ["", "   "])
+def test_search_without_query_explains_how_to_recover(query):
     tool = ContactsTool(knowledge=None)
-    result = tool._search("")
+    result = tool._search(query)
     assert result.startswith("Error: search needs a query")
-    assert "listing all contacts is not supported" in result
+    assert "action=list" in result
     assert "query" in tool.parameters["properties"]
     assert "Required for action=search" in tool.parameters["properties"]["query"]["description"]
+
+
+def test_list_schema_guides_owner_listing():
+    tool = ContactsTool()
+    properties = tool.parameters["properties"]
+    assert "list" in properties["action"]["enum"]
+    assert "list my contacts" in tool.description
+    assert "owner DM" in tool.description
+    assert "action=list" in tool.description
+    assert "not supported" not in tool.description
+    assert properties["limit"] == {
+        "type": "integer",
+        "minimum": 1,
+        "maximum": 50,
+        "default": 25,
+        "description": "Page size for action=list (1-50).",
+    }
+    assert properties["offset"]["minimum"] == 0
+    assert properties["offset"]["default"] == 0

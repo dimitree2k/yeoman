@@ -197,3 +197,86 @@ async def test_contacts_renders_at_most_eight_ambiguity_candidates(
     output = await execute(c, action="search", query="Same Name")
     assert len(rendered) == 8
     assert output.count("Same Name") == 8 and "truncated" in output
+
+
+async def test_list_owner_dm_uses_contact_scope_and_disclosure_only(contacts_directory_case):
+    c = contacts_directory_case
+    c.add_person("PRIVATE_seen", source="observed", level="seen")
+    c.add_person("Curated Seen", level="seen")  # Owner name makes effective level curated.
+    c.add_id(c.subject, "phone", "4915000000012", hidden=True)
+    c.add_id(c.subject, "phone", "4915000000013", end=1)
+    c.add_id(c.subject, "phone", "4915000000014")
+    other = c.add_person("Conflicting Phone")
+    c.add_id(other, "phone", "4915000000014", end=9999999999999)
+    output = await execute(c, action="list")
+    assert "- Vincent (phone:4915000000011)" in output
+    assert "Curated Seen" in output
+    assert "PRIVATE_" not in output
+    assert "4915000000012" not in output and "4915000000013" not in output
+    assert "4915000000014" not in output
+    assert "Owner Nickname" not in output and "allowed statement" not in output
+    c.knowledge.directory_subject_ids.assert_not_called()
+    c.knowledge.person_profile.assert_not_called()
+
+
+@pytest.mark.parametrize("kind", ["group", "other_dm"])
+async def test_list_denied_outside_owner_dm(contacts_directory_case, kind):
+    c = contacts_directory_case
+    output = await execute(c, kind, action="list")
+    assert output == "Error: listing contacts is only available in the owner DM"
+    assert "Vincent" not in output
+    c.knowledge.directory_subject_ids.assert_not_called()
+
+
+async def test_list_pagination_order_and_merged_terminals(contacts_directory_case):
+    c = contacts_directory_case
+    first = c.add_person("Alpha", ids=(("phone", "4915000000021"),))
+    c.add_person("Alpha", ids=(("phone", "4915000000022"),))
+    middle = c.add_person("Middle Alias", merged_into=first)
+    c.add_person("Earlier Alias", merged_into=middle)
+    for n in reversed(range(55)):
+        c.add_person(f"Contact {n:02}")
+    output = await execute(c, action="list")
+    lines = [line for line in output.splitlines() if line.startswith("- ")]
+    assert len(lines) == 25
+    assert lines[:2] == ["- Alpha (phone:4915000000021)", "- Alpha (phone:4915000000022)"]
+    assert lines[2] == "- Contact 00 ()"
+    assert "Next offset: 25" in output
+    page = await execute(c, action="list", offset=25, limit=50)
+    page_lines = [line for line in page.splitlines() if line.startswith("- ")]
+    assert page_lines[0] == "- Contact 23 ()"
+    assert len(page_lines) == 36
+    assert "Next offset:" not in page
+    assert "Alias" not in output + page
+    max_page = await execute(c, action="list", limit=50)
+    assert len([line for line in max_page.splitlines() if line.startswith("- ")]) == 50
+    assert await execute(c, action="list", offset=1000) == "No contacts found."
+
+
+@pytest.mark.parametrize(
+    "args",
+    [
+        {"limit": 0},
+        {"limit": -1},
+        {"limit": 51},
+        {"limit": "25"},
+        {"limit": True},
+        {"limit": None},
+        {"limit": 1.5},
+        {"offset": -1},
+        {"offset": "0"},
+        {"offset": True},
+        {"offset": None},
+        {"offset": 1.5},
+    ],
+)
+async def test_list_invalid_pagination_is_rejected(contacts_directory_case, args):
+    output = await execute(contacts_directory_case, action="list", **args)
+    assert output.startswith("Error: list needs")
+
+
+async def test_list_empty_contact_scope(contacts_directory_case):
+    c = contacts_directory_case
+    c.writer.execute("UPDATE persons SET preferred_name=NULL, notes=NULL, level='seen'")
+    c.writer.execute("DELETE FROM person_names")
+    assert await execute(c, action="list") == "No contacts found."

@@ -62,9 +62,11 @@ class ContactsTool(Tool):
     def description(self) -> str:
         return (
             "Search people, read profiles, and add or remove contact information. "
-            "Actions: search, get, add_field, remove_field. "
+            "Actions: list, search, get, add_field, remove_field. "
+            "For 'list my contacts', use action=list in the owner DM only; "
+            "paginate with limit (default 25, max 50) and offset (default 0). "
             "`search` always needs `query` (a name, nickname or phone number); "
-            "listing all contacts is not supported."
+            "do not use repeated searches to list contacts."
         )
 
     @property
@@ -74,8 +76,21 @@ class ContactsTool(Tool):
             "properties": {
                 "action": {
                     "type": "string",
-                    "enum": ["search", "get", "add_field", "remove_field"],
-                    "description": "The operation to perform.",
+                    "enum": ["list", "search", "get", "add_field", "remove_field"],
+                    "description": "The operation to perform; list is owner DM only.",
+                },
+                "limit": {
+                    "type": "integer",
+                    "minimum": 1,
+                    "maximum": 50,
+                    "default": 25,
+                    "description": "Page size for action=list (1-50).",
+                },
+                "offset": {
+                    "type": "integer",
+                    "minimum": 0,
+                    "default": 0,
+                    "description": "Number of contacts to skip for action=list; use Next offset.",
                 },
                 "name": {
                     "type": "string",
@@ -124,6 +139,10 @@ class ContactsTool(Tool):
                 history=snapshot,
             )
             action = kwargs.get("action", "")
+            if action == "list":
+                return self._list(
+                    reader, limit=kwargs.get("limit", 25), offset=kwargs.get("offset", 0)
+                )
             if action == "search":
                 return self._search(kwargs.get("query", ""), reader=reader)
             if action == "get":
@@ -134,15 +153,38 @@ class ContactsTool(Tool):
         except PeopleUnavailable:
             return "Error: directory is unavailable"
 
+    def _list(self, reader: ReaderContext, *, limit: int = 25, offset: int = 0) -> str:
+        from yeoman_gateway.people.disclosure import render_person
+
+        if reader.kind != "owner_dm":
+            return "Error: listing contacts is only available in the owner DM"
+        if type(limit) is not int or not 1 <= limit <= 50 or type(offset) is not int or offset < 0:
+            return "Error: list needs an integer limit (1-50) and integer offset (0 or greater)"
+        # Owner scope already contains unique terminals at effective level contact or curated.
+        cards = [
+            render_person(person, reader) for person in reader.directory.scope(reader).eligible_ids
+        ]
+        cards.sort(key=lambda card: (card.display_name.casefold(), card.person_id))
+        page = cards[offset : offset + limit]
+        if not page:
+            return "No contacts found."
+        lines = [f"Contacts ({offset + 1}-{offset + len(page)} of {len(cards)}):"]
+        for card in page:
+            identifiers = ", ".join(f"{kind}:{value}" for kind, value in card.identifiers)
+            lines.append(f"- {card.display_name} ({identifiers})")
+        if offset + len(page) < len(cards):
+            lines.append(f"Next offset: {offset + len(page)}")
+        return "\n".join(lines)
+
     def _search(self, query: str, *, reader: ReaderContext | None = None) -> str:
         from yeoman_gateway.people.disclosure import render_person
         from yeoman_gateway.people.resolver import resolve_person
 
-        if not query:
+        if not query.strip():
             return (
                 "Error: search needs a query (a name, nickname or phone number); "
-                "listing all contacts is not supported. Retry once with the person's name, "
-                "or ask the user who they mean."
+                "use action=list to list contacts in the owner DM. Otherwise retry once with "
+                "the person's name, or ask the user who they mean."
             )
         if reader is None:
             return "Error: directory is unavailable"
