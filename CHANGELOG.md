@@ -7,6 +7,9 @@
 - Added the standalone `yeoman a2a serve` relay command, contract conformance
   check, and source-owned `yeoman-a2a.service` user unit for the structured
   Hermes/Yeoman A2A v1 relay.
+- Security refresh of the dependency set: `litellm` 1.106.2, `aiohttp` 3.14.5,
+  `pypdf` 6.21.2, `urllib3` 2.8.0 and related transitive packages. `uv audit`
+  now reports no known advisories, down from 121.
 
 ## v1.1.0 — 11 Sep 2026
 
