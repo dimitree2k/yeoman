@@ -102,6 +102,44 @@ def people_status(json_output: bool = typer.Option(False, "--json", help="Output
         _print(_status(conn), json_output)
 
 
+@people_app.command("knowledge-mapping")
+def people_knowledge_mapping(
+    knowledge_db: Path | None = typer.Option(None, "--knowledge-db", help="Knowledge database to read"),
+    people_db: Path | None = typer.Option(None, "--people-db", help="Directory database to read"),
+    details: Path | None = typer.Option(None, "--details", help="Owner-only problem ids file"),
+    json_output: bool = typer.Option(False, "--json", help="Output JSON"),
+) -> None:
+    """Read-only Knowledge bridge report. Exit 1 for unmapped or ambiguous ids."""
+    from yeoman_shared.utils.helpers import get_operational_data_path
+
+    from yeoman_gateway.people.knowledge_mapping import knowledge_mapping, write_mapping_details
+    from yeoman_gateway.people.schema import people_db_path
+
+    try:
+        knowledge_path = knowledge_db or get_operational_data_path() / "knowledge" / "knowledge.db"
+        people_path = people_db or people_db_path()
+        report, problems = knowledge_mapping(knowledge_path, people_path)
+        if details is not None:
+            write_mapping_details(details, problems, protected=(knowledge_path, people_path))
+    except (OSError, sqlite3.Error, ValueError):
+        typer.echo("Cannot read mapping databases or write private details outside a git work tree.",
+                   err=True)
+        raise typer.Exit(2) from None
+    if json_output:
+        typer.echo(json.dumps(report, sort_keys=True))
+    else:
+        def emit(prefix: str, values: dict[str, Any]) -> None:
+            for key, value in values.items():
+                if isinstance(value, dict):
+                    emit(f"{prefix}{key}.", value)
+                else:
+                    typer.echo(f"{prefix}{key}: {value}")
+
+        emit("", report)
+    if problems:
+        raise typer.Exit(1)
+
+
 @people_app.command("sync")
 def people_sync(
     dry_run: bool = typer.Option(False, "--dry-run", help="Run on a temporary copy; required"),
