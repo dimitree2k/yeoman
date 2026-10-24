@@ -42,6 +42,7 @@ DecisionIntent = Literal["direct", "continue", "initiate"]
 #: Bounded, validated field sizes (spec section 4).
 MAX_PURPOSE_CHARS = 240
 MAX_REASON_CHARS = 160
+MAX_READING_CHARS = 240
 MAX_EVIDENCE_IDS = 8
 #: Judge view line between earlier context (below the conversation floor) and the
 #: conversation itself.
@@ -93,6 +94,7 @@ JUDGE_SYSTEM_PROMPT = (
     "comment. You never write the comment itself.\n"
     "Answer with JSON only:\n"
     "{\n"
+    '  "reading": "<what the newest message is about and its tone, one sentence>",\n'
     '  "action": "silence" | "react" | "comment",\n'
     '  "intent": "direct" | "continue" | "initiate",\n'
     '  "reason": "<short internal reason, max 160 characters>",\n'
@@ -105,6 +107,10 @@ JUDGE_SYSTEM_PROMPT = (
     '  "closes_exchange": true | false\n'
     "}\n"
     "Rules:\n"
+    "- Write reading first: what the newest message actually says or shows and its "
+    "tone (sincere, frustrated, informative, ironic, joking, ...). Decide action and "
+    "emoji from that reading, never from the format alone: a meme, image or link is "
+    "not by itself a joke worth a laugh.\n"
     "- Default to silence when no allowed, grounded contribution fits. A shared "
     "keyword, a new topic or elapsed time is not a reason to speak.\n"
     "- For initiation, direct address is not required when one of the allowed "
@@ -117,7 +123,8 @@ JUDGE_SYSTEM_PROMPT = (
     "said, and never re-skin the target's own point as a joke or metaphor; that is "
     "noise, not participation. When the only available comment would do that, choose "
     "react or silence instead.\n"
-    "- react when a gesture fits and prose would add nothing.\n"
+    "- react when a gesture fits and prose would add nothing. The emoji must match "
+    "the tone in reading; a laugh only for something that is genuinely funny.\n"
     "- intent=continue requires a delivered Arvid message (anchor_message_id) that the "
     "current material still relates to.\n"
     "- intent=direct is only valid when the context says the material is addressed to "
@@ -143,6 +150,7 @@ JUDGE_RESPONSE_FORMAT: dict[str, Any] = {
         "schema": {
             "type": "object",
             "properties": {
+                "reading": {"type": "string"},
                 "action": {"type": "string", "enum": ["silence", "react", "comment"]},
                 "intent": {"type": "string", "enum": ["direct", "continue", "initiate"]},
                 "reason": {"type": "string"},
@@ -155,7 +163,7 @@ JUDGE_RESPONSE_FORMAT: dict[str, Any] = {
                 "closes_exchange": {"type": "boolean"},
             },
             "required": [
-                "action", "intent", "reason", "evidence_ids", "anchor_message_id",
+                "reading", "action", "intent", "reason", "evidence_ids", "anchor_message_id",
                 "target_message_id", "contribution_type", "purpose", "emoji",
                 "closes_exchange",
             ],
@@ -220,6 +228,9 @@ class ParticipationDecision:
     action: DecisionAction
     intent: DecisionIntent
     reason: str
+    #: The judge's one-sentence understanding of the material, written before the
+    #: verdict. Descriptive only, like the reason.
+    reading: str = ""
     evidence_ids: tuple[str, ...] = ()
     anchor_message_id: str | None = None
     target_message_id: str | None = None
@@ -573,11 +584,13 @@ class ParticipationJudge:
             raise ParticipationDecisionError("invalid_response", detail="action_not_allowed")
 
         reason = _bounded_text(payload.get("reason"), MAX_REASON_CHARS)
+        reading = _bounded_text(payload.get("reading"), MAX_READING_CHARS)
         if action == "silence":
             return ParticipationDecision(
                 action="silence",
                 intent="initiate",
                 reason=reason,
+                reading=reading,
             )
 
         intent: DecisionIntent = "initiate"
@@ -687,6 +700,7 @@ class ParticipationJudge:
             action=action,
             intent=intent,
             reason=reason,
+            reading=reading,
             evidence_ids=evidence_ids,
             anchor_message_id=anchor,
             target_message_id=target,
