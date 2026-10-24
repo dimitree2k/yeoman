@@ -2262,3 +2262,66 @@ class KnowledgeService:
         return self._statements.active_statement_ids_for_event(
             source.event_id, source.revision
         )
+
+
+@contextmanager
+def readonly_database(path: Path) -> Iterator[sqlite3.Connection]:
+    """A closed isolated copy only: reject sidecars before immutable SQLite reads."""
+    path = path.expanduser().resolve(strict=True)
+    if any(Path(str(path) + suffix).exists() for suffix in ("-wal", "-shm", "-journal")):
+        raise ValueError("database copy must be closed and checkpointed")
+    conn = sqlite3.connect(path.as_uri() + "?mode=ro&immutable=1", uri=True)
+    try:
+        conn.row_factory = sqlite3.Row
+        conn.execute("PRAGMA query_only=ON")
+        yield conn
+    finally:
+        conn.close()
+
+
+@contextmanager
+def readonly_knowledge(
+    *, knowledge_db: Path, people_db: Path, history_db: Path,
+) -> Iterator[tuple[KnowledgeService, HistoryQueries]]:
+    """Offline evaluation boundary; never migrate or open live runtime stores."""
+    from contextlib import ExitStack
+
+    from yeoman_gateway.history.queries import HistoryQueries
+    from yeoman_gateway.history.reader import HistorySnapshot
+    from yeoman_gateway.knowledge._history_sources import HistoryKnowledgeSources
+    from yeoman_gateway.knowledge.runtime import RuntimeKnowledgePolicy, RuntimeKnowledgeSources
+    from yeoman_gateway.people.resolver import PeopleResolver
+
+    with ExitStack() as stack:
+        # Preflight all copies before constructors which normally serve live readers.
+        for path in (knowledge_db, people_db):
+            with readonly_database(path):
+                pass
+        conn = stack.enter_context(readonly_database(history_db))
+        queries = HistoryQueries(HistorySnapshot(1, (), conn))
+        directory = PeopleResolver(people_db, immutable=True)
+        stack.callback(directory.close)
+        store = KnowledgeStore(knowledge_db, readonly=True)
+        stack.callback(store.close)
+        workspaces = store.query("SELECT DISTINCT workspace_id FROM knowledge_statements")
+        if len(workspaces) > 1:
+            raise ValueError("evaluation requires a single workspace")
+        workspace = str(workspaces[0][0]) if workspaces else "evaluation-empty"
+        service = KnowledgeService(
+            store=store, workspace_id=workspace, source_authority=RuntimeKnowledgeSources(),
+            policy_authority=RuntimeKnowledgePolicy(engine=None), people=directory,
+        )
+        sources = HistoryKnowledgeSources(
+            queries, {}, service.history_source_ledger, RuntimeKnowledgeSources(),
+        )
+        stack.enter_context(service.history_scope(queries, sources))
+        yield service, queries
+
+
+def history_message_ids(service: KnowledgeService, sources: Iterable[SourceRef]) -> frozenset[str]:
+    """Resolve recalled legacy source aliases to History message ids without issuing proof."""
+    values = set()
+    for source in sources:
+        alias = service.history_source_ledger.alias(source.key)
+        values.add(alias.message_id if alias else source.event_id)
+    return frozenset(values)
