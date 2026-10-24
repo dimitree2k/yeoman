@@ -151,20 +151,28 @@ def write_private(path: Path, content: str) -> None:
         output.write(content)
 
 
-def _endpoint(conn: Any, person_id: int, queries: Any, now_ms: int) -> tuple[str, str]:
+def _endpoints(conn: Any, person_id: int, queries: Any, now_ms: int) -> list[tuple[str, str]]:
     rows = conn.execute(
         "SELECT kind,value FROM person_ids WHERE person_id=? AND hidden=0 "
         "AND kind IN ('phone','wa_lid') AND (valid_from_ms IS NULL OR valid_from_ms<=?) "
         "AND (valid_until_ms IS NULL OR valid_until_ms>?) ORDER BY kind,value",
         (person_id, now_ms, now_ms),
     )
+    proven = []
     for row in rows:
         value = str(row["value"])
         chat = value + ("@s.whatsapp.net" if row["kind"] == "phone" else "@lid")
         principal = "whatsapp:" + (value if row["kind"] == "phone" else chat)
         if queries.principal_contact(principal, now_ms) is not None:
-            return principal, chat
-    raise ValueError("reader has no proven active endpoint")
+            proven.append((principal, chat))
+    return proven
+
+
+def _endpoint(conn: Any, person_id: int, queries: Any, now_ms: int) -> tuple[str, str]:
+    proven = _endpoints(conn, person_id, queries, now_ms)
+    if not proven:
+        raise ValueError("reader has no proven active endpoint")
+    return proven[0]
 
 
 def build_reader(item: GoldItem, *, people: Any, queries: Any, now_ms: int) -> TrustedReadContext:
@@ -216,8 +224,13 @@ def build_reader(item: GoldItem, *, people: Any, queries: Any, now_ms: int) -> T
     if item.reader.startswith("group:"):
         chat = item.reader.removeprefix("group:")
         audience = queries.members(chat_id=chat, at_ms=now_ms)
-        if audience.status != "known" or principal not in audience.members:
+        # The owner may have several proven numbers; the reader is the one in this group.
+        member_endpoints = [
+            p for p, _ in _endpoints(people, owner[0][0], queries, now_ms) if p in audience.members
+        ]
+        if audience.status != "known" or not member_endpoints:
             raise ValueError("group reader requires proven owner membership")
+        principal = member_endpoints[0]
         members = audience.members
     else:
         members = frozenset({principal})

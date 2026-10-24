@@ -294,6 +294,36 @@ def test_non_member_is_proven_directory_person(copies):
         )
 
 
+def test_group_reader_uses_owner_endpoint_that_is_a_member():
+    from types import SimpleNamespace
+
+    people = sqlite3.connect(":memory:")
+    people.row_factory = sqlite3.Row
+    people.execute("CREATE TABLE persons (id INTEGER, is_owner INTEGER, merged_into INTEGER)")
+    people.execute(
+        "CREATE TABLE person_ids (person_id INTEGER, kind TEXT, value TEXT, hidden INTEGER, "
+        "valid_from_ms INTEGER, valid_until_ms INTEGER)"
+    )
+    people.execute("INSERT INTO persons VALUES (1, 1, NULL), (2, 0, NULL)")
+    people.executemany(
+        "INSERT INTO person_ids VALUES (1, 'phone', ?, 0, NULL, NULL)",
+        [("4915000000001",), ("4915000000002",)],
+    )
+    member = "whatsapp:4915000000002"
+    queries = SimpleNamespace(
+        principal_contact=lambda principal, at_ms: object(),
+        members=lambda chat_id, at_ms: SimpleNamespace(status="known", members=frozenset({member})),
+    )
+    context = gold.build_reader(
+        gold.GoldItem.model_validate(item(reader="group:g@g.us", person_ids=[2])),
+        people=people,
+        queries=queries,
+        now_ms=1000,
+    )
+    assert context.principal_id == member
+    assert context.chat_id == "g@g.us"
+
+
 @pytest.mark.asyncio
 async def test_metric_denominator_and_content_free_model_report(tmp_path):
     class Client:
