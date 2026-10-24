@@ -588,6 +588,11 @@ class ConsciousnessTools:
             payload_hash=payload_hash,
             approval_revision=max(1, int(admission.approval_revision or 0)),
             knowledge_evidence=dict(evidence) if evidence is not None else None,
+            knowledge_evidence_digest=(
+                canonical_hash(evidence)
+                if evidence is not None and set(evidence) != {"history"}
+                else ""
+            ),
         )
 
         try:
@@ -1116,9 +1121,23 @@ class ConsciousnessTools:
                 proposal.proposal_id, reason="approval_binding_changed"
             )
             return {"status": "rejected", "reason": "approval_binding_changed"}
+        async def reject_evidence(reason: str) -> dict[str, object]:
+            await self.log.release_delivery(
+                proposal.proposal_id,
+                effect_id=effect_id,
+                state="failed",
+                reason=reason,
+                now_ms=now_ms,
+            )
+            await self.log.resolve_approval_claim(
+                proposal.proposal_id, resolution="rejected", now_ms=now_ms
+            )
+            await self.log.mark_rejected(proposal.proposal_id, reason=reason)
+            return {"status": "rejected", "reason": reason}
+
         raw_admission = snapshot.get("participation_admission")
         if not isinstance(raw_admission, dict):
-            return {"status": "rejected", "reason": "approval_admission_missing"}
+            return await reject_evidence("approval_admission_missing")
         values = dict(raw_admission)
         values["source_event_ids"] = tuple(values.get("source_event_ids") or ())
         values["source_principals"] = tuple(
@@ -1132,11 +1151,11 @@ class ConsciousnessTools:
         if isinstance(stored_evidence, Mapping):
             values["knowledge_evidence"] = dict(stored_evidence)
         elif stored_evidence is not None:
-            return {"status": "rejected", "reason": "approval_admission_invalid"}
+            return await reject_evidence("approval_admission_invalid")
         try:
             admission = ParticipationAdmission(**values)
         except (TypeError, ValueError):
-            return {"status": "rejected", "reason": "approval_admission_invalid"}
+            return await reject_evidence("approval_admission_invalid")
         expected_effect_id = deterministic_effect_id(
             channel=proposal.channel,
             chat_id=proposal.chat_id,
@@ -1169,29 +1188,24 @@ class ConsciousnessTools:
             return {"status": "rejected", "reason": "approval_admission_changed"}
 
         validator = self._knowledge_decision_validator
-        if validator is not None:
+        requires_validator = bool(
+            admission.knowledge_evidence_digest
+            or (isinstance(admission.knowledge_evidence, Mapping)
+                and set(admission.knowledge_evidence) != {"history"})
+        )
+        if validator is not None or requires_validator:
             # Durable revalidation at the approval commit, from the persisted evidence
             # and the current stores. Nothing here regenerates a draft or substitutes a
             # different payload: a stale approval is rejected, never refreshed.
             try:
-                allowed, knowledge_reason = validator(admission)
+                allowed, knowledge_reason = (
+                    validator(admission) if validator is not None
+                    else (False, "revalidation_unavailable")
+                )
             except Exception:  # noqa: BLE001 - an unavailable check must not approve
                 allowed, knowledge_reason = False, "revalidation_unavailable"
             if not allowed:
-                await self.log.release_delivery(
-                    proposal.proposal_id,
-                    effect_id=effect_id,
-                    state="failed",
-                    reason=f"knowledge_approval_{knowledge_reason}",
-                    now_ms=int(self._now().timestamp() * 1000),
-                )
-                await self.log.mark_rejected(
-                    proposal.proposal_id, reason=f"knowledge_approval_{knowledge_reason}"
-                )
-                return {
-                    "status": "rejected",
-                    "reason": f"knowledge_approval_{knowledge_reason}",
-                }
+                return await reject_evidence(f"knowledge_approval_{knowledge_reason}")
 
         output = self.security.check_output(
             proposal.message,

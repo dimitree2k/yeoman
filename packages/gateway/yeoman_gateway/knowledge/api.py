@@ -817,6 +817,7 @@ class KnowledgeService:
         max_chars: int | None = None,
         group_wide: bool = False,
         require_match: bool = False,
+        lexical_only: bool = False,
     ) -> KnowledgeContext:
         """Recall under the one shared read contract.
 
@@ -824,9 +825,10 @@ class KnowledgeService:
         (a proven earlier period of a ``state_change``), ``correction_audit`` (retracted
         claims, for an authorized correction history) or ``diagnosis`` (authorized
         inspection, still never ``revoked`` content).
+        ``lexical_only`` forbids embedding calls, including during delayed approval.
         """
         checked = self._read_context(context)
-        if self._embedder is not None and query.text.strip() and view == "current":
+        if not lexical_only and self._embedder is not None and query.text.strip() and view == "current":
             return self._retrieval.recall_hybrid(
                 query, context=checked, embedder=self._embedder, max_chars=max_chars,
                 group_wide=group_wide, require_match=require_match,

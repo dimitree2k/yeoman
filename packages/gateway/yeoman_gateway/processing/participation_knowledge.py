@@ -221,6 +221,7 @@ class ParticipationKnowledgeSelector:
         query: str,
         read_context: TrustedReadContext,
         fact_context: FactReadContext,
+        lexical_only: bool = False,
     ) -> ParticipationKnowledgeSelection:
         text = _normalize_query(query)
         if not text:
@@ -237,6 +238,7 @@ class ParticipationKnowledgeSelector:
                 max_chars=MAX_TEXT_CHARS,
                 group_wide=group_wide,
                 require_match=True,
+                **({"lexical_only": True} if lexical_only else {}),
             )
             statement_lines = _statement_lines(statements)
             remaining_entries = max(0, MAX_ENTRIES - len(statement_lines))
@@ -290,7 +292,7 @@ class ParticipationKnowledgeSelector:
         )
 
     def select_for_readers(
-        self, *, query: str, readers: ParticipationKnowledgeReaders
+        self, *, query: str, readers: ParticipationKnowledgeReaders, lexical_only: bool = False
     ) -> ParticipationKnowledgeSelection:
         """Select once per verified trigger author and keep only the intersection.
 
@@ -310,6 +312,7 @@ class ParticipationKnowledgeSelector:
                 query=query,
                 read_context=reader.read_context,
                 fact_context=reader.fact_context,
+                lexical_only=lexical_only,
             )
         selections: list[ParticipationKnowledgeSelection] = []
         for reader in ordered:
@@ -317,6 +320,7 @@ class ParticipationKnowledgeSelector:
                 query=query,
                 read_context=reader.read_context,
                 fact_context=reader.fact_context,
+                lexical_only=lexical_only,
             )
             if selection.reason == "error":
                 return _empty("error")
@@ -392,6 +396,38 @@ class ParticipationKnowledgeSelector:
             revalidated[0] if len(revalidated) == 1 else _combine_records(revalidated, ordered)
         )
         if current.records != selection.records or current.text != selection.text:
+            raise ParticipationKnowledgeInvalidatedError("selected knowledge changed")
+        return current
+
+    def revalidate_durable_for_readers(
+        self,
+        selection: ParticipationKnowledgeSelection,
+        *,
+        readers: ParticipationKnowledgeReaders,
+    ) -> ParticipationKnowledgeSelection:
+        """Compare a decoded snapshot with bounded protected reads for every author.
+
+        The codec deliberately carries no live KnowledgeContext authority. Re-reading the
+        original bounded query obtains current protected records and source fingerprints;
+        equality with the durable selection is mandatory. Ranking changes can reject a
+        still-readable draft. Lexical-only reads also reject vector-only selections without
+        calling a provider or substituting evidence under approval.
+        """
+        current = self.select_for_readers(
+            query=selection.query, readers=readers, lexical_only=True
+        )
+        if (
+            not selection.records
+            or not selection.text
+            or current.reason != "selected"
+            or current.records != selection.records
+            or current.text != selection.text
+            or current.revision != selection.revision
+            or current.reader_keys != selection.reader_keys
+            or current.recipient_principals != selection.recipient_principals
+            or current.current_members != selection.current_members
+            or current.is_direct != selection.is_direct
+        ):
             raise ParticipationKnowledgeInvalidatedError("selected knowledge changed")
         return current
 
@@ -1031,6 +1067,7 @@ def _revision(
         "statements": list(statements.statement_ids),
         "statement_sources": sorted((item.event_id, item.revision) for item in statements.source_refs),
         "identity_revision": statements.identity_revision,
+        "context_revision": statements.context_revision,
         "facts": sorted((key, value) for key, value in facts.used_source_refs.items()),
         "principal": read_context.principal_id,
         "channel": read_context.channel,

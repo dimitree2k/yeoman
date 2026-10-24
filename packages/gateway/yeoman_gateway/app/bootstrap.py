@@ -1283,7 +1283,7 @@ def _build_participation_runtime(
     if knowledge is not None:
         bind_validator = getattr(approval_tools, "set_knowledge_decision_validator", None)
         if callable(bind_validator):
-            bind_validator(_history_decision_validator)
+            bind_validator(build_participation_decision_validator(knowledge=knowledge))
     reactor = (
         _ParticipationReactor(responder=responder)
         if callable(getattr(responder, "react_to_participation", None))
@@ -1993,10 +1993,75 @@ def _history_decision_validator(admission: object) -> tuple[bool, str]:
     except HistoryPaused:
         raise
     except Exception:  # noqa: BLE001 - unavailable authority must fail closed
-        return False, "knowledge_reader_authority_unavailable"
+        return False, "history_validation_unavailable"
     if set(evidence) == {"history"}:
         return True, "allow"
     return False, "knowledge_reader_authority_unavailable"
+
+
+def build_participation_decision_validator(
+    *, knowledge: Any | None,
+) -> Callable[[object], tuple[bool, str]]:
+    """Revalidate durable History and Knowledge evidence under current authority."""
+    from yeoman_gateway.processing.models import canonical_hash
+    from yeoman_gateway.processing.participation_knowledge import (
+        ParticipationKnowledgeReaders,
+        ParticipationKnowledgeSelector,
+        history_participation_readers,
+        selection_from_mapping,
+    )
+
+    def validate(admission: object) -> tuple[bool, str]:
+        from yeoman_gateway.adapters.reply_archive_history import HistoryReplyArchiveAdapter
+        from yeoman_gateway.history.context import current_history_snapshot
+        from yeoman_gateway.history.live import HistoryPaused
+        from yeoman_gateway.history.queries import HistoryQueries
+
+        evidence = getattr(admission, "knowledge_evidence", None)
+        digest = getattr(admission, "knowledge_evidence_digest", "")
+        if digest and (not isinstance(evidence, Mapping) or canonical_hash(evidence) != digest):
+            return False, "knowledge_evidence_digest_changed"
+        allowed, reason = _history_decision_validator(admission)
+        if allowed or reason != "knowledge_reader_authority_unavailable":
+            return allowed, reason
+        if knowledge is None:
+            return False, "revalidation_unavailable"
+        try:
+            if not digest:
+                return False, "knowledge_evidence_digest_missing"
+            selection = selection_from_mapping({
+                key: value for key, value in evidence.items() if key != "history"
+            })
+            if not selection.text or not selection.records:
+                return False, "knowledge_evidence_unreadable"
+            snapshot = current_history_snapshot()
+            if snapshot is None:
+                return False, "knowledge_reader_authority_unavailable"
+            archive = HistoryReplyArchiveAdapter(HistoryQueries(snapshot))
+            messages = []
+            source_ids = tuple(getattr(admission, "source_event_ids", ()))
+            channel = str(getattr(admission, "channel", ""))
+            chat_id = str(getattr(admission, "chat_id", ""))
+            for source_id in source_ids:
+                row = archive.row(channel, chat_id, source_id)
+                if row is None:
+                    return False, "knowledge_sources_changed"
+                messages.append({"event_id": source_id, "sender_id": row["sender_id"]})
+            readers = history_participation_readers(
+                admission, {"messages": messages}, knowledge=knowledge
+            )
+            if not isinstance(readers, ParticipationKnowledgeReaders):
+                return False, "knowledge_reader_authority_changed"
+            ParticipationKnowledgeSelector(knowledge=knowledge).revalidate_durable_for_readers(
+                selection, readers=readers
+            )
+        except HistoryPaused:
+            raise
+        except Exception:  # noqa: BLE001 - no draft may outlive uncheckable evidence
+            return False, "knowledge_changed_or_unavailable"
+        return True, "allow"
+
+    return validate
 
 
 def _global_pause_reason(policy_adapter: object, channel: str, chat_id: str) -> str | None:
@@ -2284,6 +2349,8 @@ def build_effect_router(
         from yeoman_gateway.history.live import HistoryPaused
         try:
             evidence = getattr(admission, "knowledge_evidence", None)
+            if getattr(admission, "knowledge_evidence_digest", "") and knowledge_decision_validator is None:
+                return False, "knowledge_approval_revalidation_unavailable"
             if not validate_history_evidence(evidence):
                 return False, 'history_sources_changed'
             if evidence is not None or knowledge_decision_validator is not None:
@@ -2648,7 +2715,7 @@ def build_gateway_runtime(
         source_registrar=observed_sources,
     )
     # The same live history proof check guards owner approval and pre-dispatch.
-    knowledge_decision_validator = _history_decision_validator
+    knowledge_decision_validator = build_participation_decision_validator(knowledge=knowledge_service)
     effect_router = build_effect_router(
         config,
         policy_adapter,

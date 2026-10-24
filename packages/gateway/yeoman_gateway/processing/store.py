@@ -4212,6 +4212,7 @@ def _admission_mapping(admission: Any, *, admission_id: str) -> dict[str, Any]:
         "payload_hash",
         "approval_revision",
         "knowledge_evidence",
+        "knowledge_evidence_digest",
     )
     result: dict[str, Any] = {}
     for name in field_names:
