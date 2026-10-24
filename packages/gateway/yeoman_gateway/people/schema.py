@@ -182,10 +182,11 @@ def _ensure_private_dir(directory: Path) -> None:
 
 
 def open_people_db(path: Path, *, readonly: bool = False,
-                   busy_timeout_ms: int = 2000) -> sqlite3.Connection:
+                   busy_timeout_ms: int = 2000, immutable: bool = False) -> sqlite3.Connection:
     """Open people.db; a writable open creates and migrates the schema (autocommit mode)."""
     if readonly:
-        conn = sqlite3.connect(f"{path.resolve().as_uri()}?mode=ro", uri=True, isolation_level=None)
+        conn = sqlite3.connect(f"{path.resolve().as_uri()}?mode=ro" + ("&immutable=1" if immutable else ""),
+                               uri=True, isolation_level=None)
         conn.row_factory = sqlite3.Row
         conn.execute("PRAGMA query_only=ON")
         conn.execute(f"PRAGMA busy_timeout={int(busy_timeout_ms)}")

@@ -901,3 +901,62 @@ def eval_participation_groupnotes_review(
     finally:
         history.close()
     _echo_label_summary(labels)
+
+
+@eval_app.command("knowledge-gold")
+def eval_knowledge_gold(
+    gold: Path = typer.Option(..., "--gold"),
+    knowledge_db: Path = typer.Option(..., "--knowledge-db"),
+    people_db: Path = typer.Option(..., "--people-db"),
+    history_db: Path = typer.Option(..., "--history-db"),
+    out: Path = typer.Option(..., "--out"),
+    grader_route: str | None = typer.Option(None, "--grader-route"),
+    dry_run: bool = typer.Option(False, "--dry-run"),
+) -> None:
+    """Measure Knowledge on private owner gold and closed, isolated database copies."""
+    from yeoman_gateway.evaluation.knowledge_gold import (
+        evaluate,
+        load_gold,
+        private_path,
+        recall_items,
+        write_outputs,
+    )
+
+    try:
+        private_path(out)
+        cases = load_gold(gold)
+        contexts = recall_items(cases, knowledge_db=knowledge_db, people_db=people_db,
+                                history_db=history_db)
+        client = None
+        if grader_route and not dry_run:
+            from yeoman_shared.config.loader import load_config
+
+            from yeoman_gateway.evaluation.judge_format import build_eval_client
+
+            client = build_eval_client(load_config(), route=grader_route)
+        report = asyncio.run(evaluate(cases, contexts, client=client))
+        write_outputs(out, report)
+    except Exception:
+        # Input, SQL and provider exceptions may include private content; never echo them.
+        typer.echo("knowledge-gold: evaluation unavailable or invalid input")
+        raise typer.Exit(2) from None
+    typer.echo("knowledge-gold: report saved")
+
+
+@eval_app.command("knowledge-gold-template")
+def eval_knowledge_gold_template(
+    people_db: Path = typer.Option(..., "--people-db"),
+    history_db: Path = typer.Option(..., "--history-db"),
+    persons: str = typer.Option(..., "--persons"),
+    out: Path = typer.Option(..., "--out"),
+) -> None:
+    """Write content-free case slots for coordinator/owner completion outside git."""
+    from yeoman_gateway.evaluation.knowledge_gold import make_template
+
+    try:
+        make_template(people_db=people_db, history_db=history_db,
+                      persons=[int(value.strip()) for value in persons.split(",")], out=out)
+    except Exception:
+        typer.echo("knowledge-gold-template: invalid input or unavailable copies")
+        raise typer.Exit(2) from None
+    typer.echo("knowledge-gold-template: skeleton saved; owner completion required")

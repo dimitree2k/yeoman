@@ -217,8 +217,9 @@ class _HistoryEvidence:
 class PeopleResolver:
     """Each execution thread owns its connection; call close in each owning thread after use."""
 
-    def __init__(self, db_path: Path) -> None:
+    def __init__(self, db_path: Path, *, immutable: bool = False) -> None:
         self.db_path = db_path
+        self._immutable = immutable
         self._local = threading.local()
 
     def close(self) -> None:
@@ -246,7 +247,8 @@ class PeopleResolver:
                 state = None
             if state is None:
                 state = _State(
-                    open_people_db(self.db_path, readonly=True, busy_timeout_ms=0), inode
+                    open_people_db(self.db_path, readonly=True, busy_timeout_ms=0,
+                                   immutable=self._immutable), inode
                 )
                 self._local.state = state
             conn = state.connection
