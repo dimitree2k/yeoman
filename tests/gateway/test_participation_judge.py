@@ -288,6 +288,32 @@ async def test_judge_requests_strict_json_schema_response_format() -> None:
 
 
 @pytest.mark.asyncio
+async def test_judge_reads_the_material_before_it_decides() -> None:
+    """``reading`` comes first so the model states what it saw before its verdict."""
+    reading = "Anna posts a meme about losing in goal; dry, self-ironic tone."
+    client = _Client(_payload(
+        reading=reading, action="react", emoji=EMOJI, target_message_id="m2"
+    ))
+    judge = ParticipationJudge(client=client, allowed_emojis=(EMOJI,))
+
+    decision = await judge.decide(_opportunity(), _context())
+
+    schema = client.response_formats[0]["json_schema"]["schema"]  # type: ignore[index]
+    assert next(iter(schema["properties"])) == "reading"
+    assert schema["required"][0] == "reading"
+    assert "Write reading first" in client.calls[0][0]["content"]
+    assert decision.reading == reading
+
+
+@pytest.mark.asyncio
+async def test_missing_reading_is_tolerated_as_empty() -> None:
+    judge = ParticipationJudge(client=_Client(_payload()), allowed_emojis=(EMOJI,))
+    decision = await judge.decide(_opportunity(), _context())
+    assert decision.action == "silence"
+    assert decision.reading == ""
+
+
+@pytest.mark.asyncio
 async def test_foreign_or_unknown_evidence_is_rejected() -> None:
     judge = ParticipationJudge(client=_Client(_payload(
         action="comment", intent="initiate", purpose="x", evidence_ids=["other-chat-msg"]
