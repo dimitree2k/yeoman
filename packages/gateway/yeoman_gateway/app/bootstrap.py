@@ -839,6 +839,40 @@ def _build_ambient_judge(config: "Config"):
     )
 
 
+VISION_ALERT_COOLDOWN_SECONDS = 300.0
+
+
+def _build_vision_failure_alert(
+    owner_recipients: Callable[[str], list[str]],
+    notify: Callable[[str, str, str], Awaitable[None]],
+    *,
+    cooldown_seconds: float = VISION_ALERT_COOLDOWN_SECONDS,
+    clock: Callable[[], float] = time.monotonic,
+) -> Callable[[str, object, str], None]:
+    """Tell the Telegram owners when an image, video or OCR call fails, at most once per cooldown."""
+    last_sent: dict[tuple[str, str], float] = {}
+    pending: set[asyncio.Task[None]] = set()
+
+    def _listener(task: str, profile: object, reason: str) -> None:
+        model = str(getattr(profile, "model", "") or "-")
+        key = (task, model)
+        now = clock()
+        if now - last_sent.get(key, float("-inf")) < cooldown_seconds:
+            return
+        targets = [target.strip() for target in owner_recipients("telegram") if target.strip()]
+        if not targets:
+            return
+        last_sent[key] = now
+        text = f"⚠️ Arvid diagnostic\n{task} failed: {reason}\nmodel={model}"
+        loop = asyncio.get_running_loop()
+        for target in sorted(set(targets)):
+            job = loop.create_task(notify("telegram", target, text))
+            pending.add(job)
+            job.add_done_callback(pending.discard)
+
+    return _listener
+
+
 def _build_short_reply_reactor(
     config: "Config", store: object | None
 ) -> "ShortReplyReactor | None":
@@ -2888,6 +2922,11 @@ def build_gateway_runtime(
         ambient_judge=_build_ambient_judge(config),
     )
     document_processor.raw_archive = channels.raw_archive
+    vision_alert = _build_vision_failure_alert(policy_adapter.owner_recipients, _admin_notify)
+    whatsapp_channel = channels.get_channel("whatsapp")
+    for describer in (lazy_vision, getattr(whatsapp_channel, "_vision_describer", None)):
+        if describer is not None:
+            describer.failure_listener = vision_alert
 
     typing_adapter = ChannelManagerTypingAdapter(channels)
 

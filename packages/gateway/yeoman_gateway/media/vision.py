@@ -5,6 +5,7 @@ from __future__ import annotations
 import asyncio
 import base64
 import mimetypes
+from collections.abc import Callable
 from pathlib import Path
 
 from loguru import logger
@@ -39,6 +40,30 @@ class VisionDescriber:
 
     def __init__(self, provider_factory: ProviderFactory) -> None:
         self._provider_factory = provider_factory
+        # Called with (task, profile, reason) when a model call fails, times out or
+        # returns nothing, so the owner can be told instead of the media going unseen.
+        self.failure_listener: Callable[[str, ResolvedProfile, str], None] | None = None
+
+    def _report_failure(self, task: str, profile: ResolvedProfile, reason: str) -> None:
+        logger.warning(
+            "vision {} failed model={} provider={} reason={}",
+            task, profile.model, profile.provider, reason,
+        )
+        if self.failure_listener is not None:
+            try:
+                self.failure_listener(task, profile, reason)
+            except Exception:
+                logger.opt(exception=True).debug("vision failure listener raised")
+
+    def _failure_reason(self, exc: BaseException, timeout_s: float) -> str:
+        if isinstance(exc, (asyncio.TimeoutError, TimeoutError)):
+            return f"timeout after {timeout_s:g} s"
+        return exc.__class__.__name__
+
+    @staticmethod
+    def _empty_reason(response: object) -> str:
+        finish = getattr(response, "finish_reason", None)
+        return "provider error" if finish == "error" else "empty response"
 
     async def describe(self, image_path: Path, profile: ResolvedProfile) -> str | None:
         if profile.kind != "vision" or not profile.model:
@@ -73,10 +98,12 @@ class VisionDescriber:
                 ),
                 timeout=max(1.0, timeout_s),
             )
-        except Exception:
+        except Exception as exc:
+            self._report_failure("image description", profile, self._failure_reason(exc, max(1.0, timeout_s)))
             return None
         text = (response.content or "").strip()
         if not text:
+            self._report_failure("image description", profile, self._empty_reason(response))
             return None
         return " ".join(text.split())
 
@@ -114,10 +141,14 @@ class VisionDescriber:
                 ),
                 timeout=max(1.0, timeout_s),
             )
-        except Exception:
+        except Exception as exc:
+            self._report_failure("OCR", profile, self._failure_reason(exc, max(1.0, timeout_s)))
             return None
         text = (response.content or "").strip()
         if not text:
+            # An image without readable text legitimately yields nothing.
+            if getattr(response, "finish_reason", None) == "error":
+                self._report_failure("OCR", profile, "provider error")
             return None
         return text
 
@@ -141,6 +172,7 @@ class VisionDescriber:
             logger.debug("Video description skipped for unsupported MIME type {}", mime)
             return None
         b64 = base64.b64encode(video_path.read_bytes()).decode("ascii")
+        timeout_s = max((profile.timeout_ms or 0) / 1000.0, 60.0)
 
         try:
             content = [
@@ -155,8 +187,6 @@ class VisionDescriber:
                 profile.provider,
             )
             messages = [{"role": "user", "content": content}]
-
-            timeout_s = max((profile.timeout_ms or 0) / 1000.0, 60.0)
             response = await asyncio.wait_for(
                 provider.chat(
                     messages=messages,
@@ -168,8 +198,10 @@ class VisionDescriber:
             )
             text = (response.content or "").strip()
             if not text:
+                self._report_failure("video description", profile, self._empty_reason(response))
                 return None
             return " ".join(text.split())
-        except Exception:
+        except Exception as exc:
             logger.opt(exception=True).debug("Video description failed for {}", video_path)
+            self._report_failure("video description", profile, self._failure_reason(exc, max(1.0, timeout_s)))
             return None
