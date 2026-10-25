@@ -7,7 +7,7 @@ dependencies = [
     "yeoman-shared",
     "hermes-yeoman-a2a-contracts==1.0.2",
     "typer>=0.20.0,<0.24.1",
-    "litellm>=1.106.2,<1.107",
+    "litellm[mcp]>=1.106.2,<1.107",
     "websockets>=16.0",
     "websocket-client>=1.9.0",
     "httpx[socks]>=0.28.1",

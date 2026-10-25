@@ -133,3 +133,11 @@ async def test_schema_http_boundary_retains_safe_diagnostics(monkeypatch):
     assert result.diagnostics["strict_schema"] is True
     assert result.diagnostics["require_parameters"] is True
     assert "PRIVATE" not in json.dumps(result.diagnostics)
+
+
+def test_litellm_tool_calls_can_load_their_mcp_handler() -> None:
+    # litellm.completion imports its MCP handler whenever tools are passed;
+    # without the mcp extra every tool-bearing reply fails before the request.
+    import importlib
+
+    importlib.import_module("litellm.responses.mcp.chat_completions_handler")
