@@ -45,7 +45,8 @@ class KnowledgeEmbedder:
         if cfg is None:
             raise ValueError("embedding_provider_unavailable")
         self.model = profile.model
-        self.dimension = 1536
+        self._requested_dimension = getattr(profile, "dimensions", None)
+        self.dimension = self._requested_dimension or 1536
         self._provider = LiteLLMProvider(api_key=cfg.api_key or None, api_base=cfg.api_base,
                                         default_model=self.model, extra_headers=cfg.extra_headers)
 
@@ -58,6 +59,8 @@ class KnowledgeEmbedder:
         kwargs: dict[str, Any] = dict(model=provider._resolve_model(self.model),
                                      input=[embedding_text(text) for text in texts],
                                      encoding_format="float", timeout=timeout)
+        if self._requested_dimension:
+            kwargs["dimensions"] = self._requested_dimension
         for name in ("api_key", "api_base", "extra_headers"):
             value = getattr(provider, name)
             if value:

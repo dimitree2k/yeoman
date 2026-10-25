@@ -49,6 +49,8 @@ class ModelProfile(BaseModel):
     cooldown_seconds: int = 60
     # OpenRouter reasoning tokens config: {enabled, effort, max_tokens, exclude}
     reasoning: dict[str, Any] | None = None
+    # Embedding profiles: vector size to request (models with adjustable output size)
+    dimensions: int | None = Field(default=None, gt=0)
     structured_output: Literal["json_schema_strict", "json_object", "prompt_only"] = (
         "json_schema_strict"
     )
