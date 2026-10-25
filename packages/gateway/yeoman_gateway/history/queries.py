@@ -390,6 +390,15 @@ class HistoryQueries:
                 return contact_id
             contact_id = rows[0]["merged_into"]
 
+    def assistant_contact_ids(self) -> frozenset[str]:
+        """Arvid's own contact ids: the assistant role contact and contacts merged into it."""
+        rows = self._rows(
+            "SELECT contact_id FROM contacts WHERE role='assistant'"
+            " OR merged_into IN (SELECT contact_id FROM contacts WHERE role='assistant')",
+            (),
+        )
+        return frozenset(str(row["contact_id"]) for row in rows if row["contact_id"])
+
     def contact(self, contact_id: str) -> Row | None:
         terminal = self.terminal(contact_id)
         if terminal is None:

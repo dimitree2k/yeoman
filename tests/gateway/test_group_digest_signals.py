@@ -106,6 +106,21 @@ def test_reactions_rank_by_distinct_reactors_and_count_negative_emojis() -> None
     assert dict(signals.emoji_counts)["🔥"] == 2
 
 
+def test_arvids_own_reactions_are_not_group_signal() -> None:
+    """His own 😂 must not come back to him as "the group likes 😂"."""
+    rows = [_row("m1", 0, text="a joke"), _row("m2", 1, "b")]
+    reactions = [
+        _reaction("e1", "m1", "arvid", "😂"), _reaction("e2", "m2", "arvid", "😂"),
+        _reaction("e3", "m2", "x", "🔥"),
+    ]
+    signals = _signals(rows, reactions, own_actor_ids={"arvid"})
+    assert signals.reactions == 1
+    assert signals.reactors == 1
+    assert dict(signals.emoji_counts) == {"🔥": 1}
+    assert [item.message_id for item in signals.approval] == ["h-m2"]
+    assert _signals(rows, reactions).reactions == 3  # without the filter all count
+
+
 def test_reacted_messages_are_described_by_kind_length_reply_and_time() -> None:
     rows = [
         _row("m1", 0, text="see https://example.invalid/x"),
