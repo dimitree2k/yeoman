@@ -137,6 +137,7 @@ _PARTICIPATION_FIELDS: tuple[str, ...] = (
     "max_unsolicited_comments_per_window",
     "comment_window_minutes",
     "max_reactions_per_window",
+    "min_messages_between_reactions",
 )
 
 

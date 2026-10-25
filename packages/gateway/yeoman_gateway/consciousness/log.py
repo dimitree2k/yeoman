@@ -2648,6 +2648,19 @@ class SpeakupLog:
             ).fetchone()
         return int(row["c"] if row else 0)
 
+    async def last_reaction_revision(self, *, channel: str, chat_id: str) -> int | None:
+        """Source revision of the newest production opportunity that sent a reaction."""
+        with self._lock:
+            row = self._conn.execute(
+                """
+                SELECT MAX(observed_revision) AS r FROM opportunity_dispositions
+                WHERE channel = ? AND chat_id = ? AND lane = 'production'
+                  AND disposition IN ('reaction_submitted', 'reaction_unknown')
+                """,
+                (str(channel), str(chat_id)),
+            ).fetchone()
+        return int(row["r"]) if row is not None and row["r"] is not None else None
+
     async def last_sent_at(
         self,
         *,
