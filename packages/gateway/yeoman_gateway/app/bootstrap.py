@@ -2554,7 +2554,7 @@ def build_gateway_runtime(
     provider_factory = ProviderFactory(config=config)
     document_cache = DocumentCache(get_operational_store_path("document_cache"))
     lazy_vision = (
-        VisionDescriber(provider_factory)
+        VisionDescriber(provider_factory, model_router)
         if config.channels.whatsapp.media.ocr_images
         else None
     )

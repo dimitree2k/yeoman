@@ -98,10 +98,60 @@ async def test_failures_reach_the_listener_but_textless_ocr_does_not(tmp_path: P
     assert await textless.ocr_image(image, profile) is None
 
     assert seen == [
-        ("image description", "timeout after 1 s"),
-        ("image description", "provider error"),
-        ("OCR", "provider error"),
+        ("image description", "z-ai/glm-5.3-flash: timeout after 1 s"),
+        ("image description", "z-ai/glm-5.3-flash: provider error"),
+        ("OCR", "z-ai/glm-5.3-flash: provider error"),
     ]
+
+
+@pytest.mark.asyncio
+async def test_a_failing_primary_falls_back_and_is_skipped_while_cooling_down(
+    tmp_path: Path,
+) -> None:
+    from yeoman_gateway.media.router import ModelRouter
+    from yeoman_shared.config.schema import ModelProfile, ModelRoutingConfig
+
+    image = tmp_path / "synthetic.png"
+    image.write_bytes(PNG)
+    routing = ModelRoutingConfig(
+        profiles={
+            "vision_primary": ModelProfile(
+                kind="vision", model="primary/model", provider="openrouter",
+                fallback=["vision_backup"], cooldown_seconds=60,
+            ),
+            "vision_backup": ModelProfile(
+                kind="vision", model="backup/model", provider="openrouter",
+            ),
+        },
+        routes={"vision.describe_image": "vision_primary"},
+    )
+    router = ModelRouter(routing)
+    used: list[str] = []
+
+    class _Factory:
+        def create_chat_provider(self, model: str, provider_name: str | None = None):
+            class _Provider:
+                async def chat(self, **kwargs):
+                    used.append(model)
+                    if model == "primary/model":
+                        raise RuntimeError("429")
+                    return SimpleNamespace(content="a red circle", finish_reason="stop")
+
+            return _Provider()
+
+    seen: list[str] = []
+    describer = VisionDescriber(_Factory(), router)
+    describer.failure_listener = lambda task, _profile, reason: seen.append(reason)
+
+    first = router.resolve("vision.describe_image")
+    assert await describer.describe(image, first) == "a red circle"
+    assert used == ["primary/model", "backup/model"]
+    assert seen == []
+
+    second = router.resolve("vision.describe_image")
+    assert second.model == "backup/model"
+    assert await describer.describe(image, second) == "a red circle"
+    assert used[-1] == "backup/model" and len(used) == 3
 
 
 @pytest.mark.asyncio
