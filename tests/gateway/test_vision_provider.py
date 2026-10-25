@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import dataclasses
 from pathlib import Path
 from types import SimpleNamespace
 
@@ -47,3 +48,87 @@ async def test_image_description_and_ocr_use_the_profiles_provider(tmp_path: Pat
     assert await describer.describe(image, _profile()) == "a red circle"
     assert await describer.ocr_image(image, _profile("ocr")) == "a red circle"
     assert factory.calls == [("z-ai/glm-5.3-flash", "openrouter")] * 2
+
+
+class _SlowFactory(_Factory):
+    def create_chat_provider(self, model: str, provider_name: str | None = None):
+        class _Provider:
+            async def chat(self, **kwargs):
+                import asyncio
+
+                await asyncio.sleep(5)
+
+        return _Provider()
+
+
+class _EmptyFactory(_Factory):
+    def __init__(self, finish_reason: str) -> None:
+        super().__init__()
+        self.finish_reason = finish_reason
+
+    def create_chat_provider(self, model: str, provider_name: str | None = None):
+        finish_reason = self.finish_reason
+
+        class _Provider:
+            async def chat(self, **kwargs):
+                return SimpleNamespace(content="", finish_reason=finish_reason)
+
+        return _Provider()
+
+
+@pytest.mark.asyncio
+async def test_failures_reach_the_listener_but_textless_ocr_does_not(tmp_path: Path) -> None:
+    image = tmp_path / "synthetic.png"
+    image.write_bytes(PNG)
+    seen: list[tuple[str, str]] = []
+    profile = _profile()
+    profile = dataclasses.replace(profile, timeout_ms=1000)
+
+    slow = VisionDescriber(_SlowFactory())
+    slow.failure_listener = lambda task, _profile, reason: seen.append((task, reason))
+    assert await slow.describe(image, profile) is None
+
+    errored = VisionDescriber(_EmptyFactory("error"))
+    errored.failure_listener = slow.failure_listener
+    assert await errored.describe(image, profile) is None
+    assert await errored.ocr_image(image, profile) is None
+
+    textless = VisionDescriber(_EmptyFactory("stop"))
+    textless.failure_listener = slow.failure_listener
+    assert await textless.ocr_image(image, profile) is None
+
+    assert seen == [
+        ("image description", "timeout after 1 s"),
+        ("image description", "provider error"),
+        ("OCR", "provider error"),
+    ]
+
+
+@pytest.mark.asyncio
+async def test_vision_alert_goes_to_telegram_owners_once_per_cooldown() -> None:
+    import asyncio
+
+    from yeoman_gateway.app.bootstrap import _build_vision_failure_alert
+
+    sent: list[tuple[str, str, str]] = []
+    now = [0.0]
+
+    async def notify(channel: str, chat_id: str, text: str) -> None:
+        sent.append((channel, chat_id, text))
+
+    alert = _build_vision_failure_alert(
+        lambda channel: ["111", " "] if channel == "telegram" else ["whatsapp-owner"],
+        notify,
+        cooldown_seconds=300,
+        clock=lambda: now[0],
+    )
+    profile = _profile()
+    alert("image description", profile, "timeout after 12 s")
+    alert("image description", profile, "timeout after 12 s")
+    now[0] = 301
+    alert("image description", profile, "provider error")
+    await asyncio.sleep(0)
+
+    assert [(channel, chat) for channel, chat, _ in sent] == [("telegram", "111")] * 2
+    assert "image description failed: timeout after 12 s" in sent[0][2]
+    assert "model=z-ai/glm-5.3-flash" in sent[0][2]
