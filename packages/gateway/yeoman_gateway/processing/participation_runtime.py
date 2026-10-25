@@ -783,7 +783,11 @@ class ParticipationRuntime:
         if direct_addressed and comment_remaining > 0:
             comment_intents.add("direct")
 
-        reaction_allowed = allow_reactions and reaction_remaining > 0
+        reaction_allowed = (
+            allow_reactions
+            and reaction_remaining > 0
+            and await self._reaction_spacing_met(opportunity, snapshot)
+        )
         candidate_actions: set[str] = {"silence"}
         if judge_remaining > 0:
             if reaction_allowed:
@@ -892,6 +896,31 @@ class ParticipationRuntime:
                 snapshot, "continuation_candidate", default=False
             ),
         )
+
+    async def _reaction_spacing_met(
+        self, opportunity: ParticipationOpportunity, snapshot: Mapping[str, Any]
+    ) -> bool:
+        """True when enough new messages arrived since this chat's last reaction.
+
+        A time window alone lets a quiet chat collect a reaction on every message; the
+        spacing ties reactions to how much is actually being said. Unreadable evidence
+        fails closed.
+        """
+        spacing = _snapshot_nonnegative_int(snapshot, "min_messages_between_reactions", default=0)
+        if spacing <= 0:
+            return True
+        reader = getattr(self._ledger, "last_reaction_revision", None)
+        if not callable(reader):
+            return False
+        try:
+            last = await reader(channel=opportunity.channel, chat_id=opportunity.chat_id)
+        except HistoryPaused:
+            raise
+        except Exception:  # noqa: BLE001 - spacing evidence is fail-closed
+            return False
+        if last is None:
+            return True
+        return int(opportunity.observed_revision) - int(last) >= spacing
 
     async def _remaining_capacity(
         self,

@@ -3166,3 +3166,60 @@ async def test_writer_budget_keeps_required_target_and_complete_shared_knowledge
 
     assert len(_render_participation_transcript(context)) <= 4000
     assert "optional context " * 600 not in prompt
+
+
+async def _record_prior_reaction(log: SpeakupLog, *, revision: int) -> None:
+    await log.record_disposition(
+        opportunity_id="opp-earlier",
+        channel=CHANNEL,
+        chat_id=CHAT,
+        disposition="reaction_submitted",
+        reason="earlier gesture",
+        observed_revision=revision,
+        now_ms=NOW_MS - 60_000,
+    )
+
+
+@pytest.mark.asyncio
+async def test_reaction_spacing_withholds_react_until_enough_new_messages(
+    tmp_path: Path,
+) -> None:
+    """A quiet chat must not collect a reaction on every message inside the window."""
+    runtime, _judge, context, log = _runtime(
+        tmp_path,
+        decision=SILENCE,
+        policy_participation={"enabled": True, "minMessagesBetweenReactions": 5},
+        snapshot_overrides={"min_messages_between_reactions": 5},
+    )
+    await _record_prior_reaction(log, revision=1)  # the opportunity is at revision 3
+
+    await runtime.evaluate_participation(_opportunity())
+
+    assert context.inputs is not None
+    assert "react" not in context.inputs.allowed_actions
+    log.close()
+
+
+@pytest.mark.asyncio
+async def test_reaction_spacing_allows_react_once_enough_messages_arrived(
+    tmp_path: Path,
+) -> None:
+    runtime, _judge, context, log = _runtime(
+        tmp_path,
+        decision=SILENCE,
+        snapshot_overrides={"min_messages_between_reactions": 2},
+    )
+    await _record_prior_reaction(log, revision=1)
+
+    await runtime.evaluate_participation(_opportunity())
+
+    assert context.inputs is not None
+    assert "react" in context.inputs.allowed_actions
+    log.close()
+
+
+def test_reaction_spacing_is_a_policy_field_that_inherits() -> None:
+    engine_policy = _policy(participation={"minMessagesBetweenReactions": 4})
+    chat = engine_policy.channels[CHANNEL].chats[CHAT]
+    assert chat.participation is not None
+    assert chat.participation.min_messages_between_reactions == 4

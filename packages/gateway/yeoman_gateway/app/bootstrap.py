@@ -1147,6 +1147,9 @@ def _build_participation_runtime(
             "allow_initiation": bool(resolved.participation.allow_initiation),
             "allow_continuation": bool(resolved.participation.allow_continuation),
             "allow_reactions": bool(resolved.participation.allow_reactions),
+            "min_messages_between_reactions": int(
+                resolved.participation.min_messages_between_reactions
+            ),
             "spontaneity_enabled": bool(effective.spontaneity_enabled),
             "spontaneity_daily_cap": max(0, int(daily_cap or 0)),
             "spontaneity_allowed_actions": tuple(

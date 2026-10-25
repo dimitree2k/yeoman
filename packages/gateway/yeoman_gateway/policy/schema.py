@@ -279,6 +279,11 @@ class ParticipationPolicy(PolicyModel):
     max_reactions_per_window: int = Field(
         default=6, alias="maxReactionsPerWindow", ge=0, le=60
     )
+    #: Message spacing on top of the time window: after a reaction, at least this many
+    #: new messages must arrive before the next one. ``0`` disables the rule.
+    min_messages_between_reactions: int = Field(
+        default=0, alias="minMessagesBetweenReactions", ge=0, le=100
+    )
 
     @field_validator("guidance")
     @classmethod
@@ -330,6 +335,9 @@ class ParticipationPolicyOverride(PolicyModel):
     )
     max_reactions_per_window: int | None = Field(
         default=None, alias="maxReactionsPerWindow", ge=0, le=60
+    )
+    min_messages_between_reactions: int | None = Field(
+        default=None, alias="minMessagesBetweenReactions", ge=0, le=100
     )
 
     @field_validator("guidance")
