@@ -51,7 +51,7 @@ class VisionDescriber:
             return None
 
         b64 = base64.b64encode(image_path.read_bytes()).decode()
-        provider = self._provider_factory.create_chat_provider(profile.model)
+        provider = self._provider_factory.create_chat_provider(profile.model, profile.provider)
         messages = [
             {
                 "role": "user",
@@ -92,7 +92,7 @@ class VisionDescriber:
             return None
 
         b64 = base64.b64encode(image_path.read_bytes()).decode()
-        provider = self._provider_factory.create_chat_provider(profile.model)
+        provider = self._provider_factory.create_chat_provider(profile.model, profile.provider)
         messages = [
             {
                 "role": "user",
