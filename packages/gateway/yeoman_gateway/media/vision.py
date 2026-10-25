@@ -107,8 +107,6 @@ class VisionDescriber:
                     if isinstance(exc, (asyncio.TimeoutError, TimeoutError))
                     else exc.__class__.__name__
                 )
-                if self._router is not None:
-                    self._router.mark_error(candidate.profile_name, error_type="timeout_or_error")
             else:
                 text = (response.content or "").strip()
                 if text:
@@ -120,8 +118,9 @@ class VisionDescriber:
                     reason = "empty response"
                 else:
                     reason = "provider error"
-                    if self._router is not None:
-                        self._router.mark_error(candidate.profile_name, error_type="provider_error")
+            if self._router is not None:
+                # Cool the profile down so the next call starts with its fallback.
+                self._router.mark_error(candidate.profile_name, error_type=reason)
             logger.warning(
                 "vision {} failed model={} provider={} reason={}",
                 task, candidate.model, candidate.provider, reason,
