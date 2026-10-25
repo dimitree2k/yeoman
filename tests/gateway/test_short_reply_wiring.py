@@ -75,15 +75,22 @@ def test_a_route_to_a_missing_profile_disables_the_reactor(
 @pytest.mark.parametrize(
     ("profile_name", "model", "provider"),
     [
-        ("reaction_decide", "openai/gpt-6-luna", "other"),
-        ("reaction_decide", "other/model", "openrouter"),
-        ("another_profile", "openai/gpt-6-luna", "openrouter"),
+        ("reaction_decide", "z-ai/glm-5.3-flash", "openrouter"),
+        ("reaction_decide", "deepseek-v4-flash", "deepseek"),
+        ("another_profile", "other/model", "openrouter"),
     ],
 )
-def test_an_unapproved_profile_disables_the_reactor(
+def test_the_reactor_uses_whatever_profile_the_route_names(
     monkeypatch: pytest.MonkeyPatch, profile_name: str, model: str, provider: str
 ) -> None:
-    monkeypatch.setattr(model_route, "RouteClient", _fail_if_built)
+    seen: dict[str, str] = {}
+
+    class _Client:
+        def __init__(self, *, config, route_key):
+            seen["route"] = route_key
+            self.model = model
+
+    monkeypatch.setattr(model_route, "RouteClient", _Client)
     config = _config("shadow")
     config.models.routes["reaction.decide"] = profile_name
     config.models.profiles[profile_name] = ModelProfile(
@@ -96,7 +103,8 @@ def test_an_unapproved_profile_disables_the_reactor(
         fallback=[],
         reasoning=None,
     )
-    assert bootstrap._build_short_reply_reactor(config, _Store()) is None
+    assert isinstance(bootstrap._build_short_reply_reactor(config, _Store()), ShortReplyReactor)
+    assert seen["route"] == "reaction.decide"
 
 
 def test_an_unapproved_configured_route_disables_the_reactor(

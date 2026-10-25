@@ -280,7 +280,12 @@ async def test_async_provider_batch_route_and_timeout(monkeypatch):
     assert calls[0]["model"] == "openrouter/openai/text-embedding-3-small"
     assert calls[0]["input"] == ["first text", "second text"]
     assert calls[0]["encoding_format"] == "float"
-    assert client.model == profile.model
+    assert "dimensions" not in calls[0]
+    assert client.model == profile.model and client.dimension == 1536
+    profile.model, profile.dimensions = "qwen/qwen3-embedding-8b", 1024
+    sized = KnowledgeEmbedder(config)
+    await sized.embed_batch(["first", "second"])
+    assert calls[-1]["dimensions"] == 1024 and sized.dimension == 1024
     async def invalid(**kwargs):
         return SimpleNamespace(data=[{"index":0,"embedding":[1,0]}, {"index":0,"embedding":[0,1]}])
     monkeypatch.setattr(litellm, "aembedding", invalid)

@@ -862,16 +862,8 @@ def _build_short_reply_reactor(
     route = "reaction.decide"
     profile_name = config.models.routes.get(route)
     profile = config.models.profiles.get(profile_name or "")
-    if (
-        settings.route not in {"", route}
-        or profile_name != "reaction_decide"
-        or profile is None
-        or profile.model != "openai/gpt-6-luna"
-        or profile.provider != "openrouter"
-    ):
-        logger.error(
-            "short_reply disabled: reaction.decide must use openai/gpt-6-luna via openrouter"
-        )
+    if settings.route not in {"", route} or profile is None:
+        logger.error("short_reply disabled: reaction.decide must route to a configured profile")
         return None
 
     try:
@@ -879,8 +871,8 @@ def _build_short_reply_reactor(
     except model_route.RouteUnavailableError as exc:
         logger.error("short_reply disabled: route={} detail={}", route, str(exc)[:160])
         return None
-    if getattr(client, "model", None) != "openai/gpt-6-luna":
-        logger.error("short_reply disabled: resolved model does not match reactionDecide")
+    if getattr(client, "model", None) != profile.model:
+        logger.error("short_reply disabled: resolved model does not match {}", profile_name)
         return None
 
     decider = ShortReplyDecider(
