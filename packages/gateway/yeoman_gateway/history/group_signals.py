@@ -289,13 +289,21 @@ def compute_signals(
     truncated: bool = False,
     min_reactions: int = MIN_REACTIONS,
     min_conversations: int = MIN_CONVERSATIONS,
+    own_actor_ids: Iterable[str] = (),
 ) -> GroupSignals:
     """The three signals of one chat for one week; pure (rows in, signals out).
 
     Rows outside ``[week.start_ms, week.end_ms)``, of another chat or without a time
     are ignored. Reactions follow the segmentation rule: the latest event per message
-    and actor counts, and a removed reaction does not.
+    and actor counts, and a removed reaction does not. Arvid's own reactions
+    (``own_actor_ids``) are not group signal: counting them would let the note learn
+    his habits back from him.
     """
+    own = frozenset(str(item) for item in own_actor_ids if str(item))
+    if own:
+        reactions = [
+            event for event in reactions if str(event.get("actor_contact_id") or "") not in own
+        ]
     timed = [
         row for row in rows
         if isinstance(row.get("sent_ms"), int)
@@ -368,7 +376,7 @@ def read_group_signals(
     return compute_signals(
         rows, events, chat_id=chat_id, week=week, lull_ms=lull_ms, burst_n=burst_n,
         burst_ms=burst_ms, registry=registry_ids(rows, thread_lookup), tz=tz,
-        truncated=truncated,
+        truncated=truncated, own_actor_ids=queries.assistant_contact_ids(),
     )
 
 
