@@ -134,7 +134,7 @@ async def test_a_failing_primary_falls_back_and_is_skipped_while_cooling_down(
                 async def chat(self, **kwargs):
                     used.append(model)
                     if model == "primary/model":
-                        raise RuntimeError("429")
+                        return SimpleNamespace(content="", finish_reason="stop")
                     return SimpleNamespace(content="a red circle", finish_reason="stop")
 
             return _Provider()
