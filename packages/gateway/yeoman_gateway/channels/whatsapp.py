@@ -367,7 +367,9 @@ class WhatsAppChannel(BaseChannel):
         self._raw_archive: RawArchive | None = None
         self._raw_archive_legacy_warned = False
         self._vision_describer = (
-            VisionDescriber(provider_factory) if provider_factory is not None else None
+            VisionDescriber(provider_factory, model_router)
+            if provider_factory is not None
+            else None
         )
         self._asr_transcriber = ASRTranscriber(
             groq_api_key=groq_api_key,

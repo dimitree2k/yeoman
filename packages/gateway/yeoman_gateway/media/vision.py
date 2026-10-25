@@ -10,7 +10,7 @@ from pathlib import Path
 
 from loguru import logger
 
-from yeoman_gateway.media.router import ResolvedProfile
+from yeoman_gateway.media.router import ModelRouter, ResolvedProfile
 from yeoman_gateway.providers.factory import ProviderFactory
 
 PROMPT = (
@@ -38,119 +38,141 @@ OCR_PROMPT = (
 class VisionDescriber:
     """Describe local image files using a routed vision-capable model."""
 
-    def __init__(self, provider_factory: ProviderFactory) -> None:
+    def __init__(
+        self, provider_factory: ProviderFactory, router: ModelRouter | None = None
+    ) -> None:
         self._provider_factory = provider_factory
-        # Called with (task, profile, reason) when a model call fails, times out or
-        # returns nothing, so the owner can be told instead of the media going unseen.
+        # Resolves a profile's `fallback` names; without it only the primary is tried.
+        self._router = router
+        # Called with (task, profile, reason) when every model in the chain failed,
+        # timed out or returned nothing, so the owner hears about media that went unseen.
         self.failure_listener: Callable[[str, ResolvedProfile, str], None] | None = None
 
     def _report_failure(self, task: str, profile: ResolvedProfile, reason: str) -> None:
-        logger.warning(
-            "vision {} failed model={} provider={} reason={}",
-            task, profile.model, profile.provider, reason,
-        )
         if self.failure_listener is not None:
             try:
                 self.failure_listener(task, profile, reason)
             except Exception:
                 logger.opt(exception=True).debug("vision failure listener raised")
 
-    def _failure_reason(self, exc: BaseException, timeout_s: float) -> str:
-        if isinstance(exc, (asyncio.TimeoutError, TimeoutError)):
-            return f"timeout after {timeout_s:g} s"
-        return exc.__class__.__name__
+    def _chain(self, profile: ResolvedProfile) -> list[ResolvedProfile]:
+        chain = [profile]
+        if self._router is None:
+            return chain
+        for name in profile.fallback:
+            try:
+                chain.append(self._router.resolve_by_profile(name))
+            except KeyError:
+                logger.warning("vision fallback profile missing name={}", name)
+        return chain
+
+    async def _run(
+        self,
+        task: str,
+        profile: ResolvedProfile,
+        content: list[dict[str, object]],
+        *,
+        timeout_s: float,
+        default_max_tokens: int,
+        default_temperature: float,
+        empty_is_failure: bool = True,
+    ) -> str | None:
+        """Try the profile, then its fallbacks; return the first non-empty answer."""
+        reasons: list[str] = []
+        chain = self._chain(profile)
+        for candidate in chain:
+            if not candidate.model:
+                continue
+            timeout = max(1.0, timeout_s)
+            try:
+                provider = self._provider_factory.create_chat_provider(
+                    candidate.model, candidate.provider
+                )
+                response = await asyncio.wait_for(
+                    provider.chat(
+                        messages=[{"role": "user", "content": content}],
+                        model=candidate.model,
+                        max_tokens=candidate.max_tokens or default_max_tokens,
+                        temperature=(
+                            candidate.temperature
+                            if candidate.temperature is not None
+                            else default_temperature
+                        ),
+                    ),
+                    timeout=timeout,
+                )
+            except Exception as exc:
+                reason = (
+                    f"timeout after {timeout:g} s"
+                    if isinstance(exc, (asyncio.TimeoutError, TimeoutError))
+                    else exc.__class__.__name__
+                )
+                if self._router is not None:
+                    self._router.mark_error(candidate.profile_name, error_type="timeout_or_error")
+            else:
+                text = (response.content or "").strip()
+                if text:
+                    return text
+                if getattr(response, "finish_reason", None) != "error":
+                    if not empty_is_failure:
+                        # e.g. OCR of an image without text: a valid answer, not a failure.
+                        return None
+                    reason = "empty response"
+                else:
+                    reason = "provider error"
+                    if self._router is not None:
+                        self._router.mark_error(candidate.profile_name, error_type="provider_error")
+            logger.warning(
+                "vision {} failed model={} provider={} reason={}",
+                task, candidate.model, candidate.provider, reason,
+            )
+            reasons.append(f"{candidate.model}: {reason}")
+        if reasons:
+            self._report_failure(task, chain[-1], "; ".join(reasons))
+        return None
 
     @staticmethod
-    def _empty_reason(response: object) -> str:
-        finish = getattr(response, "finish_reason", None)
-        return "provider error" if finish == "error" else "empty response"
+    def _image_block(image_path: Path) -> dict[str, object] | None:
+        if not image_path.exists() or not image_path.is_file():
+            return None
+        mime, _ = mimetypes.guess_type(str(image_path))
+        if not mime or not mime.startswith("image/"):
+            return None
+        b64 = base64.b64encode(image_path.read_bytes()).decode()
+        return {"type": "image_url", "image_url": {"url": f"data:{mime};base64,{b64}"}}
 
     async def describe(self, image_path: Path, profile: ResolvedProfile) -> str | None:
         if profile.kind != "vision" or not profile.model:
             return None
-        if not image_path.exists() or not image_path.is_file():
+        image = self._image_block(image_path)
+        if image is None:
             return None
-
-        mime, _ = mimetypes.guess_type(str(image_path))
-        if not mime or not mime.startswith("image/"):
-            return None
-
-        b64 = base64.b64encode(image_path.read_bytes()).decode()
-        provider = self._provider_factory.create_chat_provider(profile.model, profile.provider)
-        messages = [
-            {
-                "role": "user",
-                "content": [
-                    {"type": "text", "text": PROMPT},
-                    {"type": "image_url", "image_url": {"url": f"data:{mime};base64,{b64}"}},
-                ],
-            }
-        ]
-
-        timeout_s = (profile.timeout_ms or 12000) / 1000.0
-        try:
-            response = await asyncio.wait_for(
-                provider.chat(
-                    messages=messages,
-                    model=profile.model,
-                    max_tokens=profile.max_tokens or 160,
-                    temperature=profile.temperature if profile.temperature is not None else 0.1,
-                ),
-                timeout=max(1.0, timeout_s),
-            )
-        except Exception as exc:
-            self._report_failure("image description", profile, self._failure_reason(exc, max(1.0, timeout_s)))
-            return None
-        text = (response.content or "").strip()
-        if not text:
-            self._report_failure("image description", profile, self._empty_reason(response))
-            return None
-        return " ".join(text.split())
+        text = await self._run(
+            "image description",
+            profile,
+            [{"type": "text", "text": PROMPT}, image],
+            timeout_s=(profile.timeout_ms or 12000) / 1000.0,
+            default_max_tokens=160,
+            default_temperature=0.1,
+        )
+        return " ".join(text.split()) if text else None
 
     async def ocr_image(self, image_path: Path, profile: ResolvedProfile) -> str | None:
         """Extract visible text from a local image using a routed vision/OCR model."""
         if profile.kind not in {"vision", "ocr"} or not profile.model:
             return None
-        if not image_path.exists() or not image_path.is_file():
+        image = self._image_block(image_path)
+        if image is None:
             return None
-
-        mime, _ = mimetypes.guess_type(str(image_path))
-        if not mime or not mime.startswith("image/"):
-            return None
-
-        b64 = base64.b64encode(image_path.read_bytes()).decode()
-        provider = self._provider_factory.create_chat_provider(profile.model, profile.provider)
-        messages = [
-            {
-                "role": "user",
-                "content": [
-                    {"type": "text", "text": OCR_PROMPT},
-                    {"type": "image_url", "image_url": {"url": f"data:{mime};base64,{b64}"}},
-                ],
-            }
-        ]
-
-        timeout_s = (profile.timeout_ms or 12000) / 1000.0
-        try:
-            response = await asyncio.wait_for(
-                provider.chat(
-                    messages=messages,
-                    model=profile.model,
-                    max_tokens=profile.max_tokens or 1200,
-                    temperature=profile.temperature if profile.temperature is not None else 0.0,
-                ),
-                timeout=max(1.0, timeout_s),
-            )
-        except Exception as exc:
-            self._report_failure("OCR", profile, self._failure_reason(exc, max(1.0, timeout_s)))
-            return None
-        text = (response.content or "").strip()
-        if not text:
-            # An image without readable text legitimately yields nothing.
-            if getattr(response, "finish_reason", None) == "error":
-                self._report_failure("OCR", profile, "provider error")
-            return None
-        return text
+        return await self._run(
+            "OCR",
+            profile,
+            [{"type": "text", "text": OCR_PROMPT}, image],
+            timeout_s=(profile.timeout_ms or 12000) / 1000.0,
+            default_max_tokens=1200,
+            default_temperature=0.0,
+            empty_is_failure=False,
+        )
 
     async def describe_video(
         self,
@@ -172,36 +194,15 @@ class VisionDescriber:
             logger.debug("Video description skipped for unsupported MIME type {}", mime)
             return None
         b64 = base64.b64encode(video_path.read_bytes()).decode("ascii")
-        timeout_s = max((profile.timeout_ms or 0) / 1000.0, 60.0)
-
-        try:
-            content = [
-                {
-                    "type": "video_url",
-                    "video_url": {"url": f"data:{mime};base64,{b64}"},
-                },
+        text = await self._run(
+            "video description",
+            profile,
+            [
+                {"type": "video_url", "video_url": {"url": f"data:{mime};base64,{b64}"}},
                 {"type": "text", "text": VIDEO_PROMPT},
-            ]
-            provider = self._provider_factory.create_chat_provider(
-                profile.model,
-                profile.provider,
-            )
-            messages = [{"role": "user", "content": content}]
-            response = await asyncio.wait_for(
-                provider.chat(
-                    messages=messages,
-                    model=profile.model,
-                    max_tokens=profile.max_tokens or 320,
-                    temperature=profile.temperature if profile.temperature is not None else 0.1,
-                ),
-                timeout=max(1.0, timeout_s),
-            )
-            text = (response.content or "").strip()
-            if not text:
-                self._report_failure("video description", profile, self._empty_reason(response))
-                return None
-            return " ".join(text.split())
-        except Exception as exc:
-            logger.opt(exception=True).debug("Video description failed for {}", video_path)
-            self._report_failure("video description", profile, self._failure_reason(exc, max(1.0, timeout_s)))
-            return None
+            ],
+            timeout_s=max((profile.timeout_ms or 0) / 1000.0, 60.0),
+            default_max_tokens=320,
+            default_temperature=0.1,
+        )
+        return " ".join(text.split()) if text else None
