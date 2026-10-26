@@ -1,7 +1,10 @@
 name: PR Lens
 
+# On demand: runs only on PRs carrying the `pr-lens` label (when the label is
+# added, and on each later push). Remove the label to stop it.
 on:
   pull_request:
+    types: [labeled, synchronize, reopened]
 
 permissions:
   contents: write        # publish the rendered SVGs to the pr-lens branch
@@ -14,7 +17,10 @@ concurrency:             # one run per pull request; a push supersedes the last
 jobs:
   lens:
     # Fork PRs get no secrets, so the job cannot run for them.
-    if: github.event.pull_request.head.repo.full_name == github.repository
+    if: >-
+      github.event.pull_request.head.repo.full_name == github.repository &&
+      contains(github.event.pull_request.labels.*.name, 'pr-lens') &&
+      (github.event.action != 'labeled' || github.event.label.name == 'pr-lens')
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
