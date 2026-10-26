@@ -549,6 +549,18 @@ class CapabilityQuotaPolicy(PolicyModel):
     cooldown_seconds: StrictInt = Field(default=86_400, alias="cooldownSeconds", gt=0)
 
 
+#: Read-only web capabilities the owner keeps in every chat, whatever the chat allowlist.
+DEFAULT_OWNER_TOOLS: tuple[str, ...] = (
+    "web_search",
+    "web_fetch",
+    "web_map",
+    "web_crawl",
+    "deep_research",
+    "youtube_transcript",
+    "browse",
+)
+
+
 class PolicyConfig(PolicyModel):
     """Root policy configuration."""
 
@@ -561,6 +573,9 @@ class PolicyConfig(PolicyModel):
     admin_principals: list[str] = Field(default_factory=list)
     runtime: RuntimePolicy = Field(default_factory=RuntimePolicy)
     defaults: ChatPolicy = Field(default_factory=_default_policy_defaults)
+    # Tools granted to a configured owner on top of each chat's resolved tool set, so the
+    # owner can research from any chat. Other senders are unaffected; [] turns this off.
+    owner_tools: list[str] = Field(default_factory=lambda: list(DEFAULT_OWNER_TOOLS), alias="ownerTools")
     channels: dict[str, ChannelPolicy] = Field(default_factory=_default_channels)
     file_access: FileAccessPolicy | None = Field(default=None, alias="fileAccess")
     capability_quotas: dict[str, CapabilityQuotaPolicy] = Field(

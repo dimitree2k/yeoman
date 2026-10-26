@@ -78,6 +78,7 @@ if TYPE_CHECKING:
     from yeoman_shared.config.schema import ExecToolConfig, WebToolsConfig
 
     from yeoman_gateway.a2a.registry import A2AWorkerRegistry
+    from yeoman_gateway.agent.tools.youtube_audio import AudioTranscriber
     from yeoman_gateway.caldav.service import CalDAVService
     from yeoman_gateway.cron.service import CronService
     from yeoman_gateway.knowledge.models import TrustedReadContext
@@ -685,6 +686,7 @@ class LLMResponder(ResponderPort):
         processing_store: object | None = None,
         quota_governance: object | None = None,
         lazy_media_resolver: "LazyMediaResolver | None" = None,
+        youtube_audio_transcriber: "AudioTranscriber | None" = None,
         whatsapp_session_history_limit: int = 15,
         whatsapp_session_history_limit_group: int = 20,
     ) -> None:
@@ -696,6 +698,7 @@ class LLMResponder(ResponderPort):
         self.model = model or provider.get_default_model()
         self.max_iterations = max(1, int(max_iterations))
         self.tavily_api_key = tavily_api_key
+        self._youtube_audio_transcriber = youtube_audio_transcriber
         self.web_config = web_config
         self.exec_config = exec_config or ExecToolConfig()
         self.cron_service = cron_service
@@ -818,7 +821,7 @@ class LLMResponder(ResponderPort):
         )
         self.tools.register(MarketQuoteTool())
         self.tools.register(MarketIntelligenceTool())
-        self.tools.register(YoutubeTranscriptTool())
+        self.tools.register(YoutubeTranscriptTool(audio_transcriber=self._youtube_audio_transcriber))
 
         from yeoman_gateway.agent.tools.browse import BrowseTool
 

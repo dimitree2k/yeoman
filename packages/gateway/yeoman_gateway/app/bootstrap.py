@@ -42,6 +42,7 @@ from yeoman_gateway.cron.voice import evaluate_voice_quiet_gate
 from yeoman_gateway.heartbeat.service import HeartbeatService
 from yeoman_gateway.knowledge._capture import ObservedSourceRegistrar
 from yeoman_gateway.knowledge._source_catchup import ObservedSourceCatchup
+from yeoman_gateway.media.asr import ASRTranscriber
 from yeoman_gateway.media.document_cache import DocumentCache
 from yeoman_gateway.media.document_processing import DocumentProcessor
 from yeoman_gateway.media.lazy_resolver import LazyMediaResolver
@@ -2805,6 +2806,21 @@ def build_gateway_runtime(
         )
     )
 
+    youtube_asr = ASRTranscriber(
+        groq_api_key=config.providers.groq.api_key or None,
+        openai_api_key=openai_compat.api_key if openai_compat else None,
+        openai_api_base=openai_compat.api_base if openai_compat else None,
+        openai_extra_headers=openai_compat.extra_headers if openai_compat else None,
+        max_concurrency=1,
+    )
+
+    async def _youtube_audio_transcriber(audio_path: Path) -> str | None:
+        # Same ASR route as voice notes, with room for a long video.
+        profile = model_router.resolve("asr.transcribe_audio")
+        profile = replace(profile, timeout_ms=max(profile.timeout_ms or 0, 300_000))
+        result = await youtube_asr.transcribe(audio_path, profile)
+        return result.text if result else None
+
     responder = LLMResponder(
         provider=provider,
         workspace=workspace,
@@ -2839,6 +2855,7 @@ def build_gateway_runtime(
         a2a_registry=a2a_registry,
         quota_governance=quota_governance,
         lazy_media_resolver=lazy_media_resolver,
+        youtube_audio_transcriber=_youtube_audio_transcriber,
         whatsapp_session_history_limit=config.channels.whatsapp.session_history_limit,
         whatsapp_session_history_limit_group=config.channels.whatsapp.session_history_limit_group,
     )
