@@ -10,6 +10,7 @@ from typing import Any
 from yeoman_gateway.policy.identity import normalize_identity_token, normalize_sender_list
 from yeoman_gateway.policy.persona import load_persona_text, resolve_persona_path
 from yeoman_gateway.policy.schema import (
+    DEFAULT_OWNER_TOOLS,
     ChatPolicy,
     ChatPolicyOverride,
     ParticipationPolicy,
@@ -459,6 +460,11 @@ class PolicyEngine:
             unknown_deny = sorted(set(deny) - known_tools)
             if unknown_deny:
                 raise ValueError(f"unknown tools in deny list at {path}: {unknown_deny}")
+        # Default owner tools may be absent from a trimmed deployment; evaluation
+        # intersects with the registered tools, so only other names are typos.
+        unknown_owner = sorted(set(self.policy.owner_tools) - known_tools - set(DEFAULT_OWNER_TOOLS))
+        if unknown_owner:
+            raise ValueError(f"unknown tools in ownerTools: {unknown_owner}")
         for tools, path in self._iter_tool_access_refs():
             unknown = sorted({tool.strip() for tool in tools if tool.strip()} - known_tools)
             if unknown:
@@ -780,7 +786,10 @@ class PolicyEngine:
         # Guardrail: deny spawn whenever exec is denied.
         if "exec" not in allowed:
             allowed.discard("spawn")
-        return {tool for tool in allowed if self._is_tool_allowed_for_actor(actor, tool, policy)}
+        allowed = {tool for tool in allowed if self._is_tool_allowed_for_actor(actor, tool, policy)}
+        if self.policy.owner_tools and self._owner_match(actor):
+            allowed |= set(self.policy.owner_tools) & all_tools
+        return allowed
 
     def evaluate(self, actor: ActorContext, all_tools: set[str]) -> PolicyDecision:
         """Evaluate policy decision for an actor."""

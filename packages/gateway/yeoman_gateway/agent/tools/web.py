@@ -16,12 +16,15 @@ import httpx
 from loguru import logger
 
 from yeoman_gateway.agent.tools.base import Tool
+from yeoman_gateway.agent.tools.reddit import fetch_reddit, is_reddit_url
 from yeoman_gateway.agent.tools.url_provenance import (
     provenance_transition_error,
 )
 
 if TYPE_CHECKING:
     from yeoman_shared.config.schema import WebToolsConfig
+
+    from yeoman_gateway.agent.tools.youtube_audio import AudioTranscriber
 
 # Shared constants
 USER_AGENT = "Mozilla/5.0 (Macintosh; Intel Mac OS X 14_7_2) AppleWebKit/537.36"
@@ -558,6 +561,24 @@ class WebFetchTool(Tool):
                     "action": f'Use the youtube_transcript tool instead: youtube_transcript(url="{url}")',
                 }
             )
+
+        # Reddit blocks plain HTML fetches; its public JSON gives the post and top comments.
+        if not provenance_required and is_reddit_url(url):
+            reddit = await fetch_reddit(url)
+            if reddit is not None:
+                final_url, raw_text = reddit
+                truncated = len(raw_text) > max_chars
+                text = raw_text[:max_chars] if truncated else raw_text
+                return json.dumps(
+                    {
+                        "url": url,
+                        "finalUrl": final_url,
+                        "extractor": "reddit_json",
+                        "truncated": truncated,
+                        "length": len(text),
+                        "text": text,
+                    }
+                )
 
         # Try Tavily Extract first (handles JS-heavy pages and paywall content better)
         if self.api_key and not provenance_required:
@@ -1228,7 +1249,8 @@ class YoutubeTranscriptTool(Tool):
     description = (
         "Fetch the spoken transcript (captions) of a YouTube video. "
         "Use this whenever a YouTube URL is shared and you need to understand or summarize the video content. "
-        "Returns the full transcript text. Prefers the user's language, falls back to English, then auto-generated."
+        "Returns the full transcript text. Prefers the user's language, falls back to English, then auto-generated. "
+        "Videos without captions are transcribed from their audio (slower, up to 90 min)."
     )
     parameters = {
         "type": "object",
@@ -1241,6 +1263,9 @@ class YoutubeTranscriptTool(Tool):
         },
         "required": ["url"],
     }
+
+    def __init__(self, audio_transcriber: "AudioTranscriber | None" = None):
+        self._audio_transcriber = audio_transcriber
 
     async def execute(self, url: str, language: str = "en", **kwargs: Any) -> str:
         video_id = _extract_youtube_id(url)
@@ -1268,12 +1293,7 @@ class YoutubeTranscriptTool(Tool):
             except Exception:
                 continue
         else:
-            return json.dumps(
-                {
-                    "error": f"No transcript available for video {video_id}. The video may have no captions.",
-                    "video_id": video_id,
-                }
-            )
+            return await self._audio_fallback(url, video_id)
 
         snippets = transcript.snippets
         text = " ".join(s.text for s in snippets).strip()
@@ -1288,5 +1308,36 @@ class YoutubeTranscriptTool(Tool):
                 "language": getattr(transcript, "language_code", language),
                 "transcript": text,
                 "snippet_count": len(snippets),
+            }
+        )
+
+    async def _audio_fallback(self, url: str, video_id: str) -> str:
+        """Transcribe the audio track when the video has no usable captions."""
+        no_captions = f"No transcript available for video {video_id}. The video may have no captions."
+        if self._audio_transcriber is None:
+            return json.dumps({"error": no_captions, "video_id": video_id})
+        from yeoman_gateway.agent.tools.youtube_audio import (
+            YoutubeAudioError,
+            transcribe_youtube_audio,
+        )
+
+        logger.info("youtube_transcript audio fallback video_id={}", video_id)
+        try:
+            text = await transcribe_youtube_audio(
+                f"https://www.youtube.com/watch?v={video_id}", self._audio_transcriber
+            )
+        except YoutubeAudioError as exc:
+            return json.dumps({"error": f"{no_captions} Audio fallback failed: {exc}", "video_id": video_id})
+        except Exception as exc:  # yt-dlp/ASR failures must not break the turn
+            logger.warning("youtube audio fallback failed video_id={}: {}", video_id, exc)
+            return json.dumps({"error": f"{no_captions} Audio fallback failed.", "video_id": video_id})
+        if len(text) > 12000:
+            text = text[:12000] + "\n\n[transcript truncated]"
+        return json.dumps(
+            {
+                "video_id": video_id,
+                "url": url,
+                "source": "audio_transcription",
+                "transcript": text,
             }
         )

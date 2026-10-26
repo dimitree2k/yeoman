@@ -24,6 +24,7 @@ dependencies = [
     "lark-oapi>=1.5.3",
     "socksio>=1.0.0",
     "youtube-transcript-api>=1.2.4",
+    "yt-dlp>=2026.8.19",
     "caldav>=3.0.1",
     "icalendar>=7.0.3",
     "pypdf>=6.21.1",
