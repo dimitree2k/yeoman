@@ -615,6 +615,11 @@ class WebFetchTool(Tool):
                         "truncated": truncated,
                         "length": len(text),
                         "text": text,
+                        **(
+                            {}
+                            if "/comments/" in url
+                            else {"note": "Keenable may return a cached snapshot of this listing; check post dates."}
+                        ),
                     }
                 )
             if extract_depth is None:
