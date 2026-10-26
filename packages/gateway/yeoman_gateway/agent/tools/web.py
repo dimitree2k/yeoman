@@ -16,7 +16,6 @@ import httpx
 from loguru import logger
 
 from yeoman_gateway.agent.tools.base import Tool
-from yeoman_gateway.agent.tools.reddit import fetch_reddit, is_reddit_url
 from yeoman_gateway.agent.tools.url_provenance import (
     provenance_transition_error,
 )
@@ -208,6 +207,15 @@ async def _async_validate_dns(hostname: str) -> None:
         ip = sockaddr[0]
         if _is_private_ip(ip):
             raise ValueError(f"DNS rebinding blocked: {hostname} resolved to private IP {ip}")
+
+
+_REDDIT_HOSTS = frozenset(
+    {"reddit.com", "www.reddit.com", "old.reddit.com", "new.reddit.com", "np.reddit.com", "m.reddit.com", "redd.it"}
+)
+
+
+def _is_reddit_url(url: str) -> bool:
+    return (urlparse(url).hostname or "").lower() in _REDDIT_HOSTS
 
 
 def _tavily_auth_headers(api_key: str) -> dict[str, str]:
@@ -562,23 +570,10 @@ class WebFetchTool(Tool):
                 }
             )
 
-        # Reddit blocks plain HTML fetches; its public JSON gives the post and top comments.
-        if not provenance_required and is_reddit_url(url):
-            reddit = await fetch_reddit(url)
-            if reddit is not None:
-                final_url, raw_text = reddit
-                truncated = len(raw_text) > max_chars
-                text = raw_text[:max_chars] if truncated else raw_text
-                return json.dumps(
-                    {
-                        "url": url,
-                        "finalUrl": final_url,
-                        "extractor": "reddit_json",
-                        "truncated": truncated,
-                        "length": len(text),
-                        "text": text,
-                    }
-                )
+        # Reddit 403s anonymous fetches (including its .json API since 2026-05); only
+        # Tavily's advanced extraction reads threads, so force it for Reddit links.
+        if extract_depth is None and _is_reddit_url(url):
+            extract_depth = "advanced"
 
         # Try Tavily Extract first (handles JS-heavy pages and paywall content better)
         if self.api_key and not provenance_required:
