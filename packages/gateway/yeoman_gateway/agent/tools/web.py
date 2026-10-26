@@ -218,6 +218,35 @@ def _is_reddit_url(url: str) -> bool:
     return (urlparse(url).hostname or "").lower() in _REDDIT_HOSTS
 
 
+_KEENABLE_API = "https://api.keenable.ai/v1/fetch"
+
+
+async def _keenable_fetch(url: str) -> str | None:
+    """Fetch a page as markdown via Keenable; keyless works at a lower hourly limit."""
+    api_key = os.environ.get("KEENABLE_API_KEY", "")
+    headers = {"Accept": "application/json", "X-Keenable-Title": "yeoman"}
+    endpoint = _KEENABLE_API
+    if api_key:
+        headers["X-API-Key"] = api_key
+    else:
+        endpoint += "/public"
+    try:
+        async with httpx.AsyncClient(timeout=30.0) as client:
+            r = await client.get(endpoint, params={"url": url}, headers=headers)
+        if r.status_code != 200:
+            logger.info("keenable fetch status={} url={!r}", r.status_code, url)
+            return None
+        data = r.json()
+    except (httpx.HTTPError, ValueError) as exc:
+        logger.info("keenable fetch failed url={!r}: {}", url, exc)
+        return None
+    content = str(data.get("content") or "").strip() if isinstance(data, dict) else ""
+    if not content:
+        return None
+    title = str(data.get("title") or "").strip()
+    return f"# {title}\n\n{content}" if title else content
+
+
 def _tavily_auth_headers(api_key: str) -> dict[str, str]:
     return {"Authorization": f"Bearer {api_key}", "Content-Type": "application/json"}
 
@@ -570,10 +599,26 @@ class WebFetchTool(Tool):
                 }
             )
 
-        # Reddit 403s anonymous fetches (including its .json API since 2026-05); only
-        # Tavily's advanced extraction reads threads, so force it for Reddit links.
-        if extract_depth is None and _is_reddit_url(url):
-            extract_depth = "advanced"
+        # Reddit 403s anonymous fetches (including its .json API since 2026-05).
+        # Keenable reads subreddit pages and many threads; Tavily's advanced
+        # extraction is the fallback that reads the remaining threads.
+        if not provenance_required and _is_reddit_url(url):
+            keenable = await _keenable_fetch(url)
+            if keenable:
+                truncated = len(keenable) > max_chars
+                text = keenable[:max_chars] if truncated else keenable
+                return json.dumps(
+                    {
+                        "url": url,
+                        "finalUrl": url,
+                        "extractor": "keenable",
+                        "truncated": truncated,
+                        "length": len(text),
+                        "text": text,
+                    }
+                )
+            if extract_depth is None:
+                extract_depth = "advanced"
 
         # Try Tavily Extract first (handles JS-heavy pages and paywall content better)
         if self.api_key and not provenance_required:
