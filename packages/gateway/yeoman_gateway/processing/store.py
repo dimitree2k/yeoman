@@ -202,6 +202,7 @@ _SCHEMA = (
     "CREATE INDEX IF NOT EXISTS idx_events_source ON events(source_message_id)",
     "CREATE INDEX IF NOT EXISTS idx_events_target ON events(target_message_id)",
     "CREATE INDEX IF NOT EXISTS idx_events_thread ON events(thread_id)",
+    "CREATE INDEX IF NOT EXISTS idx_events_chat_time ON events(channel, chat_id, occurred_ms)",
     """
     CREATE TABLE IF NOT EXISTS event_relations (
       event_id TEXT NOT NULL REFERENCES events(event_id) ON DELETE CASCADE,
@@ -2493,6 +2494,41 @@ class ProcessingStore:
         with self._lock:
             rows = self._conn.execute(query, params).fetchall()
         return tuple(_thread_from_row(row) for row in rows)
+
+    def lifecycle_other_message_counts(
+        self, *, channel: str, chat_id: str, threads: tuple[StoredThread, ...], now_ms: int,
+        cap: int,
+    ) -> dict[str, int]:
+        """Other inbound messages since each thread's last activity, counted up to ``cap``.
+
+        The lifecycle only asks whether a thread reached its threshold, so each probe reads
+        at most a few rows through ``idx_events_chat_time`` instead of the whole chat.
+        """
+        if not threads or cap <= 0:
+            return {thread.thread_id: 0 for thread in threads}
+        counts: dict[str, int] = {}
+        with self._lock:
+            for thread in threads:
+                rows = self._conn.execute(
+                    "SELECT e.source_message_id FROM events e "
+                    "WHERE e.channel = ? AND e.chat_id = ? "
+                    "AND e.occurred_ms > ? AND e.occurred_ms <= ? "
+                    "AND e.direction = 'in' AND e.kind = 'message' "
+                    "AND (e.origin = e.channel OR e.origin = 'whatsapp_canonical') "
+                    "AND e.principal != '' "
+                    "AND lower(e.principal) NOT IN ('assistant', 'bot', 'system') "
+                    "AND lower(e.principal) NOT LIKE '%:bot' "
+                    "AND lower(e.principal) NOT LIKE 'service:%' "
+                    "AND e.source_message_id IS NOT NULL AND e.source_message_id != '' "
+                    "AND NOT EXISTS (SELECT 1 FROM events a "
+                    "  WHERE a.source_message_id = e.source_message_id AND a.thread_id = ?) "
+                    "ORDER BY e.occurred_ms LIMIT ?",
+                    (channel, chat_id, thread.last_activity_ms, now_ms, thread.thread_id,
+                     cap * 3),
+                ).fetchall()
+                # Duplicates only shrink the count, which keeps a thread active, never dormant.
+                counts[thread.thread_id] = min(cap, len({row[0] for row in rows}))
+        return counts
 
     def touch_thread(self, thread_id: str, now_ms: int) -> None:
         with self._write() as conn:

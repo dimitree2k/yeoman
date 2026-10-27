@@ -21,6 +21,7 @@ from typing import TYPE_CHECKING, Any, Protocol, runtime_checkable
 from loguru import logger
 
 from yeoman_gateway.core.models import InboundEvent, PolicyDecision
+from yeoman_gateway.processing.lifecycle import lifecycle_verdicts
 from yeoman_gateway.processing.models import (
     CanonicalEvent,
     DecisionRecord,
@@ -34,7 +35,7 @@ from yeoman_gateway.processing.models import (
     now_ms as _now_ms,
 )
 from yeoman_gateway.processing.store import ProcessingStore
-from yeoman_gateway.processing.threads import JoinRule
+from yeoman_gateway.processing.threads import JoinRule, ThreadPolicy
 
 if TYPE_CHECKING:
     from yeoman_gateway.policy.engine import ActorContext, PolicyEngine
@@ -471,6 +472,7 @@ class IngestGate:
                 assignment.rule,
                 getattr(assignment, "reason", "") or "-",
             )
+        self._log_lifecycle_shadow(request, assignment, now=now)
         result = self._record(
             request,
             snapshot,
@@ -844,6 +846,43 @@ class IngestGate:
             source_message_id=event.message_id,
             payload=payload,
         )
+
+    def _log_lifecycle_shadow(self, request: IngestRequest, assignment: Any, *, now: int) -> None:
+        try:
+            policy = ThreadPolicy.from_config(self._config)
+            if not policy.lifecycle_shadow or self._store is None:
+                return
+            event = request.event
+            threads = self._store.list_threads(
+                channel=event.channel, chat_id=event.chat_id, state="open", limit=10001
+            )
+            if len(threads) > 10000:
+                raise ValueError("lifecycle thread budget exceeded")
+            idle_ms = policy.dormant_after_seconds * 1000
+            counts = self._store.lifecycle_other_message_counts(
+                channel=event.channel, chat_id=event.chat_id,
+                # A thread inside the time window stays active whatever the count.
+                threads=tuple(t for t in threads if now - t.last_activity_ms >= idle_ms),
+                now_ms=now,
+                cap=policy.dormant_after_messages if event.is_group
+                else policy.dormant_after_messages_dm,
+            )
+            verdicts = lifecycle_verdicts(
+                threads, counts, now_ms=now, is_group=event.is_group, policy=policy
+            )
+            current = getattr(assignment, "thread_id", None)
+            verdict = verdicts.get(current)
+            logger.info(
+                "thread_lifecycle_shadow chat={} open={} active={} dormant={} over_cap={} "
+                "current_thread={} current_state={}",
+                event.chat_id, len(threads),
+                sum(v.state == "active" for v in verdicts.values()),
+                sum(v.state == "dormant" for v in verdicts.values()),
+                sum(v.reason == "over_cap" for v in verdicts.values()),
+                current or "-", verdict.state if verdict else "-",
+            )
+        except Exception as exc:
+            logger.warning("thread_lifecycle_shadow_failed error_type={}", type(exc).__name__)
 
     def _bridge_canonical_identity(self, request: IngestRequest) -> CanonicalEvent | None:
         """The Bridge's canonical row for this physical message, when one exists.

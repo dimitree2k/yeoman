@@ -163,6 +163,11 @@ class ThreadPolicy:
     idle_ms: int = 1_800_000
     reopen_window_ms: int = 604_800_000
     pending_inputs_per_thread: int = 32
+    dormant_after_seconds: int = 3600
+    dormant_after_messages: int = 5
+    dormant_after_messages_dm: int = 0
+    max_active_per_chat: int = 4
+    lifecycle_shadow: bool = True
 
     @classmethod
     def from_config(cls, config: Any) -> ThreadPolicy:
@@ -176,6 +181,11 @@ class ThreadPolicy:
             idle_ms=int(getattr(threads, "idle_seconds", 1800)) * 1000,
             reopen_window_ms=int(getattr(threads, "reopen_window_seconds", 604800)) * 1000,
             pending_inputs_per_thread=int(getattr(threads, "pending_inputs_per_thread", 32)),
+            dormant_after_seconds=int(getattr(threads, "dormant_after_seconds", 3600)),
+            dormant_after_messages=int(getattr(threads, "dormant_after_messages", 5)),
+            dormant_after_messages_dm=int(getattr(threads, "dormant_after_messages_dm", 0)),
+            max_active_per_chat=int(getattr(threads, "max_active_per_chat", 4)),
+            lifecycle_shadow=bool(getattr(threads, "lifecycle_shadow", True)),
         )
 
 

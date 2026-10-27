@@ -710,6 +710,11 @@ class ProcessingThreadsConfig(BaseModel):
     idle_seconds: int = Field(default=1800, ge=1)
     reopen_window_seconds: int = Field(default=604800, ge=0)
     pending_inputs_per_thread: int = Field(default=32, ge=1)
+    dormant_after_seconds: int = Field(default=3600, ge=0)
+    dormant_after_messages: int = Field(default=5, ge=0)
+    dormant_after_messages_dm: int = Field(default=0, ge=0)
+    max_active_per_chat: int = Field(default=4, ge=1)
+    lifecycle_shadow: bool = Field(default=True)
     max_generations_global: int = Field(default=1, ge=1, le=2)
     max_generations_per_thread: int = Field(default=1, ge=1, le=2)
 
