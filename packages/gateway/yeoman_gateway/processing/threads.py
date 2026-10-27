@@ -168,6 +168,7 @@ class ThreadPolicy:
     dormant_after_messages_dm: int = 0
     max_active_per_chat: int = 4
     lifecycle_shadow: bool = True
+    lifecycle_enforce: bool = True
 
     @classmethod
     def from_config(cls, config: Any) -> ThreadPolicy:
@@ -186,6 +187,7 @@ class ThreadPolicy:
             dormant_after_messages_dm=int(getattr(threads, "dormant_after_messages_dm", 0)),
             max_active_per_chat=int(getattr(threads, "max_active_per_chat", 4)),
             lifecycle_shadow=bool(getattr(threads, "lifecycle_shadow", True)),
+            lifecycle_enforce=bool(getattr(threads, "lifecycle_enforce", True)),
         )
 
 
@@ -201,7 +203,7 @@ def _rule_reply_known(
             new_thread=True,
             quote_ref=data.reply_to_message_id,
         )
-    reopenable = view.reply_thread_state in (None, "open") or view.reply_reopenable
+    reopenable = view.reply_thread_state in (None, "open", "dormant") or view.reply_reopenable
     return JoinDecision(
         rule=JoinRule.REPLY_KNOWN,
         thread_id=view.reply_thread_id,
@@ -582,6 +584,8 @@ class ThreadRegistry:
                 now_ms=now_ms,
             )
             opened = True
+        elif self._store.reactivate(thread_id, now_ms, reason=decision.reason):
+            pass
         elif decision.new_turn and self._thread_needs_reopen(thread_id, now_ms=now_ms):
             self._store.reopen_thread(thread_id, now_ms)
         else:
@@ -667,6 +671,8 @@ class ThreadRegistry:
         if thread_id is None:
             return None
         thread = self._store.get_thread(thread_id)
+        if thread is not None and thread.state == "open" and thread.conversation_state == "dormant":
+            return "dormant"
         return thread.state if thread else None
 
     def _reply_reopenable(self, data: JoinInput, *, now_ms: int) -> bool:
@@ -678,6 +684,8 @@ class ThreadRegistry:
             return False
         if thread.close_reason == "manual_new":
             return False
+        if thread.state == "open" and thread.conversation_state == "dormant":
+            return True
         if now_ms - thread.last_activity_ms > self._policy.reopen_window_ms:
             return False
         return self._store.thread_sources_available(thread_id)
@@ -707,7 +715,8 @@ class ThreadRegistry:
             for thread in threads
             # An ambient answer must never capture the next unmarked message; only an
             # explicit reply may continue it (routing spec, ambient lineage).
-            if getattr(thread, "kind", "") != "ambient"
+            if thread.conversation_state == "active"
+            and getattr(thread, "kind", "") != "ambient"
             and now_ms - thread.last_activity_ms <= self._policy.followup_window_ms
         ]
         return tuple(active)
@@ -816,6 +825,7 @@ class ThreadRegistry:
         threads = self._store.list_threads(
             chat_id=data.chat_id, principal=data.principal, state="open"
         )
+        threads = tuple(t for t in threads if t.conversation_state == "active")
         if not threads:
             return None
         return max(threads, key=lambda thread: thread.last_activity_ms).thread_id

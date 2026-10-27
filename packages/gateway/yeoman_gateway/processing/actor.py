@@ -21,6 +21,8 @@ from collections.abc import Awaitable, Callable
 from dataclasses import dataclass, field
 from typing import Any
 
+from loguru import logger
+
 from yeoman_gateway.processing.models import (
     CanonicalEvent,
     GenerationSnapshot,
@@ -451,6 +453,9 @@ class ThreadActorRegistry:
         threads = getattr(config, "threads", None) or getattr(config, "Threads", None)
         self._max_global = int(getattr(threads, "max_generations_global", 1) or 1)
         self._cap = self._policy.pending_inputs_per_thread
+        self._interval_seconds = float(getattr(threads, "lifecycle_tick_seconds", 60))
+        self._task: asyncio.Task[None] | None = None
+        self._reactivations_seen = 0
 
     def actor_for(self, thread_id: str) -> ThreadActor:
         actor = self._actors.get(thread_id)
@@ -478,12 +483,71 @@ class ThreadActorRegistry:
                 return turn.to_ref(channel=channel, chat_id=chat_id)
         return None
 
+    async def start(self) -> None:
+        """Independent maintenance; provider/classifier awaits cannot block this task."""
+        if self._task is None:
+            self._task = asyncio.create_task(self._run_loop(), name="thread-lifecycle")
+
+    async def stop(self) -> None:
+        if self._task is not None:
+            self._task.cancel()
+            try:
+                await self._task
+            except asyncio.CancelledError:
+                pass
+            self._task = None
+
+    async def _run_loop(self) -> None:
+        while True:
+            try:
+                self.tick(self._clock())
+            except Exception as exc:  # one failed pass must not stop maintenance
+                logger.warning("thread_lifecycle_tick_failed error_type={}", type(exc).__name__)
+            await asyncio.sleep(self._interval_seconds)
+
     def tick(self, now_ms: int) -> tuple[str, ...]:
-        """Close idle threads; called by the maintenance loop."""
-        closed = self._store.close_idle_threads(now_ms, self._policy.idle_ms)
-        for thread_id in closed:
-            self._actors.pop(thread_id, None)
-        return closed
+        """Apply conversation verdicts without changing execution state or evicting actors."""
+        from yeoman_gateway.processing.lifecycle import lifecycle_verdicts
+
+        chats: dict[tuple[str, str], list[Any]] = {}
+        for thread in self._store.list_threads(state="open", limit=None):
+            if thread.conversation_state == "active":
+                chats.setdefault((thread.channel, thread.chat_id), []).append(thread)
+        marked: list[str] = []
+        over_cap = skipped_busy = would_mark = 0
+        for (channel, chat_id), threads in chats.items():
+            is_group = any(t.kind == "group" for t in threads) or chat_id.endswith("@g.us")
+            counts = self._store.lifecycle_other_message_counts(
+                channel=channel, chat_id=chat_id, threads=tuple(threads), now_ms=now_ms,
+                cap=(self._policy.dormant_after_messages if is_group
+                     else self._policy.dormant_after_messages_dm),
+            )
+            verdicts = lifecycle_verdicts(
+                threads, counts, now_ms=now_ms, is_group=is_group, policy=self._policy,
+            )
+            for thread_id, verdict in verdicts.items():
+                if verdict.state != "dormant":
+                    continue
+                over_cap += verdict.reason == "over_cap"
+                actor = self._actors.get(thread_id)
+                if (actor is not None and actor.generation_in_flight) or self._store.thread_busy(thread_id):
+                    skipped_busy += 1
+                    continue
+                if self._policy.lifecycle_enforce:
+                    changed = self._store.mark_dormant((thread_id,), now_ms, verdict.reason)
+                    marked.extend(changed)
+                    skipped_busy += not changed
+                else:
+                    would_mark += 1
+        reactivations = self._store.lifecycle_reactivations
+        changed = bool(marked or would_mark or reactivations != self._reactivations_seen)
+        # A quiet minute is the normal case; only ticks that did something reach info.
+        (logger.info if changed else logger.debug)(
+            "thread_lifecycle_tick dormant_marked={} over_cap={} skipped_busy={} reactivated={} would_mark={}",
+            len(marked), over_cap, skipped_busy, reactivations - self._reactivations_seen, would_mark,
+        )
+        self._reactivations_seen = reactivations
+        return tuple(marked)
 
     def forget(self, thread_id: str) -> None:
         self._actors.pop(thread_id, None)

@@ -592,7 +592,7 @@ async def test_provider_error_sends_nothing_and_keeps_the_turn_open(tmp_path: Pa
     store.close()
 
 
-def test_actor_registry_finds_the_active_turn_and_closes_idle_threads(tmp_path: Path) -> None:
+def test_actor_registry_keeps_turns_open_during_lifecycle_tick(tmp_path: Path) -> None:
     from yeoman_gateway.processing.actor import ThreadActorRegistry
 
     store = _store(tmp_path)
@@ -603,9 +603,8 @@ def test_actor_registry_finds_the_active_turn_and_closes_idle_threads(tmp_path: 
     turn_ref = actors.active_turn("whatsapp", CHAT)
     assert turn_ref is not None and turn_ref.turn_id == decision.turn_id
 
-    closed = actors.tick(T0 + 31 * 60_000)
-    assert closed == (decision.thread_id,)
-    assert actors.active_turn("whatsapp", CHAT) is None
+    assert actors.tick(T0 + 31 * 60_000) == ()
+    assert actors.active_turn("whatsapp", CHAT).turn_id == decision.turn_id
     store.close()
 
 
