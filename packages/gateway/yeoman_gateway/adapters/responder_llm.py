@@ -89,15 +89,6 @@ if TYPE_CHECKING:
     from yeoman_gateway.storage.private_handoff import PrivateHandoffStore
 
 
-_BACKWARD_REF_RE = re.compile(
-    r"\b(?:"
-    r"as (?:we|i|you) (?:discussed|said|mentioned|talked)"
-    r"|you (?:said|mentioned|told me|suggested)"
-    r"|remember when|go back to"
-    r"|we (?:discussed|agreed|decided|talked about)"
-    r")\b",
-    re.IGNORECASE,
-)
 _BANTER_MARKER_RE = re.compile(
     r"\b(?:"
     r"cringe|glitzer|bro|bruder|junge|haha|lol|lmao|witz|joke|roast|meme|"
@@ -218,11 +209,6 @@ _DELIVERY_SUCCESS_RE = re.compile(
     re.IGNORECASE,
 )
 _PHONE_CHARS_RE = re.compile(r"[\s().-]+")
-
-
-def _has_backward_reference(text: str) -> bool:
-    """Return True if the message appears to reference earlier conversation."""
-    return bool(_BACKWARD_REF_RE.search(text))
 
 
 def _delivery_args_have_explicit_target(arguments: dict[str, Any]) -> bool:
@@ -1030,7 +1016,7 @@ class LLMResponder(ResponderPort):
     def _resolve_history_limit(
         self, chat_id: str, session_history_limit: int | None, content: str = "",
     ) -> int:
-        """Resolve session history limit: per-chat policy > heuristic > global config default."""
+        """Resolve session history limit: per-chat policy > global config default."""
         if session_history_limit is not None:
             base = int(session_history_limit)
         elif chat_id.endswith("@g.us"):
@@ -1038,10 +1024,6 @@ class LLMResponder(ResponderPort):
         else:
             base = self._session_history_limit
 
-        # Expand window when message references earlier conversation,
-        # but only when no explicit per-chat policy override is set.
-        if session_history_limit is None and content and _has_backward_reference(content):
-            return min(base * 3, 50)
         return base
 
     @staticmethod
@@ -1362,6 +1344,18 @@ class LLMResponder(ResponderPort):
                 if target_aliases.intersection(_whatsapp_aliases(str(value))):
                     return True
         return False
+
+    @staticmethod
+    def _other_threads(binding: Any) -> tuple[tuple[str, str, int], ...]:
+        """The chat's other active threads from the turn binding; none when unavailable."""
+        provider = getattr(binding, "other_threads", None)
+        if provider is None:
+            return ()
+        try:
+            return tuple(provider())
+        except Exception as exc:  # the prompt note is optional; the reply must not fail
+            logger.warning("thread_frame_other_threads_failed error_type={}", type(exc).__name__)
+            return ()
 
     @staticmethod
     def _current_thread_row(
@@ -2986,6 +2980,7 @@ class LLMResponder(ResponderPort):
                 thread_id=getattr(getattr(binding, "turn", None), "thread_id", None),
                 thread_of=getattr(binding, "thread_of", None),
                 reply_to_message_id=str(metadata.get("reply_to_message_id") or "") or None,
+                other_threads=self._other_threads(binding),
                 current_message=self._current_thread_row(
                     metadata, sender_id=sender_id, content=content, chat_id=chat_id,
                     history_snapshot=history_snapshot,

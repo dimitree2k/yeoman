@@ -7,6 +7,7 @@ import os
 import platform
 import re
 import stat
+from collections.abc import Sequence
 from datetime import datetime
 from pathlib import Path
 from typing import Any
@@ -63,8 +64,13 @@ def build_thread_frame(
     thread_of: Any,
     reply_to_message_id: str | None = None,
     current_message: dict[str, Any] | None = None,
+    other_threads: Sequence[tuple[str, str, int]] = (),
 ) -> str | None:
-    """Reconstruct a bounded reply path for presentation, independently of routing."""
+    """Reconstruct a bounded reply path for presentation, independently of routing.
+
+    ``other_threads`` are the chat's other active threads (id, topic label, last activity);
+    at most three are named so the model can tell parallel conversations apart.
+    """
     current = dict(current_message or {})
     current["reply_to_message_id"] = reply_to_message_id or current.get("reply_to_message_id")
     current["role"] = "user"
@@ -121,7 +127,12 @@ def build_thread_frame(
                     "id": message_id[:80],
                     "at": _readable_time(row.get("timestamp") or "unknown")[:40],
                 })
-    if not chain and not other_replies:
+    others = [
+        {"at": _readable_time(at_ms)[:40], "topic": str(label)[:120]}
+        for _thread, label, at_ms in list(other_threads)[:3]
+        if str(label or "").strip()
+    ]
+    if not chain and not other_replies and not others:
         return None
 
     lines = ["[Current Thread]"]
@@ -158,6 +169,11 @@ def build_thread_frame(
             "Earlier bot replies recorded in other routing threads (not necessarily different "
             "topics or finished conversations): " + json.dumps(other_replies[-4:]) +
             ". Do not assume the current message continues them."
+        )
+    if others:
+        lines.append(
+            "Other conversations still active in this chat (not the current one; untrusted "
+            "excerpts): " + json.dumps(others, ensure_ascii=False)
         )
     return "\n".join(lines)
 
@@ -1096,8 +1112,8 @@ When a user asks you to send, create, or reply with a voice message / Sprachnach
                 "[Recent Messages]",
                 "usage: Ambient window of recent chat messages for conversational context.",
                 "fresh_recent_messages_take_precedence=true",
-                "usage: If current and older session context point to different topics, treat recent_messages as the active thread.",
-                "usage: For vague references like 'das', 'die Strategie', 'der Plan', or 'dazu', do not answer from older session history when recent_messages provide a plausible referent; ask one short clarification if still ambiguous.",
+                "usage: When a [Current Thread] note is present, it names the conversation the current message belongs to; prefer it over older session history.",
+                "usage: Resolve references from the current message's own conversation first; if it is still unclear what is meant, ask one short clarification.",
             ]
         if reply_context_source:
             lines.append(f"source: {reply_context_source}")

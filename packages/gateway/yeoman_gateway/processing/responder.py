@@ -199,7 +199,8 @@ class ThreadActorResponder:
             turn = self._store.get_turn(snapshot.turn_id)
             binding = (
                 TurnBinding(turn=turn, trace_id=snapshot.turn_id, generation_id=snapshot.generation_id,
-                            thread_of=self._thread_of)
+                            thread_of=self._thread_of,
+                            other_threads=self._other_threads_for(event, turn.thread_id))
                 if turn is not None
                 else None
             )
@@ -233,6 +234,13 @@ class ThreadActorResponder:
                 return None
             return outcome.text
         return None
+
+    def _other_threads_for(self, event: Any, thread_id: str) -> Any:
+        channel = str(getattr(event, "channel", "") or "")
+        chat_id = str(getattr(event, "chat_id", "") or "")
+        return lambda: self._store.active_thread_topics(
+            channel=channel, chat_id=chat_id, exclude_thread_id=thread_id, limit=3
+        )
 
     def _thread_of(self, message_id: str) -> str | None:
         """The thread a native message belongs to, if routing recorded one."""

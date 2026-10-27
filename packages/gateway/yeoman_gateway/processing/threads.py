@@ -429,6 +429,9 @@ class ThreadRegistry:
         data = self.input_from_event(
             event, explicit_correction=explicit_correction, topic_break=topic_break
         )
+        if data.kind == "delete":
+            # A deleted message leaves no text in a topic card, whatever routing decides.
+            self._store.forget_topic_source(str(data.target_message_id or ""), moment)
 
         stored = self._store.event_assignment(event.event_id)
         if stored is not None and stored[0] is not None and (stored[1] is not None or not allow_turn):
@@ -467,7 +470,19 @@ class ThreadRegistry:
                 event_id=event.event_id, thread_id=None, turn_id=None, now_ms=moment
             )
             return decision
-        return self._persist(event, data, decision, now_ms=moment, allow_turn=allow_turn)
+        persisted = self._persist(event, data, decision, now_ms=moment, allow_turn=allow_turn)
+        self._note_topic(data, persisted, now_ms=moment)
+        return persisted
+
+    def _note_topic(self, data: JoinInput, decision: JoinDecision, *, now_ms: int) -> None:
+        """A message assigned to a thread extends that thread's topic card."""
+        if data.kind == "message" and decision.thread_id and data.text.strip():
+            self._store.note_thread_topic(
+                decision.thread_id,
+                source_id=str(data.source_message_id or data.event_id),
+                text=data.text,
+                now_ms=now_ms,
+            )
 
     def _observed(
         self, decision: JoinDecision, data: JoinInput, view: JoinView
