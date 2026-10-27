@@ -539,12 +539,22 @@ class ThreadActorRegistry:
                     skipped_busy += not changed
                 else:
                     would_mark += 1
+        settled: tuple[str, ...] = ()
+        if self._policy.lifecycle_enforce:
+            in_flight = [thread_id for thread_id, actor in self._actors.items()
+                         if actor.generation_in_flight]
+            settled = self._store.settle_idle_turns(
+                now_ms, self._policy.idle_ms, skip_threads=in_flight
+            )
         reactivations = self._store.lifecycle_reactivations
-        changed = bool(marked or would_mark or reactivations != self._reactivations_seen)
+        changed = bool(marked or would_mark or settled
+                       or reactivations != self._reactivations_seen)
         # A quiet minute is the normal case; only ticks that did something reach info.
         (logger.info if changed else logger.debug)(
-            "thread_lifecycle_tick dormant_marked={} over_cap={} skipped_busy={} reactivated={} would_mark={}",
-            len(marked), over_cap, skipped_busy, reactivations - self._reactivations_seen, would_mark,
+            "thread_lifecycle_tick dormant_marked={} over_cap={} skipped_busy={} reactivated={} "
+            "would_mark={} turns_settled={}",
+            len(marked), over_cap, skipped_busy, reactivations - self._reactivations_seen,
+            would_mark, len(settled),
         )
         self._reactivations_seen = reactivations
         return tuple(marked)
