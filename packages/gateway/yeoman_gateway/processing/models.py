@@ -1003,6 +1003,10 @@ class TurnBinding:
     #: Maps a native message id to the thread it belongs to, so the prompt can tell
     #: this turn's thread apart from the bot's earlier replies in other threads.
     thread_of: Callable[[str], str | None] | None = field(default=None, compare=False)
+    #: The chat's other active threads as (thread_id, topic label, last_activity_ms).
+    other_threads: Callable[[], tuple[tuple[str, str, int], ...]] | None = field(
+        default=None, compare=False
+    )
 
 
 @dataclass(frozen=True, slots=True)

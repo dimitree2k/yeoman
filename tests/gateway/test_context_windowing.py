@@ -238,25 +238,18 @@ class TestSessionBoundary:
         store.close()
 
 
-class TestPreflightHeuristic:
-    """Preflight heuristic should detect backward references in messages."""
+class TestNoLexicalWindowExpansion:
+    """Wording never widens the history window; quotes bring their own Reply Context."""
 
-    def test_detects_earlier_reference(self):
-        from yeoman_gateway.adapters.responder_llm import _has_backward_reference
+    def test_backward_reference_wording_keeps_the_configured_limit(self):
+        from yeoman_gateway.adapters.responder_llm import LLMResponder
 
-        assert _has_backward_reference("as we discussed earlier, the plan was...")
-        assert _has_backward_reference("you mentioned something about auth")
-        assert _has_backward_reference("remember when we talked about the API?")
-        assert _has_backward_reference("go back to what you said about config")
-        assert _has_backward_reference("we discussed that last time")
-
-    def test_ignores_normal_messages(self):
-        from yeoman_gateway.adapters.responder_llm import _has_backward_reference
-
-        assert not _has_backward_reference("hello")
-        assert not _has_backward_reference("what's the weather?")
-        assert not _has_backward_reference("please write a function that adds two numbers")
-        assert not _has_backward_reference("can you help me?")
+        responder = object.__new__(LLMResponder)
+        responder._session_history_limit = 15
+        responder._session_history_limit_group = 20
+        for text in ("as we discussed earlier, the plan was...", "hello"):
+            assert responder._resolve_history_limit("dm", None, text) == 15
+            assert responder._resolve_history_limit("g@g.us", None, text) == 20
 
 
 class TestConversationStateContext:
@@ -401,8 +394,8 @@ class TestConversationStateContext:
 
         assert "[Recent Messages]" in user_text
         assert "fresh_recent_messages_take_precedence=true" in user_text
-        assert "If current and older session context point to different topics" in user_text
-        assert "do not answer from older session history" in user_text
+        assert "Resolve references from the current message's own conversation first" in user_text
+        assert "prefer it over older session history" in user_text
         assert "bezahlt" in user_text or "bezahltes" in user_text
 
     def test_external_history_preserves_original_sender_context(self, tmp_path):
@@ -924,7 +917,7 @@ class TestRecallConversationTool:
 
 
 class TestHistoryLimitResolution:
-    """Test the full resolution chain: per-chat policy > heuristic > global default."""
+    """Test the resolution chain: per-chat policy > global default."""
 
     def test_config_defaults(self):
         from yeoman_shared.config.schema import WhatsAppConfig
@@ -956,19 +949,14 @@ class TestHistoryLimitResolution:
         )
         assert d.session_history_limit is None
 
-    def test_resolve_history_limit_heuristic(self):
+    def test_resolve_history_limit_without_heuristic(self):
         from yeoman_gateway.adapters.responder_llm import LLMResponder
 
         r = LLMResponder.__new__(LLMResponder)
         r._session_history_limit = 15
         r._session_history_limit_group = 20
-        # Heuristic expands DM from 15 → 45
-        assert r._resolve_history_limit("user@s.whatsapp.net", None, "as we discussed") == 45
-        # Normal DM stays 15
-        assert r._resolve_history_limit("user@s.whatsapp.net", None, "hello") == 15
-        # Group expands from 20 → 50 (capped)
-        assert r._resolve_history_limit("group@g.us", None, "you mentioned") == 50
-        # Explicit policy override is NOT expanded by heuristic
+        assert r._resolve_history_limit("user@s.whatsapp.net", None, "as we discussed") == 15
+        assert r._resolve_history_limit("group@g.us", None, "you mentioned") == 20
         assert r._resolve_history_limit("user@s.whatsapp.net", 5, "as we discussed") == 5
 
     def test_session_boundary_and_max_messages_combined(self):

@@ -841,6 +841,13 @@ class ProcessingStore:
         ):
             if name not in columns:
                 conn.execute(f"ALTER TABLE threads ADD COLUMN {name} {definition}")
+        # A thread's topic card outlives payload retention, so a dormant thread can still be
+        # named in the prompt and found again. Deleting the opener clears it.
+        conn.execute(
+            "CREATE TABLE IF NOT EXISTS thread_topics ("
+            " thread_id TEXT PRIMARY KEY, opener_source_id TEXT, opener TEXT,"
+            " latest_source_id TEXT, latest TEXT, updated_ms INTEGER NOT NULL)"
+        )
 
     @staticmethod
     def _ensure_participation_schema(conn: sqlite3.Connection) -> None:
@@ -2607,6 +2614,61 @@ class ProcessingStore:
             frozenset(str(row[1]) for row in rows if row[1]),
             int(human["at_ms"]) if human["at_ms"] is not None else None,
         )
+
+    def note_thread_topic(
+        self, thread_id: str, *, source_id: str, text: str, now_ms: int
+    ) -> None:
+        """Keep the thread's first and latest human text, each bounded to 240 characters."""
+        excerpt = " ".join(str(text or "").split())[:240]
+        if not thread_id or not excerpt:
+            return
+        with self._write() as conn:
+            conn.execute(
+                "INSERT INTO thread_topics (thread_id, opener_source_id, opener,"
+                " latest_source_id, latest, updated_ms) VALUES (?,?,?,?,?,?) "
+                "ON CONFLICT(thread_id) DO UPDATE SET latest_source_id = excluded.latest_source_id,"
+                " latest = excluded.latest, updated_ms = excluded.updated_ms,"
+                " opener_source_id = COALESCE(thread_topics.opener_source_id, excluded.opener_source_id),"
+                " opener = COALESCE(thread_topics.opener, excluded.opener)",
+                (thread_id, source_id, excerpt, source_id, excerpt, int(now_ms)),
+            )
+
+    def forget_topic_source(self, source_id: str, now_ms: int) -> None:
+        """A deleted message leaves no text behind in any topic card."""
+        if not source_id:
+            return
+        with self._write() as conn:
+            conn.execute(
+                "UPDATE thread_topics SET opener = NULL, updated_ms = ? WHERE opener_source_id = ?",
+                (int(now_ms), source_id),
+            )
+            conn.execute(
+                "UPDATE thread_topics SET latest = NULL, updated_ms = ? WHERE latest_source_id = ?",
+                (int(now_ms), source_id),
+            )
+
+    def thread_topic(self, thread_id: str) -> tuple[str | None, str | None] | None:
+        with self._lock:
+            row = self._conn.execute(
+                "SELECT opener, latest FROM thread_topics WHERE thread_id = ?", (thread_id,)
+            ).fetchone()
+        return (row[0], row[1]) if row is not None else None
+
+    def active_thread_topics(
+        self, *, channel: str, chat_id: str, exclude_thread_id: str | None, limit: int = 3
+    ) -> tuple[tuple[str, str, int], ...]:
+        """Other active threads of the chat with a readable opener, newest first."""
+        with self._lock:
+            rows = self._conn.execute(
+                "SELECT t.thread_id, COALESCE(p.opener, p.latest) AS label, t.last_activity_ms "
+                "FROM threads t JOIN thread_topics p ON p.thread_id = t.thread_id "
+                "WHERE t.channel = ? AND t.chat_id = ? AND t.state = 'open' "
+                "AND t.conversation_state = 'active' AND t.kind != 'ambient' "
+                "AND t.thread_id != ? AND COALESCE(p.opener, p.latest) IS NOT NULL "
+                "ORDER BY t.last_activity_ms DESC, t.thread_id LIMIT ?",
+                (channel, chat_id, exclude_thread_id or "", max(0, int(limit))),
+            ).fetchall()
+        return tuple((str(r[0]), str(r[1]), int(r[2])) for r in rows)
 
     def touch_thread(self, thread_id: str, now_ms: int) -> None:
         with self._write() as conn:

@@ -263,3 +263,38 @@ def test_adjacency_matches_sender_by_contact_when_identifiers_differ():
     assert frame is not None
     assert '"via": "adjacency"' in frame
     assert "the lights mean autonomous" in frame
+
+
+def test_frame_names_other_active_threads_bounded():
+    others = [(f"th-{i}", f"topic {i} " + "x" * 200, 1_793_090_000_000 + i) for i in range(5)]
+
+    frame = build_thread_frame(history=[], thread_id="th-cur", thread_of=None,
+                               current_message={"message_id": "q", "content": "hi"},
+                               other_threads=others)
+
+    assert frame is not None
+    assert "Other conversations still active" in frame
+    assert frame.count('"topic"') == 3
+    assert "x" * 121 not in frame
+
+
+def test_topic_cards_keep_opener_and_latest_and_forget_deleted_text(tmp_path):
+    from yeoman_gateway.processing.store import ProcessingStore
+
+    store = ProcessingStore(tmp_path / "p.db")
+    thread = store.open_thread(channel="whatsapp", chat_id=GROUP, root_principal="o",
+                               kind="group", trigger_event_id="e1", now_ms=1_000)
+    other = store.open_thread(channel="whatsapp", chat_id=GROUP, root_principal="o",
+                              kind="group", trigger_event_id="e2", now_ms=2_000)
+    store.note_thread_topic(thread, source_id="s1", text="cyan lights on cars", now_ms=1_000)
+    store.note_thread_topic(thread, source_id="s2", text="  they mean   autonomous ", now_ms=1_500)
+
+    assert store.thread_topic(thread) == ("cyan lights on cars", "they mean autonomous")
+    assert [row[1] for row in store.active_thread_topics(
+        channel="whatsapp", chat_id=GROUP, exclude_thread_id=other)] == ["cyan lights on cars"]
+
+    store.forget_topic_source("s1", 3_000)
+    assert store.thread_topic(thread) == (None, "they mean autonomous")
+    assert [row[1] for row in store.active_thread_topics(
+        channel="whatsapp", chat_id=GROUP, exclude_thread_id=other)] == ["they mean autonomous"]
+    store.close()
