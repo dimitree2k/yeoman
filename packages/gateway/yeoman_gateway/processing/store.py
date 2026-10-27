@@ -2670,6 +2670,38 @@ class ProcessingStore:
             ).fetchall()
         return tuple((str(r[0]), str(r[1]), int(r[2])) for r in rows)
 
+    def reopen_candidates(
+        self, *, channel: str, chat_id: str, limit: int = 8
+    ) -> tuple[tuple[str, str, int], ...]:
+        """Dormant threads of the chat a new request may continue, newest first.
+
+        The label is the opener and the latest text together. ``/new`` closes a thread,
+        so a manual reset never appears here.
+        """
+        with self._lock:
+            rows = self._conn.execute(
+                "SELECT t.thread_id, TRIM(COALESCE(p.opener, '') || ' / ' || COALESCE(p.latest, ''),"
+                " ' /'), t.last_activity_ms "
+                "FROM threads t JOIN thread_topics p ON p.thread_id = t.thread_id "
+                "WHERE t.channel = ? AND t.chat_id = ? AND t.state = 'open' "
+                "AND t.conversation_state = 'dormant' AND t.kind != 'ambient' "
+                "AND COALESCE(p.opener, p.latest) IS NOT NULL "
+                "ORDER BY t.last_activity_ms DESC, t.thread_id LIMIT ?",
+                (channel, chat_id, max(0, int(limit))),
+            ).fetchall()
+        return tuple((str(r[0]), str(r[1]), int(r[2])) for r in rows)
+
+    def thread_opener(self, thread_id: str) -> tuple[str, str, int] | None:
+        """(opener source id, opener text, thread opened_ms) while the opener still exists."""
+        with self._lock:
+            row = self._conn.execute(
+                "SELECT p.opener_source_id, p.opener, t.opened_ms FROM thread_topics p "
+                "JOIN threads t ON t.thread_id = p.thread_id "
+                "WHERE p.thread_id = ? AND p.opener IS NOT NULL",
+                (thread_id,),
+            ).fetchone()
+        return (str(row[0] or ""), str(row[1]), int(row[2])) if row else None
+
     def touch_thread(self, thread_id: str, now_ms: int) -> None:
         with self._write() as conn:
             conn.execute(

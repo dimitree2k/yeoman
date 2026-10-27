@@ -1358,6 +1358,18 @@ class LLMResponder(ResponderPort):
             return ()
 
     @staticmethod
+    def _thread_opener(binding: Any) -> tuple[str, str, int] | None:
+        """How the current thread began; ``None`` when unknown or unavailable."""
+        provider = getattr(binding, "thread_opener", None)
+        if provider is None:
+            return None
+        try:
+            return provider()
+        except Exception as exc:  # the prompt note is optional; the reply must not fail
+            logger.warning("thread_frame_opener_failed error_type={}", type(exc).__name__)
+            return None
+
+    @staticmethod
     def _current_thread_row(
         metadata: dict[str, Any],
         *,
@@ -2981,6 +2993,7 @@ class LLMResponder(ResponderPort):
                 thread_of=getattr(binding, "thread_of", None),
                 reply_to_message_id=str(metadata.get("reply_to_message_id") or "") or None,
                 other_threads=self._other_threads(binding),
+                opener=self._thread_opener(binding),
                 current_message=self._current_thread_row(
                     metadata, sender_id=sender_id, content=content, chat_id=chat_id,
                     history_snapshot=history_snapshot,

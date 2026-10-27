@@ -1007,6 +1007,10 @@ class TurnBinding:
     other_threads: Callable[[], tuple[tuple[str, str, int], ...]] | None = field(
         default=None, compare=False
     )
+    #: This thread's opener as (source message id, text, opened_ms), while it exists.
+    thread_opener: Callable[[], tuple[str, str, int] | None] | None = field(
+        default=None, compare=False
+    )
 
 
 @dataclass(frozen=True, slots=True)

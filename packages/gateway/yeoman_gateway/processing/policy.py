@@ -12,6 +12,7 @@ in-memory engine decides (spec R02).
 
 from __future__ import annotations
 
+import asyncio
 import uuid
 from collections.abc import Callable, Mapping
 from dataclasses import dataclass, field, replace
@@ -185,6 +186,8 @@ class IngestGate:
         cancel_chat: Callable[..., bool] | None = None,
         source_registrar: Callable[[str], bool] | None = None,
         continuation: Any = None,
+        topic_reopen: Any = None,
+        topic_reopen_mode: str = "off",
     ) -> None:
         self._config = config
         self._store = store
@@ -208,6 +211,10 @@ class IngestGate:
         #: promotion is decided later and elsewhere (spec 1.4 / owner clarification).
         self._source_registrar = source_registrar
         self._continuation = continuation
+        #: Semantic reopen of dormant threads; "shadow" logs in the background only.
+        self._topic_reopen = topic_reopen if topic_reopen_mode in ("shadow", "enforce") else None
+        self._topic_reopen_mode = topic_reopen_mode
+        self._topic_reopen_tasks: set[asyncio.Task[Any]] = set()
         #: Ambient brake state, per chat: when the last unaddressed answer went out and how
         #: much the chat has moved since. In memory on purpose - after a restart the brake
         #: simply starts cold, which is the conservative direction.
@@ -254,6 +261,7 @@ class IngestGate:
 
     async def admit_async(self, request: IngestRequest) -> FastGateResult | None:
         """Resolve free-form continuations after durable observation and access checks."""
+        request = await self._with_topic_reopen(request)
         event = request.event
         if (self._continuation is None or not self.enabled_for(event.channel, event.chat_id)
                 or self.shadowed(event.channel, event.chat_id) or not event.is_group
@@ -296,6 +304,68 @@ class IngestGate:
             logger.warning("continuation_resolution_failed error_type={}", type(exc).__name__)
             anchor = None
         return self.admit(request, continuation=anchor)
+
+    async def _with_topic_reopen(self, request: IngestRequest) -> IngestRequest:
+        """Attach a dormant thread hint to a request that would otherwise open a thread.
+
+        Only an answered request without any structural link is a candidate, so the hint
+        can never change admission, and a quote or a direct follow-up always wins.
+        """
+        if self._topic_reopen is None or not self._topic_reopen_candidate(request):
+            return request
+        event = request.event
+        if self._topic_reopen_mode == "shadow":
+            task = asyncio.create_task(self._log_topic_reopen(request))
+            self._topic_reopen_tasks.add(task)
+            task.add_done_callback(self._topic_reopen_tasks.discard)
+            return request
+        verdict = await self._log_topic_reopen(request)
+        if verdict is None or not verdict.thread_id:
+            return request
+        logger.info("semantic_reopen chat={} event_id={} thread={}",
+                    event.chat_id, request.event_id, verdict.thread_id)
+        return replace(request, payload_extra={**dict(request.payload_extra),
+                                               "semantic_thread_id": verdict.thread_id})
+
+    def _topic_reopen_candidate(self, request: IngestRequest) -> bool:
+        event = request.event
+        text = event.content.strip()
+        if (self._threads is None or self._store is None or not text or text.startswith("/")
+                or not self.enabled_for(event.channel, event.chat_id)
+                or self.shadowed(event.channel, event.chat_id)
+                or event.reply_to_message_id or event.reply_to_bot
+                or event.raw_metadata.get("topic_break")):
+            return False
+        try:
+            if not self._snapshots.snapshot().healthy:
+                return False
+            decision = self._evaluate(request)
+            if not decision.accept_message or not decision.should_respond:
+                return False
+            canonical = self._canonical_event(
+                request, identity=self._bridge_canonical_identity(request)
+            )
+            if self._store.event_assignment(canonical.event_id):
+                return False
+            data = self._threads.input_from_event(canonical)
+            routed = self._threads.decide(data, self._threads.view_for(data, now_ms=self._clock()))
+        except Exception as exc:
+            logger.warning("topic_reopen_skipped error_type={}", type(exc).__name__)
+            return False
+        return bool(routed.new_thread) and routed.thread_id is None
+
+    async def _log_topic_reopen(self, request: IngestRequest) -> Any:
+        event = request.event
+        verdict = await self._topic_reopen.resolve(
+            channel=event.channel, chat_id=event.chat_id, text=event.content
+        )
+        logger.info(
+            "thread_semantic_reopen mode={} chat={} event_id={} chosen={} reason={} best={:.3f} "
+            "shortlisted={} candidates={}",
+            self._topic_reopen_mode, event.chat_id, request.event_id, verdict.thread_id or "-",
+            verdict.reason, verdict.best_score, verdict.shortlisted, verdict.candidates,
+        )
+        return verdict
 
     def admit(self, request: IngestRequest, *, continuation: Any = None) -> FastGateResult | None:
         """Journal the event and decide before any enrichment. ``None`` = not managed.

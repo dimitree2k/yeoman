@@ -1962,6 +1962,9 @@ def build_processing_gate(
         except RouteUnavailableError as exc:
             logger.warning("semantic continuation unavailable: {}", exc)
 
+    reopen_mode = config.processing.threads.semantic_reopen
+    topic_reopen = _build_topic_reopener(config, store) if registry is not None else None
+
     return IngestGate(
         config=config.processing,
         store=store,
@@ -1971,6 +1974,48 @@ def build_processing_gate(
         participation=_participation_owns,
         source_registrar=source_registrar,
         continuation=continuation,
+        topic_reopen=topic_reopen,
+        topic_reopen_mode=reopen_mode if topic_reopen is not None else "off",
+    )
+
+
+def _build_topic_reopener(config: "Config", store: "ProcessingStore"):
+    """Embeddings plus a verifier route; any missing piece leaves the feature off, loudly."""
+    settings = config.processing.threads
+    if settings.semantic_reopen == "off":
+        return None
+    from yeoman_gateway.knowledge._embeddings import KnowledgeEmbedder
+    from yeoman_gateway.processing.model_route import (
+        RouteClient,
+        RouteUnavailableError,
+        resolve_route_key,
+    )
+    from yeoman_gateway.processing.topic_reopen import TopicReopener, TopicVerifier
+
+    route = resolve_route_key(
+        config,
+        settings.semantic_reopen_route,
+        config.processing.participation.judge_route,
+        config.processing.ambient.judge_route,
+        "memory.capture.extract",
+    )
+    try:
+        embedder = KnowledgeEmbedder(config)
+        client = RouteClient(config=config, route_key=route)
+    except (RouteUnavailableError, ValueError, KeyError) as exc:
+        logger.error("semantic reopen disabled: route={} detail={}", route, str(exc)[:160])
+        return None
+    logger.info("semantic reopen mode={} route={} min_score={}", settings.semantic_reopen,
+                route, settings.semantic_reopen_min_score)
+    return TopicReopener(
+        candidates=lambda channel, chat_id: store.reopen_candidates(
+            channel=channel, chat_id=chat_id, limit=settings.semantic_reopen_candidates
+        ),
+        embed=embedder.embed_batch,
+        verifier=TopicVerifier(client=client,
+                               timeout_seconds=settings.semantic_reopen_timeout_seconds),
+        min_score=settings.semantic_reopen_min_score,
+        timeout_seconds=settings.semantic_reopen_timeout_seconds,
     )
 
 
