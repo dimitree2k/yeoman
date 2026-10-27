@@ -57,7 +57,7 @@ def test_tick_thresholds_and_no_turn_mutation(minutes, messages, expected):
                                    source_message_id=key, occurred_ms=1)
             store.append_event(event_key=key, event_id=key, trace_id=key, payload=event, now_ms=1)
         before = store.get_turn(turn)
-        registry = actors(store)
+        registry = actors(store, idle_ms=10**12)  # dormancy alone; turn settling is separate
         assert registry.tick(minutes * 60000) == ((tid,) if expected else ())
         assert store.get_thread(tid).conversation_state == ("dormant" if expected else "active")
         assert store.get_turn(turn) == before
@@ -167,10 +167,44 @@ def test_first_tick_preserves_96_threads_and_208_open_turns():
             store.open_turn(thread_id=ids[i % 96], principal="human",
                             trigger_event_id=f"turn-{i}", now_ms=0)
         before = tuple(tuple(row) for row in store._conn.execute("SELECT * FROM turns"))
-        assert set(actors(store).tick(3600000)) == set(ids)
+        assert set(actors(store, idle_ms=10**12).tick(3600000)) == set(ids)
         assert len(store.list_threads(state="open", limit=None)) == 96
         assert tuple(tuple(row) for row in store._conn.execute("SELECT * FROM turns")) == before
         assert all(t.conversation_state == "dormant" for t in store.list_threads(limit=None))
+
+
+def test_stale_turns_drain_in_bounded_idempotent_ticks():
+    with ProcessingStore(":memory:") as store:
+        ids = [open_thread(store, str(i), kind="dm") for i in range(96)]
+        for i in range(208):
+            store.open_turn(thread_id=ids[i % 96], principal="human",
+                            trigger_event_id=f"turn-{i}", now_ms=0)
+        recent = store.open_turn(thread_id=ids[0], principal="human", trigger_event_id="recent",
+                                 now_ms=3_000_000)
+        registry = actors(store)
+
+        registry.tick(3_600_000)
+        registry.tick(3_600_000)
+        changes = store._conn.total_changes
+        registry.tick(3_600_000)
+
+        states = dict(store._conn.execute("SELECT state, COUNT(*) FROM turns GROUP BY state"))
+        assert states == {"closed": 208, "open": 1}
+        assert store.get_turn(recent).state == "open"
+        assert len(store.list_threads(state="open", limit=None)) == 96
+        assert store._conn.total_changes == changes
+
+
+def test_turn_settling_waits_for_durable_work_and_respects_dry_run():
+    with ProcessingStore(":memory:") as store:
+        tid = open_thread(store, kind="dm")
+        turn = store.open_turn(thread_id=tid, principal="human", trigger_event_id="root", now_ms=0)
+        store.enqueue_pending_input(input_id="pending", thread_id=tid, event_id="next",
+                                    principal="human", now_ms=1, turn_id=turn)
+        assert store.settle_idle_turns(3_600_000, 1_800_000) == ()
+        assert actors(store, lifecycle_enforce=False).tick(3_600_000) == ()
+        assert store.get_turn(turn).state == "open"
+        assert store.settle_idle_turns(3_600_000, 1_800_000, skip_threads=[tid]) == ()
 
 
 def test_transition_logs_are_bounded_and_counted():

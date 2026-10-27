@@ -2774,6 +2774,41 @@ class ProcessingStore:
             logger.info("thread_lifecycle_reactivated thread_id={} reason={}", thread_id, reason)
         return cursor.rowcount == 1
 
+    def settle_idle_turns(
+        self, now_ms: int, idle_ms: int, *, skip_threads: Iterable[str] = (), limit: int = 200
+    ) -> tuple[str, ...]:
+        """Close turns that went quiet long ago; the thread itself stays as it is.
+
+        An answered turn otherwise stays open forever, so an edit days later could still
+        revise it and a producer could still attach work to it. Durable work is rechecked
+        under the write lock, and repeating the call changes nothing.
+        """
+        skipped = set(skip_threads)
+        closed: list[str] = []
+        with self._write() as conn:
+            rows = conn.execute(
+                "SELECT turn_id, thread_id FROM turns WHERE state IN ('open','awaiting') "
+                "AND updated_ms <= ? ORDER BY updated_ms, turn_id LIMIT ?",
+                (now_ms - idle_ms, max(0, int(limit))),
+            ).fetchall()
+            busy: dict[str, bool] = {}
+            for row in rows:
+                thread_id = str(row["thread_id"])
+                if thread_id in skipped:
+                    continue
+                if thread_id not in busy:
+                    busy[thread_id] = self._thread_busy(conn, thread_id)
+                if busy[thread_id]:
+                    continue
+                cursor = conn.execute(
+                    "UPDATE turns SET state = 'closed', closed_ms = ?, updated_ms = ? "
+                    "WHERE turn_id = ? AND state IN ('open','awaiting') AND updated_ms <= ?",
+                    (now_ms, now_ms, row["turn_id"], now_ms - idle_ms),
+                )
+                if cursor.rowcount:
+                    closed.append(str(row["turn_id"]))
+        return tuple(closed)
+
     def close_idle_threads(self, now_ms: int, idle_ms: int) -> tuple[str, ...]:
         """Legacy helper; runtime lifecycle uses mark_dormant and never closes turns."""
         with self._write() as conn:
