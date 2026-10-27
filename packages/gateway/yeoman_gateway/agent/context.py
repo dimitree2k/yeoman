@@ -65,11 +65,14 @@ def build_thread_frame(
     reply_to_message_id: str | None = None,
     current_message: dict[str, Any] | None = None,
     other_threads: Sequence[tuple[str, str, int]] = (),
+    opener: tuple[str, str, int] | None = None,
 ) -> str | None:
     """Reconstruct a bounded reply path for presentation, independently of routing.
 
     ``other_threads`` are the chat's other active threads (id, topic label, last activity);
     at most three are named so the model can tell parallel conversations apart.
+    ``opener`` is how this thread began (source id, text, opened_ms); it is named when the
+    chain does not already show it, e.g. after a dormant thread was reopened by topic.
     """
     current = dict(current_message or {})
     current["reply_to_message_id"] = reply_to_message_id or current.get("reply_to_message_id")
@@ -132,7 +135,13 @@ def build_thread_frame(
         for _thread, label, at_ms in list(other_threads)[:3]
         if str(label or "").strip()
     ]
-    if not chain and not other_replies and not others:
+    began = None
+    if opener and str(opener[1] or "").strip():
+        source_id, text, at_ms = opener
+        shown = {str(rows[index].get("message_id") or "") for index in path}
+        if source_id not in shown and source_id != str(current.get("message_id") or ""):
+            began = {"at": _readable_time(at_ms)[:40], "text": str(text)[:240]}
+    if not chain and not other_replies and not others and began is None:
         return None
 
     lines = ["[Current Thread]"]
@@ -162,8 +171,14 @@ def build_thread_frame(
         lines.append(json.dumps(excerpts, ensure_ascii=False))
     elif current.get("reply_to_message_id"):
         lines.append("The quoted target is outside this chain window; use Reply Context.")
-    else:
+    elif began is None:
         lines.append("No supported conversation chain for the current message.")
+    if began is not None:
+        lines.append(
+            "This conversation began earlier with (untrusted excerpt): "
+            + json.dumps(began, ensure_ascii=False)
+            + ". The current message continues it unless it clearly says otherwise."
+        )
     if other_replies:
         lines.append(
             "Earlier bot replies recorded in other routing threads (not necessarily different "

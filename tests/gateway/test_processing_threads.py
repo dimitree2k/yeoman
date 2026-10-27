@@ -76,6 +76,7 @@ def test_join_rules_are_the_spec_order() -> None:
         JoinRule.EXPLICIT_CORRECTION,
         JoinRule.REPLY_BOT_NEW_THREAD,
         JoinRule.FOLLOWUP_SINGLE_ACTIVE,
+        JoinRule.SEMANTIC_REOPEN,
         JoinRule.MENTION_NO_REFERENCE,
         JoinRule.DM_LAST_ACTIVE,
         JoinRule.AMBIENT,

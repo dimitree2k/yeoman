@@ -39,6 +39,7 @@ class JoinRule(StrEnum):
     EXPLICIT_CORRECTION = "explicit_correction"  # R03.2
     REPLY_BOT_NEW_THREAD = "reply_bot_new_thread"
     FOLLOWUP_SINGLE_ACTIVE = "followup_single_active"  # R03.3
+    SEMANTIC_REOPEN = "semantic_reopen"
     MENTION_NO_REFERENCE = "mention_new_thread"  # R03.4
     DM_LAST_ACTIVE = "dm_last_active"  # R03.5
     AMBIENT = "ambient"  # R03.6
@@ -49,6 +50,7 @@ JOIN_RULES: tuple[JoinRule, ...] = (
     JoinRule.EXPLICIT_CORRECTION,
     JoinRule.REPLY_BOT_NEW_THREAD,
     JoinRule.FOLLOWUP_SINGLE_ACTIVE,
+    JoinRule.SEMANTIC_REOPEN,
     JoinRule.MENTION_NO_REFERENCE,
     JoinRule.DM_LAST_ACTIVE,
     JoinRule.AMBIENT,
@@ -98,6 +100,8 @@ class JoinInput:
     occurred_ms: int | None = None
     #: Provider id of the physical message; its Bridge twin must not count as "previous".
     source_message_id: str | None = None
+    #: A dormant thread the topic verifier matched before admission; only a hint.
+    semantic_thread_id: str | None = None
 
 
 @dataclass(frozen=True, slots=True)
@@ -113,6 +117,8 @@ class JoinView:
     last_active_dm_thread: str | None = None
     last_active_dm_turn: str | None = None
     continuum: Any = None
+    #: ``semantic_thread_id`` once re-checked: same chat, still dormant, not ambient.
+    semantic_target: str | None = None
 
     @property
     def continuity_positive(self) -> bool:
@@ -265,6 +271,20 @@ def _rule_followup_single_active(
     )
 
 
+def _rule_semantic_reopen(
+    data: JoinInput, view: JoinView, policy: ThreadPolicy
+) -> JoinDecision | None:
+    """A new request about a dormant thread's topic continues that thread."""
+    if not view.semantic_target or topic_break_is_certain(data):
+        return None
+    return JoinDecision(
+        rule=JoinRule.SEMANTIC_REOPEN,
+        thread_id=view.semantic_target,
+        reason="semantic_reopen",
+        new_turn=True,
+    )
+
+
 def _rule_reply_bot_new_thread(
     data: JoinInput, view: JoinView, policy: ThreadPolicy
 ) -> JoinDecision | None:
@@ -329,6 +349,7 @@ _RULES: Mapping[JoinRule, Callable[[JoinInput, JoinView, ThreadPolicy], JoinDeci
     JoinRule.EXPLICIT_CORRECTION: _rule_explicit_correction,
     JoinRule.REPLY_BOT_NEW_THREAD: _rule_reply_bot_new_thread,
     JoinRule.FOLLOWUP_SINGLE_ACTIVE: _rule_followup_single_active,
+    JoinRule.SEMANTIC_REOPEN: _rule_semantic_reopen,
     JoinRule.MENTION_NO_REFERENCE: _rule_mention_no_reference,
     JoinRule.DM_LAST_ACTIVE: _rule_dm_last_active,
     JoinRule.AMBIENT: _rule_ambient,
@@ -409,6 +430,7 @@ class ThreadRegistry:
             last_active_dm_thread=self._last_dm_thread(data),
             last_active_dm_turn=None,
             continuum=self._continuum(data, now_ms=now_ms),
+            semantic_target=self._semantic_target(data),
         )
 
     def assign(
@@ -665,7 +687,18 @@ class ThreadRegistry:
             topic_break=bool(payload.get("topic_break")) if topic_break is None else topic_break,
             occurred_ms=event.occurred_ms,
             source_message_id=event.source_message_id,
+            semantic_thread_id=_opt(payload.get("semantic_thread_id")),
         )
+
+    def _semantic_target(self, data: JoinInput) -> str | None:
+        if not data.semantic_thread_id:
+            return None
+        thread = self._store.get_thread(data.semantic_thread_id)
+        if (thread is None or thread.channel != data.channel or thread.chat_id != data.chat_id
+                or thread.state != "open" or thread.conversation_state != "dormant"
+                or thread.kind == "ambient"):
+            return None
+        return thread.thread_id
 
     def _reply_thread(self, data: JoinInput) -> str | None:
         hit = self._store.resolve_reference(data.reply_to_message_id)

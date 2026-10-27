@@ -718,6 +718,19 @@ class ProcessingThreadsConfig(BaseModel):
     lifecycle_enforce: bool = Field(default=True, alias="lifecycleEnforce")
     lifecycle_tick_seconds: float = Field(default=60, alias="lifecycleTickSeconds", gt=0)
     same_sender_gap_seconds: int = Field(default=120, alias="sameSenderGapSeconds", ge=0)
+    #: Reopen a dormant thread when a new request is about the same topic (embeddings plus
+    #: a verifier). "shadow" only logs the verdict, "enforce" routes by it.
+    semantic_reopen: Literal["off", "shadow", "enforce"] = Field(
+        default="off", alias="semanticReopen"
+    )
+    semantic_reopen_min_score: float = Field(
+        default=0.8, alias="semanticReopenMinScore", ge=0, le=1
+    )
+    semantic_reopen_candidates: int = Field(default=8, alias="semanticReopenCandidates", ge=1, le=32)
+    semantic_reopen_route: str = Field(default="", alias="semanticReopenRoute")
+    semantic_reopen_timeout_seconds: float = Field(
+        default=6.0, alias="semanticReopenTimeoutSeconds", gt=0
+    )
     max_generations_global: int = Field(default=1, ge=1, le=2)
     max_generations_per_thread: int = Field(default=1, ge=1, le=2)
 

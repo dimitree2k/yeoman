@@ -298,3 +298,17 @@ def test_topic_cards_keep_opener_and_latest_and_forget_deleted_text(tmp_path):
     assert [row[1] for row in store.active_thread_topics(
         channel="whatsapp", chat_id=GROUP, exclude_thread_id=other)] == ["they mean autonomous"]
     store.close()
+
+
+def test_frame_names_how_a_reopened_thread_began():
+    current = {"message_id": "now", "content": "und die Lichter?"}
+    opener = ("old-1", "Alex, wie fährt sich dein neues Auto?", 1_793_090_000_000)
+
+    frame = build_thread_frame(history=[], thread_id="th", thread_of=None,
+                               current_message=current, opener=opener)
+    fresh = build_thread_frame(history=[], thread_id="th", thread_of=None,
+                               current_message=current, opener=("now", "und die Lichter?", 1))
+
+    assert frame is not None and "began earlier" in frame and "neues Auto" in frame
+    assert "No supported conversation chain" not in frame
+    assert fresh is None

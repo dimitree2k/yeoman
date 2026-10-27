@@ -1554,3 +1554,84 @@ def test_the_routing_line_shows_a_withdrawn_answer_as_reaction(tmp_path) -> None
     assert lines, records
     assert "outcome=observe" in lines[0], lines[0]
     assert "respond=true" in lines[0] and "react_action=true" in lines[0], lines[0]
+
+
+class _Reopener:
+    def __init__(self, thread_id: str | None) -> None:
+        self.thread_id = thread_id
+        self.calls = 0
+
+    async def resolve(self, *, channel: str, chat_id: str, text: str):
+        from yeoman_gateway.processing.topic_reopen import ReopenVerdict
+
+        self.calls += 1
+        return ReopenVerdict(self.thread_id, "verified" if self.thread_id else "no_candidates")
+
+
+def _dormant_thread(runtime: _Runtime) -> str:
+    first = _admit(runtime, message_id="car-1", content="Alex, wie fährt sich dein neues Auto?")
+    runtime.store.close_turn(first.assignment.turn_id, now_ms=runtime.gate._clock())
+    assert runtime.store.mark_dormant((first.assignment.thread_id,), runtime.gate._clock(), "test")
+    return str(first.assignment.thread_id)
+
+
+def _request(message_id: str, content: str, **kwargs) -> IngestRequest:
+    return IngestRequest(event_key=message_id, event_id=message_id, trace_id=message_id,
+                         event=_event(message_id=message_id, content=content, **kwargs))
+
+
+@pytest.mark.asyncio
+async def test_enforced_semantic_reopen_continues_the_dormant_thread(runtime):
+    thread_id = _dormant_thread(runtime)
+    reopener = _Reopener(thread_id)
+    runtime.gate._topic_reopen, runtime.gate._topic_reopen_mode = reopener, "enforce"
+
+    result = await runtime.gate.admit_async(_request("car-2", "Und die Lichter am Auto?"))
+
+    assert reopener.calls == 1
+    assert result.assignment.thread_id == thread_id
+    assert result.assignment.rule.value == "semantic_reopen"
+    assert runtime.store.get_thread(thread_id).conversation_state == "active"
+
+
+@pytest.mark.asyncio
+async def test_shadow_semantic_reopen_only_logs(runtime):
+    import asyncio
+
+    thread_id = _dormant_thread(runtime)
+    reopener = _Reopener(thread_id)
+    runtime.gate._topic_reopen, runtime.gate._topic_reopen_mode = reopener, "shadow"
+
+    result = await runtime.gate.admit_async(_request("car-2", "Und die Lichter am Auto?"))
+    await asyncio.gather(*runtime.gate._topic_reopen_tasks)
+
+    assert reopener.calls == 1
+    assert result.assignment.thread_id != thread_id
+    assert runtime.store.get_thread(thread_id).conversation_state == "dormant"
+
+
+@pytest.mark.asyncio
+async def test_semantic_reopen_is_not_consulted_for_unanswered_or_linked_messages(runtime):
+    thread_id = _dormant_thread(runtime)
+    reopener = _Reopener(thread_id)
+    runtime.gate._topic_reopen, runtime.gate._topic_reopen_mode = reopener, "enforce"
+    runtime.reload_policy(_policy(when_to_reply="mention_only"))
+
+    await runtime.gate.admit_async(_request("chatter", "Auto", mentioned=False, sender=GUEST))
+    quoted = replace(_request("quote", "Auto?"), event=replace(
+        _event(message_id="quote", content="Auto?"), reply_to_message_id="car-1"))
+    await runtime.gate.admit_async(quoted)
+
+    assert reopener.calls == 0
+
+
+@pytest.mark.asyncio
+async def test_a_stale_semantic_hint_falls_back_to_a_new_thread(runtime):
+    thread_id = _dormant_thread(runtime)
+    runtime.store.close_chat_threads(channel="whatsapp", chat_id=CHAT, now_ms=runtime.gate._clock())
+    runtime.gate._topic_reopen, runtime.gate._topic_reopen_mode = _Reopener(thread_id), "enforce"
+
+    result = await runtime.gate.admit_async(_request("car-2", "Und die Lichter am Auto?"))
+
+    assert result.assignment.thread_id != thread_id
+    assert result.assignment.rule.value == "mention_new_thread"
