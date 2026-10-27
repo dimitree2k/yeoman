@@ -15,6 +15,74 @@ from yeoman_gateway.policy.persona import COMPACT_PROMPT_MARKER, uses_compact_pr
 _EXTERNAL_CHANNELS = frozenset({"whatsapp", "telegram", "discord", "feishu"})
 
 
+def _readable_time(value: Any) -> str:
+    """Epoch seconds or milliseconds as local wall time; other values unchanged.
+
+    A raw epoch hides the gap between two messages from the model, and a long gap is
+    the plainest sign that a new topic started.
+    """
+    if isinstance(value, bool) or not isinstance(value, (int, float)):
+        return str(value)
+    seconds = value / 1000 if value > 100_000_000_000 else value
+    try:
+        return datetime.fromtimestamp(seconds).astimezone().strftime("%Y-%m-%d %H:%M")
+    except (OverflowError, OSError, ValueError):
+        return str(value)
+
+
+def build_thread_frame(
+    *,
+    history: list[dict[str, Any]],
+    thread_id: str | None,
+    thread_of: Any,
+    reply_to_message_id: str | None = None,
+) -> str | None:
+    """Tell the model which of its earlier replies belong to the current thread.
+
+    Group history is the flat chat stream, so the bot's last reply sits there as an
+    assistant turn even when routing opened a new thread for the current message. A small
+    model then continues that reply's topic. Returns None when no earlier reply belongs
+    to another thread, because then there is nothing to separate.
+    """
+    if not thread_id or thread_of is None:
+        return None
+    other_times: list[str] = []
+    for message in history:
+        if message.get("role") != "assistant":
+            continue
+        message_id = str(message.get("message_id") or "")
+        if not message_id:
+            continue
+        owner = thread_of(message_id)
+        if owner and owner != thread_id:
+            stamp = message.get("timestamp")
+            other_times.append(_readable_time(stamp) if stamp else "earlier")
+    if not other_times:
+        return None
+    reply_to = str(reply_to_message_id or "").strip()
+    reply_thread = thread_of(reply_to) if reply_to else None
+    if reply_to and reply_thread == thread_id:
+        opening = "The current message replies to a message of the current thread; continue that thread."
+    elif reply_to:
+        opening = (
+            "The current message replies to the message shown in Reply Context; "
+            "answer about that message."
+        )
+    else:
+        opening = (
+            "The current message does not reply to any earlier message. Treat it as a new "
+            "question unless it clearly refers back to one of your earlier replies."
+        )
+    return "\n".join([
+        "[Current Thread]",
+        opening,
+        "Your earlier replies at " + ", ".join(other_times[-4:]) + " belong to other, "
+        "finished threads. Do not continue their topic unless the current message names it.",
+        "For vague references such as 'das', 'dazu', 'die' or 'it', look first at the sender's "
+        "own latest messages and the messages directly before the current one.",
+    ])
+
+
 def _format_untrusted_context(sender: str, channel: str, metadata: dict[str, Any] | None) -> str:
     fields = [f"channel={channel}"]
     metadata = metadata or {}
@@ -27,7 +95,7 @@ def _format_untrusted_context(sender: str, channel: str, metadata: dict[str, Any
     if metadata.get("is_owner") is True:
         fields.append("runtime_is_owner=true")
     if metadata.get("timestamp"):
-        fields.append(f"at={metadata['timestamp']}")
+        fields.append(f"at={_readable_time(metadata['timestamp'])}")
     for key in ("message_id", "reply_to_message_id", "reply_to_participant"):
         if metadata.get(key):
             fields.append(f"{key}={metadata[key]}")
@@ -554,6 +622,10 @@ When a user asks you to send, create, or reply with a voice message / Sprachnach
                     + retrieved_memory_text
                 )
             messages.append({"role": "system", "content": retrieved_memory_text})
+
+        thread_frame = (current_metadata or {}).get("thread_frame")
+        if isinstance(thread_frame, str) and thread_frame.strip():
+            messages.append({"role": "system", "content": thread_frame})
 
         # Current message (with optional image attachments)
         user_content = self._build_user_content(current_message, media, metadata=current_metadata)

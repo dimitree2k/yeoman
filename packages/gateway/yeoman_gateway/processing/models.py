@@ -19,7 +19,7 @@ from __future__ import annotations
 import hashlib
 import json
 import time
-from collections.abc import Iterable, Mapping
+from collections.abc import Callable, Iterable, Mapping
 from dataclasses import dataclass, field
 from enum import StrEnum
 from typing import Any, ClassVar, Literal
@@ -997,6 +997,9 @@ class TurnBinding:
     turn: StoredTurn
     trace_id: str = ""
     generation_id: str | None = None
+    #: Maps a native message id to the thread it belongs to, so the prompt can tell
+    #: this turn's thread apart from the bot's earlier replies in other threads.
+    thread_of: Callable[[str], str | None] | None = field(default=None, compare=False)
 
 
 @dataclass(frozen=True, slots=True)

@@ -16,7 +16,7 @@ from typing import TYPE_CHECKING, Any, Awaitable, Callable, cast, override
 from loguru import logger
 from yeoman_shared.telemetry import tracing as lf
 
-from yeoman_gateway.agent.context import ContextBuilder
+from yeoman_gateway.agent.context import ContextBuilder, build_thread_frame
 from yeoman_gateway.agent.subagent import SubagentManager
 from yeoman_gateway.agent.tools.contacts import ContactsTool
 from yeoman_gateway.agent.tools.cron import CronTool
@@ -2946,10 +2946,19 @@ class LLMResponder(ResponderPort):
                 else:
                     retrieved_memory_text = str(roster_text)
 
+            history = session.get_history(
+                max_messages=self._resolve_history_limit(chat_id, session_history_limit, content),
+            )
+            thread_frame = build_thread_frame(
+                history=history,
+                thread_id=getattr(getattr(binding, "turn", None), "thread_id", None),
+                thread_of=getattr(binding, "thread_of", None),
+                reply_to_message_id=str(metadata.get("reply_to_message_id") or "") or None,
+            )
+            if thread_frame:
+                metadata["thread_frame"] = thread_frame
             messages = self.context.build_messages(
-                history=session.get_history(
-                    max_messages=self._resolve_history_limit(chat_id, session_history_limit, content),
-                ),
+                history=history,
                 current_message=content,
                 current_metadata=metadata,
                 retrieved_memory_text=retrieved_memory_text,

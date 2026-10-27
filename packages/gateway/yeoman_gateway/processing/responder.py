@@ -198,7 +198,8 @@ class ThreadActorResponder:
             # later turn silently authorising them.
             turn = self._store.get_turn(snapshot.turn_id)
             binding = (
-                TurnBinding(turn=turn, trace_id=snapshot.turn_id, generation_id=snapshot.generation_id)
+                TurnBinding(turn=turn, trace_id=snapshot.turn_id, generation_id=snapshot.generation_id,
+                            thread_of=self._thread_of)
                 if turn is not None
                 else None
             )
@@ -232,6 +233,11 @@ class ThreadActorResponder:
                 return None
             return outcome.text
         return None
+
+    def _thread_of(self, message_id: str) -> str | None:
+        """The thread a native message belongs to, if routing recorded one."""
+        resolved = self._store.resolve_reference(message_id)
+        return resolved[0] if resolved else None
 
     def _request_event(self, event: Any, snapshot: Any) -> Any:
         """The event a generation should see: the turn's sources, in order.
