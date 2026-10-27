@@ -394,6 +394,8 @@ async def test_semantic_continuation_rechecks_policy_after_await(runtime):
     runtime.gate._continuation = ContinuationResolver(
         store=runtime.store, threads=runtime.registry, judge=AsyncMock(choose=choose),
     )
+    # Someone else spoke in between, so only the semantic resolver could attach "295k".
+    _admit(runtime, message_id="between", sender=GUEST, content="x", mentioned=False)
     result = await runtime.gate.admit_async(IngestRequest(
         event_key="m2", event_id="m2", trace_id="m2",
         event=_event(message_id="m2", content="295k", mentioned=False),
@@ -550,27 +552,30 @@ async def test_participation_reply_keeps_its_sources_existing_thread(runtime):
 async def test_an_unmarked_follow_up_needs_a_positive_signal(tmp_path: Path) -> None:
     """Routing spec: no proven continuity, no automatic attachment - both halves.
 
-    A missing topic break is not proof of continuity, so a new subject opens its own
-    thread; an explicit call-back to the subject continues the existing one.
+    Continuity is structural: a follow-up joins only when the chat message right before
+    it belongs to the thread. Wording never decides either way.
     """
-    # Half 1: a new subject is not attached to the open thread.
+    # Half 1: with someone else in between, the unmarked message is not attached.
     fresh = _make_runtime(tmp_path / "new-subject")
     try:
         first = _admit(fresh, message_id="m1", content="Fasse den Mietvertrag zusammen.")
-        other = _admit(fresh, message_id="m2", content="Wie wird morgen das Wetter?")
+        _admit(fresh, message_id="between", sender=GUEST, content="x", mentioned=False)
+        other = _admit(fresh, message_id="m2", content="Wie wird morgen das Wetter?",
+                       mentioned=False)
         assert first.assignment is not None and other.assignment is not None
         assert other.assignment.thread_id != first.assignment.thread_id
     finally:
         fresh.close()
 
-    # Half 2: an explicit call-back to the subject continues the thread.
+    # Half 2: the sender's directly following message continues the thread.
     runtime = _make_runtime(tmp_path / "call-back")
     try:
         started = _admit(runtime, message_id="m1", content="Fasse den Mietvertrag zusammen.")
         continued = _admit(
             runtime,
             message_id="m2",
-            content="Zum Mietvertrag: ergänze bitte die Kündigungsfrist.",
+            content="Wie wird morgen das Wetter?",
+            mentioned=False,
         )
         assert continued.assignment is not None
         assert continued.assignment.thread_id == started.assignment.thread_id
@@ -1033,17 +1038,13 @@ def test_the_observation_line_shows_the_reasoning_without_content(runtime) -> No
     sink = logger.add(lambda message: records.append(message.record["message"]), level="INFO")
     try:
         _admit(runtime, message_id="m1", content=f"Fasse den Mietvertrag zusammen. {secret}")
-        _admit(
-            runtime,
-            message_id="m2",
-            content="Zum Mietvertrag: ergänze bitte die Kündigungsfrist.",
-        )
+        _admit(runtime, message_id="m2", content="und noch etwas", mentioned=False)
     finally:
         logger.remove(sink)
 
     lines = [record for record in records if "routing_decision" in record]
     assert len(lines) >= 2, f"expected one observation line per message: {records}"
-    continuation = [line for line in lines if "continuity=explicit_callback" in line]
+    continuation = [line for line in lines if "continuity=adjacent_same_sender" in line]
     assert continuation, f"the call-back signal is not visible: {lines}"
     assert "evidence=" in continuation[0] and "evidence=-" not in continuation[0], (
         "the proving source ids must be visible"

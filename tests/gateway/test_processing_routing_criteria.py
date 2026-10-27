@@ -8,6 +8,7 @@ from __future__ import annotations
 from pathlib import Path
 
 import pytest
+from yeoman_gateway.processing.models import CanonicalEvent
 from yeoman_gateway.processing.store import ProcessingStore
 from yeoman_gateway.processing.threads import (
     JoinRule,
@@ -274,74 +275,93 @@ def test_criterion_3_a_resolved_reply_beats_every_heuristic(tmp_path: Path) -> N
 # criterion 13 ------------------------------------------------------------------------------
 
 
-def test_criterion_13_both_signals_attach_and_the_negatives_do_not(tmp_path: Path) -> None:
-    # (a) answer to an open question
+def _bot_reply(store: ProcessingStore, thread_id: str, turn_id: str, *, at_ms: int) -> None:
+    """A transport-confirmed bot message of the thread - the bot spoke last."""
+    store.register_thread_message(
+        thread_id=thread_id, turn_id=turn_id, now_ms=at_ms, direction="out",
+        effect_id=f"fx-{at_ms}", message_id=f"bot-{at_ms}",
+    )
+
+
+def _journal(store: ProcessingStore, event, *, at_ms: int) -> None:
+    store.append_event(
+        event_key=event.event_key, event_id=event.event_id, trace_id=event.trace_id,
+        payload=event, now_ms=at_ms,
+    )
+
+
+def test_criterion_13_structure_attaches_and_wording_does_not(tmp_path: Path) -> None:
+    # (a) the bot spoke last in the thread: the unmarked answer continues it
     store = _store(tmp_path)
     registry = _seed(store, _event("m1", "Fasse den Mietvertrag zusammen.", mentioned=True))
     started = registry.assign(_event("m1", "Fasse den Mietvertrag zusammen.", mentioned=True), now_ms=T0)
-    _sent_bot_question(
-        store, str(started.turn_id), "Soll die Zusammenfassung kurz oder ausführlich sein?"
-    )
-    store.append_event(
-        event_key="k-m2", event_id="m2", trace_id="t-m2",
-        payload=_event("m2", "kurz"), now_ms=T0 + 1,
-    )
+    _bot_reply(store, str(started.thread_id), str(started.turn_id), at_ms=T0 + 1)
+    _journal(store, _event("m2", "kurz"), at_ms=T0 + 2)
     answered = registry.assign(_event("m2", "kurz"), now_ms=T0 + 2)
     assert answered.rule is JoinRule.FOLLOWUP_SINGLE_ACTIVE
+    assert answered.continuity_kind == "adjacent_bot_reply"
     assert answered.thread_id == started.thread_id
     store.close()
 
-    # (b) explicit call-back and (c) its negatives, each in a fresh chat
-    store2 = _store(tmp_path / "b")
-    registry2 = _seed(store2, _event("m1", "Fasse den Mietvertrag zusammen.", mentioned=True))
-    started2 = registry2.assign(
-        _event("m1", "Fasse den Mietvertrag zusammen.", mentioned=True), now_ms=T0
-    )
-    call_back = "Zur Zusammenfassung des Mietvertrags: ergänze bitte die Kündigungsfrist."
-    store2.append_event(
-        event_key="k-m2", event_id="m2", trace_id="t-m2",
-        payload=_event("m2", call_back), now_ms=T0 + 1,
-    )
-    continued = registry2.assign(_event("m2", call_back), now_ms=T0 + 2)
-    assert continued.rule is JoinRule.FOLLOWUP_SINGLE_ACTIVE
-    assert continued.thread_id == started2.thread_id
-    store2.close()
-
-    for negative in ("Wie wird morgen das Wetter?", "mach weiter", "ja"):
-        store3 = _store(tmp_path / "neg" / negative.replace(" ", "-"))
-        registry3 = _seed(store3, _event("m1", "Fasse den Mietvertrag zusammen.", mentioned=True))
-        started3 = registry3.assign(
+    # (b) the same sender right after their own message, whatever the words
+    for text in ("Zum Mietvertrag: ergänze bitte die Kündigungsfrist.", "Wie wird morgen das Wetter?", "ja"):
+        store2 = _store(tmp_path / "b" / text[:8].replace(" ", "-"))
+        registry2 = _seed(store2, _event("m1", "Fasse den Mietvertrag zusammen.", mentioned=True))
+        started2 = registry2.assign(
             _event("m1", "Fasse den Mietvertrag zusammen.", mentioned=True), now_ms=T0
         )
-        store3.append_event(
-            event_key="k-m2", event_id="m2", trace_id="t-m2",
-            payload=_event("m2", negative), now_ms=T0 + 1,
-        )
-        decision3 = registry3.assign(_event("m2", negative), now_ms=T0 + 2)
-        assert decision3.rule is not JoinRule.FOLLOWUP_SINGLE_ACTIVE, negative
-        assert decision3.thread_id != started3.thread_id, negative
-        store3.close()
+        _journal(store2, _event("m2", text), at_ms=T0 + 1_000)
+        continued = registry2.assign(_event("m2", text), now_ms=T0 + 1_000)
+        assert continued.continuity_kind == "adjacent_same_sender", text
+        assert continued.thread_id == started2.thread_id, text
+        store2.close()
+
+    # (c) structural negatives: someone else in between, or the sender came back too late
+    store3 = _store(tmp_path / "between")
+    registry3 = _seed(store3, _event("m1", "Fasse den Mietvertrag zusammen.", mentioned=True))
+    started3 = registry3.assign(_event("m1", "Fasse den Mietvertrag zusammen.", mentioned=True), now_ms=T0)
+    other = CanonicalEvent(
+        event_id="o1", event_key="k-o1", trace_id="t-o1", kind="message", channel="whatsapp",
+        chat_id=CHAT, principal="20002@s.whatsapp.net", source_message_id="o1",
+        payload={"text": "x", "is_group": True},
+    )
+    _journal(store3, other, at_ms=T0 + 500)
+    _journal(store3, _event("m2", "Zum Mietvertrag: ergänze bitte."), at_ms=T0 + 1_000)
+    decision3 = registry3.assign(_event("m2", "Zum Mietvertrag: ergänze bitte."), now_ms=T0 + 1_000)
+    assert decision3.thread_id != started3.thread_id
+    store3.close()
+
+    store4 = _store(tmp_path / "late")
+    registry4 = _seed(store4, _event("m1", "Fasse den Mietvertrag zusammen.", mentioned=True))
+    started4 = registry4.assign(_event("m1", "Fasse den Mietvertrag zusammen.", mentioned=True), now_ms=T0)
+    _journal(store4, _event("m2", "Zum Mietvertrag: ergänze bitte."), at_ms=T0 + 180_000)
+    decision4 = registry4.assign(_event("m2", "Zum Mietvertrag: ergänze bitte."), now_ms=T0 + 180_000)
+    assert decision4.thread_id != started4.thread_id
+    store4.close()
 
 
-# criterion 15 ------------------------------------------------------------------------------
-
-
-def test_criterion_15_a_mention_continues_the_single_thread_without_a_reply(tmp_path: Path) -> None:
+def test_criterion_15_a_mention_continues_only_after_the_bot_spoke(tmp_path: Path) -> None:
     store = _store(tmp_path)
     registry = _seed(store, _event("m1", "Fasse den Mietvertrag zusammen.", mentioned=True))
     started = registry.assign(_event("m1", "Fasse den Mietvertrag zusammen.", mentioned=True), now_ms=T0)
+    _bot_reply(store, str(started.thread_id), str(started.turn_id), at_ms=T0 + 1)
 
-    text = "@Arvid zum Mietvertrag: ergänze bitte die Kündigungsfrist."
-    store.append_event(
-        event_key="k-m2", event_id="m2", trace_id="t-m2",
-        payload=_event("m2", text, mentioned=True), now_ms=T0 + 1,
-    )
+    text = "@Arvid und die Kündigungsfrist?"
+    _journal(store, _event("m2", text, mentioned=True), at_ms=T0 + 2)
     decision = registry.assign(_event("m2", text, mentioned=True), now_ms=T0 + 2)
 
-    assert decision.rule is JoinRule.FOLLOWUP_SINGLE_ACTIVE, "a mention plus one thread continues it"
+    assert decision.rule is JoinRule.FOLLOWUP_SINGLE_ACTIVE, "the bot spoke last, so it continues"
     assert decision.thread_id == started.thread_id
-    assert decision.turn_id == started.turn_id
     store.close()
+
+    # A fresh mention right after the sender's own message is a new request.
+    store2 = _store(tmp_path / "own")
+    registry2 = _seed(store2, _event("m1", "Fasse den Mietvertrag zusammen.", mentioned=True))
+    started2 = registry2.assign(_event("m1", "Fasse den Mietvertrag zusammen.", mentioned=True), now_ms=T0)
+    _journal(store2, _event("m2", text, mentioned=True), at_ms=T0 + 2)
+    decision2 = registry2.assign(_event("m2", text, mentioned=True), now_ms=T0 + 2)
+    assert decision2.thread_id != started2.thread_id
+    store2.close()
 
 
 # criterion 9 -------------------------------------------------------------------------------

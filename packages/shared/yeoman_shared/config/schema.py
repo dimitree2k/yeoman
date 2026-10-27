@@ -717,6 +717,7 @@ class ProcessingThreadsConfig(BaseModel):
     lifecycle_shadow: bool = Field(default=True, alias="lifecycleShadow")
     lifecycle_enforce: bool = Field(default=True, alias="lifecycleEnforce")
     lifecycle_tick_seconds: float = Field(default=60, alias="lifecycleTickSeconds", gt=0)
+    same_sender_gap_seconds: int = Field(default=120, alias="sameSenderGapSeconds", ge=0)
     max_generations_global: int = Field(default=1, ge=1, le=2)
     max_generations_per_thread: int = Field(default=1, ge=1, le=2)
 

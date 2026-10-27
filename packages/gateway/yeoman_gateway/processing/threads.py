@@ -96,6 +96,8 @@ class JoinInput:
     #: statement at all. Only "true" blocks automatic attachment.
     topic_break: str = "unknown"
     occurred_ms: int | None = None
+    #: Provider id of the physical message; its Bridge twin must not count as "previous".
+    source_message_id: str | None = None
 
 
 @dataclass(frozen=True, slots=True)
@@ -115,17 +117,6 @@ class JoinView:
     @property
     def continuity_positive(self) -> bool:
         return bool(getattr(self.continuum, "positive", False))
-
-
-@dataclass(frozen=True, slots=True)
-class _SourceRow:
-    """One readable thread source handed to the continuity signals."""
-
-    event_id: str
-    text: str
-    role: str = "context"
-    principal: str = ""
-    occurred_ms: int | None = None
 
 
 @dataclass(frozen=True, slots=True)
@@ -169,6 +160,7 @@ class ThreadPolicy:
     max_active_per_chat: int = 4
     lifecycle_shadow: bool = True
     lifecycle_enforce: bool = True
+    same_sender_gap_ms: int = 120_000
 
     @classmethod
     def from_config(cls, config: Any) -> ThreadPolicy:
@@ -188,6 +180,7 @@ class ThreadPolicy:
             max_active_per_chat=int(getattr(threads, "max_active_per_chat", 4)),
             lifecycle_shadow=bool(getattr(threads, "lifecycle_shadow", True)),
             lifecycle_enforce=bool(getattr(threads, "lifecycle_enforce", True)),
+            same_sender_gap_ms=int(getattr(threads, "same_sender_gap_seconds", 120)) * 1000,
         )
 
 
@@ -656,6 +649,7 @@ class ThreadRegistry:
             explicit_correction=correction or event.kind in {"delete", "edit"},
             topic_break=bool(payload.get("topic_break")) if topic_break is None else topic_break,
             occurred_ms=event.occurred_ms,
+            source_message_id=event.source_message_id,
         )
 
     def _reply_thread(self, data: JoinInput) -> str | None:
@@ -722,100 +716,33 @@ class ThreadRegistry:
         return tuple(active)
 
     def _continuum(self, data: JoinInput, *, now_ms: int) -> Any:
-        """The continuity verdict for the single candidate, from proven sources.
+        """The structural continuity verdict for the single candidate.
 
-        Only one candidate can be attached, so only that one is evaluated. A message with
-        no text, or a candidate without readable sources, yields no positive signal and is
-        therefore never attached automatically.
+        Only one candidate can be attached, so only that one is evaluated. The verdict
+        reads who spoke right before the current message, never its wording.
         """
-        from yeoman_gateway.processing.routing import (
-            BotMessageView,
-            SourceView,
-            continuity_signal,
-        )
+        from yeoman_gateway.processing.routing import PreviousMessage, continuity_signal
 
-        text = str(getattr(data, "text", "") or "").strip()
         candidates = self._active_threads(data, now_ms=now_ms)
-        if not text or len(candidates) != 1:
+        if len(candidates) != 1:
             return None
         thread_id, _turn_id = candidates[0]
-        sources = [
-            SourceView(
-                event_id=source.event_id,
-                text=source.text,
-                role=source.role,
-                principal=source.principal,
-                occurred_ms=source.occurred_ms,
-            )
-            for source in self._thread_sources(thread_id)
-        ]
-        if not sources:
-            return None
-        bot_messages = [
-            BotMessageView(message_id=item[0], text=item[1], occurred_ms=item[2])
-            for item in self._sent_bot_messages(thread_id)
-        ]
-        return continuity_signal(
-            current_text=text, thread_sources=sources, bot_messages=bot_messages
+        current_ms = int(data.occurred_ms if data.occurred_ms is not None else now_ms)
+        previous = self._store.previous_chat_message(
+            channel=data.channel,
+            chat_id=data.chat_id,
+            before_ms=current_ms,
+            exclude_event_id=data.event_id,
+            exclude_source_id=str(getattr(data, "source_message_id", "") or ""),
         )
-
-    def _thread_sources(self, thread_id: str) -> tuple[Any, ...]:
-        """Readable sources of the thread's recent turns, with their journal text.
-
-        Reading only the active turn was wrong: after a turn closed, its sources still
-        describe what the thread is about, so a confirmed continuation could never be
-        proven (criterion 14).
-        """
-        views: list[Any] = []
-        for _turn_id, event_id, role, _message_id in self._store.thread_source_refs(thread_id):
-            event = self._store.get_event(event_id)
-            from yeoman_gateway.history.context import current_history_snapshot
-            from yeoman_gateway.history.queries import HistoryQueries
-            history = current_history_snapshot()
-            payload = getattr(event, "payload", None)
-            if history is not None and getattr(event, 'channel', '') == 'whatsapp':
-                row = HistoryQueries(history).native_message(chat_id=event.chat_id,
-                    native_id=_message_id or event.source_message_id or '')
-                text = str(row['current_text'] or '') if row else ''
-            else:
-                text = str(payload.get("text") or "") if isinstance(payload, dict) else ""
-            if not text:
-                continue
-            views.append(
-                _SourceRow(
-                    event_id=event_id,
-                    text=text,
-                    role=role,
-                    principal=str(row['sender_identifier'] or '') if history is not None and getattr(event, 'channel', '') == 'whatsapp' else str(getattr(event, "principal", "") or ""),
-                    occurred_ms=row['sent_ms'] if history is not None and getattr(event, 'channel', '') == 'whatsapp' else getattr(event, "occurred_ms", None),
-                )
-            )
-        return tuple(views)
-
-    def _sent_bot_messages(self, thread_id: str) -> tuple[tuple[str, str, int | None], ...]:
-        """Provably sent bot texts of the thread: transport-confirmed effects only."""
-        out: list[tuple[str, str, int | None]] = []
-        for effect_id in self._store.thread_effect_ids(thread_id, states=("sent",)):
-            effect = self._store.get_effect(effect_id)
-            if effect is None or str(getattr(effect, "state", "")) != "sent":
-                continue
-            from yeoman_gateway.history.context import current_history_snapshot
-            from yeoman_gateway.history.queries import HistoryQueries
-            history = current_history_snapshot()
-            payload = getattr(effect, "payload", None)
-            if history is not None and effect.target is None:
-                continue
-            if history is not None and effect.target.channel == 'whatsapp':
-                receipt = self._store.effect_transport_receipt(effect_id)
-                row = HistoryQueries(history).native_message(chat_id=effect.target.chat_id,
-                    native_id=receipt.provider_message_id) if receipt else None
-                text = str(row['current_text'] or '') if row else ''
-            else:
-                text = str(getattr(payload, "text", "") or "") if payload is not None else ""
-            if not text:
-                continue
-            out.append((str(effect.effect_id), text, getattr(effect, "updated_ms", None)))
-        return tuple(out)
+        return continuity_signal(
+            candidate_thread_id=thread_id,
+            principal=data.principal,
+            previous=PreviousMessage(*previous) if previous is not None else None,
+            now_ms=current_ms,
+            same_sender_gap_ms=self._policy.same_sender_gap_ms,
+            mentioned_bot=data.mentioned_bot,
+        )
 
     def _active_turn_id(self, thread_id: str) -> str | None:
         turn = self._store.active_turn(thread_id)
