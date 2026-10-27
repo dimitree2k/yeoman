@@ -1364,11 +1364,43 @@ class LLMResponder(ResponderPort):
         return False
 
     @staticmethod
+    def _current_thread_row(
+        metadata: dict[str, Any],
+        *,
+        sender_id: str | None,
+        content: str,
+        chat_id: str,
+        history_snapshot: Any,
+    ) -> dict[str, Any]:
+        """The current message as a history row, with the archive's sender identity.
+
+        The event names the sender by phone token while history rows use the archived
+        identifier, so chain matching compares the archive's contact id instead.
+        """
+        row: dict[str, Any] = {**metadata, "sender_id": sender_id, "content": content}
+        message_id = str(metadata.get("message_id") or "")
+        if history_snapshot is None or not message_id:
+            return row
+        from yeoman_gateway.history.queries import HistoryQueries
+
+        queries = HistoryQueries(history_snapshot)
+        archived = queries.native_message(chat_id=chat_id, native_id=message_id)
+        if archived is not None:
+            row["sender_contact_id"] = archived["sender_contact_id"]
+            row["archived_sender_id"] = archived["sender_identifier"]
+            contact = (queries.contact(archived["sender_contact_id"])
+                       if archived["sender_contact_id"] else None)
+            if contact is not None and contact["display_name"]:
+                row["sender_name"] = contact["display_name"]
+        return row
+
+    @staticmethod
     def _metadata_for_event(event: InboundEvent) -> dict[str, object]:
         metadata = dict(event.raw_metadata)
         metadata.update(
             {
                 "message_id": event.message_id,
+                "timestamp": int(event.timestamp.timestamp() * 1000),
                 "sender_id": event.sender_id,
                 "participant": event.participant,
                 "is_group": event.is_group,
@@ -2954,7 +2986,11 @@ class LLMResponder(ResponderPort):
                 thread_id=getattr(getattr(binding, "turn", None), "thread_id", None),
                 thread_of=getattr(binding, "thread_of", None),
                 reply_to_message_id=str(metadata.get("reply_to_message_id") or "") or None,
-            )
+                current_message=self._current_thread_row(
+                    metadata, sender_id=sender_id, content=content, chat_id=chat_id,
+                    history_snapshot=history_snapshot,
+                ),
+            ) if channel == "whatsapp" and chat_id.endswith("@g.us") else None
             if thread_frame:
                 metadata["thread_frame"] = thread_frame
             messages = self.context.build_messages(

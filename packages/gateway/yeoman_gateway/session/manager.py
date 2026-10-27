@@ -203,6 +203,7 @@ class Session:
                           "content": history_text(row), "message_id": row["native_message_id"],
                           "timestamp": row["sent_ms"], "sender_id": row["sender_identifier"],
                           "sender_name": names.get(row["sender_contact_id"] or ""),
+                          "sender_contact_id": row["sender_contact_id"],
                           "reply_to_message_id": row["reply_to_native_id"]}
                          for row in rows]
             if self.thread_id and not self.chat_id.endswith("@g.us"):
