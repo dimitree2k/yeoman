@@ -22,6 +22,7 @@ OPERATIONAL_STORE_PATHS = {
     "seen_chats": "ops/seen-chats.json",
     "overseer": "ops/overseer",
     "trends": "ops/trends.db",
+    "meme_quota": "ops/meme-quota.json",
 }
 
 

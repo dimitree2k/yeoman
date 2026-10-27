@@ -393,6 +393,8 @@ class ChatPolicy(PolicyModel):
     spontaneity: SpontaneityPolicy = Field(default_factory=SpontaneityPolicy)
     participation: ParticipationPolicy = Field(default_factory=ParticipationPolicy)
     contacts_disclosure: bool = Field(default=False, alias="contactsDisclosure")
+    #: Opt-in switch for the make_meme tool; off unless a chat or channel enables it.
+    memes: bool = False
     session_history_limit: int | None = Field(default=None, alias="sessionHistoryLimit")
 
 
@@ -418,6 +420,7 @@ class ChatPolicyOverride(PolicyModel):
     spontaneity: SpontaneityPolicyOverride | None = None
     participation: ParticipationPolicyOverride | None = None
     contacts_disclosure: bool | None = Field(default=None, alias="contactsDisclosure")
+    memes: bool | None = None
     session_history_limit: int | None = Field(default=None, alias="sessionHistoryLimit", ge=1, le=100)
 
 

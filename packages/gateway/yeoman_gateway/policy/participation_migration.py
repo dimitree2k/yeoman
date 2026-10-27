@@ -146,6 +146,7 @@ def _access_fingerprint(override: Mapping[str, Any]) -> dict[str, Any]:
         "toolAccess",
         "replyBudget",
         "contactsDisclosure",
+        "memes",
     )
     return {key: override.get(key) for key in keys if key in override}
 

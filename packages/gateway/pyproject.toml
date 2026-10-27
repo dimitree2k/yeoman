@@ -29,6 +29,7 @@ dependencies = [
     "icalendar>=7.0.3",
     "pypdf>=6.21.1",
     "regex>=2024.11.6",
+    "pillow>=11.0",
 ]
 
 [project.optional-dependencies]
@@ -54,4 +55,5 @@ include = [
     "yeoman_gateway/skills/**/*.md",
     "yeoman_gateway/skills/**/*.py",
     "yeoman_gateway/skills/**/*.sh",
+    "yeoman_gateway/media/memes/assets/**/*",
 ]

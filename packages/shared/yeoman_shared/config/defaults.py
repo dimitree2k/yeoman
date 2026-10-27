@@ -60,6 +60,12 @@ DEFAULT_MODEL_PROFILES: dict[str, dict[str, Any]] = {
         "temperature": 0.0,
         "timeout_ms": 15000,
     },
+    "meme_background": {
+        "kind": "image",
+        "provider": "openrouter",
+        "model": "black-forest-labs/flux.2-klein-4b",
+        "timeout_ms": 90000,
+    },
     "security_classifier": {
         "kind": "chat",
         "model": "openai/gpt-4o-mini",
@@ -84,6 +90,7 @@ DEFAULT_MODEL_ROUTES: dict[str, str] = {
     "memory.embed": "memory_embed_fast",
     "memory.capture.extract": "memory_capture_fast",
     "security.classify": "security_classifier",
+    "meme.background": "meme_background",
 }
 
 DEFAULT_WHATSAPP_MEDIA: dict[str, Any] = {

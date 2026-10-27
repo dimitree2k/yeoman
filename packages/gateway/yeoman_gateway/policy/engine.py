@@ -67,6 +67,8 @@ def _wake_phrase_match(content: str, wake_phrases: frozenset[str]) -> bool:
 
 
 _FORWARD_COMMAND = re.compile(r"^/?forward(?:\s+.+)?$", re.IGNORECASE)
+#: Tool name gated by the per-chat `memes` switch.
+MEME_TOOL = "make_meme"
 
 
 @dataclass(slots=True)
@@ -123,6 +125,7 @@ class EffectivePolicy:
     contacts_disclosure: bool
     session_history_limit: int | None
     participation: ParticipationPolicy = field(default_factory=ParticipationPolicy)
+    memes: bool = False
 
 
 #: Per-chat participation settings and the layer each value came from.
@@ -279,6 +282,7 @@ class _CompiledPolicy:
     contacts_disclosure: bool
     session_history_limit: int | None
     participation: ParticipationPolicy = field(default_factory=ParticipationPolicy)
+    memes: bool = False
 
 
 class PolicyEngine:
@@ -391,6 +395,7 @@ class PolicyEngine:
             spontaneity_quiet_hours_start=resolved.spontaneity.quiet_hours_start,
             spontaneity_quiet_hours_end=resolved.spontaneity.quiet_hours_end,
             contacts_disclosure=bool(resolved.contacts_disclosure),
+            memes=bool(resolved.memes),
             session_history_limit=resolved.session_history_limit,
             participation=ParticipationPolicy.model_validate(
                 resolved.participation.model_dump()
@@ -573,6 +578,7 @@ class PolicyEngine:
             spontaneity_quiet_hours_start=resolved.spontaneity_quiet_hours_start,
             spontaneity_quiet_hours_end=resolved.spontaneity_quiet_hours_end,
             contacts_disclosure=resolved.contacts_disclosure,
+            memes=resolved.memes,
             session_history_limit=resolved.session_history_limit,
             participation=ParticipationPolicy.model_validate(
                 resolved.participation.model_dump()
@@ -789,6 +795,9 @@ class PolicyEngine:
         allowed = {tool for tool in allowed if self._is_tool_allowed_for_actor(actor, tool, policy)}
         if self.policy.owner_tools and self._owner_match(actor):
             allowed |= set(self.policy.owner_tools) & all_tools
+        if not policy.memes:
+            # Opt-in per chat: neither allowedTools nor ownerTools can switch memes on.
+            allowed.discard(MEME_TOOL)
         return allowed
 
     def evaluate(self, actor: ActorContext, all_tools: set[str]) -> PolicyDecision:

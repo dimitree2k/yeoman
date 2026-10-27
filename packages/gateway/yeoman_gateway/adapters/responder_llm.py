@@ -83,6 +83,7 @@ if TYPE_CHECKING:
     from yeoman_gateway.cron.service import CronService
     from yeoman_gateway.knowledge.models import TrustedReadContext
     from yeoman_gateway.media.lazy_resolver import LazyMediaResolver
+    from yeoman_gateway.media.memes.service import MemeService
     from yeoman_gateway.media.router import ModelRouter
     from yeoman_gateway.media.tts import TTSSynthesizer
     from yeoman_gateway.people.resolver import PeopleResolver, ReaderContext
@@ -686,6 +687,7 @@ class LLMResponder(ResponderPort):
         processing_store: object | None = None,
         quota_governance: object | None = None,
         lazy_media_resolver: "LazyMediaResolver | None" = None,
+        meme_service: "MemeService | None" = None,
         youtube_audio_transcriber: "AudioTranscriber | None" = None,
         whatsapp_session_history_limit: int = 15,
         whatsapp_session_history_limit_group: int = 20,
@@ -731,6 +733,7 @@ class LLMResponder(ResponderPort):
         self._processing_store = processing_store
         self._quota_governance = quota_governance
         self._lazy_media_resolver = lazy_media_resolver
+        self._meme_service = meme_service
         self._session_history_limit = whatsapp_session_history_limit
         self._session_history_limit_group = whatsapp_session_history_limit_group
         self._talkative_state: dict[str, _TalkativeCooldownState] = {}
@@ -900,6 +903,22 @@ class LLMResponder(ResponderPort):
                     cache=self._lazy_media_resolver.cache,
                     processor=self._lazy_media_resolver.processor,
                     group_resolver=self._resolve_group_reference,
+                )
+            )
+
+        if self._meme_service is not None:
+            from yeoman_gateway.agent.tools.make_meme import MakeMemeTool
+
+            # Registered everywhere; the policy `memes` switch exposes it per chat.
+            self.tools.register(
+                MakeMemeTool(
+                    service=self._meme_service,
+                    send_callback=self._outbound_dispatch_callback,
+                    media_cache=(
+                        self._lazy_media_resolver.cache
+                        if self._lazy_media_resolver is not None
+                        else None
+                    ),
                 )
             )
 
