@@ -334,6 +334,24 @@ _SCHEMA = (
 
 
 
+_THREAD_SCHEMA = """
+        CREATE TABLE IF NOT EXISTS threads (
+          thread_id TEXT PRIMARY KEY,
+          channel TEXT NOT NULL,
+          chat_id TEXT NOT NULL,
+          root_principal TEXT NOT NULL,
+          kind TEXT NOT NULL DEFAULT 'dm',
+          state TEXT NOT NULL DEFAULT 'open',
+          opened_ms INTEGER NOT NULL,
+          last_activity_ms INTEGER NOT NULL,
+          closed_ms INTEGER,
+          close_reason TEXT,
+          reopen_count INTEGER NOT NULL DEFAULT 0,
+          turn_seq INTEGER NOT NULL DEFAULT 0
+        )
+        """
+
+
 #: Ordered additive migrations. ``_MIGRATIONS[1]`` upgrades schema 1 to schema 2; existing
 #: tables (events, effects, decisions, attempts, evidence) are never altered.
 _MIGRATIONS: dict[int, tuple[str, ...]] = {
@@ -402,22 +420,7 @@ _MIGRATIONS: dict[int, tuple[str, ...]] = {
         "ON send_budget_reservations(channel, chat_id, reserved_ms)",
     ),
     1: (
-        """
-        CREATE TABLE IF NOT EXISTS threads (
-          thread_id TEXT PRIMARY KEY,
-          channel TEXT NOT NULL,
-          chat_id TEXT NOT NULL,
-          root_principal TEXT NOT NULL,
-          kind TEXT NOT NULL DEFAULT 'dm',
-          state TEXT NOT NULL DEFAULT 'open',
-          opened_ms INTEGER NOT NULL,
-          last_activity_ms INTEGER NOT NULL,
-          closed_ms INTEGER,
-          close_reason TEXT,
-          reopen_count INTEGER NOT NULL DEFAULT 0,
-          turn_seq INTEGER NOT NULL DEFAULT 0
-        )
-        """,
+        _THREAD_SCHEMA,
         "CREATE INDEX IF NOT EXISTS idx_threads_chat ON threads(channel, chat_id, state)",
         "CREATE INDEX IF NOT EXISTS idx_threads_principal "
         "ON threads(chat_id, root_principal, state)",
@@ -578,6 +581,7 @@ class ProcessingStore:
         self._conn.execute("PRAGMA synchronous=FULL")
         self._conn.execute("PRAGMA foreign_keys=ON")
         self._conn.execute(f"PRAGMA busy_timeout={int(busy_timeout_ms)}")
+        self.lifecycle_reactivations = 0
         self._create_schema()
 
     # -- lifecycle ---------------------------------------------------------------------
@@ -812,6 +816,7 @@ class ProcessingStore:
                         self._conn.execute(statement)
                     version += 1
                 self._ensure_participation_schema(self._conn)
+                self._ensure_thread_lifecycle_schema(self._conn)
                 self._conn.execute(
                     "INSERT INTO meta (key, value) VALUES ('schema_version', ?) "
                     "ON CONFLICT(key) DO UPDATE SET value = excluded.value",
@@ -821,6 +826,19 @@ class ProcessingStore:
                 self._conn.execute("ROLLBACK")
                 raise
             self._conn.execute("COMMIT")
+
+    @staticmethod
+    def _ensure_thread_lifecycle_schema(conn: sqlite3.Connection) -> None:
+        # SQLite has no ADD COLUMN IF NOT EXISTS; inspect within the schema transaction.
+        conn.execute(_THREAD_SCHEMA)
+        columns = {str(row[1]) for row in conn.execute("PRAGMA table_info(threads)")}
+        for name, definition in (
+            ("conversation_state", "TEXT NOT NULL DEFAULT 'active'"),
+            ("dormant_ms", "INTEGER"),
+            ("dormant_reason", "TEXT"),
+        ):
+            if name not in columns:
+                conn.execute(f"ALTER TABLE threads ADD COLUMN {name} {definition}")
 
     @staticmethod
     def _ensure_participation_schema(conn: sqlite3.Connection) -> None:
@@ -2473,7 +2491,7 @@ class ProcessingStore:
         chat_id: str | None = None,
         principal: str | None = None,
         state: str | None = None,
-        limit: int = 100,
+        limit: int | None = 100,
     ) -> tuple[StoredThread, ...]:
         query = "SELECT * FROM threads"
         clauses: list[str] = []
@@ -2489,8 +2507,10 @@ class ProcessingStore:
                 params.append(value)
         if clauses:
             query += " WHERE " + " AND ".join(clauses)
-        query += " ORDER BY last_activity_ms DESC, thread_id LIMIT ?"
-        params.append(max(1, int(limit)))
+        query += " ORDER BY last_activity_ms DESC, thread_id"
+        if limit is not None:
+            query += " LIMIT ?"
+            params.append(max(1, int(limit)))
         with self._lock:
             rows = self._conn.execute(query, params).fetchall()
         return tuple(_thread_from_row(row) for row in rows)
@@ -2550,8 +2570,60 @@ class ProcessingStore:
             )
         return cursor.rowcount == 1
 
+    def thread_busy(self, thread_id: str) -> bool:
+        """Unsettled work includes the gap between generation completion and dispatch."""
+        with self._lock:
+            return self._thread_busy(self._conn, thread_id)
+
+    @staticmethod
+    def _thread_busy(conn: sqlite3.Connection, thread_id: str) -> bool:
+        return bool(conn.execute(
+            "SELECT EXISTS(SELECT 1 FROM generations WHERE thread_id = ? "
+            "AND finished_ms IS NULL) OR EXISTS(SELECT 1 FROM pending_inputs "
+            "WHERE thread_id = ? AND state IN ('waiting','deferred')) "
+            "OR EXISTS(SELECT 1 FROM effects e JOIN turns t ON t.turn_id = e.turn_id "
+            "WHERE t.thread_id = ? AND e.state IN "
+            "('planned','queued','executing','unknown'))",
+            (thread_id, thread_id, thread_id),
+        ).fetchone()[0])
+
+    def mark_dormant(
+        self, thread_ids: Iterable[str], now_ms: int, reason: str
+    ) -> tuple[str, ...]:
+        """Only conversation metadata changes; recheck durable work under the write lock."""
+        changed = []
+        with self._write() as conn:
+            for thread_id in dict.fromkeys(thread_ids):
+                if self._thread_busy(conn, thread_id):
+                    continue
+                cursor = conn.execute(
+                    "UPDATE threads SET conversation_state = 'dormant', dormant_ms = ?, "
+                    "dormant_reason = ? WHERE thread_id = ? AND state = 'open' "
+                    "AND conversation_state = 'active'",
+                    (now_ms, reason, thread_id),
+                )
+                if cursor.rowcount:
+                    changed.append(thread_id)
+        return tuple(changed)
+
+    def reactivate(
+        self, thread_id: str, now_ms: int, *, reason: str = "explicit_reference"
+    ) -> bool:
+        """Reactivate only dormant open conversations, never a manually closed thread."""
+        with self._write() as conn:
+            cursor = conn.execute(
+                "UPDATE threads SET conversation_state = 'active', dormant_ms = NULL, "
+                "dormant_reason = NULL, last_activity_ms = ? "
+                "WHERE thread_id = ? AND state = 'open' AND conversation_state = 'dormant'",
+                (now_ms, thread_id),
+            )
+        if cursor.rowcount == 1:
+            self.lifecycle_reactivations += 1
+            logger.info("thread_lifecycle_reactivated thread_id={} reason={}", thread_id, reason)
+        return cursor.rowcount == 1
+
     def close_idle_threads(self, now_ms: int, idle_ms: int) -> tuple[str, ...]:
-        """Close idle threads that have no open turn and no in-flight effect."""
+        """Legacy helper; runtime lifecycle uses mark_dormant and never closes turns."""
         with self._write() as conn:
             rows = conn.execute(
                 """
@@ -4141,6 +4213,9 @@ def _thread_from_row(row: sqlite3.Row) -> StoredThread:
         close_reason=str(row["close_reason"]) if row["close_reason"] is not None else None,
         reopen_count=int(row["reopen_count"]),
         turn_seq=int(row["turn_seq"]),
+        conversation_state=str(row["conversation_state"]),
+        dormant_ms=int(row["dormant_ms"]) if row["dormant_ms"] is not None else None,
+        dormant_reason=_opt_str(row["dormant_reason"]),
     )
 
 

@@ -458,6 +458,7 @@ class GatewayRuntime:
     processing: "ProcessingStore | None" = None
     reconciliation: object | None = None
     retention: object | None = None
+    thread_lifecycle: Any | None = None
     statement_capture: object | None = None
     knowledge_embeddings: Any | None = None
     source_catchup: ObservedSourceCatchup | None = None
@@ -483,6 +484,8 @@ class GatewayRuntime:
             await self.reconciliation.start()
         if self.retention is not None:
             await self.retention.start()
+        if self.thread_lifecycle is not None:
+            await self.thread_lifecycle.start()
 
     def _resume_a2a_research(self) -> None:
         """Resume durable Hermes polling after the runtime event loop exists."""
@@ -559,6 +562,8 @@ class GatewayRuntime:
             attempt_sync(self.cron.stop)
             attempt_sync(self.orchestrator.stop)
             await attempt_async(self.channels.stop_all)
+            if self.thread_lifecycle is not None:
+                await attempt_async(self.thread_lifecycle.stop)
             if self.reconciliation is not None:
                 await attempt_async(self.reconciliation.stop)
             if self.retention is not None:
@@ -4099,6 +4104,7 @@ def build_gateway_runtime(
             recover_pending=pending_participation_recovery,
         ),
         retention=build_retention_service(config, processing_store),
+        thread_lifecycle=thread_responder._actors if thread_responder is not None else None,
         statement_capture=statement_capture,
         knowledge_embeddings=knowledge_embeddings,
         source_catchup=(ObservedSourceCatchup(

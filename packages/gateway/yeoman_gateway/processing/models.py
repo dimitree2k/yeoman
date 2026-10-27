@@ -933,6 +933,9 @@ class StoredThread:
     close_reason: str | None = None
     reopen_count: int = 0
     turn_seq: int = 0
+    conversation_state: str = "active"
+    dormant_ms: int | None = None
+    dormant_reason: str | None = None
 
     @property
     def is_open(self) -> bool:
