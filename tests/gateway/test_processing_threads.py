@@ -217,26 +217,19 @@ def test_rule_3_followup_needs_a_positive_signal(tmp_path: Path) -> None:
     assert unmarked.thread_id != first.thread_id or unmarked.new_thread
     store.close()
 
-    # With an explicit call-back to the subject, the single active thread is continued.
+    # The sender's journaled message right after their own continues the single thread,
+    # whatever its words.
     store2 = ProcessingStore(tmp_path / "p2.db")
     registry2 = _registry(store2)
-    store2.append_event(
-        event_key="k-m1b", event_id="m1b", trace_id="tr-m1b",
-        payload={"text": "Fasse den Mietvertrag zusammen.", "is_group": True},
-        now_ms=T0,
-    )
-    started = registry2.assign(
-        _event(event_id="m1b", mentioned_bot=True, text="Fasse den Mietvertrag zusammen."),
-        now_ms=T0 + 1_000,
-    )
-    continued = registry2.assign(
-        _event(
-            event_id="m2b",
-            mentioned_bot=False,
-            text="Zum Mietvertrag: ergänze bitte die Kündigungsfrist.",
-        ),
-        now_ms=T0 + 2_000,
-    )
+    first_event = _event(event_id="m1b", mentioned_bot=True, occurred_ms=T0 + 1_000)
+    store2.append_event(event_key=first_event.event_key, event_id="m1b", trace_id="tr-m1b",
+                        payload=first_event, now_ms=T0 + 1_000)
+    started = registry2.assign(first_event, now_ms=T0 + 1_000)
+    follow_event = _event(event_id="m2b", mentioned_bot=False, occurred_ms=T0 + 2_000,
+                          text="Wie wird morgen das Wetter?")
+    store2.append_event(event_key=follow_event.event_key, event_id="m2b", trace_id="tr-m2b",
+                        payload=follow_event, now_ms=T0 + 2_000)
+    continued = registry2.assign(follow_event, now_ms=T0 + 2_000)
 
     assert continued.rule is JoinRule.FOLLOWUP_SINGLE_ACTIVE
     assert continued.thread_id == started.thread_id

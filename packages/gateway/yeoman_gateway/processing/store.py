@@ -203,6 +203,8 @@ _SCHEMA = (
     "CREATE INDEX IF NOT EXISTS idx_events_target ON events(target_message_id)",
     "CREATE INDEX IF NOT EXISTS idx_events_thread ON events(thread_id)",
     "CREATE INDEX IF NOT EXISTS idx_events_chat_time ON events(channel, chat_id, occurred_ms)",
+    "CREATE INDEX IF NOT EXISTS idx_events_chat_when "
+    "ON events(channel, chat_id, COALESCE(occurred_ms, created_ms))",
     """
     CREATE TABLE IF NOT EXISTS event_relations (
       event_id TEXT NOT NULL REFERENCES events(event_id) ON DELETE CASCADE,
@@ -2549,6 +2551,62 @@ class ProcessingStore:
                 # Duplicates only shrink the count, which keeps a thread active, never dormant.
                 counts[thread.thread_id] = min(cap, len({row[0] for row in rows}))
         return counts
+
+    def previous_chat_message(
+        self,
+        *,
+        channel: str,
+        chat_id: str,
+        before_ms: int,
+        exclude_event_id: str = "",
+        exclude_source_id: str = "",
+    ) -> tuple[str, bool, frozenset[str], frozenset[str], int | None] | None:
+        """The chat message right before ``before_ms``.
+
+        Returns (id, from_bot, principals, threads, at_ms).
+
+        Inbound messages come from the journal through ``idx_events_chat_time``; the bot's
+        messages are its confirmed thread messages in this chat. Whichever is newer wins.
+        """
+        with self._lock:
+            human = self._conn.execute(
+                "SELECT event_id, principal, source_message_id, "
+                "COALESCE(occurred_ms, created_ms) AS at_ms FROM events "
+                "WHERE channel = ? AND chat_id = ? AND COALESCE(occurred_ms, created_ms) <= ? "
+                "AND direction = 'in' AND kind = 'message' AND event_id != ? "
+                "AND COALESCE(source_message_id, '') != ? "
+                "ORDER BY COALESCE(occurred_ms, created_ms) DESC LIMIT 1",
+                (channel, chat_id, int(before_ms), exclude_event_id, exclude_source_id),
+            ).fetchone()
+            bot = self._conn.execute(
+                "SELECT m.message_id, m.thread_id, m.confirmed_ms FROM thread_messages m "
+                "JOIN threads t ON t.thread_id = m.thread_id "
+                "WHERE t.channel = ? AND t.chat_id = ? AND m.direction = 'out' "
+                "AND m.confirmed_ms IS NOT NULL AND m.confirmed_ms <= ? "
+                "ORDER BY m.confirmed_ms DESC LIMIT 1",
+                (channel, chat_id, int(before_ms)),
+            ).fetchone()
+            if bot is not None and (human is None or int(bot["confirmed_ms"])
+                                    >= int(human["at_ms"] or 0)):
+                return (str(bot["message_id"]), True, frozenset(),
+                        frozenset({str(bot["thread_id"])}), int(bot["confirmed_ms"]))
+            if human is None:
+                return None
+            source_id = human["source_message_id"]
+            # Bridge and canonical rows of one physical message can name the sender in two
+            # forms and carry the assignment apart, so both rows count.
+            rows = self._conn.execute(
+                "SELECT principal, thread_id FROM events WHERE "
+                + ("source_message_id = ?" if source_id else "event_id = ?"),
+                (source_id or human["event_id"],),
+            ).fetchall()
+        return (
+            str(source_id or human["event_id"]),
+            False,
+            frozenset(str(row[0]) for row in rows if row[0]),
+            frozenset(str(row[1]) for row in rows if row[1]),
+            int(human["at_ms"]) if human["at_ms"] is not None else None,
+        )
 
     def touch_thread(self, thread_id: str, now_ms: int) -> None:
         with self._write() as conn:
