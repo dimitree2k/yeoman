@@ -193,9 +193,18 @@ class Session:
                     seen.add(key)
                 local.append(row)
             history = local
+            names: dict[str, str | None] = {}
+            for row in rows:
+                contact_id = row["sender_contact_id"]
+                if contact_id and contact_id not in names:
+                    contact = queries.contact(contact_id)
+                    names[contact_id] = contact["display_name"] if contact else None
             preceding = [{"role": "assistant" if row["direction"] == "out" else "user",
                           "content": history_text(row), "message_id": row["native_message_id"],
-                          "timestamp": row["sent_ms"], "sender_id": row["sender_identifier"]}
+                          "timestamp": row["sent_ms"], "sender_id": row["sender_identifier"],
+                          "sender_name": names.get(row["sender_contact_id"] or ""),
+                          "sender_contact_id": row["sender_contact_id"],
+                          "reply_to_message_id": row["reply_to_native_id"]}
                          for row in rows]
             if self.thread_id and not self.chat_id.endswith("@g.us"):
                 bounded = []
