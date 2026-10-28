@@ -200,6 +200,28 @@ class DeterministicExecutor:
             ),
         )
 
+    async def _log_review(self, *, target: str, **_: str) -> ActionResult:
+        """Start the headless log review as a transient systemd unit.
+
+        The run can deploy, and a deploy restarts this service; a child process
+        would die with it, a separate transient unit keeps running.
+        """
+        script = Path(target).expanduser()
+        if not script.is_file():
+            return ActionResult(success=False, detail=f"Log review script missing: {script}")
+        unit = f"yeoman-log-review-{datetime.now().strftime('%Y%m%d-%H%M%S')}"
+        proc = await asyncio.create_subprocess_exec(
+            "systemd-run", "--user", "--collect", f"--unit={unit}",
+            "--property=TimeoutStartSec=2h", "--nice=10", str(script),
+            stdout=asyncio.subprocess.PIPE, stderr=asyncio.subprocess.PIPE,
+        )
+        _, stderr = await proc.communicate()
+        if proc.returncode != 0:
+            message = f"Log review did not start: {stderr.decode(errors='replace').strip()[:300]}"
+            await self._alert(target="log-review", message=message)
+            return ActionResult(success=False, detail=message)
+        return ActionResult(success=True, detail=f"Log review started as {unit}")
+
     async def _verify_raw_archive(self, *, target: str, **_: str) -> ActionResult:
         from yeoman_shared.raw_archive.verify import verify_archive
 
@@ -273,5 +295,6 @@ _ACTION_REGISTRY = {
     "verify_raw_archive": DeterministicExecutor._verify_raw_archive,
     "update_agent_clis": DeterministicExecutor._update_agent_clis,
     "log_digest": DeterministicExecutor._log_digest,
+    "log_review": DeterministicExecutor._log_review,
     "noop": DeterministicExecutor._noop,
 }

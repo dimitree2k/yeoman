@@ -139,3 +139,36 @@ async def test_log_digest_action_is_registered(env: dict[str, Path]) -> None:
     )
     assert result.success, result.detail
     assert "incidents" in result.detail
+
+
+@pytest.mark.asyncio
+async def test_log_review_starts_a_transient_unit(tmp_path: Path, monkeypatch) -> None:
+    import asyncio
+
+    script = tmp_path / "run.sh"
+    script.write_text("#!/bin/sh\n")
+    calls: list[tuple[str, ...]] = []
+
+    class _Proc:
+        returncode = 0
+
+        async def communicate(self) -> tuple[bytes, bytes]:
+            return b"", b""
+
+    async def fake_exec(*args: str, **_: object) -> _Proc:
+        calls.append(args)
+        return _Proc()
+
+    monkeypatch.setattr(asyncio, "create_subprocess_exec", fake_exec)
+    executor = DeterministicExecutor(comms=None)  # type: ignore[arg-type]
+    result = await executor.execute("log_review", target=str(script))
+    assert result.success, result.detail
+    assert calls[0][:3] == ("systemd-run", "--user", "--collect")
+    assert calls[0][-1] == str(script)
+
+
+@pytest.mark.asyncio
+async def test_log_review_missing_script_fails(tmp_path: Path) -> None:
+    executor = DeterministicExecutor(comms=None)  # type: ignore[arg-type]
+    result = await executor.execute("log_review", target=str(tmp_path / "nope.sh"))
+    assert not result.success

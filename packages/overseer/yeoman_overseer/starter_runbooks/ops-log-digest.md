@@ -20,8 +20,8 @@ the automatic log review: warning/error counts grouped by signature, failed
 tool calls per tool, denied decisions, effect states and reply-sorter outcomes.
 The scan resumes from a timestamp checkpoint and reads rotated `.gz` logs, so a
 rotation between runs loses nothing. Digests and the incident index live in
-`~/.yeoman/data/ops/log-review/` and outlast the logs. The headless log review
-reads the newest digest at 06:30.
+`~/.yeoman/data/ops/log-review/` and outlast the logs. The `ops-log-review` runbook
+starts the review on the newest digest at 06:30.
 
 ## Actions
 - action: log_digest

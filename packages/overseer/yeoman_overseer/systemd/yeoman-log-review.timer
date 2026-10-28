@@ -1,9 +1,0 @@
-[Unit]
-Description=Run the yeoman log review daily after the 06:15 Overseer log digest
-
-[Timer]
-OnCalendar=*-*-* 06:30:00
-Persistent=true
-
-[Install]
-WantedBy=timers.target
