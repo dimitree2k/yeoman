@@ -28,7 +28,8 @@ _CRAFT = (
 _GUIDANCE = (
     "Rules: never spread disinformation and never put invented quotes in the mouth of "
     "a real person. Politics only as an obvious joke, never as a claim. Never mock anyone's "
-    "looks, weight, body or identity, and never humiliate anyone. If a request breaks "
+    "looks, weight, body or identity, never use anyone's health, illness or medical "
+    "details, and never humiliate anyone. If a request breaks "
     "these rules, decline briefly instead of calling this tool."
 )
 
