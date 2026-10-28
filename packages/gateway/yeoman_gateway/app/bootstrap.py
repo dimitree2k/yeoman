@@ -70,6 +70,12 @@ from yeoman_gateway.providers.openai_compatible import resolve_openai_compatible
 from yeoman_gateway.security import NoopSecurity, SecurityEngine
 from yeoman_gateway.session.manager import SessionManager
 from yeoman_gateway.storage.private_handoff import PrivateHandoffStore
+from yeoman_gateway.trends.seeds import (
+    TREND_SENDER,
+    build_trend_seeds,
+    is_trend_source,
+    trend_chats,
+)
 
 if TYPE_CHECKING:
     from pathlib import Path
@@ -605,7 +611,7 @@ class GatewayRuntime:
                 raise cleanup_errors[0]
 
 
-def _build_trends(config: Config) -> Any | None:
+def _build_trends(config: Config, policy_adapter: object | None = None) -> Any | None:
     """The trends collector when enabled; a missing route disables it with a warning."""
     if not config.trends.enabled:
         return None
@@ -613,7 +619,11 @@ def _build_trends(config: Config) -> Any | None:
     from yeoman_gateway.trends.service import build_trends_service
 
     try:
-        return build_trends_service(config)
+        policy_engine = getattr(policy_adapter, "policy_engine", None)
+        return build_trends_service(
+            config,
+            chats=(lambda: trend_chats(policy_engine())) if callable(policy_engine) else None,
+        )
     except RouteUnavailableError as exc:
         logger.warning("trends disabled: {}", exc)
         return None
@@ -934,6 +944,30 @@ def _build_short_reply_reactor(
     return ShortReplyReactor(decider=decider, history=store, settings=settings)
 
 
+def _seed_trend_cards(
+    *, channel: str, chat_id: str, seeds: object | None, ledger: object, active: bool
+) -> tuple[str, ...]:
+    """Register this chat's best trend cards as new material for a quiet moment.
+
+    Only chats with an enabled ``trends`` policy block get cards; the lull offer that
+    follows carries them to the judge like any other registered source.
+    """
+    if seeds is None or not active or channel != "whatsapp":
+        return ()
+    try:
+        source_ids = seeds.seed(channel, chat_id)  # type: ignore[attr-defined]
+        if source_ids:
+            ledger.ensure_source_revisions_sync(  # type: ignore[attr-defined]
+                channel=channel, chat_id=chat_id, source_ids=source_ids
+            )
+    except Exception as exc:  # noqa: BLE001 - a card store fault must not stop the lull
+        logger.warning("trend_seed_failed chat={} error_type={}", chat_id[:24], type(exc).__name__)
+        return ()
+    if source_ids:
+        logger.info("trend_seeded chat={} cards={}", chat_id[:24], len(source_ids))
+    return tuple(source_ids)
+
+
 def _offer_participation_trigger(
     *,
     channel: str,
@@ -994,6 +1028,7 @@ def _build_participation_runtime(
     policy_adapter: object | None,
     approval_tools: object | None = None,
     knowledge: object | None = None,
+    trend_seeds: object | None = None,
 ) -> tuple[object | None, object | None, object | None]:
     """Build the disabled-by-default participation runtime and scheduler.
 
@@ -1068,6 +1103,7 @@ def _build_participation_runtime(
         group_notes=group_notes,
         knowledge_selector=knowledge_selector,
         knowledge_context_supplier=knowledge_context_supplier,
+        trend_rows=getattr(trend_seeds, "row", None),
     )
 
     def _continuation_candidate(opportunity: object | None) -> bool:
@@ -1267,6 +1303,15 @@ def _build_participation_runtime(
         senders = {}
         for source in sources:  # type: ignore[union-attr]
             source_id = str(source)
+            if is_trend_source(source_id):
+                trend_sender = (
+                    trend_seeds.sender(channel, chat_id, source_id)  # type: ignore[attr-defined]
+                    if trend_seeds is not None
+                    else None
+                )
+                if trend_sender:
+                    senders[source_id] = trend_sender
+                continue
             row = archive.row(channel, chat_id, source_id)
             if row is not None and row["sender_id"]:
                 senders[source_id] = row["sender_id"]
@@ -1279,6 +1324,12 @@ def _build_participation_runtime(
         )
 
     def _is_participant_allowed(channel: str, chat_id: str, sender: str) -> bool:
+        if sender == TREND_SENDER:
+            # The owner's trend cards speak only where the chat's trends block is on.
+            return bool(
+                trend_seeds is not None
+                and trend_seeds.enabled(channel, chat_id)  # type: ignore[attr-defined]
+            )
         return participant_is_allowed(
             engine=policy_engine, channel=channel, chat_id=chat_id, sender=sender
         )
@@ -2178,6 +2229,9 @@ def build_participation_decision_validator(
             channel = str(getattr(admission, "channel", ""))
             chat_id = str(getattr(admission, "chat_id", ""))
             for source_id in source_ids:
+                if is_trend_source(source_id):
+                    # Owner material has no reader of its own; chat authors decide.
+                    continue
                 row = archive.row(channel, chat_id, source_id)
                 if row is None:
                     return False, "knowledge_sources_changed"
@@ -2230,6 +2284,7 @@ def build_effect_router(
     threads: object | None = None,
     participation_ledger: object | None = None,
     knowledge_decision_validator: object | None = None,
+    trend_seeds: object | None = None,
 ):
     """Effect gateway plus transport executor for the new mode.
 
@@ -2286,9 +2341,17 @@ def build_effect_router(
                 from yeoman_gateway.history.queries import HistoryQueries
                 archive = HistoryReplyArchiveAdapter(HistoryQueries(history_snapshot))
                 for source_id in source_ids:
+                    if is_trend_source(source_id):
+                        continue
                     row = archive.row(channel, chat_id, source_id)
                     if row is not None and row['sender_id']:
                         current_senders[source_id] = str(row['sender_id'])
+        if trend_seeds is not None:
+            for source_id in source_ids:
+                if is_trend_source(source_id):
+                    trend_sender = trend_seeds.sender(channel, chat_id, source_id)  # type: ignore[attr-defined]
+                    if trend_sender:
+                        current_senders[source_id] = trend_sender
         exact_sources = bool(
             source_ids
             and len(expected_senders) == len(source_ids)
@@ -2305,7 +2368,12 @@ def build_effect_router(
             exact_sources
             and engine is not None
             and all(
-                participant_is_allowed(
+                (
+                    trend_seeds is not None
+                    and trend_seeds.enabled(channel, chat_id)  # type: ignore[attr-defined]
+                )
+                if sender == TREND_SENDER
+                else participant_is_allowed(
                     engine=engine,
                     channel=channel,
                     chat_id=chat_id,
@@ -2858,6 +2926,9 @@ def build_gateway_runtime(
     )
     # The same live history proof check guards owner approval and pre-dispatch.
     knowledge_decision_validator = build_participation_decision_validator(knowledge=knowledge_service)
+    trend_seeds = build_trend_seeds(
+        config, getattr(policy_adapter, "policy_engine", lambda: None)
+    )
     effect_router = build_effect_router(
         config,
         policy_adapter,
@@ -2867,6 +2938,7 @@ def build_gateway_runtime(
         threads=thread_registry,
         participation_ledger=speakup_log,
         knowledge_decision_validator=knowledge_decision_validator,
+        trend_seeds=trend_seeds,
     )
     if effect_router is not None:
         from yeoman_gateway.processing.dispatch import managed_outbound_guard
@@ -3979,6 +4051,7 @@ def build_gateway_runtime(
                     policy_adapter=policy_adapter,
                     approval_tools=consciousness_tools,
                     knowledge=knowledge_service,
+                    trend_seeds=trend_seeds,
                 )
             )
         else:
@@ -4120,6 +4193,14 @@ def build_gateway_runtime(
 
         def _trigger(channel: str, chat_id: str, trigger: str) -> object:
             """Route one observer trigger to its already-resolved social owner."""
+            if trigger == "lull":
+                _seed_trend_cards(
+                    channel=channel,
+                    chat_id=chat_id,
+                    seeds=trend_seeds,
+                    ledger=speakup_log,
+                    active=_participation_active(channel, chat_id),
+                )
             result = _offer_participation_trigger(
                 channel=channel,
                 chat_id=chat_id,
@@ -4224,7 +4305,7 @@ def build_gateway_runtime(
             PeopleSyncService(projector=history_projector, db_path=people_db_path(), people=people)
             if history_projector is not None else None
         ),
-        trends=_build_trends(config),
+        trends=_build_trends(config, policy_adapter),
     )
 
 

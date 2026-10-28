@@ -233,6 +233,24 @@ class SpontaneityPolicyOverride(PolicyModel):
     quiet_hours_end: str | None = Field(default=None, alias="quietHoursEnd")
 
 
+class TrendsPolicy(PolicyModel):
+    """Per-chat trend posts: owner-written topics a quiet group may get a card about."""
+
+    enabled: bool = False
+    #: Comma-separated topics, e.g. "Finanzen, Krypto, absurde Wirtschaftsnews".
+    topics: str = ""
+    #: Comma-separated topics this group never gets, e.g. "Fußball".
+    avoid: str = ""
+
+
+class TrendsPolicyOverride(PolicyModel):
+    """Partial override for per-chat trend posts."""
+
+    enabled: bool | None = None
+    topics: str | None = None
+    avoid: str | None = None
+
+
 #: Owner-authored default participation guidance (participation spec section 6). The
 #: spec default lives in one place so policy inspection and the judge cannot drift.
 DEFAULT_PARTICIPATION_GUIDANCE = (
@@ -411,6 +429,7 @@ class ChatPolicy(PolicyModel):
     reply_budget: ReplyBudgetPolicy = Field(default_factory=ReplyBudgetPolicy, alias="replyBudget")
     spontaneity: SpontaneityPolicy = Field(default_factory=SpontaneityPolicy)
     participation: ParticipationPolicy = Field(default_factory=ParticipationPolicy)
+    trends: TrendsPolicy = Field(default_factory=TrendsPolicy)
     contacts_disclosure: bool = Field(default=False, alias="contactsDisclosure")
     #: Opt-in switch for the make_meme tool; off unless a chat or channel enables it.
     memes: bool = False
@@ -438,6 +457,7 @@ class ChatPolicyOverride(PolicyModel):
     reply_budget: ReplyBudgetPolicyOverride | None = Field(default=None, alias="replyBudget")
     spontaneity: SpontaneityPolicyOverride | None = None
     participation: ParticipationPolicyOverride | None = None
+    trends: TrendsPolicyOverride | None = None
     contacts_disclosure: bool | None = Field(default=None, alias="contactsDisclosure")
     memes: bool | None = None
     session_history_limit: int | None = Field(default=None, alias="sessionHistoryLimit", ge=1, le=100)

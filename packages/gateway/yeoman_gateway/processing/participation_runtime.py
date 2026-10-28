@@ -53,6 +53,7 @@ from yeoman_gateway.processing.participation_knowledge import (
     ParticipationKnowledgeEvidenceError,
     selection_from_mapping,
 )
+from yeoman_gateway.trends.seeds import is_trend_source
 
 #: Counters that must stay distinguishable in operational traces (spec section 12).
 COUNTERS: tuple[str, ...] = (
@@ -1646,7 +1647,7 @@ class ParticipationRuntime:
             await self._record(opportunity, "stale_discarded", "deadline_expired")
             return {"status": "comment_skipped", "reason": "deadline_expired"}
         try:
-            draft = await self._submission.generate_draft(
+            draft = await self._draft(
                 opportunity=opportunity,
                 decision=decision,
                 context=context,
@@ -1721,6 +1722,28 @@ class ParticipationRuntime:
             evaluation_index=0,
         )
 
+    async def _draft(
+        self,
+        *,
+        opportunity: ParticipationOpportunity,
+        decision: ParticipationDecision,
+        context: Mapping[str, Any],
+    ) -> str:
+        """The comment text: an offered trend card verbatim, else the writer's draft."""
+        target = str(decision.target_message_id or "")
+        if is_trend_source(target):
+            posts = context.get("trend_posts")
+            text = str(posts.get(target) or "") if isinstance(posts, Mapping) else ""
+            if not text.strip():
+                raise ParticipationDraftError("trend_card_unavailable")
+            return text
+        assert self._submission is not None
+        return await self._submission.generate_draft(
+            opportunity=opportunity,
+            decision=decision,
+            context=context,
+        )
+
     async def _release_comment(self, opportunity: ParticipationOpportunity, effect_id: str, reason: str) -> None:
         await self._ledger.release_delivery(
             opportunity.opportunity_id,
@@ -1768,7 +1791,13 @@ class ParticipationRuntime:
             await self._release_comment(opportunity, effect_id, "deadline_expired")
             await self._record(opportunity, "stale_discarded", "deadline_expired")
             return {"status": "comment_skipped", "reason": "deadline_expired"}
-        payload = TextPayload(text=text, reply_to=decision.target_message_id)
+        # A trend card is a new message in the group, not a reply to anyone.
+        reply_to = (
+            None
+            if is_trend_source(decision.target_message_id)
+            else decision.target_message_id
+        )
+        payload = TextPayload(text=text, reply_to=reply_to)
         approval_required = bool(
             _snapshot_bool(snapshot, "approval_required", default=False)
             and decision.intent == "initiate"
@@ -2249,7 +2278,7 @@ class ParticipationRuntime:
                     )
                     return {"status": "comment_skipped", "reason": "deadline_expired"}
                 try:
-                    replacement = await self._submission.generate_draft(
+                    replacement = await self._draft(
                         opportunity=current.opportunity,
                         decision=reevaluated,
                         context=current.context,
@@ -2317,7 +2346,7 @@ class ParticipationRuntime:
                     )
                     return {"status": "comment_skipped", "reason": "deadline_expired"}
                 try:
-                    replacement = await self._submission.generate_draft(
+                    replacement = await self._draft(
                         opportunity=current.opportunity,
                         decision=reevaluated,
                         context=current.context,

@@ -46,6 +46,14 @@ CREATE TABLE IF NOT EXISTS card_uses (
     used_at_ms INTEGER NOT NULL,
     PRIMARY KEY (card_id, channel, chat_id)
 );
+CREATE TABLE IF NOT EXISTS card_fits (
+    card_id TEXT NOT NULL,
+    channel TEXT NOT NULL,
+    chat_id TEXT NOT NULL,
+    topics_key TEXT NOT NULL,
+    fits INTEGER NOT NULL,
+    PRIMARY KEY (card_id, channel, chat_id, topics_key)
+);
 """
 
 
@@ -162,6 +170,70 @@ class TrendStore:
                 (card_id, channel, chat_id, now_ms),
             )
 
+    def unjudged_cards_for(
+        self, channel: str, chat_id: str, topics_key: str, *, now_ms: int, limit: int = 40
+    ) -> list[TrendCard]:
+        """Fresh, unused cards nobody has checked against this chat's topics yet."""
+        with self._lock:
+            rows = self._conn.execute(
+                "SELECT * FROM cards WHERE expires_at_ms > ? AND card_id NOT IN "
+                "(SELECT card_id FROM card_uses WHERE channel = ? AND chat_id = ?) "
+                "AND card_id NOT IN (SELECT card_id FROM card_fits WHERE channel = ? "
+                "AND chat_id = ? AND topics_key = ?) "
+                "ORDER BY score DESC, created_at_ms DESC LIMIT ?",
+                (now_ms, channel, chat_id, channel, chat_id, topics_key, limit),
+            ).fetchall()
+        return [_card(row) for row in rows]
+
+    def record_fits(
+        self,
+        channel: str,
+        chat_id: str,
+        topics_key: str,
+        judged: Iterable[str],
+        fitting: set[str],
+    ) -> None:
+        with self._lock, self._conn:
+            self._conn.executemany(
+                "INSERT OR REPLACE INTO card_fits VALUES (?, ?, ?, ?, ?)",
+                [
+                    (card_id, channel, chat_id, topics_key, int(card_id in fitting))
+                    for card_id in judged
+                ],
+            )
+
+    def fitting_card_ids(self, channel: str, chat_id: str, topics_key: str) -> set[str]:
+        with self._lock:
+            rows = self._conn.execute(
+                "SELECT card_id FROM card_fits WHERE channel = ? AND chat_id = ? "
+                "AND topics_key = ? AND fits = 1",
+                (channel, chat_id, topics_key),
+            ).fetchall()
+        return {str(row["card_id"]) for row in rows}
+
+    def last_offer_ms(self, channel: str, chat_id: str) -> int | None:
+        with self._lock:
+            row = self._conn.execute(
+                "SELECT MAX(used_at_ms) AS last FROM card_uses WHERE channel = ? AND chat_id = ?",
+                (channel, chat_id),
+            ).fetchone()
+        return int(row["last"]) if row is not None and row["last"] is not None else None
+
+    def offered_card(
+        self, card_id: str, channel: str, chat_id: str
+    ) -> tuple[TrendCard, int] | None:
+        """A card with the time it was offered to this chat; ``None`` if it never was."""
+        with self._lock:
+            row = self._conn.execute(
+                "SELECT cards.*, card_uses.used_at_ms AS used_at_ms FROM cards "
+                "JOIN card_uses ON card_uses.card_id = cards.card_id "
+                "WHERE cards.card_id = ? AND card_uses.channel = ? AND card_uses.chat_id = ?",
+                (card_id, channel, chat_id),
+            ).fetchone()
+        if row is None:
+            return None
+        return _card(row), int(row["used_at_ms"])
+
     def recent_scores(self, *, limit: int = 50) -> list[sqlite3.Row]:
         with self._lock:
             return self._conn.execute(
@@ -177,6 +249,9 @@ class TrendStore:
             self._conn.execute("DELETE FROM cards WHERE expires_at_ms <= ?", (now_ms,))
             self._conn.execute(
                 "DELETE FROM card_uses WHERE card_id NOT IN (SELECT card_id FROM cards)"
+            )
+            self._conn.execute(
+                "DELETE FROM card_fits WHERE card_id NOT IN (SELECT card_id FROM cards)"
             )
 
 

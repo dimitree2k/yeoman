@@ -11,6 +11,7 @@ from typing import Any
 from loguru import logger
 
 from .article import ArticleReader
+from .fit import TopicFitter, topics_key
 from .models import TrendItem, TrendVerdict
 from .scorer import TrendScorer
 from .sources import GoogleTrendsSource, TrendSource
@@ -30,6 +31,7 @@ class TrendsReport:
     fetched: int = 0
     scored: int = 0
     cards: int = 0
+    fitted_chats: int = 0
     articles_read: int = 0
     dropped: int = 0
     failed_sources: list[str] = field(default_factory=list)
@@ -39,6 +41,7 @@ class TrendsReport:
             "fetched": self.fetched,
             "scored": self.scored,
             "cards": self.cards,
+            "fitted_chats": self.fitted_chats,
             "articles_read": self.articles_read,
             "dropped": self.dropped,
             "failed_sources": list(self.failed_sources),
@@ -59,6 +62,8 @@ class TrendsService:
         reader: ArticleReader | None = None,
         writer: LineWriter | None = None,
         max_article_age_ms: int = 48 * 3600 * 1000,
+        fitter: TopicFitter | None = None,
+        chats: Callable[[], Sequence[tuple[str, str, Any]]] | None = None,
         clock: Callable[[], int] = _now_ms,
     ) -> None:
         if interval_seconds <= 0:
@@ -73,6 +78,8 @@ class TrendsService:
         self.reader = reader
         self.writer = writer
         self.max_article_age_ms = max_article_age_ms
+        self.fitter = fitter
+        self.chats = chats
         self.clock = clock
         self._task: asyncio.Task[None] | None = None
 
@@ -100,8 +107,34 @@ class TrendsService:
             )
             report.cards = len(cards)
         self.store.prune(now_ms=now)
+        await self._fit_chats(report, now_ms=now)
         logger.info("trends run {}", report.as_dict())
         return report
+
+    async def _fit_chats(self, report: TrendsReport, *, now_ms: int) -> None:
+        """Check new cards against the topics of every chat with trend posts on."""
+        if self.fitter is None or self.chats is None:
+            return
+        try:
+            chats = list(self.chats())
+        except Exception as exc:  # noqa: BLE001 - unreadable policy means no fitting now
+            logger.warning("trends chats unavailable error_type={}", type(exc).__name__)
+            return
+        for channel, chat_id, policy in chats:
+            topics, avoid = str(policy.topics or ""), str(policy.avoid or "")
+            if not topics.strip():
+                continue
+            key = topics_key(topics, avoid)
+            cards = self.store.unjudged_cards_for(channel, chat_id, key, now_ms=now_ms)
+            if not cards:
+                continue
+            try:
+                fitting = await self.fitter.fit(topics=topics, avoid=avoid, cards=cards)
+            except Exception as exc:  # noqa: BLE001 - retried on the next run
+                logger.warning("trends fit failed error_type={}", type(exc).__name__)
+                continue
+            self.store.record_fits(channel, chat_id, key, [c.card_id for c in cards], fitting)
+            report.fitted_chats += 1
 
     async def _rewrite_from_articles(
         self,
@@ -175,7 +208,12 @@ class TrendsService:
         self.store.close()
 
 
-def build_trends_service(config: Any, *, store_path: Any = None) -> TrendsService:
+def build_trends_service(
+    config: Any,
+    *,
+    store_path: Any = None,
+    chats: Callable[[], Sequence[tuple[str, str, Any]]] | None = None,
+) -> TrendsService:
     """The configured service; raises ``RouteUnavailableError`` when the route is missing."""
     from yeoman_shared.utils.helpers import get_operational_store_path
 
@@ -194,4 +232,6 @@ def build_trends_service(config: Any, *, store_path: Any = None) -> TrendsServic
         min_score=trends.min_score,
         card_ttl_ms=trends.card_ttl_hours * 3600 * 1000,
         max_items_per_run=trends.max_items_per_run,
+        fitter=TopicFitter(client=client),
+        chats=chats,
     )
