@@ -646,7 +646,9 @@ class TrendsConfig(BaseModel):
     google_trends_geo: str = Field(default="DE", alias="googleTrendsGeo")
     language: str = "de"
     min_score: int = Field(default=7, alias="minScore", ge=0, le=10)
-    card_ttl_hours: int = Field(default=72, alias="cardTtlHours", ge=1)
+    card_ttl_hours: int = Field(default=24, alias="cardTtlHours", ge=1)
+    read_articles: bool = Field(default=True, alias="readArticles")
+    max_article_age_hours: int = Field(default=48, alias="maxArticleAgeHours", ge=1)
     max_items_per_run: int = Field(default=20, alias="maxItemsPerRun", ge=1, le=50)
     route: str = "trends.score"
 

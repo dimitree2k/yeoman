@@ -5,14 +5,20 @@ from __future__ import annotations
 import asyncio
 import time
 from collections.abc import Callable, Sequence
-from dataclasses import dataclass, field
+from dataclasses import dataclass, field, replace
 from typing import Any
 
 from loguru import logger
 
+from .article import ArticleReader
+from .models import TrendItem, TrendVerdict
 from .scorer import TrendScorer
 from .sources import GoogleTrendsSource, TrendSource
 from .store import TrendStore
+from .writer import LineWriter
+
+#: Articles in other languages make lines the group cannot follow.
+ARTICLE_LANGUAGES = frozenset({"de", "en", ""})
 
 
 def _now_ms() -> int:
@@ -24,6 +30,8 @@ class TrendsReport:
     fetched: int = 0
     scored: int = 0
     cards: int = 0
+    articles_read: int = 0
+    dropped: int = 0
     failed_sources: list[str] = field(default_factory=list)
 
     def as_dict(self) -> dict[str, Any]:
@@ -31,6 +39,8 @@ class TrendsReport:
             "fetched": self.fetched,
             "scored": self.scored,
             "cards": self.cards,
+            "articles_read": self.articles_read,
+            "dropped": self.dropped,
             "failed_sources": list(self.failed_sources),
         }
 
@@ -46,6 +56,9 @@ class TrendsService:
         min_score: int = 7,
         card_ttl_ms: int = 72 * 3600 * 1000,
         max_items_per_run: int = 20,
+        reader: ArticleReader | None = None,
+        writer: LineWriter | None = None,
+        max_article_age_ms: int = 48 * 3600 * 1000,
         clock: Callable[[], int] = _now_ms,
     ) -> None:
         if interval_seconds <= 0:
@@ -57,6 +70,9 @@ class TrendsService:
         self.min_score = min_score
         self.card_ttl_ms = card_ttl_ms
         self.max_items_per_run = max_items_per_run
+        self.reader = reader
+        self.writer = writer
+        self.max_article_age_ms = max_article_age_ms
         self.clock = clock
         self._task: asyncio.Task[None] | None = None
 
@@ -78,6 +94,7 @@ class TrendsService:
         if fresh:
             verdicts = await self.scorer.score(fresh)
             report.scored = len(verdicts)
+            verdicts = await self._rewrite_from_articles(fresh, verdicts, report, now_ms=now)
             cards = self.store.record(
                 fresh, verdicts, min_score=self.min_score, now_ms=now, ttl_ms=self.card_ttl_ms
             )
@@ -85,6 +102,55 @@ class TrendsService:
         self.store.prune(now_ms=now)
         logger.info("trends run {}", report.as_dict())
         return report
+
+    async def _rewrite_from_articles(
+        self,
+        items: Sequence[TrendItem],
+        verdicts: list[TrendVerdict],
+        report: TrendsReport,
+        *,
+        now_ms: int,
+    ) -> list[TrendVerdict]:
+        """Read the article of every verdict at the bar and rewrite or drop it.
+
+        Stale, foreign-language and unreadable articles are dropped: a line written from
+        the headline alone too often misses what the story is about.
+        """
+        if self.reader is None or self.writer is None:
+            return verdicts
+        by_key = {item.key: item for item in items}
+        rewritten: list[TrendVerdict] = []
+        for verdict in verdicts:
+            item = by_key.get(verdict.item_key)
+            if item is None or verdict.score < self.min_score or not verdict.url:
+                rewritten.append(verdict)
+                continue
+            article = await self.reader.read(verdict.url)
+            if article is None:
+                report.dropped += 1
+                rewritten.append(replace(verdict, score=0, kind="unreadable", reason="article unreadable"))
+                continue
+            report.articles_read += 1
+            published = article.published_at_ms
+            if published is not None and now_ms - published > self.max_article_age_ms:
+                report.dropped += 1
+                rewritten.append(replace(verdict, score=0, kind="stale", reason="article too old"))
+                continue
+            if article.language not in ARTICLE_LANGUAGES:
+                report.dropped += 1
+                rewritten.append(replace(
+                    verdict, score=0, kind="foreign", reason=f"article language {article.language}"
+                ))
+                continue
+            try:
+                written = await self.writer.write(item, verdict, article.text)
+            except Exception as exc:  # noqa: BLE001 - one failed rewrite keeps the scored line
+                logger.warning("trends line writer failed error_type={}", type(exc).__name__)
+                written = verdict
+            if written.score < self.min_score:
+                report.dropped += 1
+            rewritten.append(written)
+        return rewritten
 
     async def _run(self) -> None:
         while True:
@@ -120,6 +186,9 @@ def build_trends_service(config: Any, *, store_path: Any = None) -> TrendsServic
     return TrendsService(
         sources=[GoogleTrendsSource(geo=trends.google_trends_geo)],
         scorer=TrendScorer(client=client, language=trends.language),
+        reader=ArticleReader() if trends.read_articles else None,
+        writer=LineWriter(client=client, language=trends.language) if trends.read_articles else None,
+        max_article_age_ms=trends.max_article_age_hours * 3600 * 1000,
         store=TrendStore(store_path or get_operational_store_path("trends")),
         interval_seconds=trends.interval_minutes * 60,
         min_score=trends.min_score,
