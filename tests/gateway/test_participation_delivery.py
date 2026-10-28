@@ -31,6 +31,7 @@ from yeoman_gateway.processing.models import (
     EffectEnvelope,
     EffectReceipt,
     EffectTarget,
+    MediaPayload,
     ParticipationPreDispatchDenied,
     PolicySnapshot,
     ProcessingError,
@@ -420,6 +421,57 @@ def test_snapshot_authorizer_rejects_missing_participation_hash_and_action() -> 
 
     assert decision.outcome == "deny"
     assert decision.reason == "participation_payload_hash_missing"
+
+
+@pytest.mark.parametrize(
+    ("payload", "action", "expected"),
+    [
+        (MediaPayload(media=("meme.png",)), "meme", "allow"),
+        (MediaPayload(media=("sticker.webp",)), "sticker", "allow"),
+        (MediaPayload(media=("meme.png",)), "comment", "participation_action_mismatch"),
+        (TextPayload(text="prepared"), "meme", "participation_action_mismatch"),
+        (TextPayload(text="prepared"), "comment", "allow"),
+    ],
+)
+def test_snapshot_authorizer_matches_admitted_action_to_payload_kind(
+    payload: object, action: str, expected: str
+) -> None:
+    envelope = EffectEnvelope(
+        effect_id="effect-action-kind",
+        operation_key="participation:action-kind",
+        payload=payload,
+        target=EffectTarget(channel=CHANNEL, chat_id=CHAT),
+        principal="service:speakup",
+        capability="send_media" if isinstance(payload, MediaPayload) else "send_text",
+        origin="participation",
+        admission_id="admission-action-kind",
+    )
+    admission = SimpleNamespace(
+        admission_id="admission-action-kind",
+        channel=CHANNEL,
+        chat_id=CHAT,
+        payload_hash=envelope.payload_hash,
+        action=action,
+        intent="observation",
+    )
+    authorizer = SnapshotEffectAuthorizer(
+        snapshots=_StaticPolicy(),
+        capabilities=_TargetCapabilities(),
+        admission_loader=lambda _admission_id: admission,
+        participation_authorizer=lambda _envelope, _admission: (True, "allow"),
+        clock=lambda: 2,
+    )
+
+    decision = authorizer.check(envelope, None)
+
+    assert decision.reason == expected
+
+
+def test_final_gate_image_actions_match_the_judge() -> None:
+    from yeoman_gateway.processing import policy
+    from yeoman_gateway.processing.participation import IMAGE_ACTIONS
+
+    assert policy._PARTICIPATION_IMAGE_ACTIONS == IMAGE_ACTIONS
 
 
 @pytest.mark.parametrize(
