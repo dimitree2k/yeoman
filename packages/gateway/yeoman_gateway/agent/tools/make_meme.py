@@ -18,10 +18,9 @@ _RECENT_PHOTO_SECONDS = 10 * 60
 _GUIDANCE = (
     "Rules: keep it funny or absurd and short (a few words per caption, in the chat's "
     "language). Never spread disinformation and never put invented quotes in the mouth of "
-    "a real person. Politics only as an obvious joke, never as a claim. Use a photo that "
-    "shows people only when someone in the chat asked for exactly that, and never mock "
-    "anyone's looks, body or identity. If a request breaks these rules, decline briefly "
-    "instead of calling this tool."
+    "a real person. Politics only as an obvious joke, never as a claim. Never mock anyone's "
+    "looks, weight, body or identity, and never humiliate anyone. If a request breaks "
+    "these rules, decline briefly instead of calling this tool."
 )
 
 

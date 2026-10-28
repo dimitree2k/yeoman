@@ -284,6 +284,15 @@ class ParticipationPolicy(PolicyModel):
     min_messages_between_reactions: int = Field(
         default=0, alias="minMessagesBetweenReactions", ge=0, le=100
     )
+    #: Lets the judge post a meme or sticker on its own. Off unless the chat opts in.
+    auto_memes: bool = Field(default=False, alias="autoMemes")
+    #: Hard caps; the judge is asked to stay well below them (rolling 7 days / 24 hours).
+    max_memes_per_week: int = Field(default=3, alias="maxMemesPerWeek", ge=0, le=14)
+    max_stickers_per_day: int = Field(default=2, alias="maxStickersPerDay", ge=0, le=10)
+    #: New messages required after an autonomous meme or sticker before the next one.
+    min_messages_between_memes: int = Field(
+        default=15, alias="minMessagesBetweenMemes", ge=0, le=500
+    )
 
     @field_validator("guidance")
     @classmethod
@@ -338,6 +347,16 @@ class ParticipationPolicyOverride(PolicyModel):
     )
     min_messages_between_reactions: int | None = Field(
         default=None, alias="minMessagesBetweenReactions", ge=0, le=100
+    )
+    auto_memes: bool | None = Field(default=None, alias="autoMemes")
+    max_memes_per_week: int | None = Field(
+        default=None, alias="maxMemesPerWeek", ge=0, le=14
+    )
+    max_stickers_per_day: int | None = Field(
+        default=None, alias="maxStickersPerDay", ge=0, le=10
+    )
+    min_messages_between_memes: int | None = Field(
+        default=None, alias="minMessagesBetweenMemes", ge=0, le=500
     )
 
     @field_validator("guidance")

@@ -675,6 +675,49 @@ class ServiceEffectProducer:
             admission=admission,
         )
 
+    async def send_media(
+        self,
+        *,
+        source: str,
+        operation_ref: str,
+        channel: str,
+        chat_id: str,
+        media_path: str,
+        effect_id: str,
+        admission: Any,
+    ) -> EffectReceipt:
+        """Submit one managed, caption-less media effect (an autonomous meme or sticker).
+
+        Like a managed reaction it needs the caller's effect id and a participation
+        admission, and only a ``sent`` receipt counts as transport acceptance.
+        """
+        if admission is None or not isinstance(effect_id, str) or not effect_id.strip():
+            raise EffectNotDeliveredError(
+                "managed media effect requires a caller effect id and an admission"
+            )
+        if not self._router.manages(channel, chat_id):
+            raise EffectNotDeliveredError("target is not enabled for the managed effect path")
+        principal = SERVICE_PRINCIPALS.get(source)
+        if not principal:
+            raise EffectNotDeliveredError(
+                f"system source {source!r} has no registered service principal"
+            )
+        payload = MediaPayload(media=(str(media_path),))
+        return await self._router.submit_message(
+            OutboundMessage(
+                channel=channel,
+                chat_id=chat_id,
+                content="",
+                media=[str(media_path)],
+                metadata={"message_id": operation_ref, "service_source": source},
+            ),
+            principal=principal,
+            capability="send_media",
+            payload=payload,
+            effect_id=effect_id,
+            admission=admission,
+        )
+
     async def send(
         self,
         *,

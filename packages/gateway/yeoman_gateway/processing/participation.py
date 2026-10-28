@@ -34,9 +34,10 @@ from yeoman_shared.reactions import allowed_reaction
 from yeoman_shared.telemetry import tracing
 
 from yeoman_gateway.processing.model_route import RouteClient
+from yeoman_gateway.processing.participation_memes import MAX_PROMPT_CHARS, MemePlan
 
 OpportunityTrigger = Literal["inbound", "burst", "lull"]
-DecisionAction = Literal["silence", "react", "comment"]
+DecisionAction = Literal["silence", "react", "comment", "meme", "sticker"]
 DecisionIntent = Literal["direct", "continue", "initiate"]
 
 #: Bounded, validated field sizes (spec section 4).
@@ -78,7 +79,16 @@ _ACTION_ALIASES: dict[str, str] = {
     "answer": "comment",
     "reply": "comment",
     "antwort": "comment",
+    "meme": "meme",
+    "sticker": "sticker",
 }
+
+#: Actions that post one image and nothing else.
+IMAGE_ACTIONS: frozenset[str] = frozenset(("meme", "sticker"))
+_ALL_ACTIONS: tuple[str, ...] = ("silence", "react", "comment", "meme", "sticker")
+_MEME_SOURCES: frozenset[str] = frozenset(("template", "photo", "background"))
+MAX_MEME_CAPTIONS = 4
+MAX_MEME_CAPTION_CHARS = 80
 
 _INTENT_ALIASES: dict[str, str] = {
     "direct": "direct",
@@ -174,13 +184,70 @@ JUDGE_RESPONSE_FORMAT: dict[str, Any] = {
     },
 }
 
-def response_format_for(mode: str) -> dict[str, Any] | None:
+#: Added to the system prompt only when this chat may post a meme or sticker.
+JUDGE_MEME_RULES = (
+    "\n\nMemes and stickers (only when listed in the allowed actions):\n"
+    'action may also be "meme" or "sticker" here. When it is, also answer these fields '
+    "(null or [] otherwise):\n"
+    '  "meme_source": "template" | "photo" | "background",\n'
+    '  "meme_template": "<template id from the list or null>",\n'
+    '  "meme_photo_id": "<photo id from the list or null>",\n'
+    '  "meme_captions": ["<short caption>", ...],\n'
+    '  "meme_prompt": "<scene for a generated background, no text in it, or null>"\n'
+    "- A meme is something people in a group post because one picture says more than a "
+    "sentence. Silence stays the default. Choose meme only when a picture would clearly "
+    "be funnier than any words; never as a cheaper comment and never as a reaction.\n"
+    "- The picture goes out alone: no message, caption text or explanation is sent with "
+    "it, so the captions on the image must carry the joke by themselves.\n"
+    "- sticker is the same image as a WhatsApp sticker: lighter and more like a reaction "
+    "gesture. meme is a full image post for a bigger moment.\n"
+    "- Respect the budget lines: they are a soft target, and they go fast. When unsure, "
+    "keep it for a better moment.\n"
+    "- Captions are a few words each, in the chat's language. Fill the template's caption "
+    "slots in order; use \"\" to leave one empty.\n"
+    "- Never spread disinformation and never put invented quotes in the mouth of a real "
+    "person. Politics only as an obvious meme joke, never as a claim. Never mock "
+    "anyone's looks, weight, body or identity, and never humiliate anyone.\n"
+    "- meme_source=photo uses one of the listed chat photos; background asks for a "
+    "generated scene and is only possible when the list says so."
+)
+
+_MEME_SCHEMA_PROPERTIES: dict[str, Any] = {
+    "meme_source": {"type": ["string", "null"]},
+    "meme_template": {"type": ["string", "null"]},
+    "meme_photo_id": {"type": ["string", "null"]},
+    "meme_captions": {"type": "array", "items": {"type": "string"}},
+    "meme_prompt": {"type": ["string", "null"]},
+}
+
+
+def _meme_response_format() -> dict[str, Any]:
+    schema = JUDGE_RESPONSE_FORMAT["json_schema"]["schema"]
+    action = {"type": "string", "enum": list(_ALL_ACTIONS)}
+    return {
+        "type": "json_schema",
+        "json_schema": {
+            "name": "participation_judge_decision_memes",
+            "strict": True,
+            "schema": {
+                **schema,
+                "properties": {**schema["properties"], "action": action, **_MEME_SCHEMA_PROPERTIES},
+                "required": [*schema["required"], *_MEME_SCHEMA_PROPERTIES],
+            },
+        },
+    }
+
+
+JUDGE_MEME_RESPONSE_FORMAT: dict[str, Any] = _meme_response_format()
+
+
+def response_format_for(mode: str, *, memes: bool = False) -> dict[str, Any] | None:
     """Choose provider-side JSON formatting; trusted validation remains unchanged."""
     if mode == "json_object":
         return {"type": "json_object"}
     if mode == "prompt_only":
         return None
-    return JUDGE_RESPONSE_FORMAT
+    return JUDGE_MEME_RESPONSE_FORMAT if memes else JUDGE_RESPONSE_FORMAT
 
 
 JUDGE_USER_TEMPLATE = (
@@ -240,6 +307,8 @@ class ParticipationDecision:
     purpose: str = ""
     emoji: str | None = None
     closes_exchange: bool = False
+    #: Set only for ``meme``/``sticker``: what to render. The image goes out alone.
+    meme: MemePlan | None = None
 
     @property
     def speaks(self) -> bool:
@@ -449,13 +518,16 @@ class ParticipationJudge:
                 "context_too_large",
                 detail="context_budget_exceeded",
             )
+        memes = view.offers_images
         try:
             reply = await asyncio.wait_for(
                 self._client.chat_with_usage(
                     messages,
-                    max_tokens=self._max_output_tokens,
+                    # The five meme fields need room even when the verdict is silence.
+                    max_tokens=max(self._max_output_tokens, 384) if memes else self._max_output_tokens,
                     response_format=response_format_for(
-                        str(getattr(self._client, "structured_output", "json_schema_strict"))
+                        str(getattr(self._client, "structured_output", "json_schema_strict")),
+                        memes=memes,
                     ),
                 ),
                 timeout=self._timeout_seconds,
@@ -515,13 +587,10 @@ class ParticipationJudge:
         self, opportunity: ParticipationOpportunity, view: "_JudgeContext"
     ) -> list[dict[str, str]]:
         granted = set(view.allowed_actions)
-        allowed = [
-            action
-            for action in ("silence", "react", "comment")
-            if action in granted
-        ] or ["silence"]
+        allowed = [action for action in _ALL_ACTIONS if action in granted] or ["silence"]
+        system = JUDGE_SYSTEM_PROMPT + (JUDGE_MEME_RULES if view.offers_images else "")
         return [
-            {"role": "system", "content": JUDGE_SYSTEM_PROMPT},
+            {"role": "system", "content": system},
             {
                 "role": "user",
                 "content": JUDGE_USER_TEMPLATE.format(
@@ -639,7 +708,7 @@ class ParticipationJudge:
             _bounded_id(payload.get("anchor_message_id")) if action == "comment" else None
         )
         target = _bounded_id(payload.get("target_message_id"))
-        if target is None and action in {"react", "comment"}:
+        if target is None and action in {"react", "comment", *IMAGE_ACTIONS}:
             # Trusted default: only the newest current source is targetable. Older
             # optional history must never become a silent effect target.
             target = view.newest_current_source_id
@@ -653,7 +722,7 @@ class ParticipationJudge:
             and target not in view.current_source_ids
         ):
             raise ParticipationDecisionError("unknown_evidence", detail="target_not_current")
-        if action in {"react", "comment"} and target is None:
+        if action in {"react", "comment", *IMAGE_ACTIONS} and target is None:
             raise ParticipationDecisionError("missing_target", detail="target_not_supplied")
         if intent == "continue" and action == "comment":
             # Only *prose* acts on continuity: a comment that continues an exchange must
@@ -698,6 +767,7 @@ class ParticipationJudge:
             if emoji is None:
                 raise ParticipationDecisionError("unknown_emoji", detail="unknown_emoji")
         closes = bool(action == "comment" and payload.get("closes_exchange") is True)
+        meme = _parse_meme_plan(payload, view) if action in IMAGE_ACTIONS else None
         return ParticipationDecision(
             action=action,
             intent=intent,
@@ -710,7 +780,40 @@ class ParticipationJudge:
             purpose=purpose,
             emoji=emoji,
             closes_exchange=closes,
+            meme=meme,
         )
+
+
+def _parse_meme_plan(payload: Mapping[str, Any], view: "_JudgeContext") -> MemePlan:
+    """Validate the meme fields against the offer the judge was shown."""
+    source = str(payload.get("meme_source") or "").strip().lower()
+    if source not in _MEME_SOURCES:
+        raise ParticipationDecisionError("invalid_response", detail="meme_source_invalid")
+    raw_captions = payload.get("meme_captions")
+    if not isinstance(raw_captions, (list, tuple)):
+        raise ParticipationDecisionError("invalid_response", detail="meme_captions_invalid")
+    captions = tuple(
+        " ".join(str(item or "").split())[:MAX_MEME_CAPTION_CHARS]
+        for item in raw_captions[:MAX_MEME_CAPTIONS]
+    )
+    if not any(captions):
+        raise ParticipationDecisionError("invalid_response", detail="meme_captions_empty")
+    if source == "template":
+        template = str(payload.get("meme_template") or "").strip().lower()
+        if template not in view.meme_templates:
+            raise ParticipationDecisionError("invalid_response", detail="meme_template_unknown")
+        return MemePlan(source="template", captions=captions, template=template)
+    if source == "photo":
+        photo_id = _bounded_id(payload.get("meme_photo_id"))
+        if photo_id is None or photo_id not in view.meme_photo_ids:
+            raise ParticipationDecisionError("unknown_evidence", detail="meme_photo_not_offered")
+        return MemePlan(source="photo", captions=captions, photo_id=photo_id)
+    if not view.meme_backgrounds:
+        raise ParticipationDecisionError("invalid_response", detail="meme_background_unavailable")
+    prompt = _bounded_text(payload.get("meme_prompt"), MAX_PROMPT_CHARS)
+    if not prompt:
+        raise ParticipationDecisionError("invalid_response", detail="meme_prompt_missing")
+    return MemePlan(source="background", captions=captions, prompt=prompt)
 
 
 @dataclass(frozen=True, slots=True)
@@ -734,6 +837,14 @@ class _JudgeContext:
     rendered: str
     group_notes_text: str = ""
     group_notes_week: str = ""
+    meme_templates: frozenset[str] = frozenset()
+    meme_photo_ids: frozenset[str] = frozenset()
+    meme_backgrounds: bool = False
+    meme_text: str = ""
+
+    @property
+    def offers_images(self) -> bool:
+        return bool(IMAGE_ACTIONS & set(self.allowed_actions)) and bool(self.meme_templates)
 
     @classmethod
     def from_mapping(cls, context: Mapping[str, Any]) -> "_JudgeContext":
@@ -807,7 +918,7 @@ class _JudgeContext:
         allowed_actions = tuple(
             str(item).strip()
             for item in (context.get("allowed_actions") or ("silence",))
-            if str(item).strip() in {"silence", "react", "comment"}
+            if str(item).strip() in _ALL_ACTIONS
         ) or ("silence",)
         raw_intents = context.get("allowed_intents")
         allowed_intents = frozenset(
@@ -863,6 +974,7 @@ class _JudgeContext:
             rendered="\n".join(lines) if lines else "(no retained context)",
             group_notes_text=str(context.get("group_notes_text") or ""),
             group_notes_week=str(context.get("group_notes_week") or ""),
+            **_meme_view(context),
         )
 
     def render(self) -> str:
@@ -879,7 +991,48 @@ class _JudgeContext:
         notes = render_group_notes_block(self.group_notes_week, self.group_notes_text)
         if notes:
             blocks.append(notes)
+        if self.offers_images and self.meme_text:
+            blocks.append(self.meme_text)
         return "\n\n".join(blocks)
+
+
+def _meme_view(context: Mapping[str, Any]) -> dict[str, Any]:
+    """The trusted meme offer as the judge sees it; empty when none was made."""
+    raw_templates = context.get("meme_templates")
+    templates = frozenset(
+        str(item).strip().lower()
+        for item in (raw_templates if isinstance(raw_templates, (list, tuple)) else ())
+        if str(item).strip()
+    )
+    if not templates:
+        return {}
+    raw_photos = context.get("meme_photos")
+    photos = [
+        item for item in (raw_photos if isinstance(raw_photos, (list, tuple)) else ())
+        if isinstance(item, Mapping) and str(item.get("id") or "").strip()
+    ]
+    backgrounds = bool(context.get("meme_backgrounds"))
+    lines = ["[Meme options] (trusted, owner-configured)"]
+    budget = str(context.get("meme_budget_text") or "").strip()
+    if budget:
+        lines.append(budget)
+    lines.append("Templates (id: name (caption slots)):")
+    lines.append(str(context.get("meme_template_text") or ", ".join(sorted(templates))))
+    if photos:
+        lines.append("Chat photos usable as a meme base (id: what the photo shows):")
+        lines.extend(
+            f'id="{str(item["id"]).strip()}": {str(item.get("description") or "").strip()}'
+            for item in photos
+        )
+    else:
+        lines.append("Chat photos usable as a meme base: none")
+    lines.append(f"Generated background: {'available' if backgrounds else 'not available'}")
+    return {
+        "meme_templates": templates,
+        "meme_photo_ids": frozenset(str(item["id"]).strip() for item in photos),
+        "meme_backgrounds": backgrounds,
+        "meme_text": "\n".join(lines),
+    }
 
 
 def _drop_group_notes(context: dict[str, Any]) -> None:

@@ -1014,6 +1014,7 @@ def _build_participation_runtime(
     from yeoman_gateway.consciousness.participation_runtime import (
         ParticipationRuntime as OpportunityOfferRuntime,
     )
+    from yeoman_gateway.policy.engine import MEME_WINDOW_MS, STICKER_WINDOW_MS
     from yeoman_gateway.processing.model_route import RouteClient, RouteUnavailableError
     from yeoman_gateway.processing.participation import ParticipationJudge
     from yeoman_gateway.processing.participation_context import ParticipationContextBuilder
@@ -1117,6 +1118,8 @@ def _build_participation_runtime(
         reaction_limit = int(resolved.participation.max_reactions_per_window)
         comment_limit = int(resolved.participation.max_unsolicited_comments_per_window)
         window_ms = int(resolved.participation.comment_window_minutes) * 60_000
+        meme_limit = int(getattr(resolved.participation, "max_memes_per_week", 0) or 0)
+        sticker_limit = int(getattr(resolved.participation, "max_stickers_per_day", 0) or 0)
         try:
             effective = policy_engine.resolve_policy(channel, chat_id)  # type: ignore[union-attr]
         except Exception as exc:
@@ -1224,6 +1227,14 @@ def _build_participation_runtime(
             "comment_limits": (("comment", comment_limit, window_ms),)
             if comment_limit > 0
             else (),
+            "allow_memes": bool(getattr(resolved.participation, "auto_memes", False)),
+            "min_messages_between_memes": int(
+                getattr(resolved.participation, "min_messages_between_memes", 0) or 0
+            ),
+            "meme_limits": (("meme", meme_limit, MEME_WINDOW_MS),) if meme_limit > 0 else (),
+            "sticker_limits": (("sticker", sticker_limit, STICKER_WINDOW_MS),)
+            if sticker_limit > 0
+            else (),
         }
 
     def _is_paused(channel: str, chat_id: str) -> str | None:
@@ -1326,6 +1337,10 @@ def _build_participation_runtime(
         and bool(getattr(responder, "participation_reaction_available", False))
         else None
     )
+    memes = getattr(responder, "participation_memes", None)
+    media_sender = (
+        _ParticipationMediaSender(responder=responder) if memes is not None else None
+    )
     decision_runtime = ParticipationDecisionRuntime(
         judge=judge,
         context_builder=context_builder,
@@ -1348,6 +1363,8 @@ def _build_participation_runtime(
         history_knowledge=knowledge,
         group_notes_shadow=group_notes_shadow,
         revalidate_knowledge=revalidate_knowledge,
+        memes=memes,
+        media_sender=media_sender,
     )
 
     async def _handle(opportunity: object) -> None:
@@ -1513,6 +1530,33 @@ class _ParticipationReactor:
         return await reactor(
             target_message_id=target_message_id,
             emoji=emoji,
+            channel=channel,
+            chat_id=chat_id,
+            effect_id=effect_id,
+            admission=admission,
+        )
+
+
+class _ParticipationMediaSender:
+    """Adapter from a rendered autonomous meme or sticker to the managed media path."""
+
+    def __init__(self, *, responder: object | None) -> None:
+        self._responder = responder
+
+    async def __call__(
+        self,
+        *,
+        media_path: str,
+        channel: str,
+        chat_id: str,
+        effect_id: str,
+        admission: object,
+    ) -> object | None:
+        sender = getattr(self._responder, "send_participation_media", None)
+        if sender is None:
+            return None
+        return await sender(
+            media_path=media_path,
             channel=channel,
             chat_id=chat_id,
             effect_id=effect_id,
@@ -2332,6 +2376,11 @@ def build_effect_router(
                     action == "react"
                     and reply_action in {"answer", "react"}
                     and participation.allow_reactions
+                )
+                or (
+                    action in {"meme", "sticker"}
+                    and reply_action == "answer"
+                    and bool(getattr(participation, "auto_memes", False))
                 )
                 or (
                     action == "comment"
