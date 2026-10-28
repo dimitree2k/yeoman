@@ -140,6 +140,7 @@ class Orchestrator:
             ImplicitBotAddressMiddleware(
                 session_manager=session_manager,
                 short_reply_reactor=short_reply_reactor,  # type: ignore[arg-type]
+                policy=policy,
             ),
             ReplyBudgetMiddleware(),
         ])

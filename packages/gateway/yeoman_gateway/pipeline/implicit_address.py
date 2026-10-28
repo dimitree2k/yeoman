@@ -23,6 +23,8 @@ from yeoman_gateway.short_reply.reactor import ReactorRequest
 from yeoman_gateway.short_reply.signals import compute_signals
 
 if TYPE_CHECKING:
+    from yeoman_gateway.core.models import PolicyDecision
+    from yeoman_gateway.core.ports import PolicyPort
     from yeoman_gateway.short_reply.reactor import ShortReplyReactor
 
 
@@ -55,8 +57,11 @@ class ImplicitBotAddressMiddleware:
         bait_reaction_window_seconds: float = 120.0,
         bait_reaction_cooldown_seconds: float = 600.0,
         short_reply_reactor: ShortReplyReactor | None = None,
+        policy: PolicyPort | None = None,
     ) -> None:
         self._session_manager = session_manager
+        # Re-evaluates a promoted message, so it gets the tools of a real address.
+        self._policy = policy
         self._bot_name_aliases = tuple(
             str(alias).strip() for alias in bot_name_aliases if str(alias).strip()
         )
@@ -304,9 +309,31 @@ class ImplicitBotAddressMiddleware:
         raw["conversation_state"] = state
         ctx.event = replace(ctx.event, raw_metadata=raw)
         if ctx.decision is not None and not ctx.decision.should_respond:
-            ctx.decision = replace(
-                ctx.decision, should_respond=True, reason="when_to_reply:short_reply_answer"
-            )
+            ctx.decision = self._addressed_decision(ctx, "when_to_reply:short_reply_answer")
+
+    def _addressed_decision(self, ctx: PipelineContext, reason: str) -> PolicyDecision:
+        """The decision for a message promoted to an answer, with its tools.
+
+        The policy stage evaluated the message as unaddressed, and an unaddressed message
+        in a mention-only group gets no tools at all. Promoting only ``should_respond``
+        made every name-addressed answer tool-less, so the promoted event (now carrying
+        its mention or reply flag) is evaluated again: tool lists and per-sender tool
+        access apply exactly as for an @-mention.
+        """
+        decision = ctx.decision
+        assert decision is not None
+        fresh = None
+        if self._policy is not None:
+            try:
+                fresh = self._policy.evaluate(ctx.event)
+            except Exception as exc:  # noqa: BLE001 - keep the answer, just without tools
+                logger.warning(
+                    "implicit_address_reevaluation_failed chat={} error_type={}",
+                    ctx.event.chat_id,
+                    type(exc).__name__,
+                )
+        base = fresh if fresh is not None and fresh.accept_message else decision
+        return replace(base, should_respond=True, reason=reason)
 
     def _apply_conversation_state(
         self,
@@ -334,11 +361,7 @@ class ImplicitBotAddressMiddleware:
             raw_metadata=raw,
         )
         if ctx.decision is not None:
-            ctx.decision = replace(
-                ctx.decision,
-                should_respond=True,
-                reason=f"when_to_reply:implicit_{reason}",
-            )
+            ctx.decision = self._addressed_decision(ctx, f"when_to_reply:implicit_{reason}")
         ctx.metric("implicit_bot_address_reply", labels=(("channel", ctx.event.channel),))
 
     def _react_or_silence_bait(self, ctx: PipelineContext, *, emoji: str, reason: str) -> None:
