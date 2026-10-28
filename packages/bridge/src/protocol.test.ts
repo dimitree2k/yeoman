@@ -6,6 +6,7 @@ import {
   createOkResponse,
   deriveProviderEventIdentity,
   parseBridgeCommand,
+  parseSendMediaPayload,
   PROTOCOL_VERSION,
 } from './protocol.js';
 
@@ -305,6 +306,15 @@ test('parseBridgeCommand accepts send_media with mediaPath', () => {
   if (parsed.ok) {
     assert.equal(parsed.command.type, 'send_media');
   }
+});
+
+test('parseSendMediaPayload keeps asSticker only when it is literally true', () => {
+  const flag = (asSticker: unknown) =>
+    parseSendMediaPayload({ to: '12345@g.us', mediaPath: '/tmp/meme.webp', asSticker }).asSticker;
+
+  assert.equal(flag(true), true);
+  assert.equal(flag(undefined), undefined);
+  assert.equal(flag('true'), undefined);
 });
 
 test('parseBridgeCommand rejects send_text with malformed mentions', () => {

@@ -109,6 +109,7 @@ export interface SendMediaInput {
   mentions?: string[];
   historyMentionsResolved?: boolean;
   clientMessageId?: string;
+  asSticker?: boolean;
 }
 
 export async function resolveWhatsAppWebVersion(
@@ -2433,7 +2434,12 @@ export class WhatsAppClient {
       }
     }
 
-    if (kind === 'image') {
+    if (input.asSticker && media.mimeType === 'image/webp') {
+      // Stickers carry no caption or mentions; WhatsApp shows them without text.
+      const payload = { sticker: media.buffer, mimetype: media.mimeType };
+      sent = await this.sock.sendMessage(input.to, payload, sendOptions);
+      this.rememberOutboundSelfMessage(input.to, sent);
+    } else if (kind === 'image') {
       const payload = { image: media.buffer, caption, mimetype: media.mimeType, mentions };
       sent = await this.sock.sendMessage(input.to, payload, sendOptions);
       this.rememberOutboundSelfMessage(input.to, sent);

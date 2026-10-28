@@ -16,7 +16,9 @@ from PIL import Image
 
 from yeoman_gateway.media.memes.background import BackgroundError, BackgroundGenerator
 from yeoman_gateway.media.memes.render import MAX_OUTPUT_SIDE, TOP_BOTTOM, render_meme
+from yeoman_gateway.media.memes.sticker import to_sticker
 from yeoman_gateway.media.memes.templates import MemeTemplate, load_templates
+from yeoman_gateway.media.storage import STICKER_DIR_NAME
 
 if TYPE_CHECKING:
     from yeoman_gateway.media.router import ModelRouter
@@ -85,7 +87,10 @@ class MemeService:
         background_cap: DailyCap | None = None,
         templates: dict[str, MemeTemplate] | None = None,
     ) -> None:
-        self._out_dir = Path(outgoing_dir).expanduser() / "memes"
+        outgoing = Path(outgoing_dir).expanduser()
+        self._out_dir = outgoing / "memes"
+        # The WhatsApp channel sends a .webp from this folder as a sticker.
+        self._sticker_dir = outgoing / STICKER_DIR_NAME
         self._router = router
         self._background = background
         self._cap = background_cap
@@ -106,15 +111,17 @@ class MemeService:
             raise MemeError("at least one caption is required")
         return cleaned[:MAX_CAPTIONS]
 
-    async def from_template(self, template_id: str, captions: list[str]) -> Path:
+    async def from_template(
+        self, template_id: str, captions: list[str], *, sticker: bool = False
+    ) -> Path:
         template = self.templates.get(str(template_id or "").strip().lower())
         if template is None:
             raise MemeError(f"unknown template '{template_id}'; pick one from the list")
         lines = self.clean_captions(captions)
         with Image.open(template.image_path) as base:
-            return await self._save(base, lines, template.boxes)
+            return await self._save(base, lines, template.boxes, sticker=sticker)
 
-    async def from_photo(self, path: Path, captions: list[str]) -> Path:
+    async def from_photo(self, path: Path, captions: list[str], *, sticker: bool = False) -> Path:
         lines = self.clean_captions(captions)
         try:
             with Image.open(path) as base:
@@ -123,11 +130,13 @@ class MemeService:
                 # JPEG decodes straight at a reduced scale; the final resize stays exact.
                 base.draft("RGB", (MAX_OUTPUT_SIDE, MAX_OUTPUT_SIDE))
                 base.load()
-                return await self._save(base, lines, TOP_BOTTOM)
+                return await self._save(base, lines, TOP_BOTTOM, sticker=sticker)
         except (OSError, ValueError, Image.DecompressionBombError) as exc:
             raise MemeError("that photo could not be opened") from exc
 
-    async def from_background(self, prompt: str, captions: list[str], channel: str) -> Path:
+    async def from_background(
+        self, prompt: str, captions: list[str], channel: str, *, sticker: bool = False
+    ) -> Path:
         lines = self.clean_captions(captions)
         if not self.backgrounds_available:
             raise MemeError("generated backgrounds are not configured")
@@ -144,15 +153,23 @@ class MemeService:
             await self._cap.refund()
             self._router.mark_error(profile.profile_name, error_type="image")
             raise MemeError(f"background generation failed: {exc}") from exc
-        return await self._save(base, lines, TOP_BOTTOM)
+        return await self._save(base, lines, TOP_BOTTOM, sticker=sticker)
 
-    async def _save(self, base: Image.Image, lines: list[str], boxes: tuple) -> Path:
+    async def _save(
+        self, base: Image.Image, lines: list[str], boxes: tuple, *, sticker: bool = False
+    ) -> Path:
         def work() -> Path:
             image = render_meme(base, lines, boxes)
-            self._out_dir.mkdir(parents=True, exist_ok=True)
-            self._prune()
-            path = self._out_dir / f"meme-{uuid.uuid4().hex}.jpg"
-            image.save(path, "JPEG", quality=88, optimize=True)
+            folder = self._sticker_dir if sticker else self._out_dir
+            folder.mkdir(parents=True, exist_ok=True)
+            self._prune(folder)
+            name = f"meme-{uuid.uuid4().hex}"
+            if sticker:
+                path = folder / f"{name}.webp"
+                path.write_bytes(to_sticker(image))
+            else:
+                path = folder / f"{name}.jpg"
+                image.save(path, "JPEG", quality=88, optimize=True)
             return path
 
         # Rendering takes tens to hundreds of milliseconds on a Pi; keep it off the event loop.
@@ -160,10 +177,11 @@ class MemeService:
         logger.info("meme rendered path={} captions={}", path.name, len(lines))
         return path
 
-    def _prune(self) -> None:
+    @staticmethod
+    def _prune(folder: Path) -> None:
         """Drop rendered memes older than a week; the outbox has long delivered them."""
         cutoff = time.time() - _KEEP_RENDERED_SECONDS
-        for old in self._out_dir.glob("meme-*.jpg"):
+        for old in folder.glob("meme-*.*"):
             try:
                 if old.stat().st_mtime < cutoff:
                     old.unlink()

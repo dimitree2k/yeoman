@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import base64
 import json
+import random
 import time
 from datetime import date
 from io import BytesIO
@@ -18,6 +19,7 @@ from yeoman_gateway.media.document_cache import DocumentCache
 from yeoman_gateway.media.memes.background import BackgroundError, BackgroundGenerator
 from yeoman_gateway.media.memes.render import TextBox, render_meme
 from yeoman_gateway.media.memes.service import DailyCap, MemeError, MemeService
+from yeoman_gateway.media.memes.sticker import MAX_STICKER_BYTES, to_sticker
 from yeoman_gateway.media.memes.templates import load_templates
 from yeoman_gateway.media.router import ModelRouter, ResolvedProfile
 from yeoman_gateway.policy.engine import ActorContext, PolicyEngine
@@ -240,7 +242,7 @@ async def test_template_meme_is_sent_as_photo_to_current_chat(tool_setup) -> Non
         result = await tool.execute(mode="template", template="drake", captions=["a", "b"])
     finally:
         CURRENT_TOOL_CONTEXT.reset(token)
-    assert result.startswith("Meme delivered")
+    assert result.startswith("Meme photo delivered")
     (message,) = sent.messages
     assert message.chat_id == GROUP and message.content == ""
     path = Path(message.media[0])
@@ -256,7 +258,7 @@ async def test_photo_meme_uses_replied_photo_and_replies_to_it(tool_setup) -> No
         result = await tool.execute(mode="photo", captions=["top", "bottom"])
     finally:
         CURRENT_TOOL_CONTEXT.reset(token)
-    assert result.startswith("Meme delivered")
+    assert result.startswith("Meme photo delivered")
     assert sent.messages[0].reply_to == "photo-1"
 
 
@@ -294,7 +296,7 @@ async def test_without_reply_only_a_very_recent_photo_is_used(tool_setup) -> Non
     try:
         assert "reply to the photo" in await tool.execute(mode="photo", captions=["t"])
         _photo(tmp_path, cache, GROUP, "fresh", age=30)
-        assert (await tool.execute(mode="photo", captions=["t"])).startswith("Meme delivered")
+        assert (await tool.execute(mode="photo", captions=["t"])).startswith("Meme photo delivered")
     finally:
         CURRENT_TOOL_CONTEXT.reset(token)
     assert sent.messages[0].reply_to == "fresh"
@@ -365,3 +367,84 @@ def test_memes_are_off_unless_the_chat_opts_in(tmp_path: Path) -> None:
     # Neither the default allowedTools "all" nor ownerTools switches memes on.
     assert "make_meme" not in disabled.allowed_tools
     assert "message" in disabled.allowed_tools
+
+
+# --- stickers ----------------------------------------------------------------------
+
+
+def test_sticker_is_512_square_transparent_small_webp_with_pack_metadata() -> None:
+    # Noise is the worst case for WebP size; a wide image needs transparent padding.
+    rng = random.Random(7)
+    noisy = Image.frombytes(
+        "RGB", (900, 400), bytes(rng.randrange(256) for _ in range(900 * 400 * 3))
+    )
+    data = to_sticker(render_meme(noisy, ["ЙОУ", "Grüße"]))
+
+    assert len(data) <= MAX_STICKER_BYTES
+    with Image.open(BytesIO(data)) as sticker:
+        assert sticker.format == "WEBP"
+        assert sticker.size == (512, 512)
+        assert sticker.mode == "RGBA"
+        assert sticker.getpixel((256, 0))[3] == 0, "padding must be transparent"
+        assert sticker.getpixel((256, 256))[3] == 255
+        exif = sticker.info.get("exif", b"")
+    assert b"sticker-pack-name" in exif and "Arvid".encode() in exif
+
+
+@pytest.mark.asyncio
+async def test_sticker_output_lands_in_the_sticker_folder(tool_setup) -> None:
+    tool, _cache, sent, tmp_path = tool_setup
+    token = _in_chat()
+    try:
+        result = await tool.execute(
+            mode="template", template="drake", captions=["a", "b"], output="sticker"
+        )
+        bad = await tool.execute(mode="template", template="drake", captions=["a"], output="gif")
+    finally:
+        CURRENT_TOOL_CONTEXT.reset(token)
+    assert result.startswith("Meme sticker delivered")
+    assert "unknown meme output" in bad
+    path = Path(sent.messages[0].media[0])
+    assert path.parent == tmp_path / "outgoing" / "stickers" and path.suffix == ".webp"
+    assert len(sent.messages) == 1
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    ("folder", "name", "as_sticker"),
+    [("stickers", "meme.webp", True), ("memes", "meme.webp", False), ("stickers", "x.jpg", False)],
+)
+async def test_whatsapp_channel_flags_only_sticker_folder_webp(
+    tmp_path: Path, folder: str, name: str, as_sticker: bool
+) -> None:
+    from yeoman_gateway.bus.queue import MessageBus
+    from yeoman_gateway.channels.whatsapp import WhatsAppChannel
+    from yeoman_shared.config.schema import WhatsAppConfig
+
+    path = tmp_path / folder / name
+    path.parent.mkdir()
+    path.write_bytes(b"img")
+    channel = WhatsAppChannel(WhatsAppConfig(media={"outgoing_dir": str(tmp_path)}), MessageBus())
+    channel._connected = True
+    calls: list[tuple[str, dict[str, object]]] = []
+
+    async def send(command: str, payload: dict[str, object], **kwargs: object) -> dict[str, str]:
+        calls.append((command, payload))
+        return {"messageId": "provider-1"}
+
+    channel._send_command_with_retry = send  # type: ignore[method-assign]
+    await channel.send(
+        OutboundMessage(
+            channel="whatsapp",
+            chat_id=GROUP,
+            content="caption text",
+            media=[str(path)],
+            metadata={"historyMentionsResolved": True},
+        )
+    )
+
+    ((command, payload),) = calls
+    assert command == "send_media"
+    assert payload.get("asSticker", False) is as_sticker
+    # Stickers cannot show a caption, so it is not spent on them.
+    assert (payload["caption"] is None) is as_sticker

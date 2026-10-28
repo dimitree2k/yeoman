@@ -1490,6 +1490,53 @@ test('sendMedia sends WAV and MP3 inputs through the voice PTT branch', async ()
 });
 
 
+test('sendMedia sends asSticker WebP as a sticker and keeps other WebP as photos', async () => {
+  const root = await mkdtemp(join(tmpdir(), 'yeoman-sticker-'));
+  const sent: Array<{ jid: string; payload: any }> = [];
+  const client = new WhatsAppClient({
+    authDir: join(root, 'auth'),
+    mediaOutgoingDir: root,
+    onMessage: () => {},
+    onQR: () => {},
+    onStatus: () => {},
+    onError: () => {},
+  });
+  (client as any).sock = {
+    sendMessage: async (jid: string, payload: unknown) => {
+      sent.push({ jid, payload });
+      return { key: { id: 'sticker-ack' } };
+    },
+  };
+  (client as any).connected = true;
+
+  try {
+    const webp = join(root, 'meme.webp');
+    const jpeg = join(root, 'meme.jpg');
+    await writeFile(webp, Buffer.from('webp'));
+    await writeFile(jpeg, Buffer.from('jpeg'));
+    await client.sendMedia({ to: '12345@g.us', mediaPath: webp, asSticker: true, caption: 'dropped' });
+    await client.sendMedia({ to: '12345@g.us', mediaPath: webp });
+    // A sticker request for a non-WebP file falls back to the normal photo path.
+    await client.sendMedia({ to: '12345@g.us', mediaPath: jpeg, asSticker: true });
+  } finally {
+    await rm(root, { recursive: true, force: true });
+  }
+
+  assert.deepEqual(
+    sent.map(({ payload }) => ({
+      sticker: Buffer.isBuffer(payload.sticker),
+      image: Buffer.isBuffer(payload.image),
+      caption: payload.caption,
+      mimetype: payload.mimetype,
+    })),
+    [
+      { sticker: true, image: false, caption: undefined, mimetype: 'image/webp' },
+      { sticker: false, image: true, caption: undefined, mimetype: 'image/webp' },
+      { sticker: false, image: true, caption: undefined, mimetype: 'image/jpeg' },
+    ],
+  );
+});
+
 test('getMessage reuses cached and persisted originals only within the requested key scope', async () => {
   const root = await mkdtemp(join(tmpdir(), 'yeoman-edit-get-message-'));
   try {

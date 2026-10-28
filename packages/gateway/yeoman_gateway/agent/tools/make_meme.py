@@ -49,7 +49,9 @@ class MakeMemeTool(Tool):
         if self._service.backgrounds_available:
             modes += " or 'background' (a freshly generated picture, limited per day)"
         return (
-            f"Make a meme and send it as a photo to the current chat. Modes: {modes}. "
+            f"Make a meme and send it to the current chat. Modes: {modes}. Output: "
+            "'sticker' for a short reaction (one or two words per caption, answering what "
+            "was just said), otherwise 'photo'. "
             "Write the captions yourself unless the user dictated them. For 'photo', reply "
             "context selects the photo; photos are only taken from this chat and are kept "
             "about 30 days. Templates as id(number of caption boxes): "
@@ -64,6 +66,11 @@ class MakeMemeTool(Tool):
             modes.append("background")
         properties: dict[str, Any] = {
             "mode": {"type": "string", "enum": modes},
+            "output": {
+                "type": "string",
+                "enum": ["photo", "sticker"],
+                "description": "photo (default) or sticker for short reaction memes.",
+            },
             "captions": {
                 "type": "array",
                 "items": {"type": "string"},
@@ -106,11 +113,15 @@ class MakeMemeTool(Tool):
         captions = kwargs.get("captions")
         if isinstance(captions, str):
             captions = [captions]
+        output = str(kwargs.get("output") or "photo").strip()
+        if output not in {"photo", "sticker"}:
+            return f"Error: unknown meme output '{output}'."
+        sticker = output == "sticker"
         reply_to: str | None = None
         try:
             if mode == "template":
                 path = await self._service.from_template(
-                    str(kwargs.get("template") or ""), captions
+                    str(kwargs.get("template") or ""), captions, sticker=sticker
                 )
             elif mode == "photo":
                 item = self._find_photo(
@@ -120,10 +131,15 @@ class MakeMemeTool(Tool):
                 if isinstance(item, str):
                     return item
                 reply_to = item.message_id
-                path = await self._service.from_photo(Path(item.local_path), captions)
+                path = await self._service.from_photo(
+                    Path(item.local_path), captions, sticker=sticker
+                )
             elif mode == "background" and self._service.backgrounds_available:
                 path = await self._service.from_background(
-                    str(kwargs.get("background_prompt") or ""), captions, context.channel
+                    str(kwargs.get("background_prompt") or ""),
+                    captions,
+                    context.channel,
+                    sticker=sticker,
                 )
             else:
                 return f"Error: unknown meme mode '{mode}'."
@@ -145,7 +161,7 @@ class MakeMemeTool(Tool):
         except Exception as exc:
             return f"Error: meme not delivered ({exc})"
         return (
-            f"Meme delivered to {context.channel}:{context.chat_id}. "
+            f"Meme {output} delivered to {context.channel}:{context.chat_id}. "
             "Do not describe it; at most add a very short comment."
         )
 

@@ -98,6 +98,8 @@ export interface SendMediaPayload {
   mentions?: string[];
   historyMentionsResolved?: boolean;
   clientMessageId?: string;
+  /** Send a WebP image as a WhatsApp sticker instead of a photo. Optional; older gateways omit it. */
+  asSticker?: boolean;
 }
 
 export interface ForwardMessagePayload {
@@ -501,6 +503,7 @@ function parseSendMedia(payload: Record<string, unknown>): SendMediaPayload | nu
     mentions,
     historyMentionsResolved: payload.historyMentionsResolved as boolean | undefined,
     clientMessageId,
+    ...(payload.asSticker === true ? { asSticker: true } : {}),
   };
 }
 
