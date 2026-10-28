@@ -1,6 +1,6 @@
 #!/usr/bin/env bash
-# Daily headless log review: reads the Overseer digest, lets Claude Code fix up to
-# three issues as PRs, deploys if it merged something, and sends a Telegram summary.
+# Daily headless log review (started by the Overseer ops-log-review runbook): reads the Overseer digest,
+# lets Claude Code fix up to three issues as PRs, deploys if it merged something, and sends a Telegram summary.
 set -euo pipefail
 
 REPO="${YEOMAN_REPO:-$HOME/Documents/yeoman}"

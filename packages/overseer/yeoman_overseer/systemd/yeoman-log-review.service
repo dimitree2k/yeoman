@@ -1,9 +1,0 @@
-[Unit]
-Description=Yeoman daily log review — headless Claude Code fixes issues from the Overseer log digest
-After=network-online.target
-
-[Service]
-Type=oneshot
-ExecStart=%h/Documents/yeoman/ops/log-review/run.sh
-TimeoutStartSec=2h
-Nice=10
