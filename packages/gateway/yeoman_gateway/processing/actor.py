@@ -456,6 +456,8 @@ class ThreadActorRegistry:
         self._interval_seconds = float(getattr(threads, "lifecycle_tick_seconds", 60))
         self._task: asyncio.Task[None] | None = None
         self._reactivations_seen = 0
+        #: Optional async work after each tick (e.g. preparing dormant topic vectors).
+        self.after_tick: Callable[[], Awaitable[Any]] | None = None
 
     def actor_for(self, thread_id: str) -> ThreadActor:
         actor = self._actors.get(thread_id)
@@ -503,6 +505,12 @@ class ThreadActorRegistry:
                 self.tick(self._clock())
             except Exception as exc:  # one failed pass must not stop maintenance
                 logger.warning("thread_lifecycle_tick_failed error_type={}", type(exc).__name__)
+            if self.after_tick is not None:
+                try:
+                    await self.after_tick()
+                except Exception as exc:  # optional preparation; maintenance goes on
+                    logger.warning("thread_lifecycle_after_tick_failed error_type={}",
+                                   type(exc).__name__)
             await asyncio.sleep(self._interval_seconds)
 
     def tick(self, now_ms: int) -> tuple[str, ...]:

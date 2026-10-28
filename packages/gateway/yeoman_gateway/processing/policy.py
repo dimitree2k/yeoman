@@ -305,6 +305,11 @@ class IngestGate:
             anchor = None
         return self.admit(request, continuation=anchor)
 
+    @property
+    def topic_reopen(self) -> Any:
+        """The active semantic reopener, or ``None`` when the feature is off."""
+        return self._topic_reopen
+
     async def _with_topic_reopen(self, request: IngestRequest) -> IngestRequest:
         """Attach a dormant thread hint to a request that would otherwise open a thread.
 
@@ -361,9 +366,10 @@ class IngestGate:
         )
         logger.info(
             "thread_semantic_reopen mode={} chat={} event_id={} chosen={} reason={} best={:.3f} "
-            "shortlisted={} candidates={}",
+            "shortlisted={} candidates={} embed_ms={} verify_ms={} total_ms={}",
             self._topic_reopen_mode, event.chat_id, request.event_id, verdict.thread_id or "-",
             verdict.reason, verdict.best_score, verdict.shortlisted, verdict.candidates,
+            verdict.embed_ms, verdict.verify_ms, verdict.total_ms,
         )
         return verdict
 

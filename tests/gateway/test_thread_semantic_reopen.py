@@ -132,3 +132,34 @@ def test_only_dormant_open_threads_of_the_chat_are_candidates(tmp_path: Path):
     assert [row[0] for row in store.reopen_candidates(channel="whatsapp", chat_id=CHAT)] == [dormant]
     assert active
     store.close()
+
+
+@pytest.mark.asyncio
+async def test_warm_up_leaves_only_the_message_to_embed_and_timings_are_reported():
+    embedder = _Embedder()
+    reopener = TopicReopener(candidates=lambda channel, chat_id: POOL, embed=embedder,
+                             verifier=_Verifier(), chats=lambda: [("whatsapp", CHAT)])
+
+    assert await reopener.warm() == 2
+    assert await reopener.warm() == 0
+    verdict = await reopener.resolve(channel="whatsapp", chat_id=CHAT, text="car again")
+
+    assert embedder.batches[-1] == ["car again"]
+    assert verdict.thread_id == "th-car"
+    assert verdict.total_ms >= verdict.embed_ms + verdict.verify_ms >= 0
+
+
+@pytest.mark.asyncio
+async def test_a_slow_check_times_out_and_abstains():
+    import asyncio
+
+    class _Slow:
+        async def __call__(self, texts):
+            await asyncio.sleep(1)
+            return [[1.0, 0.0, 0.0] for _ in texts]
+
+    verdict = await _reopener(POOL, _Verifier(), _Slow(), timeout_seconds=0.05).resolve(
+        channel="whatsapp", chat_id=CHAT, text="car again")
+
+    assert (verdict.thread_id, verdict.reason) == (None, "timeout")
+    assert verdict.total_ms < 1000
