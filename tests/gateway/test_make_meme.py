@@ -448,3 +448,30 @@ async def test_whatsapp_channel_flags_only_sticker_folder_webp(
     assert payload.get("asSticker", False) is as_sticker
     # Stickers cannot show a caption, so it is not spent on them.
     assert (payload["caption"] is None) is as_sticker
+
+
+def test_every_template_names_its_joke_box_by_box() -> None:
+    templates = load_templates()
+    assert templates and all(template.joke for template in templates.values())
+    catalog = MemeService(outgoing_dir=Path("/nonexistent")).template_catalog()
+    assert "drake(2): 1 what gets rejected, 2 what gets preferred instead" in catalog
+
+
+def test_template_argument_lists_every_template_and_the_craft(tool_setup) -> None:
+    tool, *_ = tool_setup
+    assert tool.parameters["properties"]["template"]["enum"] == list(load_templates())
+    assert "first find the joke" in tool.description
+    assert "send no text with it" in tool.description
+
+
+@pytest.mark.asyncio
+async def test_template_mode_without_template_names_the_choices(tool_setup) -> None:
+    tool, _cache, sent, _tmp = tool_setup
+    token = _in_chat()
+    try:
+        result = await tool.execute(mode="template", captions=["a", "b"])
+    finally:
+        CURRENT_TOOL_CONTEXT.reset(token)
+    assert result.startswith("Error: mode 'template' needs the `template` argument")
+    assert "drake" in result and "stonks" in result
+    assert not sent.messages

@@ -80,7 +80,11 @@ class ParticipationMemes:
         self, *, channel: str, chat_id: str, messages: Sequence[Mapping[str, Any]]
     ) -> MemeOffer:
         templates = tuple(
-            (template.id, template.name, len(template.boxes))
+            (
+                template.id,
+                f"{template.name}, {template.joke}" if template.joke else template.name,
+                len(template.boxes),
+            )
             for template in self._service.templates.values()
         )
         return MemeOffer(

@@ -2274,6 +2274,15 @@ class LLMResponder(ResponderPort):
                                 f"{target_label}. Do not send it again for this request."
                             )
                             return None
+                        if tool_call.name == "make_meme" and str(result or "").startswith(
+                            "Meme "
+                        ):
+                            # The meme is the answer: no caption or comment text after it.
+                            self._record_hidden_assistant_marker(
+                                "Meme delivered to this chat. Do not send it again for this "
+                                "request."
+                            )
+                            return None
                     if market_contract_active and len(market_evidence) != market_contract_prompt_evidence_count:
                         messages.append(
                             {

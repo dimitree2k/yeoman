@@ -15,9 +15,18 @@ from yeoman_gateway.media.memes.service import MemeError, MemeService
 #: A photo posted this recently may be memed without replying to it.
 _RECENT_PHOTO_SECONDS = 10 * 60
 
+_CRAFT = (
+    "How to make it funny: first find the joke, then pick the template whose structure "
+    "tells it. Build it from specifics of this chat: the actual names, things, numbers "
+    "and exact phrases people used, a running gag. Exaggerate, contrast or twist; the "
+    "punchline goes last. Captions short and punchy (at most about six words each), in "
+    "the chat's language. No generic statements, no explaining the joke, no puns just "
+    "for the pun. Think of three ideas and make only the strongest, one meme per request. "
+    "Use a generated background only when no template fits the joke."
+)
+
 _GUIDANCE = (
-    "Rules: keep it funny or absurd and short (a few words per caption, in the chat's "
-    "language). Never spread disinformation and never put invented quotes in the mouth of "
+    "Rules: never spread disinformation and never put invented quotes in the mouth of "
     "a real person. Politics only as an obvious joke, never as a claim. Never mock anyone's "
     "looks, weight, body or identity, and never humiliate anyone. If a request breaks "
     "these rules, decline briefly instead of calling this tool."
@@ -53,9 +62,10 @@ class MakeMemeTool(Tool):
             "was just said), otherwise 'photo'. "
             "Write the captions yourself unless the user dictated them. For 'photo', reply "
             "context selects the photo; photos are only taken from this chat and are kept "
-            "about 30 days. Templates as id(number of caption boxes): "
-            f"{self._service.template_catalog()}. Give exactly one caption per box, in order "
-            f"(empty string to skip a box). {_GUIDANCE}"
+            "about 30 days. The meme is sent on its own; send no text with it. "
+            "Templates as id(number of caption boxes): the joke, box by box:\n"
+            f"{self._service.template_catalog()}\nGive exactly one caption per box, in order "
+            f"(empty string to skip a box). {_CRAFT} {_GUIDANCE}"
         )
 
     @property
@@ -79,7 +89,8 @@ class MakeMemeTool(Tool):
             },
             "template": {
                 "type": "string",
-                "description": "Template id for mode 'template', e.g. drake.",
+                "enum": list(self._service.templates),
+                "description": "Template id; required for mode 'template'.",
             },
             "message_id": {
                 "type": "string",
@@ -161,7 +172,7 @@ class MakeMemeTool(Tool):
             return f"Error: meme not delivered ({exc})"
         return (
             f"Meme {output} delivered to {context.channel}:{context.chat_id}. "
-            "Do not describe it; at most add a very short comment."
+            "It stands on its own; the turn ends here."
         )
 
     def _find_photo(self, chat_id: str, message_id: str | None) -> MediaItem | str:
