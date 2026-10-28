@@ -37,7 +37,7 @@ class ModelProfile(BaseModel):
 
     model_config = ConfigDict(extra="ignore")
 
-    kind: Literal["chat", "vision", "asr", "ocr", "video", "embedding", "tts"]
+    kind: Literal["chat", "vision", "asr", "ocr", "video", "embedding", "tts", "image"]
     model: str | None = None
     provider: str | None = None
     max_tokens: int | None = None
@@ -555,12 +555,21 @@ class A2AConfig(BaseModel):
     workers: dict[str, A2AWorkerConfig] = Field(default_factory=dict)
 
 
+class MemeToolConfig(BaseModel):
+    """make_meme tool; each chat still has to opt in with `memes: true` in policy.json."""
+
+    enabled: bool = True
+    #: Generated (paid) backgrounds per day across all chats; 0 turns the mode off.
+    background_daily_cap: int = Field(default=10, ge=0)
+
+
 class ToolsConfig(BaseModel):
     """Tools configuration."""
 
     web: WebToolsConfig = Field(default_factory=WebToolsConfig)
     exec: ExecToolConfig = Field(default_factory=ExecToolConfig)
     a2a: A2AConfig = Field(default_factory=A2AConfig)
+    memes: MemeToolConfig = Field(default_factory=MemeToolConfig)
     restrict_to_workspace: bool = False  # If true, restrict all tool access to workspace directory
 
 

@@ -41,6 +41,16 @@ _VIDEO_EXTENSIONS = frozenset(
 )
 
 
+#: Outgoing WebP files in this folder are sent to WhatsApp as stickers, not photos. The
+#: location carries the choice because the effect journal stores only media paths.
+STICKER_DIR_NAME = "stickers"
+
+
+def is_sticker_file(path: Path) -> bool:
+    """True for an outgoing file the WhatsApp channel must send as a sticker."""
+    return path.suffix.lower() == ".webp" and path.parent.name == STICKER_DIR_NAME
+
+
 class MediaStorage:
     """Validate and retain media files under configured roots."""
 

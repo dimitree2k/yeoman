@@ -49,7 +49,7 @@ from yeoman_gateway.implicit_addressing import (
     looks_like_question_or_request,
 )
 from yeoman_gateway.media.asr import ASRTranscriber
-from yeoman_gateway.media.storage import MediaStorage
+from yeoman_gateway.media.storage import MediaStorage, is_sticker_file
 from yeoman_gateway.media.vision import VisionDescriber
 from yeoman_gateway.processing.models import JournalConflictError
 
@@ -777,8 +777,9 @@ class WhatsAppChannel(BaseChannel):
                 elif suffix == ".mp4":
                     mime = "video/mp4"
 
+                as_sticker = is_sticker_file(validated)
                 caption = None
-                if not caption_used and text and not mime.startswith("audio/"):
+                if not caption_used and text and not mime.startswith("audio/") and not as_sticker:
                     caption = text
                     caption_used = True
 
@@ -791,6 +792,8 @@ class WhatsAppChannel(BaseChannel):
                 }
                 if reply_to:
                     payload["replyToMessageId"] = reply_to
+                if as_sticker:
+                    payload["asSticker"] = True
                 if msg.metadata.get('historyMentionsResolved'):
                     payload['historyMentionsResolved'] = True
                 if allow_mentions and caption:

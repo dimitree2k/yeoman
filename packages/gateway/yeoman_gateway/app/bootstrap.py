@@ -78,6 +78,7 @@ if TYPE_CHECKING:
 
     from yeoman_gateway.history.live import HistoryProjector
     from yeoman_gateway.ipc.gateway_socket import GatewaySocket
+    from yeoman_gateway.media.memes.service import MemeService
     from yeoman_gateway.policy.engine import PolicyEngine
     from yeoman_gateway.processing.dispatch import IntentEffectRouter
     from yeoman_gateway.processing.store import ProcessingStore
@@ -2624,6 +2625,8 @@ def build_gateway_runtime(
         max_prompt_chars=config.channels.whatsapp.media.max_document_prompt_chars,
     )
 
+    meme_service = _build_meme_service(config, model_router, provider_factory)
+
     assistant_model = config.agents.defaults.model
     try:
         assistant_profile = model_router.resolve("assistant.reply")
@@ -2905,6 +2908,7 @@ def build_gateway_runtime(
         a2a_registry=a2a_registry,
         quota_governance=quota_governance,
         lazy_media_resolver=lazy_media_resolver,
+        meme_service=meme_service,
         youtube_audio_transcriber=_youtube_audio_transcriber,
         whatsapp_session_history_limit=config.channels.whatsapp.session_history_limit,
         whatsapp_session_history_limit_group=config.channels.whatsapp.session_history_limit_group,
@@ -4162,4 +4166,36 @@ def build_gateway_runtime(
             if history_projector is not None else None
         ),
         trends=_build_trends(config),
+    )
+
+
+def _build_meme_service(
+    config: "Config", model_router: ModelRouter, provider_factory: ProviderFactory
+) -> "MemeService | None":
+    """make_meme backend, or None when the tool is switched off in config."""
+    settings = config.tools.memes
+    if not settings.enabled:
+        return None
+    from yeoman_shared.utils.helpers import get_operational_store_path
+
+    from yeoman_gateway.media.memes.background import BackgroundGenerator
+    from yeoman_gateway.media.memes.service import BACKGROUND_ROUTE, DailyCap, MemeService
+
+    background: BackgroundGenerator | None = None
+    cap: DailyCap | None = None
+    if settings.background_daily_cap > 0:
+        try:
+            profile = model_router.resolve_primary(BACKGROUND_ROUTE, channel="whatsapp")
+        except KeyError:
+            profile = None
+        if profile is not None and profile.model:
+            background = BackgroundGenerator(
+                provider_factory.credentials(profile.model, profile.provider)
+            )
+            cap = DailyCap(get_operational_store_path("meme_quota"), settings.background_daily_cap)
+    return MemeService(
+        outgoing_dir=config.channels.whatsapp.media.outgoing_path,
+        router=model_router if background is not None else None,
+        background=background,
+        background_cap=cap,
     )
