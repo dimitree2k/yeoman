@@ -2,6 +2,8 @@
 
 from typing import Any
 
+from loguru import logger
+
 from yeoman_gateway.agent.tools.base import Tool
 
 
@@ -70,22 +72,33 @@ class ToolRegistry:
         Raises:
             KeyError: If tool not found.
         """
+        result, kind = await self._execute(name, params)
+        if kind is None and isinstance(result, str) and result.startswith("Error"):
+            kind = "error_result"
+        if kind is not None:
+            # Content-free outcome line; the Overseer log digest counts these per tool.
+            logger.warning("tool_result_failed tool={} kind={}", name, kind)
+        return result
+
+    async def _execute(self, name: str, params: dict[str, Any]) -> tuple[Any, str | None]:
         if name in self._disabled:
             return (
                 f"Error: Tool '{name}' is disabled in this mode "
                 f"({self._disabled[name]}). Do not retry it."
-            )
+            ), "disabled"
         tool = self._tools.get(name)
         if not tool:
-            return f"Error: Tool '{name}' not found"
+            return f"Error: Tool '{name}' not found", "not_found"
 
         try:
             errors = tool.validate_params(params)
             if errors:
-                return f"Error: Invalid parameters for tool '{name}': " + "; ".join(errors)
-            return await tool.execute(**params)
+                return (
+                    f"Error: Invalid parameters for tool '{name}': " + "; ".join(errors)
+                ), "invalid_params"
+            return await tool.execute(**params), None
         except Exception as e:
-            return f"Error executing {name}: {str(e)}"
+            return f"Error executing {name}: {str(e)}", f"exception:{type(e).__name__}"
 
     @property
     def tool_names(self) -> list[str]:
