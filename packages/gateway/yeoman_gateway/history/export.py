@@ -35,6 +35,27 @@ def validate_read_args(args: dict[str, Any]) -> None:
         raise ValueError('aggregate must be boolean')
 
 
+def _policy_owner(policy: Any, context: TrustedReadContext) -> bool:
+    """Whether Policy still names the owner context's actor as an owner on its channel.
+
+    ``admin_actor()`` alone is the first declared admin principal across *all*
+    channels, so an owner with a Telegram principal never matched a WhatsApp read.
+    The issuer picks the actor from the owner's proven set on the channel, so the
+    actor counts when it is in that set and the set holds a declared admin form.
+    """
+    if not context.owner or not hasattr(policy, 'admin_actor'):
+        return False
+    if policy.admin_actor() == context.principal_id:
+        return True
+    from yeoman_gateway.knowledge.api import _principal_form
+    declared_for = getattr(policy, 'admin_principals_for', None)
+    declared = declared_for(context.channel) if callable(declared_for) else ()
+    forms = {_principal_form(context.channel, str(item).partition(':')[2]) for item in declared}
+    forms.discard('')
+    recipients = context.recipient_principals or frozenset()
+    return context.principal_id in recipients and bool(forms & recipients)
+
+
 def read_history_turn(snapshot: HistorySnapshot, *, context: TrustedReadContext,
                       chat_ids: tuple[str, ...], after_ms: int, limit: int,
                       aggregate: bool = True) -> dict[str, Any]:
@@ -53,7 +74,7 @@ def read_history_turn(snapshot: HistorySnapshot, *, context: TrustedReadContext,
     policy = scope.identity._policy
     if context.policy_revision != policy.current_policy_revision():
         raise KnowledgeError('stale_revision', 'policy changed')
-    owner = context.owner and hasattr(policy, 'admin_actor') and policy.admin_actor() == context.principal_id
+    owner = _policy_owner(policy, context)
     if context.owner and not owner:
         raise KnowledgeError('unauthorized', 'owner authorization required')
     if not owner and set(chat_ids) != {context.chat_id}:
