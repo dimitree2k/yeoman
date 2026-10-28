@@ -36,6 +36,7 @@ from yeoman_gateway.processing.participation_knowledge import (
     ParticipationKnowledgeReaders,
     readers_from_single,
 )
+from yeoman_gateway.trends.seeds import is_trend_source
 
 #: Keys a stored message row may use for its identity.
 _ID_KEYS: tuple[str, ...] = ("message_id", "event_id", "id")
@@ -135,6 +136,7 @@ class ParticipationContextBuilder:
         knowledge_selector: Any | None = None,
         knowledge_context_supplier: Callable[[ParticipationOpportunity, Mapping[str, Any]], Any]
         | None = None,
+        trend_rows: Callable[[str, str, str], Mapping[str, Any] | None] | None = None,
     ) -> None:
         # Kept on the constructor for old object construction; decision inputs are the
         # sole source of trusted policy values during ``build``.
@@ -150,6 +152,9 @@ class ParticipationContextBuilder:
         # neither, and absent means the judge and writer see no Knowledge at all.
         self._knowledge_selector = knowledge_selector
         self._knowledge_context_supplier = knowledge_context_supplier
+        # Offered trend cards (``trend:`` ids) are owner-approved material, not archive
+        # rows; without a reader such a source is unavailable like any missing row.
+        self._trend_rows = trend_rows
         self._fallback_logged_ms: dict[tuple[str, str], int] = {}
 
     @property
@@ -198,7 +203,19 @@ class ParticipationContextBuilder:
         # query is only an optional-context optimization and cannot hide a trigger.
         required_ids = _unique_ids(opportunity.source_event_ids)
         required_rows: dict[str, dict[str, object]] = {}
+        trend_ids: set[str] = set()
         for source_id in required_ids:
+            if is_trend_source(source_id):
+                trend_row = (
+                    self._trend_rows(opportunity.channel, opportunity.chat_id, source_id)
+                    if self._trend_rows is not None
+                    else None
+                )
+                if not isinstance(trend_row, Mapping) or _row_id(trend_row) != source_id:
+                    raise ParticipationDecisionError("source_unavailable", detail=source_id)
+                required_rows[source_id] = dict(trend_row)
+                trend_ids.add(source_id)
+                continue
             row = archive.lookup_message(
                 opportunity.channel, opportunity.chat_id, source_id
             )
@@ -253,10 +270,11 @@ class ParticipationContextBuilder:
         conversation: Conversation | None = None
         earlier: list[dict[str, object]] = []
         earlier_ids: list[str] = []
-        if limits.context_mode == "conversation":
+        chat_required = [row for row in required if _row_id(row) not in trend_ids]
+        if limits.context_mode == "conversation" and chat_required:
             try:
                 conversation = self._conversation(
-                    archive, opportunity, range_rows, required, limits, now_ms=moment
+                    archive, opportunity, range_rows, chat_required, limits, now_ms=moment
                 )
             except (HistoryPaused, ParticipationDecisionError):
                 raise
@@ -301,6 +319,10 @@ class ParticipationContextBuilder:
         truncated = len(ordered) - len(selected)
 
         messages = [_render_message(row) for row in selected if _row_id(row)]
+        trend_posts = {
+            source_id: str(required_rows[source_id].get("trend_post") or "")
+            for source_id in sorted(trend_ids)
+        }
         anchors: list[dict[str, object]] = []
         if self._anchors is not None:
             raw_anchors = await self._anchors.delivered_anchors(
@@ -371,12 +393,18 @@ class ParticipationContextBuilder:
             "earlier_message_ids": earlier_ids,
             "direct_addressed": bool(_snapshot_value(inputs.snapshot, "direct_addressed", False)),
             "allows_continuation": "continue" in inputs.allowed_intents,
+            # Fixed text of each offered trend card; a card is posted verbatim.
+            "trend_posts": trend_posts,
         }
         selection_started = time.monotonic()
         context["knowledge_selection_status"] = "disabled"
         context["knowledge_selected_count"] = 0
         context["knowledge_rendered_chars"] = 0
-        if self._knowledge_selector is not None and self._knowledge_context_supplier is not None:
+        if (
+            self._knowledge_selector is not None
+            and self._knowledge_context_supplier is not None
+            and not (trend_ids and trend_ids == set(required_ids))
+        ):
             try:
                 trusted = self._knowledge_context_supplier(opportunity, context)
                 readers = _knowledge_readers(trusted)

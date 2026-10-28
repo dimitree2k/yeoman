@@ -162,7 +162,8 @@ async def test_service_scores_new_items_once_and_survives_a_broken_source(tmp_pa
     second = await service.run_once()
 
     assert first.as_dict() == {
-        "fetched": 1, "scored": 1, "cards": 1, "articles_read": 0, "dropped": 0,
+        "fetched": 1, "scored": 1, "cards": 1, "fitted_chats": 0, "articles_read": 0,
+        "dropped": 0,
         "failed_sources": ["broken"],
     }
     assert second.scored == 0

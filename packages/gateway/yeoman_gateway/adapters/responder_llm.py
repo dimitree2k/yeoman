@@ -73,6 +73,7 @@ from yeoman_gateway.processing.tool_context import (
 from yeoman_gateway.providers.base import LLMProvider, LLMProviderError, ToolCallRequest
 from yeoman_gateway.reply_budget import derive_reply_budget, enforce_reply_budget
 from yeoman_gateway.session.manager import SessionManager
+from yeoman_gateway.trends.seeds import is_trend_source
 
 if TYPE_CHECKING:
     from yeoman_shared.config.schema import ExecToolConfig, WebToolsConfig
@@ -3600,6 +3601,7 @@ class LLMResponder(ResponderPort):
 
                 raise EffectNotDeliveredError("participation comment path is not composed")
             return _ParticipationSubmitOutcome(status="no_managed_path")
+        target = str(getattr(admission, "target_message_id", "") or "")
         try:
             receipt = await send(
                 source="speakup",
@@ -3607,7 +3609,8 @@ class LLMResponder(ResponderPort):
                 channel=str(getattr(admission, "channel", "")),
                 chat_id=str(getattr(admission, "chat_id", "")),
                 content=str(content),
-                reply_to=str(getattr(admission, "target_message_id", "") or "") or None,
+                # A trend card is posted as a new message; it quotes nobody.
+                reply_to=None if is_trend_source(target) else target or None,
                 effect_id=str(effect_id),
                 require_managed=True,
                 admission=admission,

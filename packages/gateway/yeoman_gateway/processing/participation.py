@@ -35,6 +35,7 @@ from yeoman_shared.telemetry import tracing
 
 from yeoman_gateway.processing.model_route import RouteClient
 from yeoman_gateway.processing.participation_memes import MAX_PROMPT_CHARS, MemePlan
+from yeoman_gateway.trends.seeds import is_trend_source
 
 OpportunityTrigger = Literal["inbound", "burst", "lull"]
 DecisionAction = Literal["silence", "react", "comment", "meme", "sticker"]
@@ -151,6 +152,17 @@ JUDGE_SYSTEM_PROMPT = (
     "- purpose is an internal instruction, never the finished message.\n"
     "- closes_exchange=true only retires the social association; it never closes "
     "another person's task."
+)
+
+#: Added only when an offered trend card is among the current sources.
+JUDGE_TREND_RULES = (
+    "\n- A message from Trendkarte (id starting with trend:) is a news card the owner "
+    "approved for this quiet group, not a chat member. Post at most one card, with "
+    "action=comment, intent=initiate and that card as target_message_id; its text is "
+    "fixed, so purpose only says why it fits now. Post it when it fits the group's "
+    "topics, nothing under Nicht für diese Gruppe applies, and the chat has gone quiet: "
+    "no question still waiting for a member and no serious or sad topic the card would "
+    "trample. Otherwise choose silence. Never react to a card."
 )
 
 
@@ -588,7 +600,15 @@ class ParticipationJudge:
     ) -> list[dict[str, str]]:
         granted = set(view.allowed_actions)
         allowed = [action for action in _ALL_ACTIONS if action in granted] or ["silence"]
-        system = JUDGE_SYSTEM_PROMPT + (JUDGE_MEME_RULES if view.offers_images else "")
+        system = (
+            JUDGE_SYSTEM_PROMPT
+            + (
+                JUDGE_TREND_RULES
+                if any(is_trend_source(item) for item in view.current_source_ids)
+                else ""
+            )
+            + (JUDGE_MEME_RULES if view.offers_images else "")
+        )
         return [
             {"role": "system", "content": system},
             {
@@ -724,6 +744,15 @@ class ParticipationJudge:
             raise ParticipationDecisionError("unknown_evidence", detail="target_not_current")
         if action in {"react", "comment", *IMAGE_ACTIONS} and target is None:
             raise ParticipationDecisionError("missing_target", detail="target_not_supplied")
+        if is_trend_source(target) and (action != "comment" or intent != "initiate"):
+            # A trend card is posted as itself or not at all: no reaction, image or
+            # continuation can target owner material that nobody in the chat wrote.
+            return ParticipationDecision(
+                action="silence",
+                intent="initiate",
+                reason="trend_card_only_posts",
+                reading=reading,
+            )
         if intent == "continue" and action == "comment":
             # Only *prose* acts on continuity: a comment that continues an exchange must
             # be grounded in a delivered Arvid message. A reaction is a gesture anchored

@@ -16,6 +16,7 @@ from yeoman_gateway.policy.schema import (
     ParticipationPolicy,
     ParticipationPolicyOverride,
     PolicyConfig,
+    TrendsPolicy,
 )
 
 
@@ -129,6 +130,7 @@ class EffectivePolicy:
     session_history_limit: int | None
     participation: ParticipationPolicy = field(default_factory=ParticipationPolicy)
     memes: bool = False
+    trends: TrendsPolicy = field(default_factory=TrendsPolicy)
 
 
 #: Per-chat participation settings and the layer each value came from.
@@ -294,6 +296,7 @@ class _CompiledPolicy:
     session_history_limit: int | None
     participation: ParticipationPolicy = field(default_factory=ParticipationPolicy)
     memes: bool = False
+    trends: TrendsPolicy = field(default_factory=TrendsPolicy)
 
 
 class PolicyEngine:
@@ -411,6 +414,7 @@ class PolicyEngine:
             participation=ParticipationPolicy.model_validate(
                 resolved.participation.model_dump()
             ),
+            trends=TrendsPolicy.model_validate(resolved.trends.model_dump()),
         )
 
     def resolve_compiled_policy(self, channel: str, chat_id: str) -> _CompiledPolicy:
@@ -594,6 +598,7 @@ class PolicyEngine:
             participation=ParticipationPolicy.model_validate(
                 resolved.participation.model_dump()
             ),
+            trends=resolved.trends,
         )
 
     def resolve_participation(self, channel: str, chat_id: str) -> ParticipationPolicy:
