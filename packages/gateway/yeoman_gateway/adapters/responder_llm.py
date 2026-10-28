@@ -1827,9 +1827,33 @@ class LLMResponder(ResponderPort):
             arguments=arguments,
         )
 
-    async def _chat_loop(
+    async def _chat_loop(self, **kwargs: Any) -> str | None:
+        """Run one turn's model/tool loop and log which tools it was offered and used.
+
+        Only tool names are logged, never arguments or message content, so a turn that
+        answers in text where a tool was expected can be told apart from a turn that
+        never had the tool.
+        """
+        called: list[str] = []
+        try:
+            return await self._run_chat_loop(called_tools=called, **kwargs)
+        finally:
+            offered = sorted(
+                name
+                for name in (kwargs.get("allowed_tools") or ())
+                if name in self.tool_names
+            )
+            logger.info(
+                "turn_tools chat={} offered={} called={}",
+                kwargs.get("current_chat_id") or "-",
+                ",".join(offered) or "-",
+                ",".join(called) or "-",
+            )
+
+    async def _run_chat_loop(
         self,
         *,
+        called_tools: list[str],
         messages: list[dict[str, Any]],
         allowed_tools: set[str],
         security_context: dict[str, object] | None = None,
@@ -2025,6 +2049,7 @@ class LLMResponder(ResponderPort):
                             )
                             continue
                         logger.info("Tool call: {}({})", tool_call.name, observability_args[:200])
+                        called_tools.append(tool_call.name)
                         tool_span = lf.start_span(
                             trace=trace,
                             name=f"tool/{tool_call.name}",
