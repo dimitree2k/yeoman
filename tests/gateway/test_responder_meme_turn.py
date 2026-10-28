@@ -101,9 +101,7 @@ async def test_turn_log_names_offered_and_called_tools_without_content(
             LLMResponse(
                 content=None,
                 tool_calls=[
-                    ToolCallRequest(
-                        id="c1", name="web_search", arguments={"query": "secret words"}
-                    )
+                    ToolCallRequest(id="c1", name="web_search", arguments={"query": "secret words"})
                 ],
             ),
             LLMResponse(content="done"),
@@ -119,3 +117,56 @@ async def test_turn_log_shows_a_text_only_turn(tmp_path: Path) -> None:
     provider = _ScriptedProvider([LLMResponse(content="kein Meme-Tool")])
     (line,) = await _turn(tmp_path, provider, "web_search")
     assert line.rstrip().endswith("called=-")
+
+
+class _FailingMemeTool(_FakeMemeTool):
+    async def execute(self, **kwargs: Any) -> str:
+        del kwargs
+        self.calls += 1
+        return "Error: unknown template 'x'; pick one from the list"
+
+
+async def _meme_reply(tmp_path: Path, tool: _FakeMemeTool) -> tuple[str | None, _ScriptedProvider]:
+    provider = _ScriptedProvider(
+        [
+            LLMResponse(
+                content=None,
+                tool_calls=[
+                    ToolCallRequest(id="m1", name="make_meme", arguments={"captions": ["a", "b"]})
+                ],
+            ),
+            LLMResponse(content="Fertig. Der Frosch hatte offenbar auch keinen Plan."),
+        ]
+    )
+    responder = LLMResponder(
+        bus=MessageBus(), provider=provider, workspace=tmp_path, max_iterations=3
+    )
+    responder.tools.register(tool)
+    try:
+        reply = await responder.generate_reply(_event(), _decision("make_meme"))
+    finally:
+        await responder.aclose()
+    return reply, provider
+
+
+@pytest.mark.asyncio
+async def test_a_delivered_meme_is_the_whole_answer(tmp_path: Path) -> None:
+    tool = _FakeMemeTool()
+    reply, provider = await _meme_reply(tmp_path, tool)
+    assert tool.calls == 1
+    assert reply is None
+    # The model is not even asked for a follow-up comment.
+    assert len(provider.messages) == 1
+
+
+@pytest.mark.asyncio
+async def test_a_failed_meme_still_lets_the_model_answer(tmp_path: Path) -> None:
+    tool = _FailingMemeTool()
+    reply, provider = await _meme_reply(tmp_path, tool)
+    assert tool.calls == 1
+    assert reply and "Frosch" in reply
+    assert len(provider.messages) == 2
+
+
+def test_meme_note_says_the_meme_goes_out_alone() -> None:
+    assert "without any text" in MEME_TOOL_NOTE

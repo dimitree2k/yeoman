@@ -101,8 +101,11 @@ class MemeService:
         return self._background is not None and self._router is not None and self._cap is not None
 
     def template_catalog(self) -> str:
-        """Compact `id(boxes)` list for the tool description."""
-        return ", ".join(f"{t.id}({len(t.boxes)})" for t in self.templates.values())
+        """One `id(boxes): joke` line per template for the tool description."""
+        return "\n".join(
+            f"{t.id}({len(t.boxes)}): {t.joke}" if t.joke else f"{t.id}({len(t.boxes)})"
+            for t in self.templates.values()
+        )
 
     @staticmethod
     def clean_captions(captions: list[str] | None) -> list[str]:
@@ -116,6 +119,11 @@ class MemeService:
     ) -> Path:
         template = self.templates.get(str(template_id or "").strip().lower())
         if template is None:
+            if not str(template_id or "").strip():
+                raise MemeError(
+                    "mode 'template' needs the `template` argument: one of "
+                    + ", ".join(self.templates)
+                )
             raise MemeError(f"unknown template '{template_id}'; pick one from the list")
         lines = self.clean_captions(captions)
         with Image.open(template.image_path) as base:
