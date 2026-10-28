@@ -51,7 +51,9 @@ PROPOSAL_STATES: tuple[str, ...] = (
 DELIVERY_RESERVATION_TTL_MS = 10 * 60_000
 
 #: Reservation categories with their identity in the ledger.
-RESERVATION_CATEGORIES: tuple[str, ...] = ("initiation", "comment", "reaction")
+RESERVATION_CATEGORIES: tuple[str, ...] = (
+    "initiation", "comment", "reaction", "meme", "sticker"
+)
 
 #: Delivery evidence that a release/failure claim must not overwrite.
 CONSUMED_DELIVERY_STATES: frozenset[str] = frozenset(
@@ -2660,6 +2662,26 @@ class SpeakupLog:
                 (str(channel), str(chat_id)),
             ).fetchone()
         return int(row["r"]) if row is not None and row["r"] is not None else None
+
+    async def last_meme_activity(
+        self, *, channel: str, chat_id: str
+    ) -> tuple[int, int] | None:
+        """``(source revision, created_at_ms)`` of the newest autonomous meme or sticker."""
+        with self._lock:
+            row = self._conn.execute(
+                """
+                SELECT MAX(observed_revision) AS r, MAX(created_at_ms) AS t
+                FROM opportunity_dispositions
+                WHERE channel = ? AND chat_id = ? AND lane = 'production'
+                  AND disposition IN (
+                      'meme_submitted', 'meme_unknown', 'sticker_submitted', 'sticker_unknown'
+                  )
+                """,
+                (str(channel), str(chat_id)),
+            ).fetchone()
+        if row is None or row["r"] is None:
+            return None
+        return int(row["r"]), int(row["t"] or 0)
 
     async def last_sent_at(
         self,

@@ -3639,6 +3639,53 @@ class LLMResponder(ResponderPort):
             )
             raise
 
+    async def send_participation_media(
+        self,
+        *,
+        media_path: str,
+        channel: str,
+        chat_id: str,
+        effect_id: str,
+        admission: object,
+    ) -> object:
+        """Submit one autonomous meme or sticker through the managed media effect path."""
+        from yeoman_gateway.processing.dispatch import EffectNotDeliveredError
+
+        sender = getattr(self._service_effect_sender, "send_media", None)
+        if not callable(sender):
+            raise EffectNotDeliveredError("participation media path is not composed")
+        try:
+            return await sender(
+                source="speakup",
+                operation_ref=f"participation-media:{effect_id}",
+                channel=str(channel),
+                chat_id=str(chat_id),
+                media_path=str(media_path),
+                effect_id=effect_id,
+                admission=admission,
+            )
+        except HistoryPaused:
+            raise
+        except Exception as exc:
+            logger.warning("participation_media_failed error_type={}", type(exc).__name__)
+            raise
+
+    @property
+    def participation_memes(self) -> object | None:
+        """The meme renderer for autonomous memes, when memes and media sending exist."""
+        if self._meme_service is None or not callable(
+            getattr(self._service_effect_sender, "send_media", None)
+        ):
+            return None
+        from yeoman_gateway.processing.participation_memes import ParticipationMemes
+
+        return ParticipationMemes(
+            service=self._meme_service,
+            media_cache=(
+                self._lazy_media_resolver.cache if self._lazy_media_resolver is not None else None
+            ),
+        )
+
     @property
     def participation_reaction_available(self) -> bool:
         """Whether the managed reaction sender is composed before any reservation."""

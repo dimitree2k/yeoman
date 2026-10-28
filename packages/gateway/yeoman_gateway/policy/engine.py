@@ -69,6 +69,9 @@ def _wake_phrase_match(content: str, wake_phrases: frozenset[str]) -> bool:
 _FORWARD_COMMAND = re.compile(r"^/?forward(?:\s+.+)?$", re.IGNORECASE)
 #: Tool name gated by the per-chat `memes` switch.
 MEME_TOOL = "make_meme"
+#: Rolling windows of the autonomous meme and sticker budgets.
+MEME_WINDOW_MS = 7 * 24 * 60 * 60 * 1000
+STICKER_WINDOW_MS = 24 * 60 * 60 * 1000
 
 
 @dataclass(slots=True)
@@ -142,6 +145,10 @@ _PARTICIPATION_FIELDS: tuple[str, ...] = (
     "comment_window_minutes",
     "max_reactions_per_window",
     "min_messages_between_reactions",
+    "auto_memes",
+    "max_memes_per_week",
+    "max_stickers_per_day",
+    "min_messages_between_memes",
 )
 
 
@@ -225,6 +232,10 @@ class ParticipationSnapshot:
                 int(self.participation.comment_window_minutes) * 60_000,
                 "rolling",
             )
+        if category == "meme":
+            return (int(self.participation.max_memes_per_week), MEME_WINDOW_MS, "rolling")
+        if category == "sticker":
+            return (int(self.participation.max_stickers_per_day), STICKER_WINDOW_MS, "rolling")
         raise ValueError(f"unknown participation category: {category}")
 
 

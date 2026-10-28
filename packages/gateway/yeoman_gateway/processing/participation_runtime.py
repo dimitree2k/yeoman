@@ -31,12 +31,14 @@ from loguru import logger
 from yeoman_gateway.consciousness.log import deterministic_effect_id
 from yeoman_gateway.history.live import HistoryPaused
 from yeoman_gateway.processing.models import (
+    MediaPayload,
     ReactionPayload,
     TextPayload,
     canonical_hash,
     payload_to_mapping,
 )
 from yeoman_gateway.processing.participation import (
+    IMAGE_ACTIONS,
     ParticipationDecision,
     ParticipationDecisionError,
     ParticipationJudge,
@@ -61,6 +63,7 @@ COUNTERS: tuple[str, ...] = (
     "judge_failed",
     "reaction_selected",
     "comment_selected",
+    "meme_selected",
     "generated",
     "shadow_decision",
     "duplicate_suppressed",
@@ -68,7 +71,7 @@ COUNTERS: tuple[str, ...] = (
     "stale_discarded",
 )
 
-_ACTIONS: tuple[str, ...] = ("silence", "react", "comment")
+_ACTIONS: tuple[str, ...] = ("silence", "react", "comment", "meme", "sticker")
 _INTENTS: frozenset[str] = frozenset(("direct", "continue", "initiate"))
 _LIMIT_KINDS: frozenset[str] = frozenset(("rolling", "calendar_day"))
 _MISSING = object()
@@ -171,6 +174,8 @@ class ParticipationRuntime:
         revalidate_knowledge: Callable[[ParticipationOpportunity, Mapping[str, Any], Any], Any]
         | None = None,
         group_notes_shadow: Any | None = None,
+        memes: Any | None = None,
+        media_sender: Any | None = None,
     ) -> None:
         self._history_projector = history_projector
         self._history_knowledge = history_knowledge
@@ -197,6 +202,10 @@ class ParticipationRuntime:
         # Paired group-notes shadow (``GroupNotesShadowRecorder``): a second, judge-only
         # call with the weekly note beside each live judgment; no quota, no effect.
         self._group_notes_shadow = group_notes_shadow
+        # Autonomous memes/stickers (``ParticipationMemes`` + a managed media sender).
+        # Both must be composed; otherwise the actions are never offered.
+        self._memes = memes
+        self._media_sender = media_sender
         self._group_notes_tasks: set[asyncio.Task[None]] = set()
         self._counters: dict[str, int] = {}
 
@@ -416,6 +425,7 @@ class ParticipationRuntime:
         inputs, context = self._apply_continuation_candidate(
             opportunity, inputs, context
         )
+        inputs, context = self._with_meme_offer(opportunity, inputs, context)
         if not any(action != "silence" for action in inputs.allowed_actions):
             self._count("preflight_skipped")
             await self._record(opportunity, "preflight_skipped", "no_feasible_action")
@@ -566,6 +576,10 @@ class ParticipationRuntime:
         if decision.action == "react":
             self._count("reaction_selected")
             return await self._run_reaction(opportunity, decision, inputs, context)
+
+        if decision.action in IMAGE_ACTIONS:
+            self._count("meme_selected")
+            return await self._run_image(opportunity, decision, inputs, context)
 
         self._count("comment_selected")
         return await self._run_comment(opportunity, snapshot, decision, context, inputs)
@@ -788,12 +802,18 @@ class ParticipationRuntime:
             and reaction_remaining > 0
             and await self._reaction_spacing_met(opportunity, snapshot)
         )
+        meme_limits = _snapshot_limits(snapshot, "meme_limits", "meme")
+        sticker_limits = _snapshot_limits(snapshot, "sticker_limits", "sticker")
+        image_actions, meme_budget_text = await self._image_actions(
+            opportunity, snapshot, meme_limits, sticker_limits, now_ms=now_ms
+        )
         candidate_actions: set[str] = {"silence"}
         if judge_remaining > 0:
             if reaction_allowed:
                 candidate_actions.add("react")
             if comment_intents:
                 candidate_actions.add("comment")
+            candidate_actions.update(image_actions)
         requested_actions = _snapshot_tokens(snapshot, "allowed_actions")
         if requested_actions is not None:
             candidate_actions &= set(requested_actions)
@@ -802,7 +822,7 @@ class ParticipationRuntime:
             if reply_action not in {"answer", "react", "silence"}:
                 raise ParticipationBlockedError("invalid_snapshot")
             reply_allowed = {
-                "answer": {"silence", "react", "comment"},
+                "answer": {"silence", "react", "comment", *IMAGE_ACTIONS},
                 "react": {"silence", "react"},
                 "silence": {"silence"},
             }[str(reply_action)]
@@ -818,9 +838,9 @@ class ParticipationRuntime:
 
         requested_intents = _snapshot_tokens(snapshot, "allowed_intents")
         allowed_intents = set(comment_intents)
-        if reaction_allowed:
-            # Reactions carry a neutral label for model bookkeeping. This label does
-            # not grant the corresponding comment intent (checked below).
+        if reaction_allowed or image_actions:
+            # Reactions and images carry a neutral label for model bookkeeping. This
+            # label does not grant the corresponding comment intent (checked below).
             allowed_intents.add("continue" if allow_continuation else "initiate")
         if direct_addressed and "direct" in comment_intents:
             allowed_intents.add("direct")
@@ -840,6 +860,9 @@ class ParticipationRuntime:
                 "reaction_limits": reaction_limits,
                 "comment_limits": comment_limits,
                 "initiation_limits": initiation_limits,
+                "meme_limits": meme_limits,
+                "sticker_limits": sticker_limits,
+                "meme_budget_text": meme_budget_text,
                 "writer_unavailable": writer_unavailable,
             }
         )
@@ -921,6 +944,70 @@ class ParticipationRuntime:
         if last is None:
             return True
         return int(opportunity.observed_revision) - int(last) >= spacing
+
+    async def _image_actions(
+        self,
+        opportunity: ParticipationOpportunity,
+        snapshot: Mapping[str, Any],
+        meme_limits: tuple[_LedgerLimit, ...],
+        sticker_limits: tuple[_LedgerLimit, ...],
+        *,
+        now_ms: int,
+    ) -> tuple[set[str], str]:
+        """Which image actions the caps still allow, and the budget line the judge sees.
+
+        The budget line is the soft target; the ledger limits are the hard cap and
+        stay authoritative at reservation. Every cap that removes an action is logged.
+        """
+        if not _snapshot_bool(snapshot, "allow_memes", default=False):
+            return set(), ""
+        if self._memes is None or self._media_sender is None:
+            logger.info(
+                "participation_meme_unavailable chat={} reason=not_composed",
+                opportunity.chat_id,
+            )
+            return set(), ""
+        meme_left = await self._remaining_capacity(opportunity, meme_limits, now_ms=now_ms)
+        sticker_left = await self._remaining_capacity(
+            opportunity, sticker_limits, now_ms=now_ms
+        )
+        last: tuple[int, int] | None = None
+        spacing_ok = False
+        reader = getattr(self._ledger, "last_meme_activity", None)
+        if callable(reader):
+            try:
+                last = await reader(channel=opportunity.channel, chat_id=opportunity.chat_id)
+                spacing = _snapshot_nonnegative_int(
+                    snapshot, "min_messages_between_memes", default=0
+                )
+                spacing_ok = (
+                    last is None or int(opportunity.observed_revision) - int(last[0]) >= spacing
+                )
+            except HistoryPaused:
+                raise
+            except Exception:  # noqa: BLE001 - spacing evidence is fail-closed
+                spacing_ok = False
+        actions: set[str] = set()
+        blocked: list[str] = []
+        if not spacing_ok:
+            blocked.append("spacing")
+        else:
+            for action, left in (("meme", meme_left), ("sticker", sticker_left)):
+                if left > 0:
+                    actions.add(action)
+                else:
+                    blocked.append(f"{action}_cap")
+        if blocked:
+            logger.info(
+                "participation_meme_capped chat={} blocked={} memes_left={} stickers_left={}",
+                opportunity.chat_id,
+                ",".join(blocked),
+                meme_left,
+                sticker_left,
+            )
+        return actions, _meme_budget_text(
+            meme_limits, meme_left, sticker_limits, sticker_left, last, opportunity, now_ms
+        )
 
     async def _remaining_capacity(
         self,
@@ -1092,7 +1179,7 @@ class ParticipationRuntime:
         if action not in set(inputs.allowed_actions):
             raise ParticipationDecisionError("invalid_response", detail="action_not_allowed")
         target = str(decision.target_message_id or "").strip()
-        if action in {"react", "comment"}:
+        if action in {"react", "comment", *IMAGE_ACTIONS}:
             if not target:
                 raise ParticipationDecisionError("missing_target")
             if target not in set(opportunity.source_event_ids):
@@ -1102,6 +1189,10 @@ class ParticipationRuntime:
         if action == "react":
             if not decision.emoji:
                 raise ParticipationDecisionError("missing_target")
+            return
+        if action in IMAGE_ACTIONS:
+            if decision.meme is None:
+                raise ParticipationDecisionError("invalid_response", detail="meme_plan_missing")
             return
         if intent not in set(inputs.allowed_intents):
             raise ParticipationDecisionError("invalid_response", detail="intent_not_allowed")
@@ -1261,6 +1352,218 @@ class ParticipationRuntime:
         self._close_social_association(opportunity, decision)
         await self._record(opportunity, "reaction_submitted", decision.reason)
         return {"status": "reaction_submitted", "effect_id": effect_id}
+
+    def _with_meme_offer(
+        self,
+        opportunity: ParticipationOpportunity,
+        inputs: ParticipationDecisionInputs,
+        context: Mapping[str, Any],
+    ) -> tuple[ParticipationDecisionInputs, Mapping[str, Any]]:
+        """Show the judge what it may meme with; without an offer the actions go away."""
+        if not IMAGE_ACTIONS & set(inputs.allowed_actions):
+            return inputs, context
+        offer = None
+        try:
+            raw_messages = context.get("messages")
+            messages = [
+                row for row in (raw_messages if isinstance(raw_messages, (list, tuple)) else ())
+                if isinstance(row, Mapping)
+            ]
+            offer = self._memes.offer(
+                channel=opportunity.channel, chat_id=opportunity.chat_id, messages=messages
+            )
+        except HistoryPaused:
+            raise
+        except Exception as exc:  # noqa: BLE001 - no offer means no meme, never a failure
+            logger.warning(
+                "participation_meme_offer_failed chat={} error_type={}",
+                opportunity.chat_id,
+                type(exc).__name__,
+            )
+        updated = dict(context)
+        if offer is None or not offer.templates:
+            inputs = replace(
+                inputs,
+                allowed_actions=tuple(
+                    item for item in inputs.allowed_actions if item not in IMAGE_ACTIONS
+                ),
+            )
+        else:
+            updated.update(offer.context_fields())
+            updated["meme_budget_text"] = str(
+                _snapshot_value(inputs.snapshot, "meme_budget_text", "") or ""
+            )
+        updated["allowed_actions"] = list(inputs.allowed_actions)
+        return inputs, updated
+
+    async def _run_image(
+        self,
+        opportunity: ParticipationOpportunity,
+        decision: ParticipationDecision,
+        inputs: ParticipationDecisionInputs,
+        context: Mapping[str, Any],
+    ) -> dict[str, object]:
+        """Render one meme or sticker and post it alone: no text, no explanation."""
+        kind = str(decision.action)
+        plan = decision.meme
+        if (
+            self._memes is None
+            or self._media_sender is None
+            or plan is None
+            or not decision.target_message_id
+        ):
+            await self._record(opportunity, f"{kind}_skipped", "no_meme_path")
+            return {"status": f"{kind}_skipped", "reason": "no_meme_path"}
+        limits = _snapshot_limits(inputs.snapshot, f"{kind}_limits", kind)
+        logger.info(
+            "participation_meme_selected chat={} kind={} {} reading={!r} reason={!r}",
+            opportunity.chat_id,
+            kind,
+            plan.log_fields(),
+            decision.reading,
+            decision.reason,
+        )
+        if not limits:
+            await self._record(opportunity, "skipped", f"{kind}_budget_exhausted")
+            return {"status": "skipped", "reason": f"{kind}_budget_exhausted"}
+        effect_id = deterministic_effect_id(
+            channel=opportunity.channel,
+            chat_id=opportunity.chat_id,
+            operation=kind,
+            proposal_id=opportunity.opportunity_id,
+        )
+        reserved = await self._ledger.reserve_delivery(
+            proposal_id=opportunity.opportunity_id,
+            effect_id=effect_id,
+            channel=opportunity.channel,
+            chat_id=opportunity.chat_id,
+            now_ms=int(self._clock_ms()),
+            limits=limits,
+            observed_revision=opportunity.observed_revision,
+            activation_epoch=opportunity.activation_epoch,
+            origin="participation",
+            lane=str(opportunity.lane),
+        )
+        if not reserved:
+            logger.info(
+                "participation_meme_capped chat={} blocked={}_cap at=reserve",
+                opportunity.chat_id,
+                kind,
+            )
+            await self._record(opportunity, "skipped", f"{kind}_budget_exhausted")
+            return {"status": "skipped", "reason": f"{kind}_budget_exhausted"}
+        veto = await self._image_veto(opportunity, inputs, context)
+        if veto is not None:
+            await self._release_comment(opportunity, effect_id, veto)
+            if veto == "direct_superseded":
+                return self._direct_superseded()
+            await self._record(opportunity, "stale_discarded", veto)
+            return {"status": f"{kind}_skipped", "reason": veto}
+        try:
+            path = await self._memes.render(
+                plan,
+                channel=opportunity.channel,
+                chat_id=opportunity.chat_id,
+                sticker=kind == "sticker",
+            )
+        except HistoryPaused:
+            await self._release_comment(opportunity, effect_id, "history_paused")
+            raise
+        except Exception as exc:  # noqa: BLE001 - nothing was sent; free the slot
+            reason = f"render_{type(exc).__name__}"[:60]
+            logger.warning(
+                "participation_meme_render_failed chat={} kind={} error={}",
+                opportunity.chat_id,
+                kind,
+                str(exc)[:160],
+            )
+            await self._release_comment(opportunity, effect_id, reason)
+            await self._record(opportunity, f"{kind}_failed", reason)
+            return {"status": f"{kind}_failed", "reason": reason}
+        media_path = str(path)
+        try:
+            admission = self._build_admission(
+                opportunity=opportunity,
+                snapshot=inputs.snapshot,
+                decision=decision,
+                effect_id=effect_id,
+                payload=MediaPayload(media=(media_path,)),
+            )
+        except ParticipationBlockedError as blocked:
+            await self._release_comment(opportunity, effect_id, blocked.reason)
+            await self._record(opportunity, f"{kind}_skipped", blocked.reason)
+            return {"status": f"{kind}_skipped", "reason": blocked.reason}
+        # A background render can take seconds: the fences are read again after it.
+        veto = await self._image_veto(opportunity, inputs, context)
+        if veto is not None:
+            await self._release_comment(opportunity, effect_id, veto)
+            if veto == "direct_superseded":
+                return self._direct_superseded()
+            await self._record(opportunity, "stale_discarded", veto)
+            return {"status": f"{kind}_skipped", "reason": veto}
+        try:
+            receipt = await self._media_sender(
+                media_path=media_path,
+                channel=opportunity.channel,
+                chat_id=opportunity.chat_id,
+                effect_id=effect_id,
+                admission=admission,
+            )
+        except BaseException as exc:  # noqa: BLE001 - unknown transport work keeps hold
+            logger.warning(
+                "participation_meme_unknown chat={} kind={} error_type={}",
+                opportunity.chat_id,
+                kind,
+                type(exc).__name__,
+            )
+            await self._record(opportunity, f"{kind}_unknown", type(exc).__name__)
+            return {"status": f"{kind}_unknown", "reason": type(exc).__name__}
+        accepted = bool(getattr(receipt, "accepted", False))
+        state = str(getattr(receipt, "state", "") or "")
+        if accepted and state == "sent" and getattr(receipt, "transport_receipt", None) is not None:
+            await self._ledger.project_transport_accepted(
+                opportunity.opportunity_id,
+                effect_id=effect_id,
+                provider_message_id=_provider_message_id(receipt),
+                evidence_kind="transport_receipt",
+                evidence_ref=str(getattr(receipt, "attempt_id", "") or effect_id),
+                now_ms=int(self._clock_ms()),
+            )
+        elif state in {"failed", "not_executed", "blocked", "cancelled", "expired"}:
+            await self._ledger.release_delivery(
+                opportunity.opportunity_id,
+                effect_id=effect_id,
+                state="failed",
+                reason=f"{kind}_{state}",
+                now_ms=int(self._clock_ms()),
+            )
+            await self._record(opportunity, f"{kind}_failed", state)
+            return {"status": f"{kind}_failed", "reason": state}
+        else:
+            # Unknown or in-flight: keep the reservation so a retry cannot double-post.
+            await self._record(opportunity, f"{kind}_unknown", state or "no_receipt")
+            return {"status": f"{kind}_unknown", "reason": state or "no_receipt"}
+        await self._record(opportunity, f"{kind}_submitted", decision.reason)
+        return {"status": f"{kind}_submitted", "effect_id": effect_id}
+
+    async def _image_veto(
+        self,
+        opportunity: ParticipationOpportunity,
+        inputs: ParticipationDecisionInputs,
+        context: Mapping[str, Any],
+    ) -> str | None:
+        if self._direct_active(opportunity):
+            return "direct_superseded"
+        try:
+            if await self._revalidate_selected_knowledge(opportunity, context):
+                return "knowledge_changed"
+        except ParticipationBlockedError as blocked:
+            return blocked.reason
+        if not _within_opportunity_deadline(
+            opportunity, inputs.snapshot, now_ms=int(self._clock_ms())
+        ):
+            return "deadline_expired"
+        return None
 
     async def _run_comment(
         self,
@@ -2332,6 +2635,34 @@ class ParticipationRuntime:
             raise
         except Exception as exc:  # noqa: BLE001 - recording must not break decisions
             logger.warning("participation_record_failed error_type={}", type(exc).__name__)
+
+
+def _meme_budget_text(
+    meme_limits: tuple[_LedgerLimit, ...],
+    meme_left: int,
+    sticker_limits: tuple[_LedgerLimit, ...],
+    sticker_left: int,
+    last: tuple[int, int] | None,
+    opportunity: ParticipationOpportunity,
+    now_ms: int,
+) -> str:
+    """The soft budget as the judge reads it: about two thirds of each hard cap."""
+    meme_cap = int(meme_limits[0][1]) if meme_limits else 0
+    sticker_cap = int(sticker_limits[0][1]) if sticker_limits else 0
+    lines = [
+        f"Memes: {meme_left} of {meme_cap} left in the last 7 days "
+        f"(aim for about {max(1, round(meme_cap * 2 / 3))} a week at most).",
+        f"Stickers: {sticker_left} of {sticker_cap} left in the last 24 hours "
+        f"(aim for about {max(1, round(sticker_cap * 2 / 3))} a day at most).",
+    ]
+    if last is None:
+        lines.append("No autonomous meme or sticker was posted here yet.")
+    else:
+        hours = max(0, (int(now_ms) - int(last[1])) // 3_600_000)
+        ago = f"{hours // 24} days" if hours >= 48 else f"{hours} hours"
+        messages = max(0, int(opportunity.observed_revision) - int(last[0]))
+        lines.append(f"Last meme or sticker: about {ago} and {messages} messages ago.")
+    return " ".join(lines)
 
 
 def _snapshot_value(snapshot: Any, name: str, default: Any = _MISSING) -> Any:
