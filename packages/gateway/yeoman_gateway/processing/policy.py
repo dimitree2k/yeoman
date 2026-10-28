@@ -52,6 +52,9 @@ TOOL_CAPABILITIES: Mapping[str, str] = {
 }
 #: Everything else must be named here or it is refused: no capability falls through.
 EXTERNAL_CAPABILITIES: Mapping[str, str] = {}
+#: Admitted participation actions that may carry a media payload; mirrors the judge's
+#: ``participation.IMAGE_ACTIONS`` without importing the judge into the final gate.
+_PARTICIPATION_IMAGE_ACTIONS: frozenset[str] = frozenset(("meme", "sticker"))
 
 
 def effect_guard(
@@ -1298,8 +1301,13 @@ class SnapshotEffectAuthorizer:
             return "participation_action_missing"
         if not intent:
             return "participation_intent_missing"
-        expected_action = "react" if envelope.payload.kind == "reaction" else "comment"
-        if action != expected_action:
+        if envelope.payload.kind == "reaction":
+            expected_actions: frozenset[str] = frozenset(("react",))
+        elif envelope.payload.kind == "media":
+            expected_actions = _PARTICIPATION_IMAGE_ACTIONS
+        else:
+            expected_actions = frozenset(("comment",))
+        if action not in expected_actions:
             return "participation_action_mismatch"
         if envelope.payload.kind == "reaction":
             target_message_id = str(getattr(admission, "target_message_id", "") or "")
