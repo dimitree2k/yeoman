@@ -2061,7 +2061,17 @@ def _build_topic_reopener(config: "Config", store: "ProcessingStore"):
                                timeout_seconds=settings.semantic_reopen_timeout_seconds),
         min_score=settings.semantic_reopen_min_score,
         timeout_seconds=settings.semantic_reopen_timeout_seconds,
+        chats=store.dormant_topic_chats,
     )
+
+
+def _thread_lifecycle(thread_responder: Any, gate: Any) -> Any:
+    """The lifecycle tick, which also prepares dormant topic vectors when reopen is on."""
+    actors = getattr(thread_responder, "_actors", None)
+    reopener = getattr(gate, "topic_reopen", None)
+    if actors is not None and reopener is not None:
+        actors.after_tick = reopener.warm
+    return actors
 
 
 def build_thread_responder(
@@ -4202,7 +4212,7 @@ def build_gateway_runtime(
             recover_pending=pending_participation_recovery,
         ),
         retention=build_retention_service(config, processing_store),
-        thread_lifecycle=thread_responder._actors if thread_responder is not None else None,
+        thread_lifecycle=_thread_lifecycle(thread_responder, processing_gate),
         statement_capture=statement_capture,
         knowledge_embeddings=knowledge_embeddings,
         source_catchup=(ObservedSourceCatchup(

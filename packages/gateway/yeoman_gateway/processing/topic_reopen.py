@@ -11,9 +11,10 @@ from __future__ import annotations
 import asyncio
 import json
 import math
+import time
 from collections import OrderedDict
 from collections.abc import Awaitable, Callable, Sequence
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 from typing import Any
 
 from loguru import logger
@@ -40,6 +41,10 @@ class ReopenVerdict:
     best_score: float = 0.0
     shortlisted: int = 0
     candidates: int = 0
+    #: Milliseconds spent embedding, verifying and in total (the delay before routing).
+    embed_ms: int = 0
+    verify_ms: int = 0
+    total_ms: int = 0
 
 
 def _cosine(left: Sequence[float], right: Sequence[float]) -> float:
@@ -95,10 +100,12 @@ class TopicReopener:
         verifier: Any,
         min_score: float = 0.8,
         shortlist: int = 3,
-        timeout_seconds: float = 6.0,
-        cache_size: int = 512,
+        timeout_seconds: float = 2.5,
+        cache_size: int = 2048,
+        chats: Callable[[], Sequence[tuple[str, str]]] | None = None,
     ) -> None:
         self._candidates = candidates
+        self._chats = chats
         self._embed = embed
         self._verifier = verifier
         self._min_score = float(min_score)
@@ -108,14 +115,27 @@ class TopicReopener:
         self._cache_size = max(0, int(cache_size))
 
     async def resolve(self, *, channel: str, chat_id: str, text: str) -> ReopenVerdict:
+        started = time.monotonic()
         try:
-            return await asyncio.wait_for(
+            verdict = await asyncio.wait_for(
                 self._resolve(channel=channel, chat_id=chat_id, text=text),
                 timeout=self._timeout,
             )
         except Exception as exc:
             logger.warning("topic_reopen_failed error_type={}", type(exc).__name__)
-            return ReopenVerdict(None, "error")
+            verdict = ReopenVerdict(None, "timeout" if isinstance(exc, TimeoutError) else "error")
+        return replace(verdict, total_ms=int((time.monotonic() - started) * 1000))
+
+    async def warm(self) -> int:
+        """Embed dormant topic labels ahead of time, so a request only embeds its own text."""
+        if self._chats is None:
+            return 0
+        labels = [label for channel, chat_id in self._chats()
+                  for _id, label, _at in self._candidates(channel, chat_id)]
+        missing = [label for label in dict.fromkeys(labels) if label not in self._cache]
+        for start in range(0, len(missing), 64):
+            await self._vectors(missing[start:start + 64])
+        return len(missing)
 
     async def _resolve(self, *, channel: str, chat_id: str, text: str) -> ReopenVerdict:
         message = " ".join(text.split())
@@ -124,7 +144,9 @@ class TopicReopener:
         pool = tuple(self._candidates(channel, chat_id))
         if not pool:
             return ReopenVerdict(None, "no_candidates")
+        started = time.monotonic()
         vectors = await self._vectors([message, *(label for _id, label, _at in pool)])
+        embed_ms = int((time.monotonic() - started) * 1000)
         current, labels = vectors[0], vectors[1:]
         scored = sorted(
             ((_cosine(current, vector), item) for vector, item in zip(labels, pool, strict=True)),
@@ -133,10 +155,12 @@ class TopicReopener:
         best = scored[0][0]
         shortlist = [item for score, item in scored if score >= self._min_score][: self._shortlist]
         if not shortlist:
-            return ReopenVerdict(None, "below_threshold", best, 0, len(pool))
+            return ReopenVerdict(None, "below_threshold", best, 0, len(pool), embed_ms)
+        started = time.monotonic()
         chosen = await self._verifier.choose(text=message, candidates=shortlist)
         return ReopenVerdict(
-            chosen, "verified" if chosen else "verifier_abstained", best, len(shortlist), len(pool)
+            chosen, "verified" if chosen else "verifier_abstained", best, len(shortlist), len(pool),
+            embed_ms, int((time.monotonic() - started) * 1000),
         )
 
     async def _vectors(self, texts: list[str]) -> list[list[float]]:

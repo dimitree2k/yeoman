@@ -247,3 +247,24 @@ async def test_runtime_starts_lifecycle_independently():
                              responder=None, history_projector=None, thread_lifecycle=lifecycle)
     await runtime._start_processing_services()
     lifecycle.start.assert_awaited_once()
+
+
+@pytest.mark.asyncio
+async def test_after_tick_failure_does_not_stop_maintenance():
+    with ProcessingStore(":memory:") as store:
+        registry = actors(store)
+        registry._interval_seconds = 0.01
+        calls = []
+
+        async def after_tick():
+            calls.append(1)
+            raise RuntimeError("embedding route down")
+
+        registry.after_tick = after_tick
+        await registry.start()
+        for _ in range(100):
+            if len(calls) >= 2:
+                break
+            await asyncio.sleep(0.01)
+        await registry.stop()
+        assert len(calls) >= 2

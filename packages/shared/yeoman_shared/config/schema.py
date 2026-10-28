@@ -738,7 +738,7 @@ class ProcessingThreadsConfig(BaseModel):
     semantic_reopen_candidates: int = Field(default=8, alias="semanticReopenCandidates", ge=1, le=32)
     semantic_reopen_route: str = Field(default="", alias="semanticReopenRoute")
     semantic_reopen_timeout_seconds: float = Field(
-        default=6.0, alias="semanticReopenTimeoutSeconds", gt=0
+        default=2.5, alias="semanticReopenTimeoutSeconds", gt=0
     )
     max_generations_global: int = Field(default=1, ge=1, le=2)
     max_generations_per_thread: int = Field(default=1, ge=1, le=2)

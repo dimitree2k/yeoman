@@ -2696,6 +2696,17 @@ class ProcessingStore:
             ).fetchall()
         return tuple((str(r[0]), str(r[1]), int(r[2])) for r in rows)
 
+    def dormant_topic_chats(self) -> tuple[tuple[str, str], ...]:
+        """Chats that have at least one dormant thread with a topic card."""
+        with self._lock:
+            rows = self._conn.execute(
+                "SELECT DISTINCT t.channel, t.chat_id FROM threads t "
+                "JOIN thread_topics p ON p.thread_id = t.thread_id "
+                "WHERE t.state = 'open' AND t.conversation_state = 'dormant' "
+                "AND t.kind != 'ambient' AND COALESCE(p.opener, p.latest) IS NOT NULL"
+            ).fetchall()
+        return tuple((str(r[0]), str(r[1])) for r in rows)
+
     def thread_opener(self, thread_id: str) -> tuple[str, str, int] | None:
         """(opener source id, opener text, thread opened_ms) while the opener still exists."""
         with self._lock:
