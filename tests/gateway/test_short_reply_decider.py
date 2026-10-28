@@ -195,3 +195,15 @@ async def test_long_texts_are_truncated_by_grapheme() -> None:
     user = client.calls[0]["messages"][1]["content"]
     assert "x" * 400 in user and "x" * 401 not in user
     assert "y" * 400 in user and "y" * 401 not in user
+
+
+async def test_the_prompt_makes_every_request_to_arvid_an_answer() -> None:
+    # Live, "Mach mal endlich ein meme jetze" was read as banter and got only an emoji.
+    client = _Client('{"action":"answer","emojis":[],"confidence":0.9}')
+    verdict = await _decider(client).decide(
+        ShortReplyInput(text="Mach mal endlich ein meme jetze", bot_text="Fair. MRS-Studien …")
+    )
+    system = str(client.calls[0]["messages"][0]["content"])
+    assert "A request for Arvid to do something" in system
+    assert "even when it is short, joking or impatient" in system
+    assert verdict.action == "answer"
