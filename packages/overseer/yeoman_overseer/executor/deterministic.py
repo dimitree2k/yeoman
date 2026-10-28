@@ -171,6 +171,35 @@ class DeterministicExecutor:
         return ActionResult(success=False, detail=detail)
 
 
+    async def _log_digest(
+        self,
+        *,
+        target: str,
+        processing_db: str = "~/.yeoman/data/ops/processing.db",
+        out_dir: str = "~/.yeoman/data/ops/log-review",
+        **_: str,
+    ) -> ActionResult:
+        from yeoman_overseer.executor.log_digest import build_log_digest
+
+        try:
+            result = await asyncio.to_thread(
+                build_log_digest,
+                log_dir=Path(target).expanduser(),
+                processing_db=Path(processing_db).expanduser(),
+                out_dir=Path(out_dir).expanduser(),
+            )
+        except Exception as exc:
+            message = f"Log digest failed: {type(exc).__name__}: {exc}"
+            await self._alert(target="log-digest", message=message)
+            return ActionResult(success=False, detail=message)
+        return ActionResult(
+            success=True,
+            detail=(
+                f"log digest {result.path.name}: {result.lines_read} lines, "
+                f"{result.incidents} incidents ({result.new_incidents} new)"
+            ),
+        )
+
     async def _verify_raw_archive(self, *, target: str, **_: str) -> ActionResult:
         from yeoman_shared.raw_archive.verify import verify_archive
 
@@ -243,5 +272,6 @@ _ACTION_REGISTRY = {
     "cleanup_stale_agent_sessions": DeterministicExecutor._cleanup_stale_agent_sessions,
     "verify_raw_archive": DeterministicExecutor._verify_raw_archive,
     "update_agent_clis": DeterministicExecutor._update_agent_clis,
+    "log_digest": DeterministicExecutor._log_digest,
     "noop": DeterministicExecutor._noop,
 }
