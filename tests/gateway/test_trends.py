@@ -6,11 +6,13 @@ import json
 from types import SimpleNamespace
 
 import pytest
-from yeoman_gateway.trends.models import Headline, TrendItem
+from yeoman_gateway.trends.article import Article, parse_article
+from yeoman_gateway.trends.models import Headline, TrendItem, TrendVerdict
 from yeoman_gateway.trends.scorer import TrendScorer, parse_verdicts
 from yeoman_gateway.trends.service import TrendsService
 from yeoman_gateway.trends.sources import parse_google_trends
 from yeoman_gateway.trends.store import TrendStore
+from yeoman_gateway.trends.writer import LineWriter, apply_written
 
 FEED = b"""<?xml version="1.0" encoding="UTF-8"?>
 <rss xmlns:ht="https://trends.google.com/trending/rss" version="2.0"><channel>
@@ -159,7 +161,10 @@ async def test_service_scores_new_items_once_and_survives_a_broken_source(tmp_pa
     first = await service.run_once()
     second = await service.run_once()
 
-    assert first.as_dict() == {"fetched": 1, "scored": 1, "cards": 1, "failed_sources": ["broken"]}
+    assert first.as_dict() == {
+        "fetched": 1, "scored": 1, "cards": 1, "articles_read": 0, "dropped": 0,
+        "failed_sources": ["broken"],
+    }
     assert second.scored == 0
     assert len(client.calls) == 1
     prompt = client.calls[0][1]["content"]
@@ -181,3 +186,122 @@ def test_trends_config_defaults_off_and_bootstrap_skips_it() -> None:
     assert _build_trends(config) is None
     missing_route = Config.model_validate({"trends": {"enabled": True, "route": "nope"}})
     assert _build_trends(missing_route) is None
+
+
+ARTICLE_HTML = """<html lang="de-DE"><head>
+<meta property="article:published_time" content="2026-10-27T08:15:00+01:00">
+</head><body><nav>Menu</nav><article><h1>Urteil</h1>
+<p>Ein Gericht hat entschieden, dass Google Maps ein Haus auf Wunsch verpixeln muss.
+Die Besitzerin hatte geklagt, weil Autoposer vor ihrem Haus posierten.</p>
+<p>Der Fall geht wohl in die nächste Instanz, Google prüft das Urteil.</p>
+</article></body></html>"""
+
+
+def test_parse_article_reads_text_date_and_language() -> None:
+    article = parse_article(ARTICLE_HTML)
+
+    assert article is not None
+    assert "Google Maps ein Haus auf Wunsch verpixeln" in article.text
+    assert article.language == "de"
+    assert article.published_at_ms == 1793085300000
+
+
+def test_parse_article_falls_back_to_json_ld_and_time() -> None:
+    ld = parse_article(
+        '<html><head><script type="application/ld+json">{"datePublished": "2026-10-27"}'
+        "</script></head><body><article><p>" + "Text. " * 40 + "</p></article></body></html>"
+    )
+    timed = parse_article(
+        '<html><body><time datetime="Tue, 27 Oct 2026 07:00:00 GMT"></time>'
+        "<article><p>" + "Text. " * 40 + "</p></article></body></html>"
+    )
+
+    assert ld is not None and ld.published_at_ms == 1793059200000
+    assert timed is not None and timed.published_at_ms == 1793084400000
+    assert parse_article("<html><body></body></html>") is None
+
+
+def _verdict(key: str = "test:a", score: int = 9) -> TrendVerdict:
+    return TrendVerdict(
+        item_key=key, score=score, kind="absurd", hook="old hook", line="old line",
+        url="https://example.org/a",
+    )
+
+
+def test_apply_written_rewrites_drops_or_keeps() -> None:
+    verdict = _verdict()
+
+    assert apply_written(verdict, {"keep": True, "hook": "new", "line": "neu"}).line == "neu"
+    dropped = apply_written(verdict, {"keep": False, "line": "x"})
+    assert (dropped.score, dropped.kind) == (0, "dropped")
+    assert apply_written(verdict, {"keep": True, "line": "  "}) == verdict
+    assert apply_written(verdict, None) == verdict
+
+
+class _Reader:
+    def __init__(self, articles: dict[str, Article | None]) -> None:
+        self.articles = articles
+
+    async def read(self, url: str) -> Article | None:
+        return self.articles.get(url)
+
+
+class _WriterClient:
+    def __init__(self) -> None:
+        self.calls: list[list[dict[str, str]]] = []
+
+    async def chat_with_usage(self, messages, *, max_tokens, response_format=None, max_retries=None):
+        self.calls.append(messages)
+        return SimpleNamespace(content=json.dumps(
+            {"keep": True, "hook": "Hook.", "line": "Das wird ein Feature."}
+        ))
+
+
+@pytest.mark.asyncio
+async def test_service_rewrites_from_the_article_and_drops_stale_foreign_or_unreadable(tmp_path) -> None:
+    now = 100 * 3600 * 1000
+    items = [
+        _item("fresh", "https://example.org/fresh"),
+        _item("stale", "https://example.org/stale"),
+        _item("french", "https://example.org/french"),
+        _item("paywall", "https://example.org/paywall"),
+        _item("boring", "https://example.org/boring"),
+    ]
+    reader = _Reader({
+        "https://example.org/fresh": Article(text="Body.", published_at_ms=now - 3600_000, language="de"),
+        "https://example.org/stale": Article(text="Body.", published_at_ms=now - 72 * 3600_000),
+        "https://example.org/french": Article(text="Corps.", language="fr"),
+        "https://example.org/paywall": None,
+    })
+    writer_client = _WriterClient()
+
+    class _ScoreAll:
+        async def chat_with_usage(self, messages, *, max_tokens, response_format=None, max_retries=None):
+            return SimpleNamespace(content=json.dumps({"items": [
+                {"index": i, "score": 2 if i == 4 else 9, "kind": "absurd", "line": "Alt.",
+                 "url": items[i].headlines[0].url}
+                for i in range(len(items))
+            ]}))
+
+    service = TrendsService(
+        sources=[_Source(items)],
+        scorer=TrendScorer(client=_ScoreAll()),
+        store=TrendStore(tmp_path / "trends.db"),
+        reader=reader,
+        writer=LineWriter(client=writer_client),
+        clock=lambda: now,
+    )
+
+    report = await service.run_once()
+    cards = {card.title: card for card in service.store.active_cards(now_ms=now)}
+
+    assert (report.articles_read, report.dropped, report.cards) == (3, 3, 1)
+    assert cards["fresh"].line == "Das wird ein Feature."
+    assert set(cards) == {"fresh"}
+    kinds = {row["title"]: row["kind"] for row in service.store.recent_scores()}
+    assert (kinds["stale"], kinds["french"], kinds["paywall"]) == ("stale", "foreign", "unreadable")
+    assert len(writer_client.calls) == 1
+    system, user = writer_client.calls[0]
+    assert "Grillen im Tourbus" in system["content"] and "German" in system["content"]
+    assert "Article:\nBody." in user["content"]
+    await service.stop()
