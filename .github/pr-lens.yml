@@ -1,0 +1,3 @@
+# PR Lens GitHub App: draw only when asked. Comment `@pr-lens draw` on a PR.
+github:
+  draw: on-demand
