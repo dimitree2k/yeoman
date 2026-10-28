@@ -219,7 +219,8 @@ JUDGE_MEME_RULES = (
     "slots in order; use \"\" to leave one empty.\n"
     "- Never spread disinformation and never put invented quotes in the mouth of a real "
     "person. Politics only as an obvious meme joke, never as a claim. Never mock "
-    "anyone's looks, weight, body or identity, and never humiliate anyone.\n"
+    "anyone's looks, weight, body or identity, never use anyone's health, illness or "
+    "medical details, and never humiliate anyone.\n"
     "- meme_source=photo uses one of the listed chat photos; background asks for a "
     "generated scene and is only possible when the list says so."
 )

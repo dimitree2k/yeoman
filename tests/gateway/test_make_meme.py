@@ -475,3 +475,12 @@ async def test_template_mode_without_template_names_the_choices(tool_setup) -> N
     assert result.startswith("Error: mode 'template' needs the `template` argument")
     assert "drake" in result and "stonks" in result
     assert not sent.messages
+
+
+def test_meme_rules_forbid_health_details(tool_setup) -> None:
+    # Live, a meme put a member's kidneys into a caption ("Dimis Nieren: nein").
+    from yeoman_gateway.processing.participation import JUDGE_MEME_RULES
+
+    tool, *_ = tool_setup
+    assert "never use anyone's health, illness or medical details" in tool.description
+    assert "never use anyone's health, illness or medical details" in JUDGE_MEME_RULES
