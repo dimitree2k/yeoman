@@ -2628,22 +2628,27 @@ class ProcessingStore:
                 " latest_source_id, latest, updated_ms) VALUES (?,?,?,?,?,?) "
                 "ON CONFLICT(thread_id) DO UPDATE SET latest_source_id = excluded.latest_source_id,"
                 " latest = excluded.latest, updated_ms = excluded.updated_ms,"
-                " opener_source_id = COALESCE(thread_topics.opener_source_id, excluded.opener_source_id),"
+                # The opener and its source id move together: after the opener was
+                # deleted, the next message becomes the opener under its own id.
+                " opener_source_id = CASE WHEN thread_topics.opener IS NULL"
+                " THEN excluded.opener_source_id ELSE thread_topics.opener_source_id END,"
                 " opener = COALESCE(thread_topics.opener, excluded.opener)",
                 (thread_id, source_id, excerpt, source_id, excerpt, int(now_ms)),
             )
 
     def forget_topic_source(self, source_id: str, now_ms: int) -> None:
-        """A deleted message leaves no text behind in any topic card."""
+        """A deleted or edited message leaves no stale text behind in any topic card."""
         if not source_id:
             return
         with self._write() as conn:
             conn.execute(
-                "UPDATE thread_topics SET opener = NULL, updated_ms = ? WHERE opener_source_id = ?",
+                "UPDATE thread_topics SET opener = NULL, opener_source_id = NULL, updated_ms = ? "
+                "WHERE opener_source_id = ?",
                 (int(now_ms), source_id),
             )
             conn.execute(
-                "UPDATE thread_topics SET latest = NULL, updated_ms = ? WHERE latest_source_id = ?",
+                "UPDATE thread_topics SET latest = NULL, latest_source_id = NULL, updated_ms = ? "
+                "WHERE latest_source_id = ?",
                 (int(now_ms), source_id),
             )
 

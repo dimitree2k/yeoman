@@ -451,8 +451,8 @@ class ThreadRegistry:
         data = self.input_from_event(
             event, explicit_correction=explicit_correction, topic_break=topic_break
         )
-        if data.kind == "delete":
-            # A deleted message leaves no text in a topic card, whatever routing decides.
+        if data.kind in ("delete", "edit"):
+            # A deleted or edited message leaves no stale text in a topic card.
             self._store.forget_topic_source(str(data.target_message_id or ""), moment)
 
         stored = self._store.event_assignment(event.event_id)

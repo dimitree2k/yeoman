@@ -312,3 +312,19 @@ def test_frame_names_how_a_reopened_thread_began():
     assert frame is not None and "began earlier" in frame and "neues Auto" in frame
     assert "No supported conversation chain" not in frame
     assert fresh is None
+
+
+def test_a_new_opener_after_a_delete_is_forgotten_by_its_own_id(tmp_path):
+    from yeoman_gateway.processing.store import ProcessingStore
+
+    store = ProcessingStore(tmp_path / "p.db")
+    thread = store.open_thread(channel="whatsapp", chat_id=GROUP, root_principal="o",
+                               kind="group", trigger_event_id="e1", now_ms=1_000)
+    store.note_thread_topic(thread, source_id="a", text="first words", now_ms=1_000)
+    store.forget_topic_source("a", 1_100)
+    store.note_thread_topic(thread, source_id="b", text="second words", now_ms=1_200)
+
+    assert store.thread_opener(thread) == ("b", "second words", 1_000)
+    store.forget_topic_source("b", 1_300)
+    assert store.thread_topic(thread) == (None, None)
+    store.close()
