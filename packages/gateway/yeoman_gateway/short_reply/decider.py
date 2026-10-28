@@ -27,7 +27,9 @@ SHORT_REPLY_PROMPT = (
     'needs no content. Put 1-3 emojis from the allowed list in "emojis", best fit '
     "first, matching the sender's tone (mirror their emotion where it fits).\n"
     "answer: the message adds a new claim, correction, request or question that "
-    "deserves a real reply.\n"
+    "deserves a real reply. A request for Arvid to do something (make a meme or "
+    "sticker, look something up, explain, send something) is always answer, even when "
+    "it is short, joking or impatient: only a real reply can do it, an emoji cannot.\n"
     "none: nothing Arvid could add, not even a gesture.\n"
     "Emojis Arvid used recently in this chat: {recent}. Prefer a different emoji when "
     "several fit equally well; never pick one only for variety.\n"
