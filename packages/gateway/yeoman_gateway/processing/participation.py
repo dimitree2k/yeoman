@@ -361,7 +361,7 @@ class ParticipationJudge:
         )
         self._timeout_seconds = max(1.0, float(timeout_seconds))
         self._max_input_tokens = max(512, int(max_input_tokens))
-        self._max_output_tokens = max(64, min(1024, int(max_output_tokens)))
+        self._max_output_tokens = max(64, min(4096, int(max_output_tokens)))
 
     @property
     def route_key(self) -> str:

@@ -885,7 +885,7 @@ class ProcessingParticipationConfig(BaseModel):
         default=4000, alias="judgeMaxInputTokens", ge=512, le=16_000
     )
     judge_max_output_tokens: int = Field(
-        default=256, alias="judgeMaxOutputTokens", ge=64, le=1024
+        default=256, alias="judgeMaxOutputTokens", ge=64, le=4096
     )
     #: Candidate search horizon. It bounds work and retention; it is not permission.
     context_window_minutes: int = Field(default=120, alias="contextWindowMinutes", ge=1, le=1440)

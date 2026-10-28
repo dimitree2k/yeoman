@@ -177,7 +177,9 @@ class GatewaySocket:
                 return await self.history_read_handler(args)
             except ValueError:
                 return {'status': 'error', 'code': 'INVALID_READ'}
-            except Exception:
+            except Exception as exc:
+                reason = getattr(exc, 'reason', '') or getattr(exc, 'code', '')
+                logger.warning('history_read_unavailable error_type={} reason={}', type(exc).__name__, reason if isinstance(reason, str) and reason.isidentifier() else '')
                 return {'status': 'paused', 'code': 'HISTORY_READ_UNAVAILABLE'}
 
         if cmd == 'history_control':
