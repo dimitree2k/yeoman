@@ -17,6 +17,16 @@ from yeoman_gateway.policy.persona import COMPACT_PROMPT_MARKER, uses_compact_pr
 
 _EXTERNAL_CHANNELS = frozenset({"whatsapp", "telegram", "discord", "feishu"})
 
+#: Added only when `make_meme` is offered: small models otherwise claim they have no
+#: such tool and hand out captions to paste into a meme generator instead.
+MEME_TOOL_NOTE = (
+    "You can make memes and stickers: the `make_meme` tool is available in this chat. "
+    "When someone asks for a meme or a sticker, call `make_meme` and pick a fitting "
+    "template and captions yourself (from the recent conversation when they name no "
+    "topic). Never claim you can't make images or memes, and never send captions for "
+    "someone else to put into a meme generator instead."
+)
+
 
 def _readable_time(value: Any) -> str:
     """Epoch seconds or milliseconds as local wall time; other values unchanged.
@@ -687,6 +697,8 @@ When a user asks you to send, create, or reply with a voice message / Sprachnach
                     ),
                 }
             )
+        if "make_meme" in (allowed_tools or set()):
+            messages.append({"role": "system", "content": MEME_TOOL_NOTE})
 
         # History — wrap user-role messages from external channels
         if is_external:
