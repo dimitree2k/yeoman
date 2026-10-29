@@ -473,6 +473,7 @@ class GatewayRuntime:
     people_sync: PeopleSyncService | None = None
     people: PeopleResolver | None = None
     trends: Any | None = None
+    decision_sweeper: Any | None = None
 
     async def _start_processing_services(self) -> None:
         """Plan 04 start order: recover and reconcile before any channel consumes input.
@@ -514,6 +515,8 @@ class GatewayRuntime:
                 await self.people_sync.start()
             if self.trends is not None:
                 await self.trends.start()
+            if self.decision_sweeper is not None:
+                await self.decision_sweeper.start()
             self._resume_a2a_research()
             await self.cron.start()
             await self.heartbeat.start()
@@ -597,6 +600,8 @@ class GatewayRuntime:
                 await attempt_async(self.people_sync.stop)
             if self.trends is not None:
                 await attempt_async(self.trends.stop)
+            if self.decision_sweeper is not None:
+                await attempt_async(self.decision_sweeper.stop)
             if self.processing is not None:
                 attempt_sync(self.processing.close)
             if self.people is not None:
@@ -2962,6 +2967,12 @@ def build_gateway_runtime(
         if effect_router is not None
         else None
     )
+    from yeoman_gateway.group_decisions.store import GroupDecisionStore
+    from yeoman_gateway.group_decisions.sweeper import DecisionSweeper
+
+    # One store for the decisions tool and its due-nudge sweep; opened on first use.
+    group_decisions = GroupDecisionStore()
+    decision_sweeper = DecisionSweeper(group_decisions, service_effects=service_effects, bus=bus)
     from yeoman_gateway.history.export import SecondaryArchive
     secondary_inbound_archive = SecondaryArchive()
     consciousness_tools = None
@@ -3027,6 +3038,7 @@ def build_gateway_runtime(
         telemetry=telemetry,
         security=security,
         cron_service=cron,
+        group_decisions=group_decisions,
         caldav_service=_caldav_service,
         owner_alert_resolver=policy_adapter.owner_recipients,
         file_access_resolver=file_access_resolver,
@@ -4374,6 +4386,7 @@ def build_gateway_runtime(
             if history_projector is not None else None
         ),
         trends=_build_trends(config, policy_adapter),
+        decision_sweeper=decision_sweeper,
     )
 
 
