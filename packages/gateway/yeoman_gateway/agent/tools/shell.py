@@ -264,6 +264,7 @@ class ExecTool(Tool):
                 command=command,
                 host_cwd=cwd,
                 timeout=self.timeout,
+                with_extra_mounts=grants_are_active(),
             )
         except SandboxTimeoutError:
             return f"Error: Command timed out after {self.timeout} seconds"

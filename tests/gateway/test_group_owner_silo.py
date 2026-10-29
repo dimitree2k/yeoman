@@ -181,3 +181,74 @@ async def test_subagent_mounts_grants_only_for_owner_outside_groups(
 
     assert bool(captured["extra_mounts"]) is mounted
     assert bool(captured["grant_container_prefixes"]) is mounted
+
+
+# --- exec sandbox grant mounts ----------------------------------------------------
+
+
+class _RecordingSandboxSession:
+    def __init__(self, session_key, workspace, extra_mounts=None):
+        self.session_key = session_key
+        self.extra_mounts = list(extra_mounts or [])
+        self.last_used_at = 0.0
+        self.active = False
+
+    async def start(self) -> None:
+        return None
+
+    async def run_command(self, command, cwd, timeout):
+        from yeoman_gateway.agent.tools.exec_isolation import CommandResult
+
+        return CommandResult(output=f"{self.session_key}:{len(self.extra_mounts)}", exit_code=0)
+
+    async def stop(self, reason=None) -> None:
+        return None
+
+    def stop_now(self) -> None:
+        return None
+
+
+@pytest.mark.parametrize("grants_on", [True, False])
+async def test_exec_sandbox_mounts_grants_only_while_grants_are_active(
+    tmp_path, monkeypatch, grants_on,
+):
+    from yeoman_gateway.agent.tools import exec_isolation
+    from yeoman_gateway.agent.tools.exec_isolation import (
+        ExecSandboxManager,
+        MountAllowlist,
+        SandboxMount,
+    )
+    from yeoman_gateway.agent.tools.file_access import enable_grants
+    from yeoman_gateway.agent.tools.shell import ExecTool
+    from yeoman_shared.config.schema import ExecIsolationConfig
+
+    workspace = tmp_path / "workspace"
+    workspace.mkdir()
+    granted = tmp_path / "private"
+    granted.mkdir()
+    allowlist = MountAllowlist(allowed_roots=[tmp_path.resolve()], blocked_patterns=[])
+    monkeypatch.setattr(ExecSandboxManager, "_check_runtime", staticmethod(lambda: None))
+    monkeypatch.setattr(MountAllowlist, "load", staticmethod(lambda _path: allowlist))
+    monkeypatch.setattr(exec_isolation, "BubblewrapSandboxSession", _RecordingSandboxSession)
+    tool = ExecTool(
+        working_dir=str(workspace),
+        isolation_config=ExecIsolationConfig(enabled=True, allowlist_path=str(tmp_path / "a.json")),
+        extra_mounts=[SandboxMount(host_path=granted, container_path="/grants/notes", readonly=True)],
+        grant_container_prefixes=["/grants/notes"],
+    )
+    tool.set_session_context("whatsapp:123@g.us")
+
+    if grants_on:
+        with enable_grants():
+            output = await tool.execute(command="ls")
+    else:
+        output = await tool.execute(command="ls")
+
+    sessions = tool._sandbox_manager._sessions
+    if grants_on:
+        assert output == "whatsapp:123@g.us:1"
+        assert set(sessions) == {"whatsapp:123@g.us"}
+    else:
+        # A separate session that never had the grant folders mounted.
+        assert output == "whatsapp:123@g.us#no-grants:0"
+        assert set(sessions) == {"whatsapp:123@g.us#no-grants"}
