@@ -21,7 +21,8 @@ class CronSchedule:
 @dataclass
 class CronPayload:
     """What to do when the job runs."""
-    kind: Literal["system_event", "agent_turn", "voice_broadcast"] = "agent_turn"
+    # "plain_text" sends `message` as-is to `to`, without an agent turn (group reminders).
+    kind: Literal["system_event", "agent_turn", "voice_broadcast", "plain_text"] = "agent_turn"
     message: str = ""
     # Deliver response to channel
     deliver: bool = False
@@ -56,6 +57,9 @@ class CronPayload:
     workflow_id: str | None = None
     workflow_step: int = 0
     max_chain_depth: int = 5
+    # Who created the job (canonical principal) and in which chat; set for plain_text jobs.
+    created_by: str | None = None
+    source_chat: str | None = None
 
 
 @dataclass

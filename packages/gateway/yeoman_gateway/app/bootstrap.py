@@ -3398,6 +3398,9 @@ def build_gateway_runtime(
         return cleaned
 
     async def on_cron_job(job: CronJob) -> str | None:
+        if job.payload.kind == "plain_text":
+            # Fail closed: group-created text must never become an agent turn.
+            raise RuntimeError("plain_text job reached the agent path")
         if job.payload.kind == "voice_broadcast":
             phrases = [str(v).strip() for v in list(job.payload.voice_messages) if str(v).strip()]
             if not phrases and str(job.payload.message or "").strip():
@@ -3635,7 +3638,12 @@ def build_gateway_runtime(
             with history_knowledge_scope(snapshot, knowledge_service):
                 return await on_cron_job(job)
 
-    cron.on_job = scoped_cron_job
+    from yeoman_gateway.cron.plain_text import plain_text_deliverer, plain_text_first
+
+    # Plain-text jobs (group reminders) are sent before any history scope or agent turn.
+    cron.on_job = plain_text_first(
+        scoped_cron_job, plain_text_deliverer(service_effects=service_effects, bus=bus)
+    )
 
     def _cron_owner_dm() -> tuple[str, str] | None:
         from yeoman_gateway.consciousness.tools import ConsciousnessTools
@@ -3654,16 +3662,25 @@ def build_gateway_runtime(
             logger.warning("Cron: no owner DM configured for failure alert job={}", job.id)
             return
         channel, chat_id = target
+        from yeoman_gateway.cron.plain_text import failure_alert_error, failure_alert_label
+
+        # Group reminders are named by id only: their text belongs to the group.
+        label = failure_alert_label(job)
         if recovered:
             content = (
-                f"Cron job '{job.name}' works again after "
+                f"{label} works again after "
                 f"{job.state.consecutive_failures} failed run(s)."
             )
         else:
-            error = redact_secrets(" ".join(str(job.state.last_error or "unknown error").split()))
+            raw_error = failure_alert_error(job)
+            last_error = (
+                f"Last error: {redact_secrets(' '.join(raw_error.split()))[:300]}\n"
+                if raw_error is not None
+                else ""
+            )
             content = (
-                f"Cron job '{job.name}' failed ({job.state.consecutive_failures} in a row). "
-                f"Last error: {error[:300]}\n"
+                f"{label} failed ({job.state.consecutive_failures} in a row). "
+                f"{last_error}"
                 "I remind you at most once a day while it keeps failing."
             )
         kind = "recovered" if recovered else "failing"
