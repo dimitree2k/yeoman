@@ -72,6 +72,8 @@ _FORWARD_COMMAND = re.compile(r"^/?forward(?:\s+.+)?$", re.IGNORECASE)
 MEME_TOOL = "make_meme"
 #: Tool name gated by the per-chat `polls` switch.
 POLL_TOOL = "poll"
+#: Tool name gated by the per-chat `groupReminders` switch.
+GROUP_REMINDER_TOOL = "group_reminder"
 #: Rolling windows of the autonomous meme and sticker budgets.
 MEME_WINDOW_MS = 7 * 24 * 60 * 60 * 1000
 STICKER_WINDOW_MS = 24 * 60 * 60 * 1000
@@ -133,6 +135,7 @@ class EffectivePolicy:
     participation: ParticipationPolicy = field(default_factory=ParticipationPolicy)
     memes: bool = False
     polls: bool = False
+    group_reminders: bool = False
     trends: TrendsPolicy = field(default_factory=TrendsPolicy)
 
 
@@ -300,6 +303,7 @@ class _CompiledPolicy:
     participation: ParticipationPolicy = field(default_factory=ParticipationPolicy)
     memes: bool = False
     polls: bool = False
+    group_reminders: bool = False
     trends: TrendsPolicy = field(default_factory=TrendsPolicy)
 
 
@@ -415,6 +419,7 @@ class PolicyEngine:
             contacts_disclosure=bool(resolved.contacts_disclosure),
             memes=bool(resolved.memes),
             polls=bool(resolved.polls),
+            group_reminders=bool(resolved.group_reminders),
             session_history_limit=resolved.session_history_limit,
             participation=ParticipationPolicy.model_validate(
                 resolved.participation.model_dump()
@@ -600,6 +605,7 @@ class PolicyEngine:
             contacts_disclosure=resolved.contacts_disclosure,
             memes=resolved.memes,
             polls=resolved.polls,
+            group_reminders=resolved.group_reminders,
             session_history_limit=resolved.session_history_limit,
             participation=ParticipationPolicy.model_validate(
                 resolved.participation.model_dump()
@@ -823,6 +829,8 @@ class PolicyEngine:
         if not policy.polls:
             # Same opt-in as memes: a poll speaks to the whole chat.
             allowed.discard(POLL_TOOL)
+        if not policy.group_reminders:
+            allowed.discard(GROUP_REMINDER_TOOL)
         return allowed
 
     def evaluate(self, actor: ActorContext, all_tools: set[str]) -> PolicyDecision:

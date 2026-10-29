@@ -435,6 +435,8 @@ class ChatPolicy(PolicyModel):
     memes: bool = False
     #: Opt-in switch for the poll tool; off unless a chat or channel enables it.
     polls: bool = False
+    #: Opt-in switch for the group_reminder tool; off unless a chat or channel enables it.
+    group_reminders: bool = Field(default=False, alias="groupReminders")
     session_history_limit: int | None = Field(default=None, alias="sessionHistoryLimit")
 
 
@@ -463,6 +465,7 @@ class ChatPolicyOverride(PolicyModel):
     contacts_disclosure: bool | None = Field(default=None, alias="contactsDisclosure")
     memes: bool | None = None
     polls: bool | None = None
+    group_reminders: bool | None = Field(default=None, alias="groupReminders")
     session_history_limit: int | None = Field(default=None, alias="sessionHistoryLimit", ge=1, le=100)
 
 

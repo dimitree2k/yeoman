@@ -848,6 +848,10 @@ class LLMResponder(ResponderPort):
         self.tools.register(FactCheckTool(manager=self.subagents))
 
         if self.cron_service is not None:
+            from yeoman_gateway.agent.tools.group_reminder import GroupReminderTool
+
+            # Registered everywhere; the policy `groupReminders` switch exposes it per chat.
+            self.tools.register(GroupReminderTool(self.cron_service))
             cron_tool = CronTool(self.cron_service)
             self.tools.register(cron_tool)
 

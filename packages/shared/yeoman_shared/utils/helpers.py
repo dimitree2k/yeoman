@@ -24,6 +24,7 @@ OPERATIONAL_STORE_PATHS = {
     "trends": "ops/trends.db",
     "meme_quota": "ops/meme-quota.json",
     "poll_guard": "ops/poll-guard.json",
+    "group_reminder_quota": "ops/group-reminder-quota.json",
 }
 
 

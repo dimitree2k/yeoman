@@ -58,6 +58,15 @@ class CronJobSkippedError(Exception):
         self.reason = str(reason or "skipped")
 
 
+def _in_scope(job: CronJob, *, chat_id: str | None, created_by: str | None) -> bool:
+    """Whether a job is a plain-text job of this chat and/or creator."""
+    if job.payload.kind != "plain_text":
+        return False
+    if chat_id is not None and job.payload.to != chat_id:
+        return False
+    return created_by is None or job.payload.created_by == created_by
+
+
 class CronService:
     """Service for managing and executing scheduled jobs."""
 
@@ -138,6 +147,8 @@ class CronService:
                             workflow_id=j["payload"].get("workflowId"),
                             workflow_step=int(j["payload"].get("workflowStep", 0)),
                             max_chain_depth=int(j["payload"].get("maxChainDepth", 5)),
+                            created_by=j["payload"].get("createdBy"),
+                            source_chat=j["payload"].get("sourceChat"),
                         ),
                         state=CronJobState(
                             next_run_at_ms=j.get("state", {}).get("nextRunAtMs"),
@@ -214,6 +225,8 @@ class CronService:
                         "workflowId": j.payload.workflow_id,
                         "workflowStep": j.payload.workflow_step,
                         "maxChainDepth": j.payload.max_chain_depth,
+                        "createdBy": j.payload.created_by,
+                        "sourceChat": j.payload.source_chat,
                     },
                     "state": {
                         "nextRunAtMs": j.state.next_run_at_ms,
@@ -430,10 +443,18 @@ class CronService:
 
     # ========== Public API ==========
 
-    def list_jobs(self, include_disabled: bool = False) -> list[CronJob]:
-        """List all jobs."""
+    def list_jobs(
+        self,
+        include_disabled: bool = False,
+        *,
+        chat_id: str | None = None,
+        created_by: str | None = None,
+    ) -> list[CronJob]:
+        """List jobs, optionally only the plain-text jobs of one chat and/or one creator."""
         store = self._load_store()
         jobs = store.jobs if include_disabled else [j for j in store.jobs if j.enabled]
+        if chat_id is not None or created_by is not None:
+            jobs = [j for j in jobs if _in_scope(j, chat_id=chat_id, created_by=created_by)]
         return sorted(jobs, key=lambda j: j.state.next_run_at_ms or float('inf'))
 
     def add_job(
@@ -475,6 +496,48 @@ class CronService:
         self._arm_timer()
 
         logger.info(f"Cron: added job '{name}' ({job.id})")
+        return job
+
+    def add_plain_text_job(
+        self,
+        *,
+        at_ms: int,
+        message: str,
+        channel: str,
+        chat_id: str,
+        created_by: str,
+    ) -> CronJob:
+        """Add a one-shot job that sends ``message`` verbatim to ``chat_id``.
+
+        It never runs an agent turn. The name stays neutral, so logs and failure
+        alerts never carry the reminder text.
+        """
+        store = self._load_store()
+        now = _now_ms()
+        schedule = CronSchedule(kind="at", at_ms=at_ms)
+        job = CronJob(
+            id=str(uuid.uuid4())[:8],
+            name="group reminder",
+            enabled=True,
+            schedule=schedule,
+            payload=CronPayload(
+                kind="plain_text",
+                message=message,
+                deliver=True,
+                channel=channel,
+                to=chat_id,
+                created_by=created_by,
+                source_chat=chat_id,
+            ),
+            state=CronJobState(next_run_at_ms=_compute_next_run(schedule, now)),
+            created_at_ms=now,
+            updated_at_ms=now,
+            delete_after_run=True,
+        )
+        store.jobs.append(job)
+        self._save_store()
+        self._arm_timer()
+        logger.info("Cron: added group reminder ({})", job.id)
         return job
 
     def add_voice_job(
@@ -548,11 +611,22 @@ class CronService:
         logger.info(f"Cron: added voice job '{name}' ({job.id})")
         return job
 
-    def remove_job(self, job_id: str) -> bool:
-        """Remove a job by ID."""
+    def remove_job(
+        self,
+        job_id: str,
+        *,
+        chat_id: str | None = None,
+        created_by: str | None = None,
+    ) -> bool:
+        """Remove a job by ID; with a scope, only a plain-text job inside that scope."""
         store = self._load_store()
         before = len(store.jobs)
-        store.jobs = [j for j in store.jobs if j.id != job_id]
+        scoped = chat_id is not None or created_by is not None
+        store.jobs = [
+            j for j in store.jobs
+            if j.id != job_id
+            or (scoped and not _in_scope(j, chat_id=chat_id, created_by=created_by))
+        ]
         removed = len(store.jobs) < before
 
         if removed:
