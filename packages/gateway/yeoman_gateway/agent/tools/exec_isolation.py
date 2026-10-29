@@ -363,8 +363,14 @@ class ExecSandboxManager:
         command: str,
         host_cwd: str,
         timeout: int,
+        with_extra_mounts: bool = True,
     ) -> CommandResult:
-        session = await self._get_or_create_session(session_key)
+        # Grant mounts are bound at session start, so a turn without grants gets its own
+        # session that never had them mounted.
+        mounted = with_extra_mounts and bool(self._extra_mounts)
+        if self._extra_mounts and not mounted:
+            session_key = f"{session_key}#no-grants"
+        session = await self._get_or_create_session(session_key, with_extra_mounts=mounted)
         cwd = self._to_container_path(host_cwd)
 
         try:
@@ -391,7 +397,9 @@ class ExecSandboxManager:
         for session in sessions:
             session.stop_now()
 
-    async def _get_or_create_session(self, session_key: str) -> BubblewrapSandboxSession:
+    async def _get_or_create_session(
+        self, session_key: str, *, with_extra_mounts: bool = True
+    ) -> BubblewrapSandboxSession:
         now = time.monotonic()
 
         async with self._lock:
@@ -406,7 +414,7 @@ class ExecSandboxManager:
             session = BubblewrapSandboxSession(
                 session_key=session_key,
                 workspace=self.workspace,
-                extra_mounts=self._extra_mounts,
+                extra_mounts=self._extra_mounts if with_extra_mounts else [],
             )
             await session.start()
             self._sessions[session_key] = session
