@@ -99,6 +99,7 @@ async def _try_autostart(base: str, headers: dict[str, str]) -> bool:
 
 class BrowseTool(Tool):
     """Navigate and interact with web pages via pinchtab browser automation."""
+    external_content = True
 
     @property
     def name(self) -> str:

@@ -68,6 +68,7 @@ from yeoman_gateway.processing.signals import SignalJournalSink
 from yeoman_gateway.providers.factory import ProviderFactory
 from yeoman_gateway.providers.openai_compatible import resolve_openai_compatible_credentials
 from yeoman_gateway.security import NoopSecurity, SecurityEngine
+from yeoman_gateway.security.rules import redact_secrets
 from yeoman_gateway.session.manager import SessionManager
 from yeoman_gateway.storage.private_handoff import PrivateHandoffStore
 from yeoman_gateway.trends.seeds import (
@@ -3473,6 +3474,8 @@ def build_gateway_runtime(
             model_profile=job.payload.model_profile,
             is_owner=(not job.payload.deliver and not job.payload.to
                       and job.payload.channel in {None, "cli"}),
+            # A dropped provider-error turn must count as a failed run, not "ok".
+            raise_provider_errors=True,
         )
         if job.payload.deliver and job.payload.to:
             delivery_channel = job.payload.channel or "cli"
@@ -3631,6 +3634,52 @@ def build_gateway_runtime(
                 return await on_cron_job(job)
 
     cron.on_job = scoped_cron_job
+
+    def _cron_owner_dm() -> tuple[str, str] | None:
+        from yeoman_gateway.consciousness.tools import ConsciousnessTools
+
+        owners = policy_engine.policy.owners if policy_engine is not None else {}
+        for channel in ("whatsapp", "telegram"):
+            for owner in owners.get(channel, []):
+                chat_id = ConsciousnessTools._owner_dm_chat_id(channel, owner)
+                if chat_id and not ConsciousnessTools._is_group_chat(channel, chat_id):
+                    return channel, chat_id
+        return None
+
+    async def on_cron_failure_alert(job: CronJob, recovered: bool) -> None:
+        target = _cron_owner_dm()
+        if target is None:
+            logger.warning("Cron: no owner DM configured for failure alert job={}", job.id)
+            return
+        channel, chat_id = target
+        if recovered:
+            content = (
+                f"Cron job '{job.name}' works again after "
+                f"{job.state.consecutive_failures} failed run(s)."
+            )
+        else:
+            error = redact_secrets(" ".join(str(job.state.last_error or "unknown error").split()))
+            content = (
+                f"Cron job '{job.name}' failed ({job.state.consecutive_failures} in a row). "
+                f"Last error: {error[:300]}\n"
+                "I remind you at most once a day while it keeps failing."
+            )
+        kind = "recovered" if recovered else "failing"
+        if service_effects is not None:
+            await service_effects.send(
+                source="cron",
+                # One alert per failure streak and day: the alert time is set before the call.
+                operation_ref=f"cron-alert:{job.id}:{job.state.failure_alerted_at_ms}:{kind}",
+                channel=channel,
+                chat_id=chat_id,
+                content=content,
+            )
+        else:
+            await bus.publish_outbound(
+                OutboundMessage(channel=channel, chat_id=chat_id, content=content)
+            )
+
+    cron.on_failure_alert = on_cron_failure_alert
 
     async def on_heartbeat(prompt: str) -> str:
         return await responder.process_direct(

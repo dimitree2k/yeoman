@@ -5,6 +5,7 @@ from typing import Any
 from loguru import logger
 
 from yeoman_gateway.agent.tools.base import Tool
+from yeoman_gateway.agent.untrusted import wrap_external_content
 
 
 class ToolRegistry:
@@ -96,7 +97,10 @@ class ToolRegistry:
                 return (
                     f"Error: Invalid parameters for tool '{name}': " + "; ".join(errors)
                 ), "invalid_params"
-            return await tool.execute(**params), None
+            result = await tool.execute(**params)
+            if tool.external_content and isinstance(result, str) and not result.startswith("Error"):
+                result = wrap_external_content(name, result)
+            return result, None
         except Exception as e:
             return f"Error executing {name}: {str(e)}", f"exception:{type(e).__name__}"
 

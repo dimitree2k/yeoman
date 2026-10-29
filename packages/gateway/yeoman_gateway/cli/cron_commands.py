@@ -56,6 +56,8 @@ def cron_list(
             )
 
         status = "[green]enabled[/green]" if job.enabled else "[dim]disabled[/dim]"
+        if job.state.consecutive_failures:
+            status += f" [red]{job.state.consecutive_failures} failed in a row[/red]"
 
         table.add_row(job.id, job.name, job.payload.kind, sched, status, next_run)
 

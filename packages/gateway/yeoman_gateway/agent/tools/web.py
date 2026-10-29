@@ -263,6 +263,7 @@ def _add_optional(payload: dict[str, Any], **values: Any) -> dict[str, Any]:
 
 class WebSearchTool(Tool):
     """Search the web using Tavily Search API."""
+    external_content = True
 
     name = "web_search"
     description = (
@@ -476,6 +477,7 @@ class WebFetchTool(Tool):
     Uses Tavily Extract when an API key is available (handles JS-heavy and paywalled pages),
     falls back to direct HTTP fetch with Readability extraction.
     """
+    external_content = True
 
     name = "web_fetch"
     description = (
@@ -917,6 +919,8 @@ class WebFetchTool(Tool):
 
 
 class _TavilySiteTool(Tool):
+    external_content = True
+
     def __init__(self, api_key: str | None = None, web_config: "WebToolsConfig | None" = None):
         from yeoman_shared.config.schema import WebToolsConfig as WebToolsCfg
 
@@ -1102,6 +1106,7 @@ class DeepResearchTool(Tool):
 
     No shell or exec access required — runs entirely in-process.
     """
+    external_content = True
 
     name = "deep_research"
     description = (
@@ -1289,6 +1294,7 @@ def _extract_youtube_id(url: str) -> str | None:
 
 class YoutubeTranscriptTool(Tool):
     """Fetch the transcript/captions of a YouTube video."""
+    external_content = True
 
     name = "youtube_transcript"
     description = (

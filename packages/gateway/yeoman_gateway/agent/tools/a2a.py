@@ -16,6 +16,7 @@ from yeoman_gateway.a2a.client import A2APollTimeoutError, A2AProtocolError, A2A
 from yeoman_gateway.a2a.contracts import A2AContractValidationError
 from yeoman_gateway.a2a.registry import A2AWorkerRegistry
 from yeoman_gateway.agent.tools.base import Tool
+from yeoman_gateway.agent.untrusted import wrap_external_content
 from yeoman_gateway.channels.whatsapp import _markdown_to_whatsapp as _to_chat_markup
 from yeoman_gateway.observability import private_log_identifier, safe_log_token
 from yeoman_gateway.processing.models import (
@@ -726,7 +727,10 @@ class A2ADelegateTool(Tool):
             safe_log_token(result.state, max_length=80),
         )
         output = (
-            json.dumps(result.output, ensure_ascii=False, sort_keys=True)
+            # Worker output is outside data; the runtime contract appended below is not.
+            wrap_external_content(
+                f"a2a:{result.worker}", json.dumps(result.output, ensure_ascii=False, sort_keys=True)
+            )
             if result.output is not None
             else (
                 f"error={result.error_code} retryable={result.retryable}"

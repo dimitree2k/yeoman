@@ -8,6 +8,7 @@ from yeoman_gateway.a2a.client import A2AWorker, A2AWorkerResult
 from yeoman_gateway.a2a.registry import A2AWorkerRegistry
 from yeoman_gateway.agent.tools.a2a import A2ADelegateTool
 from yeoman_gateway.agent.tools.a2a_research import A2AResearchStore, PendingResearch
+from yeoman_gateway.agent.untrusted import wrap_external_content
 from yeoman_gateway.processing.dispatch import CURRENT_TURN
 from yeoman_gateway.processing.store import ProcessingStore
 from yeoman_gateway.processing.tool_context import (
@@ -47,7 +48,8 @@ async def test_registry_and_delegate_use_structured_skill_input() -> None:
     assert "message" not in tool.parameters["properties"]
     assert (
         await tool.execute(worker="hermes", skill="search.web", input={"query": "weather"})
-        == '[hermes | search.web | TASK_STATE_COMPLETED | task-3]\n{"results": []}'
+        == '[hermes | search.web | TASK_STATE_COMPLETED | task-3]\n'
+        + wrap_external_content("a2a:hermes", '{"results": []}')
     )
     assert calls == [("search.web", {"query": "weather"}, None)]
 

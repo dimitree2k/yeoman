@@ -15,6 +15,7 @@ from yeoman_shared.utils.helpers import get_operational_store_path, get_sessions
 from yeoman_gateway.history.live import HistoryPaused
 from yeoman_gateway.history.queries import HistoryQueries
 from yeoman_gateway.history.reader import HistorySnapshot
+from yeoman_gateway.security.rules import redact_secret_arguments, redact_secrets
 
 if TYPE_CHECKING:
     from .operational import OperationalSessions
@@ -76,6 +77,9 @@ class Session:
         result: str,
     ) -> None:
         """Record a tool call trace (excluded from LLM context, kept for debugging)."""
+        # The trace is append-only, so a credential written here can never be purged.
+        arguments = redact_secret_arguments(arguments)
+        result = redact_secrets(result)
         if self.operational_store is not None:
             self.operational_store.record_tool_trace(
                 session_key=self.key, turn_id=self.turn_id, tool_call_id=tool_call_id,

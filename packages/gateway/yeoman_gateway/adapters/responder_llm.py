@@ -2665,6 +2665,7 @@ class LLMResponder(ResponderPort):
         private_handoff_id: str | None = None,
         draft_only: bool = False,
         history_snapshot: HistorySnapshot | None = None,
+        raise_provider_errors: bool = False,
     ) -> str | None:
         # Serialize concurrent calls for the same session to prevent session
         # state corruption (lost messages, overwritten saves).
@@ -2692,6 +2693,7 @@ class LLMResponder(ResponderPort):
                 private_handoff_id=private_handoff_id,
                 draft_only=draft_only,
                 history_snapshot=history_snapshot,
+                raise_provider_errors=raise_provider_errors,
             )
 
     async def _generate_draft_only(
@@ -2841,6 +2843,7 @@ class LLMResponder(ResponderPort):
         private_handoff_id: str | None = None,
         draft_only: bool = False,
         history_snapshot: HistorySnapshot | None = None,
+        raise_provider_errors: bool = False,
     ) -> str | None:
         if draft_only:
             return await self._generate_draft_only(
@@ -3069,6 +3072,7 @@ class LLMResponder(ResponderPort):
 
             self._current_session = session
             resolved_profile = self._profile_for_name(model_profile)
+            provider_failed = False
             try:
                 final_content = await self._chat_loop(
                     messages=messages,
@@ -3111,6 +3115,7 @@ class LLMResponder(ResponderPort):
             except LLMProviderError:
                 logger.warning("Provider-error turn dropped channel={} chat={}", channel, chat_id)
                 final_content = None
+                provider_failed = True
             finally:
                 self._current_session = None
 
@@ -3121,6 +3126,8 @@ class LLMResponder(ResponderPort):
             self.sessions.save(session)
             lf.end_span(trace, output={"outcome": "no_response"})
             self._current_trace = None
+            if provider_failed and raise_provider_errors:
+                raise LLMProviderError()
             return None
 
         final_content = self._normalize_social_question_ending(final_content, metadata)
@@ -3782,6 +3789,7 @@ class LLMResponder(ResponderPort):
         model_profile: str | None = None,
         sender_id: str | None = None,
         metadata: dict[str, object] | None = None,
+        raise_provider_errors: bool = False,
     ) -> str:
         from yeoman_gateway.history.context import (
             current_history_snapshot,
@@ -3813,6 +3821,7 @@ class LLMResponder(ResponderPort):
             talkative_cooldown_use_llm_message=False,
             is_owner=is_owner,
             model_profile=model_profile,
+            raise_provider_errors=raise_provider_errors,
         ) or ""
 
     async def aclose(self) -> None:
