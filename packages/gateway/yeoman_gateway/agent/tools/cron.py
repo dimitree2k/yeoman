@@ -262,7 +262,12 @@ class CronTool(Tool):
         jobs = self._cron.list_jobs()
         if not jobs:
             return "No scheduled jobs."
-        lines = [f"- {j.name} (id: {j.id}, {j.schedule.kind})" for j in jobs]
+        lines = [
+            f"- {j.name} (id: {j.id}, {j.schedule.kind})"
+            + (f", {j.state.consecutive_failures} failed in a row"
+               if j.state.consecutive_failures else "")
+            for j in jobs
+        ]
         return "Scheduled jobs:\n" + "\n".join(lines)
 
     def _remove_job(self, job_id: str | None) -> str:

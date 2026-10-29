@@ -253,3 +253,21 @@ async def test_langfuse_v4_records_generation_and_closes_root(
         assert tool.calls == [{"value": "ok"}]
     finally:
         await responder.aclose()
+
+
+@pytest.mark.asyncio
+async def test_process_direct_can_raise_provider_errors_for_cron(tmp_path: Path) -> None:
+    from yeoman_gateway.providers.base import LLMProviderError
+
+    provider = _Provider([LLMResponse(content="Error calling LLM", finish_reason="error")])
+    responder = LLMResponder(bus=MessageBus(), provider=provider, workspace=tmp_path,
+                             max_iterations=2)
+    try:
+        assert await responder.process_direct("digest", session_key="cron:a") == ""
+        with pytest.raises(LLMProviderError):
+            await responder.process_direct(
+                "digest", session_key="cron:b", raise_provider_errors=True
+            )
+        assert getattr(responder, "_current_trace", None) is None
+    finally:
+        await responder.aclose()

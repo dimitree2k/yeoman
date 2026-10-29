@@ -11,6 +11,8 @@ from loguru import logger
 
 from yeoman_gateway.cron.types import CronJob, CronJobState, CronPayload, CronSchedule, CronStore
 
+FAILURE_ALERT_INTERVAL_MS = 24 * 60 * 60 * 1000
+
 
 def _now_ms() -> int:
     return int(time.time() * 1000)
@@ -66,12 +68,16 @@ class CronService:
         sessions_dir: Path | None = None,
         workflow_state: Any | None = None,
         on_approval_expired: Callable[..., Coroutine[Any, Any, None]] | None = None,
+        on_failure_alert: Callable[[CronJob, bool], Coroutine[Any, Any, None]] | None = None,
     ):
         self.store_path = store_path
         self.on_job = on_job  # Callback to execute job, returns response text
         self.sessions_dir = sessions_dir
         self._workflow_state = workflow_state
         self._on_approval_expired = on_approval_expired
+        # Called with (job, recovered): at most once a day while a job keeps failing,
+        # and once when it succeeds again after an alert.
+        self.on_failure_alert = on_failure_alert
         self._store: CronStore | None = None
         self._timer_task: asyncio.Task | None = None
         self._running = False
@@ -138,6 +144,10 @@ class CronService:
                             last_run_at_ms=j.get("state", {}).get("lastRunAtMs"),
                             last_status=j.get("state", {}).get("lastStatus"),
                             last_error=j.get("state", {}).get("lastError"),
+                            consecutive_failures=int(
+                                j.get("state", {}).get("consecutiveFailures") or 0
+                            ),
+                            failure_alerted_at_ms=j.get("state", {}).get("failureAlertedAtMs"),
                         ),
                         created_at_ms=j.get("createdAtMs", 0),
                         updated_at_ms=j.get("updatedAtMs", 0),
@@ -210,6 +220,8 @@ class CronService:
                         "lastRunAtMs": j.state.last_run_at_ms,
                         "lastStatus": j.state.last_status,
                         "lastError": j.state.last_error,
+                        "consecutiveFailures": j.state.consecutive_failures,
+                        "failureAlertedAtMs": j.state.failure_alerted_at_ms,
                     },
                     "createdAtMs": j.created_at_ms,
                     "updatedAtMs": j.updated_at_ms,
@@ -356,6 +368,10 @@ class CronService:
             job.state.last_status = "ok"
             job.state.last_error = None
             logger.info(f"Cron: job '{job.name}' completed")
+            if job.state.failure_alerted_at_ms is not None:
+                await self._alert_failure(job, recovered=True)
+            job.state.consecutive_failures = 0
+            job.state.failure_alerted_at_ms = None
 
         except CronJobDeferredError as e:
             job.state.last_status = "skipped"
@@ -378,8 +394,16 @@ class CronService:
 
         except Exception as e:
             job.state.last_status = "error"
-            job.state.last_error = str(e)
-            logger.error(f"Cron: job '{job.name}' failed: {e}")
+            job.state.last_error = str(e) or type(e).__name__
+            job.state.consecutive_failures += 1
+            logger.error(
+                f"Cron: job '{job.name}' failed "
+                f"({job.state.consecutive_failures} in a row): {e}"
+            )
+            alerted = job.state.failure_alerted_at_ms
+            if alerted is None or start_ms - alerted >= FAILURE_ALERT_INTERVAL_MS:
+                job.state.failure_alerted_at_ms = start_ms
+                await self._alert_failure(job, recovered=False)
 
         job.state.last_run_at_ms = start_ms
         job.updated_at_ms = _now_ms()
@@ -395,6 +419,14 @@ class CronService:
         else:
             # Compute next run
             job.state.next_run_at_ms = _compute_next_run(job.schedule, _now_ms())
+
+    async def _alert_failure(self, job: CronJob, *, recovered: bool) -> None:
+        if self.on_failure_alert is None:
+            return
+        try:
+            await self.on_failure_alert(job, recovered)
+        except Exception as e:  # noqa: BLE001 - an alert must never stop the schedule
+            logger.warning("Cron: failure alert for job '{}' not sent: {}", job.name, e)
 
     # ========== Public API ==========
 
@@ -547,6 +579,8 @@ class CronService:
                 job.enabled = enabled
                 job.updated_at_ms = _now_ms()
                 if enabled:
+                    job.state.consecutive_failures = 0
+                    job.state.failure_alerted_at_ms = None
                     job.state.next_run_at_ms = _compute_next_run(job.schedule, _now_ms())
                 else:
                     job.state.next_run_at_ms = None

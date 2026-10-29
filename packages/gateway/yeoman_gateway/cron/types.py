@@ -65,6 +65,8 @@ class CronJobState:
     last_run_at_ms: int | None = None
     last_status: Literal["ok", "error", "skipped"] | None = None
     last_error: str | None = None
+    consecutive_failures: int = 0
+    failure_alerted_at_ms: int | None = None
 
 
 @dataclass
