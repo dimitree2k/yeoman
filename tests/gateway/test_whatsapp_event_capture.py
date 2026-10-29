@@ -520,6 +520,35 @@ def test_ack_failure_cascade_logs_one_failure_and_one_replay_summary(caplog) -> 
     assert published == []
 
 
+def test_frame_after_intake_closed_is_deferred_without_malformed_warning(caplog) -> None:
+    from loguru import logger
+
+    channel = WhatsAppChannel(WhatsAppConfig(), MessageBus())
+    channel._bridge_intake_closed = True
+    frame = json.loads(
+        _frame("group_subject",
+               {"chatJid": CHAT, "value": "s", "snapshot": True, "observedAtMs": NOW},
+               event_id="event-after-close", event_key="wa:after-close")
+    )
+    sink = logger.add(lambda message: logging.getLogger("whatsapp-test").log(
+        message.record["level"].no, str(message).strip()
+    ))
+    caplog.set_level(logging.DEBUG, logger="whatsapp-test")
+
+    try:
+        accepted = asyncio.run(
+            channel._capture_and_queue_bridge_event(frame, "group_subject", frame["payload"])
+        )
+    finally:
+        logger.remove(sink)
+    assert accepted is False
+    assert not [record for record in caplog.records if record.levelno >= logging.WARNING]
+    assert any(
+        "deferred to bridge replay type=group_subject reason=intake_closed" in record.message
+        for record in caplog.records
+    )
+
+
 def test_unrelated_ack_failure_still_warns_after_intake_closes(caplog) -> None:
     from loguru import logger
     from yeoman_gateway.channels.whatsapp import _BridgeEventWork

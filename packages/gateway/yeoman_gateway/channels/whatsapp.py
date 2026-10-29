@@ -1474,7 +1474,12 @@ class WhatsAppChannel(BaseChannel):
             return False
 
         if self._bridge_intake_closed or self._stopping:
-            self._reject_replayable_frame(kind, "intake_closed")
+            # A valid frame that arrives while intake is closing stays unACKed in
+            # the Bridge outbox and is replayed after reconnect; it is not malformed.
+            logger.debug(
+                "WhatsApp canonical frame deferred to bridge replay type={} reason=intake_closed",
+                kind,
+            )
             return False
         self._ensure_bridge_pipeline()
 
