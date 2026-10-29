@@ -83,6 +83,34 @@ _OUTPUT_SECRET_PATTERNS = [
 ]
 
 
+# Argument names whose string values are credentials whatever they look like.
+_SECRET_ARGUMENT_KEY = re.compile(
+    r"pass(word|wd)|secret|token|api[_-]?key|authorization|credential|private[_-]?key|cookie",
+    re.IGNORECASE,
+)
+
+
+def redact_secrets(text: str, placeholder: str = "[REDACTED]") -> str:
+    """Replace known credential token patterns in ``text``."""
+    for pattern in _OUTPUT_SECRET_PATTERNS:
+        text = pattern.sub(placeholder, text)
+    return text
+
+
+def redact_secret_arguments(value: Any, placeholder: str = "[REDACTED]", key: str = "") -> Any:
+    """Redact credentials in tool arguments: string values of secret-named keys, and
+    known token patterns anywhere."""
+    if isinstance(value, dict):
+        return {k: redact_secret_arguments(v, placeholder, str(k)) for k, v in value.items()}
+    if isinstance(value, list):
+        return [redact_secret_arguments(item, placeholder, key) for item in value]
+    if isinstance(value, str):
+        return placeholder if value and _SECRET_ARGUMENT_KEY.search(key) else redact_secrets(
+            value, placeholder
+        )
+    return value
+
+
 def _match_any(patterns: list[re.Pattern[str]], text: str) -> bool:
     return any(p.search(text) for p in patterns)
 

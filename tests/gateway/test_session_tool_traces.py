@@ -1,4 +1,5 @@
 # tests/test_session_tool_traces.py
+import json
 import os
 
 import pytest
@@ -70,3 +71,47 @@ def test_session_save_replaces_file_atomically(
         manager.save(session)
 
     assert path.read_bytes() == original
+
+
+_KEY = "sk-" + "a" * 32
+
+
+def test_tool_trace_redacts_secrets_in_jsonl_fallback():
+    session = Session(key="test:secrets")
+    session.add_tool_call(
+        tool_name="a2a_delegate",
+        tool_call_id="tc_secret",
+        arguments={"input": {"question": f"use {_KEY}"}, "api_key": "plain-value",
+                   "headers": [{"Authorization": "abc"}], "max_tokens": 5},
+        result=f"echo {_KEY}",
+    )
+    trace = session.get_full_history()[0]
+    assert trace["arguments"] == {
+        "input": {"question": "use [REDACTED]"}, "api_key": "[REDACTED]",
+        "headers": [{"Authorization": "[REDACTED]"}], "max_tokens": 5,
+    }
+    assert trace["result"] == "echo [REDACTED]"
+
+
+def test_tool_trace_redacts_secrets_in_operational_store(tmp_path):
+    import sqlite3
+
+    from yeoman_gateway.session.operational import OperationalSessions
+
+    path = tmp_path / "ops.sqlite"
+    ops = OperationalSessions(path)
+    try:
+        session = Session(key="whatsapp:chat", operational_store=ops)
+        session.add_tool_call(
+            tool_name="web_fetch", tool_call_id="tc_1",
+            arguments={"url": f"https://x.test/?k={_KEY}", "password": "hunter2"},
+            result=f"Bearer {'z' * 30}",
+        )
+    finally:
+        ops.close()
+    with sqlite3.connect(path) as db:
+        arguments, result = db.execute("SELECT arguments, result FROM tool_traces").fetchone()
+    assert _KEY not in arguments and "hunter2" not in arguments
+    assert json.loads(arguments) == {"password": "[REDACTED]",
+                                     "url": "https://x.test/?k=[REDACTED]"}
+    assert result == "[REDACTED]"
