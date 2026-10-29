@@ -70,6 +70,8 @@ def _wake_phrase_match(content: str, wake_phrases: frozenset[str]) -> bool:
 _FORWARD_COMMAND = re.compile(r"^/?forward(?:\s+.+)?$", re.IGNORECASE)
 #: Tool name gated by the per-chat `memes` switch.
 MEME_TOOL = "make_meme"
+#: Tool name gated by the per-chat `polls` switch.
+POLL_TOOL = "poll"
 #: Rolling windows of the autonomous meme and sticker budgets.
 MEME_WINDOW_MS = 7 * 24 * 60 * 60 * 1000
 STICKER_WINDOW_MS = 24 * 60 * 60 * 1000
@@ -130,6 +132,7 @@ class EffectivePolicy:
     session_history_limit: int | None
     participation: ParticipationPolicy = field(default_factory=ParticipationPolicy)
     memes: bool = False
+    polls: bool = False
     trends: TrendsPolicy = field(default_factory=TrendsPolicy)
 
 
@@ -296,6 +299,7 @@ class _CompiledPolicy:
     session_history_limit: int | None
     participation: ParticipationPolicy = field(default_factory=ParticipationPolicy)
     memes: bool = False
+    polls: bool = False
     trends: TrendsPolicy = field(default_factory=TrendsPolicy)
 
 
@@ -410,6 +414,7 @@ class PolicyEngine:
             spontaneity_quiet_hours_end=resolved.spontaneity.quiet_hours_end,
             contacts_disclosure=bool(resolved.contacts_disclosure),
             memes=bool(resolved.memes),
+            polls=bool(resolved.polls),
             session_history_limit=resolved.session_history_limit,
             participation=ParticipationPolicy.model_validate(
                 resolved.participation.model_dump()
@@ -594,6 +599,7 @@ class PolicyEngine:
             spontaneity_quiet_hours_end=resolved.spontaneity_quiet_hours_end,
             contacts_disclosure=resolved.contacts_disclosure,
             memes=resolved.memes,
+            polls=resolved.polls,
             session_history_limit=resolved.session_history_limit,
             participation=ParticipationPolicy.model_validate(
                 resolved.participation.model_dump()
@@ -814,6 +820,9 @@ class PolicyEngine:
         if not policy.memes:
             # Opt-in per chat: neither allowedTools nor ownerTools can switch memes on.
             allowed.discard(MEME_TOOL)
+        if not policy.polls:
+            # Same opt-in as memes: a poll speaks to the whole chat.
+            allowed.discard(POLL_TOOL)
         return allowed
 
     def evaluate(self, actor: ActorContext, all_tools: set[str]) -> PolicyDecision:

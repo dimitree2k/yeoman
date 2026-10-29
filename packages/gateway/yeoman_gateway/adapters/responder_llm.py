@@ -80,6 +80,7 @@ if TYPE_CHECKING:
     from yeoman_shared.config.schema import ExecToolConfig, WebToolsConfig
 
     from yeoman_gateway.a2a.registry import A2AWorkerRegistry
+    from yeoman_gateway.agent.tools.poll import PollSender
     from yeoman_gateway.agent.tools.youtube_audio import AudioTranscriber
     from yeoman_gateway.caldav.service import CalDAVService
     from yeoman_gateway.cron.service import CronService
@@ -721,6 +722,7 @@ class LLMResponder(ResponderPort):
         self._processing_store = processing_store
         self._quota_governance = quota_governance
         self._lazy_media_resolver = lazy_media_resolver
+        self._poll_sender: PollSender | None = None
         self._meme_service = meme_service
         self._session_history_limit = whatsapp_session_history_limit
         self._session_history_limit_group = whatsapp_session_history_limit_group
@@ -893,6 +895,12 @@ class LLMResponder(ResponderPort):
                     group_resolver=self._resolve_group_reference,
                 )
             )
+
+        from yeoman_gateway.agent.tools.poll import PollTool
+
+        # Registered everywhere; the policy `polls` switch exposes it per chat. The
+        # WhatsApp transport arrives after construction through set_poll_sender().
+        self.tools.register(PollTool(sender=lambda: self._poll_sender))
 
         if self._meme_service is not None:
             from yeoman_gateway.agent.tools.make_meme import MakeMemeTool
@@ -1744,6 +1752,10 @@ class LLMResponder(ResponderPort):
             return None
         provider = str(getattr(profile, "provider", "") or "").strip() or None
         return self._routed_provider_factory(model, provider)
+
+    def set_poll_sender(self, sender: "PollSender | None") -> None:
+        """Install the transport the poll tool sends through (WhatsApp only)."""
+        self._poll_sender = sender
 
     def _should_enable_grants(self, is_owner: bool) -> bool:
         """Check whether grants should be activated for tool execution.
