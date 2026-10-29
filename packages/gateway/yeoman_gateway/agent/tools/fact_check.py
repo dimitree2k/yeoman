@@ -21,6 +21,8 @@ Be concise. Only output the JSON."""
 
 
 class FactCheckTool(Tool):
+    external_content = True
+
     def __init__(self, manager: SubagentManager) -> None:
         self._manager = manager
 

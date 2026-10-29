@@ -21,6 +21,10 @@ class Tool(ABC):
         "object": dict,
     }
 
+    # True when the result carries text from outside sources (web pages, videos, other
+    # agents); the registry then wraps successful results in an untrusted envelope.
+    external_content: bool = False
+
     @property
     @abstractmethod
     def name(self) -> str:
