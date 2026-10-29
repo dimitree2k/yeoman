@@ -484,3 +484,13 @@ def test_meme_rules_forbid_health_details(tool_setup) -> None:
     tool, *_ = tool_setup
     assert "never use anyone's health, illness or medical details" in tool.description
     assert "never use anyone's health, illness or medical details" in JUDGE_MEME_RULES
+
+
+def test_meme_rules_forbid_invented_topics(tool_setup) -> None:
+    # Live, the judge captioned "EVs an Bad Banks auslagern" when nobody had named EVs.
+    from yeoman_gateway.processing.participation import JUDGE_MEME_RULES
+
+    tool, *_ = tool_setup
+    rule = "A caption may only name things actually said or shown in this chat"
+    assert rule in tool.description
+    assert rule in JUDGE_MEME_RULES

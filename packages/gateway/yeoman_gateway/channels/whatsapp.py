@@ -798,13 +798,17 @@ class WhatsAppChannel(BaseChannel):
                     payload['historyMentionsResolved'] = True
                 if allow_mentions and caption:
                     payload["mentions"] = list(mentions)
-                await self._send_command_with_retry(
+                media_result = await self._send_command_with_retry(
                     "send_media",
                     payload,
                     timeout_seconds=30.0,
                     max_attempts=self._send_attempts(msg.metadata),
                 )
                 sent_any_media = True
+                # Without the provider id an autonomous meme stays "unknown": it was
+                # posted, yet never counted against the chat's meme budget.
+                if media_receipt is None:
+                    media_receipt = _receipt_from_bridge(media_result)
 
                 # Best-effort cleanup for generated TTS voice notes.
                 if (

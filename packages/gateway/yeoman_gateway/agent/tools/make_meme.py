@@ -18,7 +18,8 @@ _RECENT_PHOTO_SECONDS = 10 * 60
 _CRAFT = (
     "How to make it funny: first find the joke, then pick the template whose structure "
     "tells it. Build it from specifics of this chat: the actual names, things, numbers "
-    "and exact phrases people used, a running gag. Exaggerate, contrast or twist; the "
+    "and exact phrases people used, a running gag. A caption may only name things "
+    "actually said or shown in this chat; never invent a topic. Exaggerate, contrast or twist; the "
     "punchline goes last. Captions short and punchy (at most about six words each), in "
     "the chat's language. No generic statements, no explaining the joke, no puns just "
     "for the pun. Think of three ideas and make only the strongest, one meme per request. "
