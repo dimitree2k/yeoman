@@ -766,6 +766,7 @@ def test_all_side_effect_bridge_commands_are_archived() -> None:
         "login_wait",
         "logout",
         "lookup_message",
+        "lookup_poll_results",
         "subscribe_events",
         "ack_event",
         "health",

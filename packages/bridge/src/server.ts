@@ -20,6 +20,7 @@ import {
   parseReactPayload,
   parseSendMediaPayload,
   parseSendPollPayload,
+  parseLookupPollResultsPayload,
   parseSendTextPayload,
   validateOutboundResult,
   MAX_BRIDGE_FRAME_BYTES,
@@ -505,6 +506,10 @@ export class BridgeServer {
         return { status: 'unsupported' as const };
       }
       return this.wa.lookupMessage({ chatJid, messageId });
+    }
+
+    if (type === 'lookup_poll_results') {
+      return this.wa.lookupPollResults(parseLookupPollResultsPayload(payload));
     }
 
     if (type === 'list_groups') {

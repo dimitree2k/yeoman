@@ -13,6 +13,7 @@ from typing import Any, Awaitable, Callable
 from loguru import logger
 
 from yeoman_gateway.agent.tools.base import Tool
+from yeoman_gateway.agent.untrusted import wrap_external_content
 from yeoman_gateway.processing.tool_context import current_tool_context, tool_in_group_chat
 
 MAX_QUESTION_CHARS = 255
@@ -26,6 +27,8 @@ MAX_POLLS_PER_WINDOW = 3
 
 #: (chat_id, question, options, max_selections, client_message_id) -> provider poll id.
 PollSender = Callable[[str, str, list[str], int, str], Awaitable[str | None]]
+#: (chat_id, poll_id, forget) -> counts {options: [{name, count}], total_votes, updated_at_ms}.
+PollResultsLookup = Callable[[str, str, bool], Awaitable[dict[str, Any] | None]]
 
 
 class PollGuard:
@@ -105,6 +108,15 @@ class PollGuard:
             entries = self._read(now_ms)
             self._write([entry for entry in entries if entry.get("id") != client_id])
 
+    async def latest_poll_id(self, chat_id: str, now_ms: int) -> str | None:
+        """This chat's most recent sent poll, open or closed, within the window."""
+        async with self._lock:
+            sent = [entry for entry in self._read(now_ms)
+                    if entry.get("chat") == chat_id and entry.get("poll_id")]
+        if not sent:
+            return None
+        return str(max(sent, key=lambda entry: int(entry.get("opened_ms", 0)))["poll_id"])
+
     async def close(self, chat_id: str, now_ms: int) -> bool:
         """Close this chat's open poll; False when none was open."""
         async with self._lock:
@@ -150,10 +162,12 @@ class PollTool(Tool):
         self,
         *,
         sender: Callable[[], PollSender | None],
+        results: Callable[[], PollResultsLookup | None] = lambda: None,
         guard: PollGuard | None = None,
         clock_ms: Callable[[], int] = lambda: int(time.time() * 1000),
     ) -> None:
         self._sender = sender
+        self._results = results
         self._guard = guard or PollGuard()
         self._clock_ms = clock_ms
 
@@ -164,8 +178,9 @@ class PollTool(Tool):
     @property
     def description(self) -> str:
         return (
-            "Post a WhatsApp poll into the current chat (action 'create'), or mark this "
-            "chat's open poll as closed (action 'close'). Use it only when someone "
+            "Post a WhatsApp poll into the current chat (action 'create'), show the vote "
+            "counts of this chat's latest poll ('results'), or close this chat's open poll "
+            "and get its final counts ('close'). Use 'create' only when someone "
             "explicitly asks for a poll, or when several people are stuck on one concrete "
             "choice (a date, a place, an option). Never for small talk, jokes or rhetorical "
             "questions. One open poll per chat and at most three per chat per day. Write a "
@@ -178,7 +193,8 @@ class PollTool(Tool):
         return {
             "type": "object",
             "properties": {
-                "action": {"type": "string", "enum": ["create", "close"], "default": "create"},
+                "action": {"type": "string", "enum": ["create", "results", "close"],
+                           "default": "create"},
                 "question": {"type": "string", "maxLength": MAX_QUESTION_CHARS},
                 "options": {
                     "type": "array",
@@ -208,10 +224,16 @@ class PollTool(Tool):
             return "Error: polls are only available in WhatsApp chats."
         if not tool_in_group_chat(context) and not context.is_owner:
             return "Error: polls are only available in groups."
+        if action == "results":
+            return await self._counts(context.chat_id, forget=False)
         if action == "close":
-            if await self._guard.close(context.chat_id, self._clock_ms()):
-                return "The open poll in this chat is now closed; a new one may be started."
-            return "There is no open poll in this chat."
+            now_ms = self._clock_ms()
+            if not await self._guard.close(context.chat_id, now_ms):
+                return "There is no open poll in this chat."
+            closed = "The open poll in this chat is now closed; a new one may be started."
+            # The bridge drops its poll reference with this last lookup.
+            final = await self._counts(context.chat_id, forget=True)
+            return closed if final.startswith("Error") else f"{closed}\n{final}"
         if action != "create":
             return f"Unknown action: {action}"
 
@@ -239,6 +261,29 @@ class PollTool(Tool):
             return "Error: the poll could not be sent."
         await self._guard.confirm(client_id, poll_id, now_ms)
         return f"Poll sent to this chat: {text} ({len(cleaned)} options)."
+
+
+    async def _counts(self, chat_id: str, *, forget: bool) -> str:
+        """Counts for this chat's latest poll; another chat's poll is never reachable."""
+        poll_id = await self._guard.latest_poll_id(chat_id, self._clock_ms())
+        if poll_id is None:
+            return "Error: no poll was sent in this chat in the last 24 hours."
+        lookup = self._results()
+        if lookup is None:
+            return "Error: poll results are unavailable right now."
+        try:
+            results = await lookup(chat_id, poll_id, forget)
+        except Exception as exc:  # noqa: BLE001 - an older bridge or a lost connection
+            logger.warning("poll results failed chat={} error_type={}", chat_id,
+                           type(exc).__name__)
+            return "Error: poll results are unavailable right now."
+        if not results:
+            return "Error: the results of this chat's poll are no longer available."
+        lines = [f"- {option.get('name', '')}: {int(option.get('count', 0))}"
+                 for option in results.get("options", []) if isinstance(option, dict)]
+        lines.append(f"Voters so far: {int(results.get('total_votes', 0))}")
+        # Option names were written for this chat; they stay data, never instructions.
+        return wrap_external_content("poll", "\n".join(lines))
 
 
 def _client_message_id(turn_key: str, chat_id: str, question: str, options: list[str]) -> str:
