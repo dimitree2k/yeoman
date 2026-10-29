@@ -353,7 +353,9 @@ class IngestGate:
             canonical = self._canonical_event(
                 request, identity=self._bridge_canonical_identity(request)
             )
-            if self._store.event_assignment(canonical.event_id):
+            # The Bridge journals its canonical row before the gate runs, so an existing
+            # but still unassigned row is the normal case, not a replay.
+            if any(self._store.event_assignment(canonical.event_id) or ()):
                 return False
             data = self._threads.input_from_event(canonical)
             routed = self._threads.decide(data, self._threads.view_for(data, now_ms=self._clock()))
