@@ -1595,6 +1595,28 @@ async def test_enforced_semantic_reopen_continues_the_dormant_thread(runtime):
 
 
 @pytest.mark.asyncio
+async def test_semantic_reopen_runs_when_the_bridge_journaled_the_message_first(runtime):
+    from yeoman_gateway.processing.models import CanonicalEvent
+
+    thread_id = _dormant_thread(runtime)
+    reopener = _Reopener(thread_id)
+    runtime.gate._topic_reopen, runtime.gate._topic_reopen_mode = reopener, "enforce"
+    bridge = CanonicalEvent(
+        event_id="wa_car-2", event_key="wa:car-2", trace_id="car-2", kind="message",
+        origin="whatsapp_canonical", channel="whatsapp", chat_id=CHAT, principal=ORDERER,
+        source_message_id="car-2", occurred_ms=runtime.gate._clock(), payload={"text": "x"},
+    )
+    runtime.store.append_event(event_key=bridge.event_key, event_id=bridge.event_id,
+                               trace_id=bridge.trace_id, payload=bridge,
+                               now_ms=runtime.gate._clock())
+
+    result = await runtime.gate.admit_async(_request("car-2", "Und die Lichter am Auto?"))
+
+    assert reopener.calls == 1
+    assert result.assignment.thread_id == thread_id
+
+
+@pytest.mark.asyncio
 async def test_shadow_semantic_reopen_only_logs(runtime):
     import asyncio
 
