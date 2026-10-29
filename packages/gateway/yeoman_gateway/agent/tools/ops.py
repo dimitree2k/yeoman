@@ -13,6 +13,7 @@ from yeoman_shared.utils.helpers import get_logs_path, get_run_path
 from yeoman_shared.utils.process import pid_alive, read_pid_file
 
 from yeoman_gateway.agent.tools.base import Tool
+from yeoman_gateway.processing.tool_context import owner_dm_only_refusal
 
 _LOGS_DIR = get_logs_path()
 _GATEWAY_LOG = _LOGS_DIR / "gateway.log"
@@ -146,6 +147,8 @@ class OpsTool(Tool):
         }
 
     async def execute(self, **kwargs: Any) -> str:
+        if refusal := owner_dm_only_refusal(self.name):
+            return refusal
         action = kwargs.get("action", "system_stats")
         if action == "system_stats":
             return await self._system_stats()
