@@ -84,6 +84,7 @@ if TYPE_CHECKING:
     from yeoman_gateway.agent.tools.youtube_audio import AudioTranscriber
     from yeoman_gateway.caldav.service import CalDAVService
     from yeoman_gateway.cron.service import CronService
+    from yeoman_gateway.group_decisions.store import GroupDecisionStore
     from yeoman_gateway.knowledge.models import TrustedReadContext
     from yeoman_gateway.media.lazy_resolver import LazyMediaResolver
     from yeoman_gateway.media.memes.service import MemeService
@@ -677,6 +678,7 @@ class LLMResponder(ResponderPort):
         quota_governance: object | None = None,
         lazy_media_resolver: "LazyMediaResolver | None" = None,
         meme_service: "MemeService | None" = None,
+        group_decisions: "GroupDecisionStore | None" = None,
         youtube_audio_transcriber: "AudioTranscriber | None" = None,
         whatsapp_session_history_limit: int = 15,
         whatsapp_session_history_limit_group: int = 20,
@@ -693,6 +695,7 @@ class LLMResponder(ResponderPort):
         self.web_config = web_config
         self.exec_config = exec_config or ExecToolConfig()
         self.cron_service = cron_service
+        self._group_decisions = group_decisions
         self.caldav_service = caldav_service
         #: Public person-knowledge facade.  Read paths that need names, rosters or a
         #: protected recall use this instead of reaching into contacts/memory stores.
@@ -899,6 +902,12 @@ class LLMResponder(ResponderPort):
                     group_resolver=self._resolve_group_reference,
                 )
             )
+
+        if self._group_decisions is not None:
+            from yeoman_gateway.agent.tools.decisions import DecisionsTool
+
+            # Registered everywhere; the policy `decisions` switch exposes it per chat.
+            self.tools.register(DecisionsTool(self._group_decisions))
 
         from yeoman_gateway.agent.tools.poll import PollTool
 

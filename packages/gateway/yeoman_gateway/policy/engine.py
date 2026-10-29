@@ -74,6 +74,8 @@ MEME_TOOL = "make_meme"
 POLL_TOOL = "poll"
 #: Tool name gated by the per-chat `groupReminders` switch.
 GROUP_REMINDER_TOOL = "group_reminder"
+#: Tool name gated by the per-chat `decisions` switch.
+DECISIONS_TOOL = "decisions"
 #: Rolling windows of the autonomous meme and sticker budgets.
 MEME_WINDOW_MS = 7 * 24 * 60 * 60 * 1000
 STICKER_WINDOW_MS = 24 * 60 * 60 * 1000
@@ -136,6 +138,7 @@ class EffectivePolicy:
     memes: bool = False
     polls: bool = False
     group_reminders: bool = False
+    decisions: bool = False
     trends: TrendsPolicy = field(default_factory=TrendsPolicy)
 
 
@@ -304,6 +307,7 @@ class _CompiledPolicy:
     memes: bool = False
     polls: bool = False
     group_reminders: bool = False
+    decisions: bool = False
     trends: TrendsPolicy = field(default_factory=TrendsPolicy)
 
 
@@ -420,6 +424,7 @@ class PolicyEngine:
             memes=bool(resolved.memes),
             polls=bool(resolved.polls),
             group_reminders=bool(resolved.group_reminders),
+            decisions=bool(resolved.decisions),
             session_history_limit=resolved.session_history_limit,
             participation=ParticipationPolicy.model_validate(
                 resolved.participation.model_dump()
@@ -606,6 +611,7 @@ class PolicyEngine:
             memes=resolved.memes,
             polls=resolved.polls,
             group_reminders=resolved.group_reminders,
+            decisions=resolved.decisions,
             session_history_limit=resolved.session_history_limit,
             participation=ParticipationPolicy.model_validate(
                 resolved.participation.model_dump()
@@ -831,6 +837,8 @@ class PolicyEngine:
             allowed.discard(POLL_TOOL)
         if not policy.group_reminders:
             allowed.discard(GROUP_REMINDER_TOOL)
+        if not policy.decisions:
+            allowed.discard(DECISIONS_TOOL)
         return allowed
 
     def evaluate(self, actor: ActorContext, all_tools: set[str]) -> PolicyDecision:
