@@ -935,6 +935,29 @@ class WhatsAppChannel(BaseChannel):
         receipt = _receipt_from_bridge(result) or {}
         return receipt.get("provider_message_id")
 
+    async def lookup_poll_results(
+        self, chat_id: str, poll_id: str, *, forget: bool = False
+    ) -> dict[str, Any] | None:
+        """Vote counts for one poll this account sent into ``chat_id``, or None if unknown.
+
+        The bridge answers only for its own polls in that exact chat and never returns
+        who voted. ``forget`` drops the bridge's poll reference after answering.
+        """
+        if not self._connected:
+            connected = await self._wait_connected_for_send(SEND_CONNECT_WAIT_SECONDS)
+            if not connected:
+                raise RuntimeError("WhatsApp bridge not connected")
+        result = await self._send_command_with_retry(
+            "lookup_poll_results",
+            {"chatJid": str(chat_id), "pollId": str(poll_id), "forget": bool(forget)},
+            timeout_seconds=12.0,
+            max_attempts=1,
+        )
+        if not isinstance(result, dict) or result.get("status") != "found":
+            return None
+        results = result.get("results")
+        return results if isinstance(results, dict) else None
+
     async def lookup_message(self, chat_id: str, message_id: str) -> dict[str, object]:
         """Look up one exact locally retained provider message reference."""
         if not self._connected:

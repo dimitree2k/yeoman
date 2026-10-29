@@ -499,3 +499,14 @@ test('history mentions require a boolean and resolved phone JIDs', () => {
     assert.equal(parse({ mentions: ['100000000001@lid'] }).ok, true);
   }
 });
+
+test('parseBridgeCommand accepts lookup_poll_results with an exact poll only', () => {
+  const command = (payload: Record<string, unknown>) => parseBridgeCommand({
+    version: PROTOCOL_VERSION, type: 'lookup_poll_results', token: 'secret', requestId: 'req-p',
+    payload,
+  });
+  assert.equal(command({ chatJid: '123@g.us', pollId: 'POLL' }).ok, true);
+  assert.equal(command({ chatJid: '123@g.us', pollId: 'POLL', forget: true }).ok, true);
+  assert.equal(command({ chatJid: '123@g.us' }).ok, false);
+  assert.equal(command({ chatJid: '123@g.us', pollId: 'POLL', forget: 'yes' }).ok, false);
+});

@@ -44,6 +44,7 @@ export type BridgeCommandType =
   | 'login_wait'
   | 'logout'
   | 'lookup_message'
+  | 'lookup_poll_results'
   | 'subscribe_events'
   | 'ack_event'
   | 'health';
@@ -152,6 +153,13 @@ export interface LoginWaitPayload {
 export interface LookupMessagePayload {
   chatJid: string;
   messageId: string;
+}
+
+/** Counts for one poll this bridge sent; ``forget`` drops its reference afterwards. */
+export interface LookupPollResultsPayload {
+  chatJid: string;
+  pollId: string;
+  forget?: boolean;
 }
 
 export interface SubscribeEventsPayload {
@@ -647,6 +655,7 @@ export function parseBridgeCommand(
     validPayload =
       typeof (payload as Record<string, unknown>).chatJid === 'string' &&
       typeof (payload as Record<string, unknown>).messageId === 'string';
+  else if (typed === 'lookup_poll_results') validPayload = Boolean(parseLookupPollResults(payload));
   else if (typed === 'list_groups') validPayload = Boolean(parseListGroups(payload));
   else if (typed === 'login_start') validPayload = Boolean(parseLoginStart(payload));
   else if (typed === 'login_wait') validPayload = Boolean(parseLoginWait(payload));
@@ -687,6 +696,21 @@ export function parseSendMediaPayload(payload: Record<string, unknown>): SendMed
 export function parseForwardMessagePayload(payload: Record<string, unknown>): ForwardMessagePayload {
   const parsed = parseForwardMessage(payload);
   if (!parsed) throw new Error('Invalid forward_message payload');
+  return parsed;
+}
+
+function parseLookupPollResults(payload: Record<string, unknown>): LookupPollResultsPayload | null {
+  const chatJid = asString(payload.chatJid);
+  const pollId = asString(payload.pollId);
+  const forget = asOptionalBool(payload.forget);
+  if (!chatJid || !pollId || chatJid.length > 128 || pollId.length > 128) return null;
+  if (payload.forget !== undefined && forget === undefined) return null;
+  return { chatJid, pollId, forget };
+}
+
+export function parseLookupPollResultsPayload(payload: Record<string, unknown>): LookupPollResultsPayload {
+  const parsed = parseLookupPollResults(payload);
+  if (!parsed) throw new Error('Invalid lookup_poll_results payload');
   return parsed;
 }
 

@@ -8,6 +8,7 @@ import makeWASocket, {
   downloadMediaMessage,
   fetchLatestBaileysVersion,
   makeCacheableSignalKeyStore,
+  normalizeMessageContent,
   WAMessageStubType,
   useMultiFileAuthState,
 } from '@whiskeysockets/baileys';
@@ -20,6 +21,7 @@ import {
   defaultMessageReferenceDir,
   MessageReferenceStore,
 } from './message_reference_store.js';
+import { defaultPollReferenceFile, PollReferenceStore, type PollResults } from './poll_reference_store.js';
 
 const VERSION = '0.2.0';
 const INBOUND_DEDUPE_TTL_MS = 20 * 60_000;
@@ -167,6 +169,7 @@ export interface WhatsAppClientOptions {
   messageReferenceRetentionMs?: number;
   messageReferenceMaxEntries?: number;
   messageReferenceMaxRecordBytes?: number;
+  pollReferenceFile?: string;
   mediaIncomingDir?: string;
   mediaOutgoingDir?: string;
   persistInboundAudio?: boolean;
@@ -596,6 +599,7 @@ export interface GroupMetadataResult extends GroupMetadata {
 export class WhatsAppClient {
   private readonly options: WhatsAppClientOptions;
   private readonly referenceStore: MessageReferenceStore;
+  private readonly pollStore: PollReferenceStore;
   private sock: any = null;
   private running = false;
   private loopTask: Promise<void> | null = null;
@@ -635,6 +639,7 @@ export class WhatsAppClient {
 
   constructor(options: WhatsAppClientOptions) {
     this.options = options;
+    this.pollStore = new PollReferenceStore(options.pollReferenceFile || defaultPollReferenceFile());
     this.referenceStore = new MessageReferenceStore(
       options.messageReferenceDir || defaultMessageReferenceDir(),
       {
@@ -896,6 +901,7 @@ export class WhatsAppClient {
   async start(): Promise<void> {
     if (this.running) return;
     await this.referenceStore.open();
+    await this.pollStore.open();
     await this.ensureMediaDirs();
     this.acceptingProviderEvents = true;
     this.running = true;
@@ -2128,6 +2134,12 @@ export class WhatsAppClient {
     this.sock.ev.on('messages.upsert', ({ messages, type }: { messages: any[]; type: string }) => {
       if (type !== 'notify' && type !== 'append') return;
       for (const msg of messages ?? []) {
+        // Votes are counted here and never become events: they carry voter identities.
+        if (normalizeMessageContent(msg?.message)?.pollUpdateMessage) {
+          void this.handlePollVote(msg).catch((err) =>
+            this.options.onError(`poll_vote_failed: ${safeErrorMessage(err)}`));
+          continue;
+        }
         this.handleInboundMessage(msg);
       }
     });
@@ -2491,8 +2503,62 @@ export class WhatsAppClient {
       input.clientMessageId ? { messageId: input.clientMessageId } : undefined,
     );
     this.rememberOutboundSelfMessage(input.to, sent);
+    await this.rememberPoll(input.to, sent, poll.values);
 
     return { ...sendResult(input.to, sent, input.clientMessageId), options: options.length, poll };
+  }
+
+  /** Keep only what decrypting votes needs: the poll's secret and option names. */
+  private async rememberPoll(to: string, sent: any, options: string[]): Promise<void> {
+    const secret = sent?.message?.messageContextInfo?.messageSecret;
+    const pollId = String(sent?.key?.id || '').trim();
+    if (!pollId || !(secret instanceof Uint8Array)) return;
+    try {
+      await this.pollStore.remember({ chatJid: normalizeJid(to), pollId, secret, options });
+    } catch (err) {
+      // The poll is already sent; without a reference its results are just unavailable.
+      this.options.onError(`poll_reference_failed: ${safeErrorMessage(err)}`);
+    }
+  }
+
+  /** Counts for one poll this bridge sent into that chat; no voter identities. */
+  async lookupPollResults(input: {
+    chatJid: string; pollId: string; forget?: boolean;
+  }): Promise<{ status: 'found'; results: PollResults } | { status: 'unknown' }> {
+    const chatJid = normalizeJid(input.chatJid);
+    const results = await this.pollStore.results(chatJid, input.pollId);
+    if (!results) return { status: 'unknown' };
+    if (input.forget) await this.pollStore.forget(chatJid, input.pollId);
+    return { status: 'found', results };
+  }
+
+  /** Count a vote on one of this bridge's polls; votes on other polls are dropped. */
+  private async handlePollVote(msg: any): Promise<void> {
+    if (!this.acceptingProviderEvents) return;
+    const update = normalizeMessageContent(msg?.message)?.pollUpdateMessage;
+    if (!update) return;
+    const chatJid = normalizeJid(String(msg?.key?.remoteJid || ''));
+    const pollId = String(update.pollCreationMessageKey?.id || '').trim();
+    const vote = update.vote;
+    if (!chatJid || !pollId || !vote?.encPayload || !vote?.encIv) return;
+    if (!(await this.pollStore.knows(chatJid, pollId))) return;
+    const key = msg.key || {};
+    const voterJids = key.fromMe
+      ? [...this.selfJids]
+      : [key.participant, key.participantAlt, key.remoteJid, key.remoteJidAlt]
+        .map((jid) => normalizeJid(String(jid || '')))
+        .filter((jid) => jid && !jid.endsWith('@g.us'));
+    const timestamp = Number(update.senderTimestampMs ?? 0);
+    const counted = await this.pollStore.recordVote({
+      chatJid,
+      pollId,
+      encPayload: vote.encPayload,
+      encIv: vote.encIv,
+      voterJids,
+      creatorJids: [...this.selfJids],
+      senderTimestampMs: Number.isFinite(timestamp) ? timestamp : 0,
+    });
+    if (!counted) this.options.onError('poll_vote_undecryptable');
   }
 
   async react(

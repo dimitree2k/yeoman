@@ -3146,6 +3146,7 @@ def build_gateway_runtime(
     typing_adapter = ChannelManagerTypingAdapter(channels)
     # The poll tool posts through the channel manager, so the owner's global pause applies.
     responder.set_poll_sender(channels.send_poll_now)
+    responder.set_poll_results(channels.lookup_poll_results_now)
 
     if effect_router is not None:
         # Approved effects go straight to the channel transport, so a successful send is

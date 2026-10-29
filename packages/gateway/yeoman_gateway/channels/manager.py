@@ -484,6 +484,17 @@ class ChannelManager:
         result = await sender(chat_id, question, options, max_selections, client_message_id)
         return str(result) if result else None
 
+    async def lookup_poll_results_now(
+        self, chat_id: str, poll_id: str, forget: bool = False
+    ) -> dict[str, Any] | None:
+        """Vote counts for one WhatsApp poll this account sent; it sends nothing."""
+        channel = self.channels.get("whatsapp")
+        lookup = getattr(channel, "lookup_poll_results", None) if channel is not None else None
+        if lookup is None:
+            raise RuntimeError("channel does not support poll results: whatsapp")
+        result = await lookup(chat_id, poll_id, forget=forget)
+        return result if isinstance(result, dict) else None
+
     async def lookup_message(
         self, channel: str, chat_id: str, message_id: str
     ) -> dict[str, object]:

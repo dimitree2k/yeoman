@@ -12,6 +12,7 @@ from yeoman_gateway.agent.tools.poll import (
     PollTool,
     normalize_poll,
 )
+from yeoman_gateway.agent.untrusted import EXTERNAL_START
 from yeoman_gateway.policy.engine import ActorContext, PolicyEngine
 from yeoman_gateway.policy.schema import PolicyConfig
 from yeoman_gateway.processing.tool_context import ToolInvocationContext, set_tool_context
@@ -295,3 +296,101 @@ async def test_channel_manager_poll_respects_the_global_pause() -> None:
     with pytest.raises(Exception):
         await manager.send_poll_now(GROUP, "Q?", ["a", "b"], 1, "YPOLLABCDEF124")
     assert sent == [GROUP]
+
+
+# --- results (F4) ------------------------------------------------------------------
+
+
+class _Results:
+    def __init__(self, answer=None, *, fail: bool = False) -> None:
+        self.calls: list[tuple] = []
+        self.fail = fail
+        self.answer = answer if answer is not None else {
+            "options": [{"name": "Freitag", "count": 2}, {"name": "Samstag", "count": 1}],
+            "total_votes": 3, "updated_at_ms": 1,
+        }
+
+    async def __call__(self, chat_id, poll_id, forget):
+        self.calls.append((chat_id, poll_id, forget))
+        if self.fail:
+            raise RuntimeError("bridge too old")
+        return self.answer
+
+
+def _results_setup(tmp_path: Path, results: _Results):
+    sender = _Sender()
+    clock = _Clock()
+    tool = PollTool(sender=lambda: sender, results=lambda: results,
+                    guard=PollGuard(tmp_path / "poll-guard.json"), clock_ms=clock)
+    return tool, clock
+
+
+async def test_results_show_counts_of_this_chats_latest_poll(tmp_path: Path) -> None:
+    results = _Results()
+    tool, _ = _results_setup(tmp_path, results)
+    _context(turn="t1")
+    await tool.execute(action="create", **ASK)
+
+    answer = await tool.execute(action="results")
+
+    assert results.calls == [(GROUP, "poll-1", False)]
+    assert "Freitag: 2" in answer and "Voters so far: 3" in answer
+    assert EXTERNAL_START in answer
+    # The tool takes no poll or chat parameter; it can only reach this chat's poll.
+    assert "poll_id" not in tool.parameters["properties"]
+
+
+async def test_results_never_reach_another_chats_poll(tmp_path: Path) -> None:
+    results = _Results()
+    tool, _ = _results_setup(tmp_path, results)
+    _context(turn="t1")
+    await tool.execute(action="create", **ASK)
+
+    _context("456@g.us", turn="t2")
+    answer = await tool.execute(action="results")
+
+    assert answer.startswith("Error") and "no poll" in answer
+    assert results.calls == []
+
+
+async def test_close_returns_final_counts_and_drops_the_bridge_reference(tmp_path: Path) -> None:
+    results = _Results()
+    tool, _ = _results_setup(tmp_path, results)
+    _context(turn="t1")
+    await tool.execute(action="create", **ASK)
+
+    answer = await tool.execute(action="close")
+
+    assert "now closed" in answer and "Freitag: 2" in answer
+    assert results.calls == [(GROUP, "poll-1", True)]
+
+
+async def test_results_failures_are_reported_without_detail(tmp_path: Path) -> None:
+    tool, _ = _results_setup(tmp_path, _Results(fail=True))
+    _context(turn="t1")
+    await tool.execute(action="create", **ASK)
+    assert await tool.execute(action="results") == "Error: poll results are unavailable right now."
+    # Closing still works when the bridge cannot answer.
+    assert (await tool.execute(action="close")).startswith("The open poll in this chat is now closed")
+
+    gone, _ = _results_setup(tmp_path / "b", _Results(answer={}))
+    _context(turn="t2")
+    await gone.execute(action="create", **ASK)
+    assert "no longer available" in await gone.execute(action="results")
+
+
+async def test_whatsapp_lookup_poll_results_payload() -> None:
+    from types import SimpleNamespace
+    from unittest.mock import AsyncMock
+
+    from yeoman_gateway.channels.whatsapp import WhatsAppChannel
+
+    channel = SimpleNamespace(_connected=True, _send_command_with_retry=AsyncMock(return_value={
+        "status": "found", "results": {"options": [], "total_votes": 0, "updated_at_ms": 5}}))
+    found = await WhatsAppChannel.lookup_poll_results(channel, GROUP, "P1", forget=True)
+
+    assert found == {"options": [], "total_votes": 0, "updated_at_ms": 5}
+    args = channel._send_command_with_retry.await_args
+    assert args.args == ("lookup_poll_results", {"chatJid": GROUP, "pollId": "P1", "forget": True})
+    channel._send_command_with_retry.return_value = {"status": "unknown"}
+    assert await WhatsAppChannel.lookup_poll_results(channel, GROUP, "P1") is None
