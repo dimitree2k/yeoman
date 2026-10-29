@@ -898,6 +898,43 @@ class WhatsAppChannel(BaseChannel):
         )
         return _receipt_from_bridge(result, target_message_id=msg.message_id)
 
+    async def send_poll(
+        self,
+        chat_id: str,
+        question: str,
+        options: list[str],
+        max_selections: int,
+        client_message_id: str,
+    ) -> str | None:
+        """Send one poll and return its provider message id.
+
+        One attempt only: the caller holds a quota reservation and a stable
+        ``client_message_id``, so a failure is reported instead of retried blindly.
+        """
+        from yeoman_gateway.history.context import history_effect_metadata
+        token = _SEND_HISTORY_GENERATION.set(history_effect_metadata().get('history_generation'))
+        try:
+            if not self._connected:
+                connected = await self._wait_connected_for_send(SEND_CONNECT_WAIT_SECONDS)
+                if not connected:
+                    raise RuntimeError("WhatsApp bridge not connected")
+            result = await self._send_command_with_retry(
+                "send_poll",
+                {
+                    "to": chat_id,
+                    "question": question,
+                    "options": list(options),
+                    "maxSelections": int(max_selections),
+                    "clientMessageId": client_message_id,
+                },
+                timeout_seconds=20.0,
+                max_attempts=1,
+            )
+        finally:
+            _SEND_HISTORY_GENERATION.reset(token)
+        receipt = _receipt_from_bridge(result) or {}
+        return receipt.get("provider_message_id")
+
     async def lookup_message(self, chat_id: str, message_id: str) -> dict[str, object]:
         """Look up one exact locally retained provider message reference."""
         if not self._connected:

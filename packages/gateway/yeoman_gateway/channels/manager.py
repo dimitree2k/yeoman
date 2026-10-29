@@ -464,6 +464,26 @@ class ChannelManager:
             raise self._refusal(denied)
         return await sender(message)
 
+    async def send_poll_now(
+        self,
+        chat_id: str,
+        question: str,
+        options: list[str],
+        max_selections: int,
+        client_message_id: str,
+    ) -> str | None:
+        """Send one WhatsApp poll directly; the owner's global pause applies as for text."""
+        channel = self.channels.get("whatsapp")
+        sender = getattr(channel, "send_poll", None) if channel is not None else None
+        if sender is None:
+            raise RuntimeError("channel does not support polls: whatsapp")
+        denied = self._pause_denial("whatsapp", chat_id, content=question)
+        if denied is not None:
+            self._denied("direct poll", "whatsapp", chat_id, denied)
+            raise self._refusal(denied)
+        result = await sender(chat_id, question, options, max_selections, client_message_id)
+        return str(result) if result else None
+
     async def lookup_message(
         self, channel: str, chat_id: str, message_id: str
     ) -> dict[str, object]:
