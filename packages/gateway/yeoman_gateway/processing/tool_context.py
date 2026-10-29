@@ -62,6 +62,31 @@ def current_tool_context() -> ToolInvocationContext | None:
     return CURRENT_TOOL_CONTEXT.get()
 
 
+def is_group_chat(channel: str, chat_id: str) -> bool:
+    """Whether a chat has members other than the owner (WhatsApp group or Telegram group)."""
+    value = str(chat_id or "")
+    if str(channel) == "telegram":
+        return value.startswith("-")
+    return value.endswith("@g.us")
+
+
+def tool_in_group_chat(context: ToolInvocationContext | None = None) -> bool:
+    """Whether the tool call runs in a group chat; a call without a context is not one."""
+    context = context if context is not None else current_tool_context()
+    return context is not None and is_group_chat(context.channel, context.chat_id)
+
+
+def owner_dm_only_refusal(tool_name: str) -> str | None:
+    """Refusal text for an owner-private tool called from a group chat, else None.
+
+    Group members see the reply, so owner-private tools refuse there for everyone,
+    the owner included.
+    """
+    if not tool_in_group_chat():
+        return None
+    return f"Error: {tool_name} is only available in the owner DM, not in group chats."
+
+
 def tool_history_snapshot() -> HistorySnapshot | None:
     context = current_tool_context()
     if context is not None and context.channel != 'whatsapp':

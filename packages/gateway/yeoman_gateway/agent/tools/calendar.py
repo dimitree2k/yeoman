@@ -8,6 +8,7 @@ from loguru import logger
 from yeoman_gateway.agent.tools.base import Tool
 from yeoman_gateway.caldav.service import CalDAVService
 from yeoman_gateway.caldav.types import EventInfo, RecurrenceRule, Reminder
+from yeoman_gateway.processing.tool_context import owner_dm_only_refusal
 
 
 class CalendarTool(Tool):
@@ -133,6 +134,8 @@ class CalendarTool(Tool):
         query: str = "",
         **kwargs: Any,
     ) -> str:
+        if refusal := owner_dm_only_refusal(self.name):
+            return refusal
         match action:
             case "list_calendars":
                 return await self._list_calendars()

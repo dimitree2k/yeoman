@@ -35,6 +35,7 @@ from yeoman_gateway.processing.tool_context import (
     current_tool_context,
     reset_tool_context,
     set_tool_context,
+    tool_in_group_chat,
 )
 from yeoman_gateway.providers.base import LLMProvider
 
@@ -254,7 +255,12 @@ class SubagentManager:
                 tools.register(ListDirTool(allowed_dir=allowed_dir))
             grant_mounts: list[SandboxMount] = []
             grant_container_prefixes: list[str] = []
-            if self.file_access_resolver is not None and self.file_access_resolver.has_grants:
+            # Grant mounts follow the turn that spawned the subagent: owner only, never a group.
+            context = current_tool_context()
+            if self.file_access_resolver is not None and self.file_access_resolver.grants_allowed(
+                is_owner=context is not None and context.is_owner,
+                in_group=tool_in_group_chat(context),
+            ):
                 for host_path, container_path, readonly in self.file_access_resolver.iter_grant_mounts():
                     grant_mounts.append(
                         SandboxMount(

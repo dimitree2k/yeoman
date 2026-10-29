@@ -69,6 +69,7 @@ from yeoman_gateway.policy.identity import normalize_sender_list
 from yeoman_gateway.processing.tool_context import (
     ASYNC_HANDOFF_SIGNAL,
     set_turn_signals,
+    tool_in_group_chat,
 )
 from yeoman_gateway.providers.base import LLMProvider, LLMProviderError, ToolCallRequest
 from yeoman_gateway.reply_budget import derive_reply_budget, enforce_reply_budget
@@ -1745,12 +1746,15 @@ class LLMResponder(ResponderPort):
         return self._routed_provider_factory(model, provider)
 
     def _should_enable_grants(self, is_owner: bool) -> bool:
-        """Check whether grants should be activated for tool execution."""
-        if self.file_access_resolver is None or not self.file_access_resolver.has_grants:
+        """Check whether grants should be activated for tool execution.
+
+        Group members see the turn's output, so grants stay off in groups even for the owner.
+        """
+        if self.file_access_resolver is None:
             return False
-        if self.file_access_resolver.owner_only:
-            return is_owner
-        return True
+        return self.file_access_resolver.grants_allowed(
+            is_owner=is_owner, in_group=tool_in_group_chat()
+        )
 
     async def _execute_tool(
         self,

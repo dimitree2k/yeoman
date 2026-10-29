@@ -132,6 +132,12 @@ class FileAccessResolver:
     def owner_only(self) -> bool:
         return self._owner_only
 
+    def grants_allowed(self, *, is_owner: bool, in_group: bool) -> bool:
+        """Whether a caller may use grants: never in a group, owner-only when so configured."""
+        if not self._grants or in_group:
+            return False
+        return is_owner or not self._owner_only
+
     def iter_grant_mounts(self) -> tuple[tuple[Path, str, bool], ...]:
         """Return (host_path, container_path, readonly) tuples for exec sandbox mounts."""
         mounts: list[tuple[Path, str, bool]] = []
