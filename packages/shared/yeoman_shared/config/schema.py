@@ -651,6 +651,12 @@ class TrendsConfig(BaseModel):
     max_article_age_hours: int = Field(default=48, alias="maxArticleAgeHours", ge=1)
     max_items_per_run: int = Field(default=20, alias="maxItemsPerRun", ge=1, le=50)
     route: str = "trends.score"
+    # When groups with a trends block may get a card (local time, end exclusive).
+    post_from: str = Field(default="07:00", alias="postFrom", pattern=r"^\d{2}:\d{2}$")
+    post_until: str = Field(default="23:00", alias="postUntil", pattern=r"^\d{2}:\d{2}$")
+    max_posts_per_day: int = Field(default=1, alias="maxPostsPerDay", ge=0, le=10)
+    # A group silent this long gets a card offer even without a lull before it.
+    idle_hours: float = Field(default=4.0, alias="idleHours", gt=0)
 
 
 class ConsciousnessConfig(BaseModel):

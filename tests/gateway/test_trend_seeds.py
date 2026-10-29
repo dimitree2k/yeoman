@@ -526,3 +526,71 @@ async def test_trend_card_reaches_transport_as_a_new_unquoted_message(
         archive.close()
         log.close()
         processing.close()
+
+
+def test_posting_hours_and_daily_cap_gate_new_offers(tmp_path: Path) -> None:
+    from datetime import UTC, datetime
+
+    store = _store(tmp_path, ("Bitcoin Toaster", 8, ["krypto"]))
+    _fit_all(store, FINANCE)
+    engine = _engine(tmp_path, trends=FINANCE)
+    posts: list[int] = []
+
+    def at(hour: int) -> TrendSeeds:
+        moment = datetime(2026, 4, 25, hour, 30, tzinfo=UTC).timestamp()
+        return TrendSeeds(
+            store=store, policy_engine=lambda: engine, clock=lambda: moment,
+            post_from="07:00", post_until="23:00", max_posts_per_day=1,
+            posts_since=lambda channel, chat_id, since_ms: (
+                posts.append(since_ms) or 1 if hour == 15 else 0
+            ),
+            tz=UTC,
+        )
+
+    assert at(6).seed(CHANNEL, CHAT) == ()  # before 07:00
+    assert at(23).seed(CHANNEL, CHAT) == ()  # 23:00 is outside
+    assert at(15).seed(CHANNEL, CHAT) == ()  # one trend post already today
+    assert posts == [int(datetime(2026, 4, 25, tzinfo=UTC).timestamp() * 1000)]
+    assert at(12).seed(CHANNEL, CHAT) == (f"trend:{card_id_for('Bitcoin Toaster')}",)
+
+
+def test_ledger_counts_sent_comments_that_carried_a_card(tmp_path: Path) -> None:
+    import asyncio
+
+    ledger = SpeakupLog(tmp_path / "speakups.db")
+
+    async def record(opportunity_id: str, sources: tuple[str, ...], disposition: str) -> None:
+        await ledger.record_disposition(
+            opportunity_id=opportunity_id, channel=CHANNEL, chat_id=CHAT,
+            disposition=disposition, reason="", observed_revision=1, activation_epoch=1,
+            lane="production", trigger="lull", source_ids=sources, now_ms=NOW_MS,
+        )
+
+    asyncio.run(record("a", ("trend:abc",), "comment_sent"))
+    asyncio.run(record("b", ("trend:def",), "decided_silence"))
+    asyncio.run(record("c", ("m1",), "comment_sent"))
+    assert ledger.trend_posts_since(CHANNEL, CHAT, NOW_MS - 1) == 1
+    assert ledger.trend_posts_since(CHANNEL, CHAT, NOW_MS + 1) == 0
+    assert ledger.trend_posts_since(CHANNEL, OTHER_CHAT, 0) == 0
+
+
+@pytest.mark.asyncio
+async def test_idle_watcher_triggers_only_long_silent_groups_it_may_post_in() -> None:
+    from yeoman_gateway.trends.idle import TrendIdleWatcher
+
+    last = {"quiet": NOW_MS - 5 * HOUR_MS, "chatty": NOW_MS - HOUR_MS, "capped": 0, "new": None}
+    triggered: list[str] = []
+
+    async def last_activity(channel: str, chat_id: str) -> int | None:
+        return last[chat_id]
+
+    watcher = TrendIdleWatcher(
+        chats=lambda: [(CHANNEL, chat, None) for chat in last],
+        last_activity_ms=last_activity,
+        may_post=lambda channel, chat_id: chat_id != "capped",
+        trigger=lambda channel, chat_id: triggered.append(chat_id),
+        idle_ms=4 * HOUR_MS,
+        clock=lambda: NOW_MS / 1000,
+    )
+    assert await watcher.tick() == ["quiet"]
+    assert triggered == ["quiet"]

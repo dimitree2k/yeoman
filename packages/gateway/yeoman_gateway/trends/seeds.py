@@ -12,6 +12,7 @@ from __future__ import annotations
 import re
 import time
 from collections.abc import Callable
+from datetime import datetime, tzinfo
 from typing import Any
 
 from .fit import topics_key
@@ -28,6 +29,11 @@ MAX_SEED_CARDS = 3
 MIN_SEED_GAP_MS = 3 * 3600 * 1000
 _CANDIDATE_POOL = 50
 _TERM_SPLIT = re.compile(r"[,;\n]+")
+
+
+def _minutes(clock: str) -> int:
+    hours, _, minutes = clock.partition(":")
+    return int(hours) * 60 + int(minutes or 0)
 
 
 def is_trend_source(source_id: object) -> bool:
@@ -91,13 +97,40 @@ class TrendSeeds:
         store: TrendStore,
         policy_engine: Callable[[], Any],
         clock: Callable[[], float] = time.time,
+        post_from: str = "00:00",
+        post_until: str = "24:00",
+        max_posts_per_day: int | None = None,
+        posts_since: Callable[[str, str, int], int] | None = None,
+        tz: tzinfo | None = None,
     ) -> None:
         self._store = store
         self._policy_engine = policy_engine
         self._clock = clock
+        self._post_from = _minutes(post_from)
+        self._post_until = _minutes(post_until)
+        self._max_posts_per_day = max_posts_per_day
+        self._posts_since = posts_since
+        self._tz = tz
 
     def _now_ms(self) -> int:
         return int(self._clock() * 1000)
+
+    def _local(self, now_ms: int) -> datetime:
+        # ``tz=None`` means the gateway's local time, which is the owner's.
+        return datetime.fromtimestamp(now_ms / 1000, self._tz).astimezone(self._tz)
+
+    def may_post_now(self, channel: str, chat_id: str, *, now_ms: int | None = None) -> bool:
+        """Inside the posting hours and below today's trend post cap."""
+        moment = self._now_ms() if now_ms is None else int(now_ms)
+        local = self._local(moment)
+        minute = local.hour * 60 + local.minute
+        if not self._post_from <= minute < self._post_until:
+            return False
+        if self._max_posts_per_day is None or self._posts_since is None:
+            return True
+        midnight = local.replace(hour=0, minute=0, second=0, microsecond=0)
+        posted = self._posts_since(channel, chat_id, int(midnight.timestamp() * 1000))
+        return posted < self._max_posts_per_day
 
     def policy(self, channel: str, chat_id: str) -> Any | None:
         """The chat's enabled trends block, else ``None`` (unreadable policy counts as off)."""
@@ -132,6 +165,8 @@ class TrendSeeds:
         An offered card is used up for the chat whether or not the judge posts it.
         """
         moment = self._now_ms() if now_ms is None else int(now_ms)
+        if not self.may_post_now(channel, chat_id, now_ms=moment):
+            return ()
         last = self._store.last_offer_ms(channel, chat_id)
         if last is not None and moment - last < MIN_SEED_GAP_MS:
             return ()
@@ -197,12 +232,22 @@ def trend_chats(engine: Any) -> list[tuple[str, str, Any]]:
     return found
 
 
-def build_trend_seeds(config: Any, policy_engine: Callable[[], Any]) -> TrendSeeds | None:
+def build_trend_seeds(
+    config: Any,
+    policy_engine: Callable[[], Any],
+    posts_since: Callable[[str, str, int], int] | None = None,
+) -> TrendSeeds | None:
     """Seeds over the trends store when the collector is enabled."""
-    if not bool(getattr(getattr(config, "trends", None), "enabled", False)):
+    trends = getattr(config, "trends", None)
+    if not bool(getattr(trends, "enabled", False)):
         return None
     from yeoman_shared.utils.helpers import get_operational_store_path
 
     return TrendSeeds(
-        store=TrendStore(get_operational_store_path("trends")), policy_engine=policy_engine
+        store=TrendStore(get_operational_store_path("trends")),
+        policy_engine=policy_engine,
+        post_from=trends.post_from,
+        post_until=trends.post_until,
+        max_posts_per_day=trends.max_posts_per_day,
+        posts_since=posts_since,
     )

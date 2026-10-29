@@ -1307,6 +1307,23 @@ class SpeakupLog:
         revision = max((int(row["revision"]) for row in rows), default=considered)
         return material, revision
 
+    def trend_posts_since(self, channel: str, chat_id: str, since_ms: int) -> int:
+        """Comments sent for opportunities that carried an offered trend card.
+
+        Conservative for the daily trend cap: a sent comment on a mixed opportunity
+        counts even when it answered a chat message instead of posting the card.
+        """
+        with self._lock:
+            row = self._conn.execute(
+                """
+                SELECT COUNT(*) AS posts FROM opportunity_dispositions
+                WHERE channel = ? AND chat_id = ? AND disposition = 'comment_sent'
+                  AND created_at_ms >= ? AND source_ids_json LIKE '%"trend:%'
+                """,
+                (str(channel), str(chat_id), int(since_ms)),
+            ).fetchone()
+        return int(row["posts"] if row is not None else 0)
+
     def mark_material_considered_sync(
         self,
         *,

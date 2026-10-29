@@ -459,6 +459,7 @@ class GatewayRuntime:
     gateway_socket: "GatewaySocket | None" = None
     speakup_log: object | None = None
     lull_observer: object | None = None
+    trend_idle: object | None = None
     opportunity_scheduler: object | None = None
     #: The decision runtime behind the scheduler; held for composition checks only.
     participation_decision: object | None = None
@@ -522,6 +523,8 @@ class GatewayRuntime:
             await self.heartbeat.start()
             if self.lull_observer is not None and hasattr(self.lull_observer, "start"):
                 await self.lull_observer.start()
+            if self.trend_idle is not None:
+                await self.trend_idle.start()  # type: ignore[attr-defined]
             if self.opportunity_scheduler is not None:
                 await self.opportunity_scheduler.start()
             if self.participation_maintenance is not None:
@@ -570,6 +573,8 @@ class GatewayRuntime:
                     await attempt_async(maintenance_stop)
             if self.lull_observer is not None and hasattr(self.lull_observer, "stop"):
                 attempt_sync(self.lull_observer.stop)
+            if self.trend_idle is not None:
+                attempt_sync(self.trend_idle.stop)  # type: ignore[attr-defined]
             attempt_sync(self.cron.stop)
             attempt_sync(self.orchestrator.stop)
             await attempt_async(self.channels.stop_all)
@@ -972,6 +977,53 @@ def _seed_trend_cards(
     if source_ids:
         logger.info("trend_seeded chat={} cards={}", chat_id[:24], len(source_ids))
     return tuple(source_ids)
+
+
+def _build_trend_idle(
+    *,
+    config: Config,
+    seeds: object,
+    ledger: object,
+    policy_adapter: object,
+    history_projector: object,
+    active: Callable[[str, str], bool],
+    offer: Callable[[str, str], object],
+) -> object:
+    """The dead-group watcher: a silent group gets the lull path with fresh cards."""
+    from yeoman_gateway.history.context import history_turn
+    from yeoman_gateway.history.live import HistoryPaused
+    from yeoman_gateway.history.queries import HistoryQueries
+    from yeoman_gateway.trends.idle import TrendIdleWatcher
+
+    async def last_activity_ms(channel: str, chat_id: str) -> int | None:
+        try:
+            async with history_turn(history_projector) as snapshot:
+                rows = HistoryQueries(snapshot).recent(chat_id=chat_id, limit=1)
+        except HistoryPaused:
+            return None
+        sent = rows[0]["sent_ms"] if rows else None
+        return int(sent) if sent is not None else None
+
+    def trigger(channel: str, chat_id: str) -> object:
+        # Offer only when new cards were seeded: idling alone is no reason to judge.
+        if not _seed_trend_cards(
+            channel=channel,
+            chat_id=chat_id,
+            seeds=seeds,
+            ledger=ledger,
+            active=active(channel, chat_id),
+        ):
+            return None
+        return offer(channel, chat_id)
+
+    engine = getattr(policy_adapter, "policy_engine", lambda: None)
+    return TrendIdleWatcher(
+        chats=lambda: trend_chats(engine()),
+        last_activity_ms=last_activity_ms,
+        may_post=seeds.may_post_now,  # type: ignore[attr-defined]
+        trigger=trigger,
+        idle_ms=int(config.trends.idle_hours * 3_600_000),
+    )
 
 
 def _offer_participation_trigger(
@@ -2933,7 +2985,9 @@ def build_gateway_runtime(
     # The same live history proof check guards owner approval and pre-dispatch.
     knowledge_decision_validator = build_participation_decision_validator(knowledge=knowledge_service)
     trend_seeds = build_trend_seeds(
-        config, getattr(policy_adapter, "policy_engine", lambda: None)
+        config,
+        getattr(policy_adapter, "policy_engine", lambda: None),
+        posts_since=getattr(speakup_log, "trend_posts_since", None),
     )
     effect_router = build_effect_router(
         config,
@@ -4058,6 +4112,7 @@ def build_gateway_runtime(
 
     burst_observer = None
     lull_observer = None
+    trend_idle = None
     participation_maintenance = None
     _decision_runtime = None
     def _participation_active(channel: str, chat_id: str) -> bool:
@@ -4330,6 +4385,24 @@ def build_gateway_runtime(
             )
             bus.subscribe_event("InboundObservedEvent", lull_observer.handle)
 
+        if trend_seeds is not None:
+            trend_idle = _build_trend_idle(
+                config=config,
+                seeds=trend_seeds,
+                ledger=speakup_log,
+                policy_adapter=policy_adapter,
+                history_projector=history_projector,
+                active=_participation_active,
+                offer=lambda channel, chat_id: _offer_participation_trigger(
+                    channel=channel,
+                    chat_id=chat_id,
+                    trigger="lull",
+                    runtime=participation_runtime,
+                    policy_adapter=policy_adapter,
+                    material_provider=participation_material,
+                ),
+            )
+
     knowledge_policy.capture_policy_provider = policy_adapter.current_policy_snapshot
 
     statement_capture = build_statement_capture(
@@ -4363,6 +4436,7 @@ def build_gateway_runtime(
         gateway_socket=gateway_socket,
         speakup_log=speakup_log,
         lull_observer=lull_observer,
+        trend_idle=trend_idle,
         opportunity_scheduler=opportunity_scheduler,
         participation_decision=_decision_runtime,
         participation_maintenance=participation_maintenance,
