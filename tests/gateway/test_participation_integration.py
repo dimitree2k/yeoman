@@ -2761,6 +2761,65 @@ async def test_writer_draft_is_held_to_the_chat_reply_budget() -> None:
 
 
 @pytest.mark.asyncio
+@pytest.mark.parametrize(
+    ("writer_output", "expected"),
+    [
+        # The exact drafts the writer sent as text in Ente on 2026-10-28 and 2026-10-30.
+        ("::reaction::🤡", ""),
+        ("::reaction::🤖", ""),
+        ("`::reaction::🤙`", ""),
+        ("::reaction::😏\n\nWir bleiben erstmal an Deck.", "Wir bleiben erstmal an Deck."),
+        ("Steht korrigiert.\n\n::reaction::👍", "Steht korrigiert."),
+        ("Kein Marker hier 😄", "Kein Marker hier 😄"),
+    ],
+)
+async def test_writer_draft_never_carries_a_reaction_marker(
+    writer_output: str, expected: str
+) -> None:
+    """A participation draft is sent verbatim, so a reaction marker must not survive.
+
+    The reply pipeline turns ``::reaction::`` into a real reaction; the managed
+    comment path does not, and the chat saw the marker as text. A marker-only draft
+    becomes empty, which releases the comment reservation and sends nothing.
+    """
+    from yeoman_gateway.adapters.responder_llm import LLMResponder
+    from yeoman_gateway.core.models import InboundEvent, PolicyDecision
+
+    class _MarkerDraft(LLMResponder):
+        def __init__(self) -> None:
+            self.prompt = ""
+            self.telemetry = None
+
+        def _metadata_for_event(self, event: InboundEvent) -> dict[str, object]:
+            del event
+            return {}
+
+        async def _generate(self, **kwargs: object) -> str:
+            self.prompt = str(kwargs["content"])
+            return writer_output
+
+    responder = _MarkerDraft()
+    draft = await responder.generate_participation_draft(
+        InboundEvent(channel=CHANNEL, chat_id=CHAT, sender_id="", content="", is_group=True),
+        PolicyDecision(
+            accept_message=False,
+            should_respond=False,
+            allowed_tools=frozenset(),
+            reason="participation_draft_only",
+        ),
+        purpose="React to the joke.",
+        context={
+            "target_message_id": "selected",
+            "messages": [{"event_id": "selected", "sender": "Ben", "text": "lol"}],
+        },
+        model_profile="participation_writer",
+    )
+
+    assert draft == expected
+    assert "never write a ::reaction:: marker" in responder.prompt
+
+
+@pytest.mark.asyncio
 async def test_submission_passes_policy_reply_budget_to_writer(tmp_path: Path) -> None:
     """The draft decision carries the chat's budget, so the writer can be held to it."""
     from yeoman_gateway.app.bootstrap import _ParticipationSubmission
