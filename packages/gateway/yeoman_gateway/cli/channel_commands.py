@@ -88,6 +88,75 @@ def whatsapp_ensure(
     console.print(f"Log: {report.status.log_path}")
 
 
+async def _request_owner_poll(socket_path: Path, args: dict) -> dict:
+    """Send one owner poll request to the running gateway and return its reply."""
+    import asyncio
+    import json
+
+    writer = None
+    try:
+        reader, writer = await asyncio.open_unix_connection(str(socket_path))
+        writer.write(json.dumps({"cmd": "send_poll", "args": args}).encode() + b"\n")
+        await writer.drain()
+        line = await asyncio.wait_for(reader.readline(), timeout=60)
+    finally:
+        if writer is not None:
+            writer.close()
+            try:
+                await writer.wait_closed()
+            except (ConnectionError, OSError):
+                pass
+    reply = json.loads(line)
+    if not isinstance(reply, dict):
+        raise ValueError("invalid reply")
+    return reply
+
+
+@whatsapp_app.command("poll")
+def whatsapp_poll(
+    chat_id: str = typer.Argument(..., help="WhatsApp chat JID, e.g. 120363...@g.us"),
+    question: str = typer.Option(..., "--question", "-q", help="Poll question"),
+    options: list[str] = typer.Option(
+        ..., "--option", "-o", help="One answer option; repeat for each option (2-12)"
+    ),
+    multi: bool = typer.Option(False, "--multi", help="Allow choosing several options"),
+) -> None:
+    """Post a WhatsApp poll as Arvid into one chat through the running gateway."""
+    import asyncio
+    from uuid import uuid4
+
+    from yeoman_shared.config.loader import load_config
+
+    if "@" not in chat_id:
+        console.print("[red]Invalid chat id. Expected WhatsApp JID like ...@g.us[/red]")
+        raise typer.Exit(1)
+    args = {
+        "chat_id": chat_id,
+        "question": question,
+        "options": list(options),
+        "multi_select": multi,
+        "request_id": uuid4().hex,
+    }
+    socket_path = load_config().ipc.resolved_gateway_socket_path
+    try:
+        reply = asyncio.run(_request_owner_poll(socket_path, args))
+    except (OSError, ValueError, TimeoutError):
+        console.print(
+            "[red]Gateway unavailable.[/red] If interrupted, the poll may have been sent; "
+            "check the chat before retrying."
+        )
+        raise typer.Exit(1) from None
+    if reply.get("status") != "ok":
+        detail = reply.get("message") or reply.get("code") or reply.get("status")
+        console.print(f"[red]Poll not sent:[/red] {detail}")
+        raise typer.Exit(1)
+    console.print(
+        f"[green]✓[/green] Poll sent to {chat_id} "
+        f"({len(reply.get('options', []))} options, max {reply.get('max_selections')} "
+        f"selections, poll id {reply.get('poll_id')})"
+    )
+
+
 @whatsapp_app.command("repair-sender")
 def whatsapp_repair_sender(
     sender_id: str = typer.Option(

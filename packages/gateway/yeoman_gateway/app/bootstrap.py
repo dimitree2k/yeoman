@@ -4092,6 +4092,21 @@ def build_gateway_runtime(
             chat_ids=tuple(args['chat_ids']), after_ms=args['after_ms'], limit=args['limit'],
             aggregate=args.get('aggregate', True))
 
+    async def ipc_send_poll(args: dict[str, Any]) -> dict[str, Any]:
+        from yeoman_gateway.agent.tools.poll import PollGuard, send_owner_poll
+
+        # Same guard file as the poll tool, and send_poll_now applies the owner's pause.
+        return await send_owner_poll(
+            channels.send_poll_now,
+            PollGuard(),
+            chat_id=args["chat_id"],
+            question=args["question"],
+            options=args["options"],
+            multi_select=args["multi_select"],
+            request_id=args["request_id"],
+            now_ms=int(time.time() * 1000),
+        )
+
     gateway_socket = GatewaySocket(
         path=socket_path,
         send_message_handler=ipc_send_message,
@@ -4107,6 +4122,7 @@ def build_gateway_runtime(
         knowledge_read_handler=ipc_knowledge_read,
         history_read_handler=ipc_history_read,
         history_control_handler=history_projector.control,
+        send_poll_handler=ipc_send_poll,
         rate_limit=ipc_config.command_rate_limit,
     )
 

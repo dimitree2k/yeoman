@@ -11,6 +11,7 @@ from yeoman_gateway.agent.tools.poll import (
     PollGuard,
     PollTool,
     normalize_poll,
+    send_owner_poll,
 )
 from yeoman_gateway.agent.untrusted import EXTERNAL_START
 from yeoman_gateway.policy.engine import ActorContext, PolicyEngine
@@ -394,3 +395,46 @@ async def test_whatsapp_lookup_poll_results_payload() -> None:
     assert args.args == ("lookup_poll_results", {"chatJid": GROUP, "pollId": "P1", "forget": True})
     channel._send_command_with_retry.return_value = {"status": "unknown"}
     assert await WhatsAppChannel.lookup_poll_results(channel, GROUP, "P1") is None
+
+
+@pytest.mark.asyncio
+async def test_owner_poll_sends_multi_select_and_shares_the_tool_guard(tmp_path: Path) -> None:
+    sender = _Sender()
+    guard = PollGuard(tmp_path / "guard.json")
+    reply = await send_owner_poll(
+        sender, guard, chat_id=GROUP, question="  Was  ändern? ", options=["A", "B", "a", "C"],
+        multi_select=True, request_id="r1", now_ms=1_000,
+    )
+    assert reply == {"status": "ok", "poll_id": "poll-1", "question": "Was ändern?",
+                     "options": ["A", "B", "C"], "max_selections": 3}
+    assert sender.calls[0][:4] == (GROUP, "Was ändern?", ["A", "B", "C"], 3)
+    assert await guard.latest_poll_id(GROUP, 1_000) == "poll-1"
+
+    second = await send_owner_poll(
+        sender, guard, chat_id=GROUP, question="Noch eine?", options=["Ja", "Nein"],
+        multi_select=False, request_id="r2", now_ms=2_000,
+    )
+    assert second["code"] == "POLL_LIMIT"
+    assert len(sender.calls) == 1
+
+
+@pytest.mark.asyncio
+async def test_owner_poll_rejects_invalid_input_and_frees_the_slot_on_failure(tmp_path: Path) -> None:
+    guard = PollGuard(tmp_path / "guard.json")
+    invalid = await send_owner_poll(
+        _Sender(), guard, chat_id=GROUP, question="Q", options=["only one"],
+        multi_select=False, request_id="r1", now_ms=1_000,
+    )
+    assert invalid["code"] == "INVALID_POLL"
+
+    failed = await send_owner_poll(
+        _Sender(fail=True), guard, chat_id=GROUP, question="Q", options=["A", "B"],
+        multi_select=False, request_id="r2", now_ms=1_000,
+    )
+    assert failed["code"] == "SEND_FAILED"
+    sender = _Sender()
+    retry = await send_owner_poll(
+        sender, guard, chat_id=GROUP, question="Q", options=["A", "B"],
+        multi_select=False, request_id="r3", now_ms=1_000,
+    )
+    assert retry["status"] == "ok" and sender.calls[0][3] == 1
