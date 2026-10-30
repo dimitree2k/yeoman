@@ -11,6 +11,7 @@ BUDGET_USD="${LOG_REVIEW_BUDGET_USD:-8}"
 TODAY="$(date +%F)"
 RUN_DIR="$REVIEW_DIR/runs/$TODAY-$(date +%H%M%S)"
 REPORT="$RUN_DIR/report.md"
+CANDIDATES="$RUN_DIR/merge-candidates.txt"
 export PATH="$HOME/.local/bin:$PATH"
 
 # Only the two Telegram values are read from ~/.yeoman/.env; nothing else from it
@@ -53,7 +54,7 @@ fi
 (cd "$WORKTREE" && uv sync -q)
 
 PROMPT="$(sed -e "s|\$DIGEST|$DIGEST|g" -e "s|\$REVIEW_DIR|$REVIEW_DIR|g" \
-  -e "s|\$AUTONOMY|$AUTONOMY|g" -e "s|\$REPORT|$REPORT|g" "$REPO/ops/log-review/prompt.md")"
+  -e "s|\$AUTONOMY|$AUTONOMY|g" -e "s|\$REPORT|$REPORT|g" -e "s|\$CANDIDATES|$CANDIDATES|g" "$REPO/ops/log-review/prompt.md")"
 BEFORE_MAIN="$(git -C "$REPO" rev-parse origin/main)"
 START_ISO="$(date -u +%FT%TZ)"
 
@@ -68,12 +69,51 @@ set +e
       "Bash(jq:*)" "Bash(rg:*)" "Bash(sqlite3 -readonly:*)" \
     --disallowedTools "Read(~/.yeoman/.env)" "Read(~/.yeoman/secrets/**)" \
       "Read(~/.yeoman/policy.json)" "Read(**/.env)" "Bash(yeoman deploy:*)" \
-      "Bash(git push --force:*)" "Bash(gh pr merge --admin:*)" \
+      "Bash(git push --force:*)" "Bash(gh pr merge:*)" "Bash(gh pr ready:*)" \
     --output-format json > "$RUN_DIR/claude.json" 2> "$RUN_DIR/claude.err")
 STATUS=$?
 set -e
 
 SUMMARY="$(head -c 3000 "$REPORT" 2>/dev/null || echo "No report written (exit $STATUS).")"
+# Second layer: the fixer only proposes candidates; headless dsh reviews each diff
+# and only an APPROVE (plus green CI, size and path limits) is merged.
+review_candidate() {
+  local pr="$1" diff files lines verdict
+  files="$(cd "$REPO" && gh pr view "$pr" --json files -q '.files[].path')" || return 1
+  if grep -qE '(^|/)(policy|knowledge|history|migrations?)(/|\.py$)|prompts?/|personas?/|\.yeoman/' <<<"$files"; then
+    echo "#$pr: touches a protected path"; return 1
+  fi
+  lines="$(cd "$REPO" && gh pr view "$pr" --json additions,deletions -q '.additions + .deletions')"
+  [ "${lines:-999}" -le 80 ] || { echo "#$pr: $lines changed lines"; return 1; }
+  (cd "$REPO" && timeout 900 gh pr checks "$pr" --watch --interval 20 >/dev/null) \
+    || { echo "#$pr: CI not green"; return 1; }
+  diff="$(cd "$REPO" && gh pr view "$pr" --json title,body -q '.title + "\n\n" + .body'; \
+    cd "$REPO" && gh pr diff "$pr")"
+  verdict="$(cd "$WORKTREE" && git checkout -q --detach "origin/log-review/${2}" 2>/dev/null; \
+    { cat "$REPO/ops/log-review/review-prompt.md"; printf '\n--- PULL REQUEST ---\n%s\n' "$diff"; } \
+    | timeout 900 dsh headless - 2>> "$RUN_DIR/dsh.err")"
+  printf '#%s dsh review:\n%s\n\n' "$pr" "$verdict" >> "$RUN_DIR/dsh-reviews.md"
+  [ "$(printf '%s\n' "$verdict" | grep -E '^VERDICT: ' | tail -1)" = "VERDICT: APPROVE" ] \
+    || { echo "#$pr: dsh blocked"; return 1; }
+  (cd "$REPO" && gh pr ready "$pr" >/dev/null && gh pr merge "$pr" --squash --delete-branch) \
+    && echo "#$pr: approved by dsh and merged" \
+    && jq --arg pr "/pull/$pr" '(.[] | select((.pr // "") | endswith($pr))) |= (.state = "merged")' \
+      "$REVIEW_DIR/ledger.json" > "$REVIEW_DIR/ledger.json.tmp" \
+    && mv "$REVIEW_DIR/ledger.json.tmp" "$REVIEW_DIR/ledger.json"
+}
+
+GATE=""
+if [ "$AUTONOMY" = "auto-merge" ] && [ -s "$CANDIDATES" ]; then
+  git -C "$REPO" fetch -q origin
+  for pr in $(grep -oE '[0-9]+' "$CANDIDATES" | sort -u); do
+    branch="$(cd "$REPO" && gh pr view "$pr" --json headRefName,state -q 'select(.state == "OPEN") | .headRefName')"
+    case "$branch" in log-review/*) ;; *) GATE="$GATE"$'\n'"#$pr: not an open log-review PR"; continue ;; esac
+    GATE="$GATE"$'\n'"$(review_candidate "$pr" "${branch#log-review/}" 2>&1 | tail -1)"
+  done
+  git -C "$WORKTREE" checkout -q --detach origin/main || true
+  SUMMARY="$SUMMARY"$'\n\n'"Second review (dsh):$GATE"
+fi
+
 # Only the review's own squash merges are deployed-and-maybe-reverted; other
 # threads' merges that landed meanwhile are never touched.
 MERGED="$(cd "$REPO" && gh pr list --state merged --limit 20 \
