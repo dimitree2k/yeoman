@@ -320,3 +320,37 @@ async def test_ipc_oversize_and_garbled_requests_leave_status_usable(tmp_path):
     finally:
         await server.stop()
         loop.set_exception_handler(prior_handler)
+
+
+@pytest.mark.asyncio
+async def test_send_poll_validates_exact_arguments_before_the_handler(tmp_path: Path) -> None:
+    seen: list[dict] = []
+
+    async def handler(args: dict) -> dict:
+        seen.append(args)
+        return {"status": "ok", "poll_id": "p1"}
+
+    server = GatewaySocket(path=tmp_path / "gateway.sock", send_poll_handler=handler)
+    await server.start()
+    try:
+        reader, writer = await asyncio.open_unix_connection(str(server.path))
+        good = {"chat_id": "1@g.us", "question": "Q", "options": ["A", "B"],
+                "multi_select": True, "request_id": "r1"}
+        bad_frames = [
+            {**good, "extra": 1},
+            {**good, "options": ["A", 2]},
+            {**good, "multi_select": "yes"},
+            {**good, "chat_id": ""},
+        ]
+        for args in bad_frames:
+            writer.write(json.dumps({"cmd": "send_poll", "args": args}).encode() + b"\n")
+            await writer.drain()
+            assert json.loads(await reader.readline())["code"] == "INVALID_POLL"
+        writer.write(json.dumps({"cmd": "send_poll", "args": good}).encode() + b"\n")
+        await writer.drain()
+        assert json.loads(await reader.readline()) == {"status": "ok", "poll_id": "p1"}
+        assert seen == [good]
+        writer.close()
+        await writer.wait_closed()
+    finally:
+        await server.stop()

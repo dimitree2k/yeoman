@@ -286,6 +286,40 @@ class PollTool(Tool):
         return wrap_external_content("poll", "\n".join(lines))
 
 
+async def send_owner_poll(
+    sender: PollSender | None,
+    guard: PollGuard,
+    *,
+    chat_id: str,
+    question: str,
+    options: list[str],
+    multi_select: bool,
+    request_id: str,
+    now_ms: int,
+) -> dict[str, Any]:
+    """Owner-requested poll into one named chat, under the same guard as the tool."""
+    normalized = normalize_poll(question, options)
+    if isinstance(normalized, str):
+        return {"status": "error", "code": "INVALID_POLL", "message": normalized}
+    text, cleaned = normalized
+    if sender is None:
+        return {"status": "error", "code": "POLLS_UNAVAILABLE"}
+    client_id = _client_message_id(f"owner:{request_id}", chat_id, text, cleaned)
+    refusal = await guard.reserve(chat_id, client_id, now_ms)
+    if refusal is not None:
+        return {"status": "error", "code": "POLL_LIMIT", "message": refusal}
+    max_selections = len(cleaned) if multi_select else 1
+    try:
+        poll_id = await sender(chat_id, text, cleaned, max_selections, client_id)
+    except Exception as exc:  # noqa: BLE001 - any send failure frees the slot
+        await guard.release(client_id, now_ms)
+        logger.warning("owner poll send failed chat={} error_type={}", chat_id, type(exc).__name__)
+        return {"status": "error", "code": "SEND_FAILED", "message": str(exc)}
+    await guard.confirm(client_id, poll_id, now_ms)
+    return {"status": "ok", "poll_id": poll_id, "question": text, "options": cleaned,
+            "max_selections": max_selections}
+
+
 def _client_message_id(turn_key: str, chat_id: str, question: str, options: list[str]) -> str:
     """Same turn and same poll give the same id, so a repeated call cannot post twice."""
     digest = hashlib.sha256(
