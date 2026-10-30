@@ -2498,8 +2498,10 @@ export class WhatsAppClient {
       values: options.slice(0, 12),
       selectableCount: Math.max(1, Math.min(12, input.maxSelections ?? 1)),
     };
+    // Baileys adds fields such as toAnnouncementGroup to the poll it is given; send a copy
+    // so the result keeps exactly the fields validateOutboundResult accepts.
     const sent = await this.sock.sendMessage(
-      input.to, { poll },
+      input.to, { poll: { ...poll, values: [...poll.values] } },
       input.clientMessageId ? { messageId: input.clientMessageId } : undefined,
     );
     this.rememberOutboundSelfMessage(input.to, sent);
