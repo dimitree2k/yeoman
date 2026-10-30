@@ -55,6 +55,7 @@ fi
 PROMPT="$(sed -e "s|\$DIGEST|$DIGEST|g" -e "s|\$REVIEW_DIR|$REVIEW_DIR|g" \
   -e "s|\$AUTONOMY|$AUTONOMY|g" -e "s|\$REPORT|$REPORT|g" "$REPO/ops/log-review/prompt.md")"
 BEFORE_MAIN="$(git -C "$REPO" rev-parse origin/main)"
+START_ISO="$(date -u +%FT%TZ)"
 
 set +e
 (cd "$WORKTREE" && timeout 5400 claude -p "$PROMPT" \
@@ -73,15 +74,21 @@ STATUS=$?
 set -e
 
 SUMMARY="$(head -c 3000 "$REPORT" 2>/dev/null || echo "No report written (exit $STATUS).")"
-git -C "$REPO" fetch -q origin main
-AFTER_MAIN="$(git -C "$REPO" rev-parse origin/main)"
+# Only the review's own squash merges are deployed-and-maybe-reverted; other
+# threads' merges that landed meanwhile are never touched.
+MERGED="$(cd "$REPO" && gh pr list --state merged --limit 20 \
+  --search "head:log-review/ merged:>=$START_ISO" --json mergeCommit,headRefName \
+  -q '.[] | select(.headRefName | startswith("log-review/revert-") | not) | .mergeCommit.oid' || true)"
 
-if [ "$AUTONOMY" = "auto-merge" ] && [ "$BEFORE_MAIN" != "$AFTER_MAIN" ]; then
-  if "$REPO/ops/log-review/deploy-and-check.sh" "$BEFORE_MAIN" >> "$RUN_DIR/deploy.log" 2>&1; then
-    SUMMARY="$SUMMARY"$'\n\n'"Deployed $(git -C "$REPO" rev-parse --short "$AFTER_MAIN"); smoke check passed."
-  else
-    SUMMARY="$SUMMARY"$'\n\n'"⚠️ Deploy smoke check failed; reverted to $(git -C "$REPO" rev-parse --short "$BEFORE_MAIN"). See $RUN_DIR/deploy.log"
-  fi
+if [ "$AUTONOMY" = "auto-merge" ] && [ -n "$MERGED" ]; then
+  # shellcheck disable=SC2086
+  "$REPO/ops/log-review/deploy-and-check.sh" $MERGED >> "$RUN_DIR/deploy.log" 2>&1
+  case $? in
+    0) SUMMARY="$SUMMARY"$'\n\n'"Deployed; smoke check passed." ;;
+    2) SUMMARY="$SUMMARY"$'\n\n'"⚠️ Deploy failed before the smoke check; the merged fix is not live. See $RUN_DIR/deploy.log" ;;
+    1) SUMMARY="$SUMMARY"$'\n\n'"⚠️ Smoke check failed; the review's merges were reverted and the revert deployed. See $RUN_DIR/deploy.log" ;;
+    *) SUMMARY="$SUMMARY"$'\n\n'"🔴 Smoke check failed and the revert did not complete. Needs a look: $RUN_DIR/deploy.log" ;;
+  esac
 fi
 
 notify "🔎 Log review $TODAY ($AUTONOMY)"$'\n'"$SUMMARY"
