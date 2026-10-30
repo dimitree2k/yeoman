@@ -549,8 +549,20 @@ _PARTICIPATION_DRAFT_RULES = (
     "never address a different chat and never mention this message. Answer only the "
     "[CURRENT] message; use [CONTEXT] only to understand it and never answer an older "
     "request. You have no tools in this mode: never claim to open, read, fetch or "
-    "check anything, and never promise to do so."
+    "check anything, and never promise to do so. Write words only: a reaction is not "
+    "yours to choose here, so never write a ::reaction:: marker."
 )
+
+#: A ``::reaction::<emoji>`` marker, bare or in inline code. The reply pipeline turns
+#: it into a real reaction; a participation draft is sent verbatim, so it is removed.
+_DRAFT_REACTION_MARKER_RE = re.compile(r"`?[ \t]*::reaction::[^\s`]*[ \t]*`?")
+
+
+def _strip_reaction_markers(draft: str | None) -> str | None:
+    """Remove reaction markers from a participation draft; ``""`` when nothing remains."""
+    if draft is None or "::reaction::" not in draft:
+        return draft
+    return _DRAFT_REACTION_MARKER_RE.sub("", draft).strip()
 
 #: The judge's purpose is a subordinate hint, never the leading instruction. It is
 #: placed after the transcript and explicitly ranked below the persona.
@@ -3597,7 +3609,7 @@ class LLMResponder(ResponderPort):
             draft_only=True,
         )
         return self._apply_draft_budget(
-            draft,
+            _strip_reaction_markers(draft),
             metadata,
             channel=route_channel,
             chat_id=route_chat_id,
