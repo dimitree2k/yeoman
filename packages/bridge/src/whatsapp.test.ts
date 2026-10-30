@@ -14,7 +14,7 @@ import {
 } from './whatsapp.js';
 import { BridgeServer } from './server.js';
 import { BridgeOutbox } from './outbox.js';
-import { MAX_BRIDGE_FRAME_BYTES, createEventEnvelope, deriveEditSignalIdentity, deriveProviderEventIdentity } from './protocol.js';
+import { MAX_BRIDGE_FRAME_BYTES, createEventEnvelope, deriveEditSignalIdentity, deriveProviderEventIdentity, validateOutboundResult } from './protocol.js';
 import { proto } from '@whiskeysockets/baileys/WAProto/index.js';
 
 function inboundMessage(messageId: string): Record<string, unknown> {
@@ -1704,6 +1704,9 @@ test('poll_result_uses_normalized_question_options', async (t) => {
   const client = await outboundContractClient(t);
   const calls: any[] = [];
   (client as any).sock = { sendMessage: async (...args: any[]) => {
+    // Like Baileys: generateWAMessageContent fills defaults into the caller's poll object.
+    args[1].poll.toAnnouncementGroup = false;
+    args[1].poll.messageSecret = Buffer.alloc(32);
     calls.push(args); return { key: { id: 'POLL' } };
   } };
   const options = [' ', ...Array.from({ length: 14 }, (_, i) => ` option-${i} `)];
@@ -1712,7 +1715,10 @@ test('poll_result_uses_normalized_question_options', async (t) => {
   assert.deepEqual(JSON.parse(JSON.stringify(result)), { to: 'target@g.us', messageId: 'POLL',
     providerMessageId: 'POLL', clientMessageId: 'CLIENT', options: 14,
     poll: { name: 'q'.repeat(512), values: options.slice(1, 13).map(x => x.trim()), selectableCount: 12 } });
-  assert.deepEqual((result as any).poll, calls[0][1].poll);
+  assert.deepEqual(Object.keys((result as any).poll), ['name', 'values', 'selectableCount']);
+  assert.equal(validateOutboundResult('send_poll', { sent: result as any }), true);
+  assert.equal(calls[0][1].poll.name, (result as any).poll.name);
+  assert.deepEqual(calls[0][1].poll.values, (result as any).poll.values);
   assert.deepEqual(calls[0][2], { messageId: 'CLIENT' });
   const before = calls.length;
   await assert.rejects(client.sendPoll({ to: 'target@g.us', question: 'bad', options: [' ', 'one'] }));
