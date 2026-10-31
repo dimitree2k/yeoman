@@ -644,19 +644,28 @@ class TrendsConfig(BaseModel):
     enabled: bool = False
     interval_minutes: int = Field(default=180, alias="intervalMinutes", ge=15)
     google_trends_geo: str = Field(default="DE", alias="googleTrendsGeo")
+    # Extra news feeds (RSS or Atom); each story is scored like a trending topic.
+    rss_feeds: list[str] = Field(
+        default_factory=lambda: [
+            "https://www.n-tv.de/panorama/rss",
+            "https://www.stern.de/feed/standard/panorama/",
+            "https://www.spiegel.de/panorama/index.rss",
+        ],
+        alias="rssFeeds",
+    )
     language: str = "de"
     min_score: int = Field(default=7, alias="minScore", ge=0, le=10)
     card_ttl_hours: int = Field(default=24, alias="cardTtlHours", ge=1)
     read_articles: bool = Field(default=True, alias="readArticles")
     max_article_age_hours: int = Field(default=48, alias="maxArticleAgeHours", ge=1)
-    max_items_per_run: int = Field(default=20, alias="maxItemsPerRun", ge=1, le=50)
+    max_items_per_run: int = Field(default=40, alias="maxItemsPerRun", ge=1, le=80)
     route: str = "trends.score"
     # When groups with a trends block may get a card (local time, end exclusive).
     post_from: str = Field(default="07:00", alias="postFrom", pattern=r"^\d{2}:\d{2}$")
     post_until: str = Field(default="23:00", alias="postUntil", pattern=r"^\d{2}:\d{2}$")
     max_posts_per_day: int = Field(default=1, alias="maxPostsPerDay", ge=0, le=10)
     # A group silent this long gets a card offer even without a lull before it.
-    idle_hours: float = Field(default=4.0, alias="idleHours", gt=0)
+    idle_hours: float = Field(default=2.0, alias="idleHours", gt=0)
 
 
 class ConsciousnessConfig(BaseModel):

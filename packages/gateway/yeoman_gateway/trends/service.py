@@ -14,7 +14,7 @@ from .article import ArticleReader
 from .fit import TopicFitter, topics_key
 from .models import TrendItem, TrendVerdict
 from .scorer import TrendScorer
-from .sources import GoogleTrendsSource, TrendSource
+from .sources import GoogleTrendsSource, RssFeedSource, TrendSource
 from .store import TrendStore
 from .writer import LineWriter
 
@@ -222,7 +222,10 @@ def build_trends_service(
     trends = config.trends
     client = RouteClient(config=config, route_key=trends.route)
     return TrendsService(
-        sources=[GoogleTrendsSource(geo=trends.google_trends_geo)],
+        sources=[
+            GoogleTrendsSource(geo=trends.google_trends_geo),
+            *(RssFeedSource(url=url) for url in trends.rss_feeds),
+        ],
         scorer=TrendScorer(client=client, language=trends.language),
         reader=ArticleReader() if trends.read_articles else None,
         writer=LineWriter(client=client, language=trends.language) if trends.read_articles else None,
