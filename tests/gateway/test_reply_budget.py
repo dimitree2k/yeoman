@@ -23,6 +23,8 @@ _SHORT_REPLY = "Das ist ein kompakter erster Satz, der fuer den Chat reicht."
 
 
 class _LongReplyProvider(LLMProvider):
+    rewrite = _SHORT_REPLY
+
     async def chat(
         self,
         messages: list[dict[str, Any]],
@@ -32,7 +34,10 @@ class _LongReplyProvider(LLMProvider):
         temperature: float = 0.7,
         reasoning: dict[str, Any] | None = None,
     ) -> LLMResponse:
-        del messages, tools, model, max_tokens, temperature, reasoning
+        del tools, model, max_tokens, temperature, reasoning
+        # The budget's shorten request gets a rewrite that fits; every turn gets the long draft.
+        if "You shorten a chat reply" in str(messages[0].get("content", "")):
+            return LLMResponse(content=self.rewrite)
         return LLMResponse(content=_LONG_REPLY)
 
     def get_default_model(self) -> str:
@@ -314,10 +319,11 @@ def test_casual_time_words_do_not_relax_reply_budget(word: str) -> None:
         answer_shape="social_one_liner", content=content, is_owner=False,
     )
     assert budget is not None and budget.hard_cap_enabled
-    reply, _ = enforce_reply_budget(
+    reply, result = enforce_reply_budget(
         _LONG_REPLY, budget.as_metadata(), user_content=content, tool_used=True,
     )
-    assert reply == _SHORT_REPLY
+    assert reply == _LONG_REPLY
+    assert result["over_budget"] is True and result["limit"] == 80
 
 
 @pytest.mark.parametrize("content", ["Quelle: https://example.org/ " + _LONG_REPLY, "Der Aktienkurs ist unsicher. " + _LONG_REPLY])
@@ -343,58 +349,86 @@ def _short_take_budget(target: int = 420) -> dict[str, object]:
     return budget.as_metadata()
 
 
-def test_clip_keeps_every_sentence_that_fits_not_only_the_first() -> None:
+def test_over_budget_reply_is_never_cut() -> None:
     from yeoman_gateway.reply_budget import enforce_reply_budget
 
-    # The Finanzgruppe failure: a one-line opener followed by the findings.
-    text = (
-        "Gefunden, was es gibt und was nicht. "
-        "Eine Umfrage von 2025 zeigt breite Ablehnung von KI-Models in der Modewerbung. "
-        "Eine zweite Erhebung findet vor allem bei Juengeren Skepsis. "
-        + "Danach kommt noch ein sehr langer Absatz, der nicht mehr in das Budget passt. " * 4
-    )
+    # The Finanzgruppe failure: the findings after a one-line opener were cut away.
+    text = "Gefunden, was es gibt und was nicht. " + "Eine Umfrage zeigt Ablehnung. " * 20
     reply, result = enforce_reply_budget(text, _short_take_budget(200))
 
-    assert reply.startswith("Gefunden, was es gibt und was nicht. Eine Umfrage von 2025")
-    assert reply.endswith("Skepsis.")
-    assert result["after_chars"] == len(reply)
+    assert reply == text.strip()
+    assert result == {
+        "over_budget": True,
+        "reason": "target_chars",
+        "limit": 200,
+        "before_chars": len(text.strip()),
+    }
 
 
-def test_clip_preserves_line_breaks_and_drops_a_dangling_lead_in() -> None:
-    from yeoman_gateway.reply_budget import enforce_reply_budget
+@pytest.mark.parametrize(
+    ("rewrite", "accepted"),
+    [
+        ("Kurz und passend.", True),
+        ("", False),
+        (None, False),
+        ("x" * 81, False),
+    ],
+    ids=["fits", "empty", "missing", "still_too_long"],
+)
+def test_shortened_reply_is_accepted_only_when_it_fits(rewrite: str | None, accepted: bool) -> None:
+    from yeoman_gateway.reply_budget import accept_shortened_reply
 
-    text = (
-        "Kurz vorweg, das ist duenn belegt.\n"
-        "Die ueblichen Verdaechtigen:\n"
-        "- *Morning Consult 2023*: 57 von 100 befragten Gen Z wollen Influencer werden, "
-        "bei allen Erwachsenen deutlich weniger, und die Stichprobe ist klein."
+    result = accept_shortened_reply(_LONG_REPLY, rewrite, 80)
+
+    assert (result == rewrite) if accepted else result is None
+
+
+@pytest.mark.asyncio
+async def test_responder_sends_full_reply_when_rewrite_still_too_long(tmp_path: Path) -> None:
+    provider = _LongReplyProvider()
+    provider.rewrite = _LONG_REPLY[:-5]
+    responder = LLMResponder(
+        bus=MessageBus(), provider=provider, workspace=tmp_path, max_iterations=1,
     )
-    reply, _ = enforce_reply_budget(text, _short_take_budget(80))
+    event = InboundEvent(
+        channel="whatsapp",
+        chat_id="group@g.us",
+        sender_id="u1",
+        content="Arvid, kurze Einschaetzung",
+        is_group=True,
+        mentioned_bot=True,
+        raw_metadata={
+            "reply_budget": {
+                "enabled": True,
+                "answer_shape": "short_take",
+                "target_chars": 80,
+                "hard_cap_enabled": True,
+            },
+        },
+    )
 
-    assert reply == "Kurz vorweg, das ist duenn belegt."
+    reply = await responder.generate_reply(
+        event,
+        PolicyDecision(
+            accept_message=True, should_respond=True, allowed_tools=frozenset(), reason="test",
+        ),
+    )
 
-
-def test_clip_keeps_bullet_lines_that_fit() -> None:
-    from yeoman_gateway.reply_budget import enforce_reply_budget
-
-    text = "Zwei Quellen:\n- Erste Studie zeigt Ablehnung\n- Zweite Studie zeigt Skepsis\n" + "x " * 300
-    reply, _ = enforce_reply_budget(text, _short_take_budget(120))
-
-    assert reply == "Zwei Quellen:\n- Erste Studie zeigt Ablehnung\n- Zweite Studie zeigt Skepsis"
+    assert reply == _LONG_REPLY
 
 
 def test_research_tool_turn_gets_the_long_form_limit() -> None:
     from yeoman_gateway.reply_budget import enforce_reply_budget
 
     budget = _short_take_budget(80)
-    capped, _ = enforce_reply_budget(_LONG_REPLY, budget, tool_used=True)
+    _, capped = enforce_reply_budget(_LONG_REPLY, budget, tool_used=True)
     researched, result = enforce_reply_budget(
         _LONG_REPLY, budget, tool_used=True, research_used=True
     )
 
-    assert capped == _SHORT_REPLY
+    assert capped["over_budget"] is True
     assert researched == _LONG_REPLY
-    assert result["applied"] is False
+    assert result["over_budget"] is False
 
 
 def test_percent_figures_count_as_current_data() -> None:

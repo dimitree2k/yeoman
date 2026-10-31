@@ -2704,14 +2704,23 @@ async def test_writer_prompt_subordinates_purpose_below_persona_and_transcript()
 
 @pytest.mark.asyncio
 async def test_writer_draft_is_held_to_the_chat_reply_budget() -> None:
-    """A draft over the chat's budget is compressed, as a direct reply would be."""
+    """A draft over the chat's budget is rewritten shorter, as a direct reply would be."""
     from yeoman_gateway.adapters.responder_llm import LLMResponder
     from yeoman_gateway.core.models import InboundEvent, PolicyDecision
+    from yeoman_gateway.providers.base import LLMResponse
+
+    class _Rewriter:
+        async def chat(self, **kwargs: object) -> LLMResponse:
+            del kwargs
+            return LLMResponse(content="Kurz: das ist der Punkt.")
 
     class _LongDraft(LLMResponder):
         def __init__(self) -> None:
             self.metadata: dict[str, object] = {}
             self.telemetry = None
+            self.provider = _Rewriter()  # type: ignore[assignment]
+            self.model = "test/model"
+            self._routed_provider_factory = None
 
         def _metadata_for_event(self, event: InboundEvent) -> dict[str, object]:
             del event

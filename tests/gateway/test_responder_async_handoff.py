@@ -152,6 +152,7 @@ async def test_handoff_turn_is_budgeted_as_acknowledgement_and_stops_working(
                 ],
             ),
             LLMResponse(content="Läuft, ich melde mich gleich mit dem Ergebnis. " + "y" * 400),
+            LLMResponse(content="Läuft, ich melde mich gleich mit dem Ergebnis."),
         ]
     )
 
@@ -159,7 +160,7 @@ async def test_handoff_turn_is_budgeted_as_acknowledgement_and_stops_working(
         tmp_path, provider, _decision("delegate", "record"), handoff, recorder
     )
     try:
-        assert provider.calls == 2
+        assert provider.calls == 3
         # The call after the handoff runs without tools at all.
         assert provider.tool_definitions[1] == []
         # The tool call that merely accompanied the delegation was not executed.
@@ -169,7 +170,8 @@ async def test_handoff_turn_is_budgeted_as_acknowledgement_and_stops_working(
             for message in provider.messages[1]
         )
         # The request was classified short_take (420); the acknowledgement is not: the
-        # 447-character answer is compressed to its first sentence.
+        # 447-character answer is over the ack budget, so the model is asked to shorten it.
+        assert "You shorten a chat reply" in str(provider.messages[2][0]["content"])
         assert result == "Läuft, ich melde mich gleich mit dem Ergebnis."
     finally:
         await responder.aclose()
