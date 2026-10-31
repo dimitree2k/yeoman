@@ -30,9 +30,6 @@ _REPAIR_FEEDBACK_RE = re.compile(
     r"quatsch|bullshit|garbage|macht keinen sinn|nicht gut|fail|json|tool call"
     r")\b"
 )
-_RESEARCH_REQUEST_RE = re.compile(
-    r"(?i)\b(deep\s+search|deep\s+research|recherch|quellen?|sources?|such(?:e|st)?|prüf|pruef)\b"
-)
 _SIDE_EFFECT_FOLLOWUP_RE = re.compile(
     r"(?i)\b("
     r"schick(?:e|st|en)?|send(?:e|est)?|sende|"
@@ -430,8 +427,6 @@ def classify_conversation_state(
         answer_shape = "social_one_liner"
     elif preferred_action != "answer":
         answer_shape = "none"
-    elif _RESEARCH_REQUEST_RE.search(content):
-        answer_shape = "researched_answer"
     elif address_mode == "recent_assistant_followup" and len(content.strip()) <= 90:
         answer_shape = "one_liner"
     else:

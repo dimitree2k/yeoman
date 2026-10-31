@@ -226,6 +226,7 @@ async def test_responder_applies_budget_before_return(tmp_path: Path, compact: b
                 "enabled": True,
                 "answer_shape": "short_take",
                 "target_chars": 80,
+                "hard_max_chars": 80,
                 "hard_cap_enabled": True,
             },
         },
@@ -253,10 +254,11 @@ async def test_responder_applies_budget_before_return(tmp_path: Path, compact: b
     ("extra_metadata", "content", "expected"),
     [
         ({}, "Arvid, kurze Einschaetzung", _SHORT_REPLY),
-        ({"reply_budget_tool_used": True}, "Arvid, kurze Einschaetzung", _SHORT_REPLY),
-        ({}, "Arvid, was macht die Aktie heute?", _LONG_REPLY),
+        # Wording no longer relaxes the ceiling; only a research tool the turn called does.
+        ({}, "Arvid, was macht die Aktie heute?", _SHORT_REPLY),
+        ({"reply_budget_research_used": True}, "Arvid, kurze Einschaetzung", _LONG_REPLY),
     ],
-    ids=["short_no_tool_no_signal", "short_tool_used", "long_current_data_signal"],
+    ids=["short_no_research", "keywords_do_not_relax", "research_tool_used"],
 )
 async def test_compact_persona_reply_budget_keeps_short_and_long_form_branches(
     tmp_path: Path,
@@ -286,7 +288,7 @@ async def test_compact_persona_reply_budget_keeps_short_and_long_form_branches(
                 "enabled": True,
                 "answer_shape": "short_take",
                 "target_chars": 80,
-                "hard_max_chars": 600,
+                "hard_max_chars": 80,
                 "long_form_max_chars": 2200,
                 "long_form_allowed": False,
                 "hard_cap_enabled": True,
@@ -309,40 +311,47 @@ async def test_compact_persona_reply_budget_keeps_short_and_long_form_branches(
     assert reply == expected
 
 
-@pytest.mark.parametrize("word", ["heute", "jetzt", "gerade", "aktuell", "stand", "current", "today", "latest"])
-def test_casual_time_words_do_not_relax_reply_budget(word: str) -> None:
-    from yeoman_gateway.reply_budget import derive_reply_budget, enforce_reply_budget
+@pytest.mark.parametrize(
+    "content",
+    ["Du redest heute viel.", "Erklär mir ausführlich die Aktie", "Quelle: https://example.org/"],
+)
+def test_wording_does_not_change_the_budget(content: str) -> None:
+    """Whether an answer needs room is the writing model's call, not a keyword match."""
+    from yeoman_gateway.reply_budget import derive_reply_budget
 
-    content = f"Du redest {word} viel."
+    del content
     budget = derive_reply_budget(
-        policy={"enabled": True, "targets": {"social_one_liner": 80}},
-        answer_shape="social_one_liner", content=content, is_owner=False,
+        policy={"enabled": True, "targets": {"short_take": 80}, "hard_max_chars": 300},
+        answer_shape="short_take",
+        is_owner=False,
     )
-    assert budget is not None and budget.hard_cap_enabled
-    reply, result = enforce_reply_budget(
-        _LONG_REPLY, budget.as_metadata(), user_content=content, tool_used=True,
-    )
-    assert reply == _LONG_REPLY
-    assert result["over_budget"] is True and result["limit"] == 80
+    assert budget is not None
+    assert budget.hard_cap_enabled and not budget.long_form_allowed
+    assert "Aim for about 80 characters" in budget.instruction
+    assert "stay under 300 characters" in budget.instruction
 
 
-@pytest.mark.parametrize("content", ["Quelle: https://example.org/ " + _LONG_REPLY, "Der Aktienkurs ist unsicher. " + _LONG_REPLY])
-def test_evidence_still_uses_long_form_limit(content: str) -> None:
+def test_owner_long_form_follows_policy_not_wording() -> None:
     from yeoman_gateway.reply_budget import derive_reply_budget, enforce_reply_budget
 
-    budget = derive_reply_budget(policy={"enabled": True, "targets": {"short_take": 80}}, answer_shape="short_take", content="Kurz bitte", is_owner=False)
-    assert budget is not None
-    reply, _ = enforce_reply_budget(content, budget.as_metadata())
-    assert reply == content
+    budget = derive_reply_budget(
+        policy={"enabled": True, "targets": {"short_take": 80}, "hard_max_chars": 100,
+                "long_form_max_chars": 2000, "long_form_bypass": "owner_only"},
+        answer_shape="short_take",
+        is_owner=True,
+    )
+    assert budget is not None and budget.long_form_allowed
+    assert "stay under 2000 characters" in budget.instruction
+    _, result = enforce_reply_budget("x" * 500, budget.as_metadata())
+    assert result["over_budget"] is False
 
 
 def _short_take_budget(target: int = 420) -> dict[str, object]:
     from yeoman_gateway.reply_budget import derive_reply_budget
 
     budget = derive_reply_budget(
-        policy={"enabled": True, "targets": {"short_take": target}},
+        policy={"enabled": True, "targets": {"short_take": target}, "hard_max_chars": target},
         answer_shape="short_take",
-        content="Kennst du die Umfragen?",
         is_owner=False,
     )
     assert budget is not None and budget.hard_cap_enabled
@@ -359,7 +368,7 @@ def test_over_budget_reply_is_never_cut() -> None:
     assert reply == text.strip()
     assert result == {
         "over_budget": True,
-        "reason": "target_chars",
+        "reason": "hard_max_chars",
         "limit": 200,
         "before_chars": len(text.strip()),
     }
@@ -402,6 +411,7 @@ async def test_responder_sends_full_reply_when_rewrite_still_too_long(tmp_path: 
                 "enabled": True,
                 "answer_shape": "short_take",
                 "target_chars": 80,
+                "hard_max_chars": 80,
                 "hard_cap_enabled": True,
             },
         },
@@ -421,9 +431,9 @@ def test_research_tool_turn_gets_the_long_form_limit() -> None:
     from yeoman_gateway.reply_budget import enforce_reply_budget
 
     budget = _short_take_budget(80)
-    _, capped = enforce_reply_budget(_LONG_REPLY, budget, tool_used=True)
+    _, capped = enforce_reply_budget(_LONG_REPLY, budget)
     researched, result = enforce_reply_budget(
-        _LONG_REPLY, budget, tool_used=True, research_used=True
+        _LONG_REPLY, budget, research_used=True
     )
 
     assert capped["over_budget"] is True

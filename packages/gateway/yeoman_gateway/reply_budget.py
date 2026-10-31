@@ -2,7 +2,6 @@
 
 from __future__ import annotations
 
-import re
 from dataclasses import dataclass
 from typing import Literal
 
@@ -36,30 +35,6 @@ RESEARCH_TOOL_NAMES: frozenset[str] = frozenset(
         "market_intelligence",
     }
 )
-
-_URL_RE = re.compile(r"(?i)\bhttps?://|www\.")
-_CODE_RE = re.compile(r"```|`[^`]+`|^\s{4,}\S", re.MULTILINE)
-_CURRENT_DATA_RE = re.compile(
-    r"(?i)\b("
-    r"kurs|quote|preis|rendite|zins|"
-    r"price|market|stock|ticker|crypto|forex|yield|"
-    r"aktie|etf|index|börse|boerse|dax|nasdaq|s&p|bitcoin|btc|eth|%"
-    r")\b"
-)
-_LEGAL_OR_CAVEAT_RE = re.compile(
-    r"(?i)\b("
-    r"rechtlich|gesetz|haftung|steuer|vertrag|anwalt|legal|law|liability|tax|"
-    r"nicht verfügbar|unavailable|unsicher|uncertain|caveat|einschränkung|einschraenkung"
-    r")\b"
-)
-_LONG_FORM_REQUEST_RE = re.compile(
-    r"(?i)\b("
-    r"ausführlich|ausfuehrlich|detailliert|detail|deep dive|analyse|analysiere|"
-    r"erklär|erklaer|warum|strategie|thesis|begründ|begruend|pros und cons|"
-    r"schrittweise|vollständig|vollstaendig"
-    r")\b"
-)
-
 
 @dataclass(frozen=True, slots=True)
 class ReplyBudgetDecision:
@@ -143,7 +118,6 @@ def derive_reply_budget(
     *,
     policy: object,
     answer_shape: str,
-    content: str,
     is_owner: bool,
 ) -> ReplyBudgetDecision | None:
     cfg = coerce_reply_budget_policy(policy)
@@ -161,25 +135,28 @@ def derive_reply_budget(
         )
     )
     hard_max_chars = int(str(cfg["hard_max_chars"]))
+    if shape == "ack":
+        # An acknowledgement is a status line by construction, never the work itself:
+        # its target is also its ceiling.
+        hard_max_chars = min(hard_max_chars, target_chars)
     long_form_max_chars = int(str(cfg["long_form_max_chars"]))
     long_form_bypass = str(cfg["long_form_bypass"])
-    long_form_allowed = (
-        looks_like_long_form_request(content)
-        and (long_form_bypass == "always" or (long_form_bypass == "owner_only" and is_owner))
+    # Who may get long answers is policy; whether this answer needs the room is the
+    # writing model's judgment, made while it writes - no keyword guess, no extra call.
+    long_form_allowed = shape != "ack" and (
+        long_form_bypass == "always" or (long_form_bypass == "owner_only" and is_owner)
     )
-    domain_sensitive = shape == "researched_answer" or has_domain_sensitive_signal(content)
-    hard_cap_enabled = not long_form_allowed and not domain_sensitive
+    hard_cap_enabled = not long_form_allowed
+    ceiling = long_form_max_chars if long_form_allowed else hard_max_chars
 
     instruction = (
         "Use the smallest complete answer that satisfies the user. "
-        f"Aim for about {target_chars} characters."
+        f"Aim for about {target_chars} characters. Go longer only when the answer "
+        "needs it: the person asked for detail or an explanation, or a required fact, "
+        "number, caveat, source, link or code would otherwise be lost. "
+        f"Even then stay under {ceiling} characters; when you report findings from "
+        f"research or market tools, stay under {long_form_max_chars}."
     )
-    if hard_cap_enabled:
-        instruction += " If the draft is longer, compress to the limit before sending."
-    else:
-        instruction += " Do not drop required facts, citations, caveats, code, URLs, or current numbers just to hit the target."
-    if long_form_allowed:
-        instruction += f" Long-form detail is allowed up to about {long_form_max_chars} characters."
 
     session_history_limit = cfg["session_history_limit"]
     assert session_history_limit is None or isinstance(session_history_limit, int)
@@ -196,60 +173,31 @@ def derive_reply_budget(
     )
 
 
-def has_domain_sensitive_signal(text: str) -> bool:
-    compact = str(text or "")
-    return bool(
-        _URL_RE.search(compact)
-        or _CODE_RE.search(compact)
-        or _CURRENT_DATA_RE.search(compact)
-        or _LEGAL_OR_CAVEAT_RE.search(compact)
-    )
-
-
-def looks_like_long_form_request(text: str) -> bool:
-    return bool(_LONG_FORM_REQUEST_RE.search(str(text or "")))
-
-
 def enforce_reply_budget(
     text: str,
     budget: object,
     *,
-    user_content: str = "",
-    tool_used: bool = False,
     research_used: bool = False,
 ) -> tuple[str, dict[str, object]]:
-    """Measure a reply against its budget; the text itself is never cut.
+    """Measure a reply against its budget's ceiling; the text itself is never cut.
 
-    A reply over budget comes back unchanged with ``over_budget`` and the ``limit``
-    it missed, so the caller can ask the model for a shorter version. A sentence
-    sliced out of a written answer reads as a broken answer; the full one does not.
+    The target is guidance the writing model weighs; the ceiling is the backstop. A
+    reply over it comes back unchanged with ``over_budget`` and the ``limit`` it missed,
+    so the caller can ask the model for a shorter version. A sentence sliced out of a
+    written answer reads as a broken answer; the full one does not.
     """
-    # Tool use alone says nothing about how much explanation the answer needs; a research
-    # tool does, because its findings are what the answer exists to report.
-    del tool_used
     original = str(text or "").strip()
     if not original or not isinstance(budget, dict) or not bool(budget.get("enabled", False)):
         return original, {"over_budget": False, "reason": "disabled"}
 
-    final_sensitive = (
-        research_used
-        or has_domain_sensitive_signal(original)
-        or has_domain_sensitive_signal(user_content)
-    )
-    if final_sensitive or bool(budget.get("long_form_allowed", False)):
+    acknowledgement = budget.get("answer_shape") == "ack"
+    if (research_used and not acknowledgement) or bool(budget.get("long_form_allowed", False)):
         limit = int(budget.get("long_form_max_chars") or DEFAULT_REPLY_BUDGET_LONG_FORM_MAX_CHARS)
         reason = "long_form_max_chars"
-    elif not bool(budget.get("hard_cap_enabled", True)):
-        return original, {"over_budget": False, "reason": "hard_cap_disabled"}
     else:
-        target = int(
-            budget.get("target_chars")
-            or budget.get("hard_max_chars")
-            or DEFAULT_REPLY_BUDGET_HARD_MAX_CHARS
-        )
-        hard_max = int(budget.get("hard_max_chars") or DEFAULT_REPLY_BUDGET_HARD_MAX_CHARS)
-        limit = max(1, min(target, hard_max))
-        reason = "target_chars"
+        limit = int(budget.get("hard_max_chars") or DEFAULT_REPLY_BUDGET_HARD_MAX_CHARS)
+        reason = "hard_max_chars"
+    limit = max(1, limit)
     if len(original) <= limit:
         return original, {"over_budget": False, "reason": "within_budget", "limit": limit}
     return original, {
