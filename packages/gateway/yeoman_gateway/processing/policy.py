@@ -301,7 +301,7 @@ class IngestGate:
         try:
             anchor = await self._continuation.resolve(
                 canonical, aliases=aliases, now_ms=self._clock(),
-                source_authorized=source_authorized,
+                source_authorized=source_authorized, mentioned=bool(event.mentioned_bot),
             )
         except Exception as exc:
             logger.warning("continuation_resolution_failed error_type={}", type(exc).__name__)
@@ -399,6 +399,7 @@ class IngestGate:
             current = self._continuation.candidates(
                 self._canonical_event(request, identity=identity),
                 aliases=(identity.principal,) if identity else (), now_ms=now,
+                mentioned=bool(event.mentioned_bot),
             )
             promoted = replace(request, event=replace(
                 event, reply_to_bot=True, reply_to_message_id=continuation.message_id,

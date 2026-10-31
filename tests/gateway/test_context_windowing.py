@@ -74,6 +74,73 @@ class TestAmbientWindowSkipDM:
         projected.close()
 
 
+    @pytest.mark.asyncio
+    async def test_ambient_lines_name_what_a_reply_answers(self, tmp_path):
+        """Finanzgruppe, 2026-10-31: "Gab Umfragen dazu" answered Dimi's question about
+        the Zalando post, but in a flat window it read as a reply to the line above it."""
+        chat_id = "123456@g.us"
+        frank, dimi, vynz = (f"49100000000{n}@s.whatsapp.net" for n in (1, 2, 3))
+        projected = ProjectedHistory(
+            tmp_path / "reply-history",
+            messages=[
+                dict(channel="whatsapp", chat_id=chat_id, message_id="old",
+                     text="Zalando nutzt nur noch AI Models", timestamp=1_700_000_000,
+                     sender_id=frank),
+                dict(channel="whatsapp", chat_id=chat_id, message_id="ask",
+                     text="Und was heißt alle?", timestamp=1_700_000_060, sender_id=dimi),
+                dict(channel="whatsapp", chat_id=chat_id, message_id="noise",
+                     text="TikTok Trends nachtanzen", timestamp=1_700_000_120,
+                     sender_id=vynz),
+                dict(channel="whatsapp", chat_id=chat_id, message_id="answer",
+                     text="Gab Umfragen dazu", timestamp=1_700_000_180, sender_id=frank,
+                     reply_to_message_id="ask"),
+                dict(channel="whatsapp", chat_id=chat_id, message_id="msg-1",
+                     text="current message", timestamp=1_700_000_240, sender_id=dimi),
+            ],
+        )
+        mw = ReplyContextMiddleware(ambient_window_limit=3)
+        event = _make_event(chat_id=chat_id, message_id="msg-1", is_group=True)
+
+        async with projected.turn():
+            result = mw._build_ambient_window(event)
+
+        assert result == [
+            f"[{dimi}] Und was heißt alle?",
+            f"[{vynz}] TikTok Trends nachtanzen",
+            f'[{frank}, replying to {dimi}: "Und was heißt alle?"] Gab Umfragen dazu',
+        ]
+        projected.close()
+
+    @pytest.mark.asyncio
+    async def test_reply_to_a_message_outside_the_window_is_still_named(self, tmp_path):
+        chat_id = "123456@g.us"
+        frank, dimi = (f"49100000000{n}@s.whatsapp.net" for n in (1, 2))
+        projected = ProjectedHistory(
+            tmp_path / "older-history",
+            messages=[
+                dict(channel="whatsapp", chat_id=chat_id, message_id="old",
+                     text="Zalando nutzt nur noch AI Models", timestamp=1_700_000_000,
+                     sender_id=frank),
+                dict(channel="whatsapp", chat_id=chat_id, message_id="ask",
+                     text="Und was heißt alle?", timestamp=1_700_000_060, sender_id=dimi,
+                     reply_to_message_id="old"),
+                dict(channel="whatsapp", chat_id=chat_id, message_id="msg-1",
+                     text="current message", timestamp=1_700_000_240, sender_id=dimi),
+            ],
+        )
+        mw = ReplyContextMiddleware(ambient_window_limit=1)
+        event = _make_event(chat_id=chat_id, message_id="msg-1", is_group=True)
+
+        async with projected.turn():
+            result = mw._build_ambient_window(event)
+
+        assert result == [
+            f'[{dimi}, replying to {frank}: "Zalando nutzt nur noch AI Models"] '
+            "Und was heißt alle?"
+        ]
+        projected.close()
+
+
 class TestSessionBoundary:
     """Session.get_history() should stop at the most recent session_boundary."""
 

@@ -77,10 +77,18 @@ class ContinuationResolver:
         self._store, self._threads, self._judge = store, threads, judge
         self._context_limit = context_limit
 
+    def window_ms(self, *, mentioned: bool) -> int:
+        """How far back an anchor may lie: longer when the sender names Arvid again."""
+        policy = self._threads.policy
+        if mentioned:
+            return max(policy.followup_window_ms, policy.mention_continuation_window_ms)
+        return policy.followup_window_ms
+
     def candidates(
-        self, event: CanonicalEvent, *, aliases: tuple[str, ...], now_ms: int
+        self, event: CanonicalEvent, *, aliases: tuple[str, ...], now_ms: int,
+        mentioned: bool = False,
     ) -> tuple[ContinuationAnchor, ...]:
-        since = now_ms - self._threads.policy.followup_window_ms
+        since = now_ms - self.window_ms(mentioned=mentioned)
         result: list[ContinuationAnchor] = []
         seen: set[str] = set()
         for effect in self._store.recent_reply_effects(
@@ -137,15 +145,19 @@ class ContinuationResolver:
 
     async def resolve(
         self, event: CanonicalEvent, *, aliases: tuple[str, ...], now_ms: int,
-        source_authorized: Callable[[CanonicalEvent], bool],
+        source_authorized: Callable[[CanonicalEvent], bool], mentioned: bool = False,
     ) -> ContinuationAnchor | None:
-        candidates = tuple(item for item in self.candidates(event, aliases=aliases, now_ms=now_ms)
-                           if source_authorized(item.source))
+        candidates = tuple(
+            item for item in self.candidates(
+                event, aliases=aliases, now_ms=now_ms, mentioned=mentioned,
+            )
+            if source_authorized(item.source)
+        )
         if not candidates:
             return None
         context = self._store.recent_context_events(
             channel=event.channel, chat_id=event.chat_id,
-            since_ms=now_ms - self._threads.policy.followup_window_ms,
+            since_ms=now_ms - self.window_ms(mentioned=mentioned),
             before_ms=now_ms, limit=self._context_limit,
         )
         from yeoman_gateway.history.context import current_history_snapshot
