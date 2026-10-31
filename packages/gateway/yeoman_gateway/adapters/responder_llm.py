@@ -2061,10 +2061,10 @@ class LLMResponder(ResponderPort):
                     continue
 
                 if tool_calls:
-                    if current_metadata is not None:
-                        current_metadata["reply_budget_tool_used"] = True
-                        if any(tc.name in RESEARCH_TOOL_NAMES for tc in tool_calls):
-                            current_metadata["reply_budget_research_used"] = True
+                    if current_metadata is not None and any(
+                        tc.name in RESEARCH_TOOL_NAMES for tc in tool_calls
+                    ):
+                        current_metadata["reply_budget_research_used"] = True
                     tool_call_dicts: list[dict[str, Any]] = [
                         {
                             "id": tc.id,
@@ -3196,7 +3196,6 @@ class LLMResponder(ResponderPort):
             acknowledgement_budget = derive_reply_budget(
                 policy=metadata.get("reply_budget_policy"),
                 answer_shape="ack",
-                content="",
                 is_owner=False,
             )
             if acknowledgement_budget is not None:
@@ -3211,8 +3210,6 @@ class LLMResponder(ResponderPort):
         final_content, budget_result = enforce_reply_budget(
             final_content,
             budget_metadata,
-            user_content=content,
-            tool_used=bool(metadata.get("reply_budget_tool_used", False)),
             research_used=bool(metadata.get("reply_budget_research_used", False)),
         )
         if bool(budget_result.get("over_budget", False)):
@@ -3490,7 +3487,6 @@ class LLMResponder(ResponderPort):
             budget = derive_reply_budget(
                 policy=decision.reply_budget,
                 answer_shape=str(state.get("answer_shape") or "short_take"),
-                content=event.content,
                 is_owner=bool(decision.is_owner),
             )
             if budget is not None:
@@ -3589,7 +3585,6 @@ class LLMResponder(ResponderPort):
         budget = derive_reply_budget(
             policy=getattr(decision, "reply_budget", None),
             answer_shape="short_take",
-            content="",
             is_owner=False,
         )
         if budget is not None:
@@ -3642,7 +3637,6 @@ class LLMResponder(ResponderPort):
         final, result = enforce_reply_budget(
             text,
             metadata.get("reply_budget"),
-            user_content="",
         )
         if not bool(result.get("over_budget", False)):
             return final

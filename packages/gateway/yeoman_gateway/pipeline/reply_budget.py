@@ -24,7 +24,6 @@ class ReplyBudgetMiddleware:
         budget = derive_reply_budget(
             policy=decision.reply_budget,
             answer_shape=answer_shape,
-            content=ctx.event.content,
             is_owner=bool(decision.is_owner),
         )
         if budget is None:
