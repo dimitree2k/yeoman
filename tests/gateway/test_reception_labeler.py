@@ -191,6 +191,37 @@ async def test_invalid_json_is_bounded_and_stores_nothing(tmp_path: Path) -> Non
         runner._store.close()
 
 
+class ProviderErrorClient(FakeClient):
+    """The provider wrapper reports a rejected request as an empty error reply."""
+
+    async def chat_with_usage(self, messages, **kwargs):  # noqa: ANN001, ANN003
+        self.calls.append(messages)
+        return RouteReply(content="", model=self.model, finish_reason="error")
+
+
+@pytest.mark.asyncio
+async def test_provider_error_reply_is_not_reported_as_invalid_json(
+    tmp_path: Path, caplog: pytest.LogCaptureFixture
+) -> None:
+    from loguru import logger
+
+    history = _history(tmp_path)
+    client = ProviderErrorClient()
+    runner = _runner(tmp_path, history, client)
+    handler = logger.add(caplog.handler, format="{message}", level="WARNING")
+    try:
+        outcome = await runner.label_day(CHAT, DAY)
+        assert (outcome.state, outcome.reason) == ("failed", "provider_error")
+        assert len(client.calls) == 2
+        assert "reception_label_provider_failed" in caplog.text
+        assert "reception_label_invalid_json" not in caplog.text
+        assert runner._store.labels(CHAT) == ()
+    finally:
+        logger.remove(handler)
+        history.close()
+        runner._store.close()
+
+
 @pytest.mark.asyncio
 async def test_route_unavailable_is_a_clean_failure(tmp_path: Path) -> None:
     from yeoman_gateway.processing.model_route import RouteUnavailableError
