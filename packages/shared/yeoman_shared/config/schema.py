@@ -1022,7 +1022,7 @@ class ProcessingReceptionConfig(BaseModel):
     label_hour: int = Field(default=3, alias="labelHour", ge=0, le=23)
     batch_messages: int = Field(default=6, alias="batchMessages", ge=1, le=20)
     max_input_tokens: int = Field(default=6_000, alias="maxInputTokens", ge=512)
-    max_output_tokens: int = Field(default=1_200, alias="maxOutputTokens", ge=128)
+    max_output_tokens: int = Field(default=3_000, alias="maxOutputTokens", ge=128)
     timeout_seconds: float = Field(default=30.0, alias="timeoutSeconds", gt=0, le=120)
     max_attempts: int = Field(default=2, alias="maxAttempts", ge=1, le=5)
     #: Weekly owner report and alerting.
