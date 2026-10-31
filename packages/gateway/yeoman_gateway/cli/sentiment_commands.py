@@ -148,6 +148,13 @@ def sentiment_run(
         f"[green]✓[/green] Empfang neu berechnet: "
         f"{reply.get('weeks', 0)} Wochen, {reply.get('labels', 0)} Labels"
     )
+    failed_days = int(reply.get("failed_days") or 0)
+    if failed_days:
+        console.print(
+            f"[yellow]{failed_days} Tage ohne Labels (Modell nicht erreichbar oder "
+            "Antwort unbrauchbar), siehe gateway.log.[/yellow]"
+        )
+        raise typer.Exit(1)
 
 
 @sentiment_app.command("validate")
@@ -176,7 +183,7 @@ def sentiment_validate(
     table.add_column("value", style="cyan")
     for key in (
         "rows", "missing_labels", "responds_total", "responds_accuracy",
-        "stance_total", "stance_accuracy",
+        "stance_total", "stance_accuracy", "negative_accuracy",
     ):
         table.add_row(key, str(report[key]))
     console.print(table)

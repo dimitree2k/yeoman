@@ -386,6 +386,14 @@ class SentimentStore:
             db.execute("ROLLBACK")
             raise
 
+    def claim_digest(self, iso_week: str) -> bool:
+        """Claim the owner digest for ``iso_week`` once, across restarts."""
+        cursor = self._db().execute(
+            "INSERT OR IGNORE INTO meta(key, value) VALUES (?, ?)",
+            (f"digest_sent:{iso_week}", str(now_ms())),
+        )
+        return cursor.rowcount == 1
+
     def last_alert_ms(self, chat_id: str) -> int | None:
         row = self._db().execute(
             "SELECT last_alert_ms FROM alerts WHERE chat_id=?", (chat_id,)

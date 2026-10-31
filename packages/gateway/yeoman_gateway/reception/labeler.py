@@ -268,7 +268,9 @@ def _candidate_rows(
         row for row in humans
         if sent < int(row["sent_ms"]) <= limit
         and not row.get("media_json")
-        and " ".join(str(row.get("current_text") or row.get("text") or "").split())
+        and (text := " ".join(str(row.get("current_text") or row.get("text") or "").split()))
+        # Slash commands (``/pause``) steer the bot; they are not a reaction to it.
+        and not text.startswith("/")
     ]
     return selected[:MAX_CANDIDATES]
 

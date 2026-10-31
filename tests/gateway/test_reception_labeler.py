@@ -15,6 +15,7 @@ from yeoman_gateway.reception.labeler import (
     DayWindow,
     ReceptionLabelJob,
     ReceptionLabelRunner,
+    _candidate_rows,
     parse_labels,
     strip_identifiers,
 )
@@ -119,6 +120,15 @@ def test_label_without_arvid_message_id_is_dropped() -> None:
          "signals": [], "confidence": 0.8},
     ]})
     assert parse_labels(raw, arvid_ids={"a1": "a"}, message_ids={"m1": "m"}) == []
+
+
+def test_slash_commands_are_not_label_candidates() -> None:
+    arvid = {"message_id": "a", "sent_ms": 1_000, "direction": "out"}
+    humans = [
+        {"message_id": "cmd", "sent_ms": 2_000, "text": "/pause 10min"},
+        {"message_id": "reply", "sent_ms": 3_000, "text": "na gut"},
+    ]
+    assert [row["message_id"] for row in _candidate_rows(arvid, humans)] == ["reply"]
 
 
 def test_identifiers_are_stripped_before_the_model_sees_text() -> None:

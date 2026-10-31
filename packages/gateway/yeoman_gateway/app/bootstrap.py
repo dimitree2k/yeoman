@@ -4383,6 +4383,7 @@ def build_gateway_runtime(
             )
             weeks = 0
             labels = 0
+            failed_days = 0
             for chat_id in chats:
                 outcomes = await service.backfill(
                     chat_id=chat_id, since_ms=since_ms, until_ms=now
@@ -4392,8 +4393,12 @@ def build_gateway_runtime(
                 while day.end_ms <= now:
                     outcome = await runner.label_day(chat_id, day)
                     labels += outcome.labels
+                    failed_days += int(outcome.state != "done")
                     day = day_window(day.end_ms)
-            return {"status": "ok", "weeks": weeks, "labels": labels, "chats": len(chats)}
+            return {
+                "status": "ok", "weeks": weeks, "labels": labels, "chats": len(chats),
+                "failed_days": failed_days,
+            }
         except Exception as exc:
             # The socket answers only a code; the cause belongs in the gateway log.
             logger.exception("sentiment_run_failed error_type={}", type(exc).__name__)
