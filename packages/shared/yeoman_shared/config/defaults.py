@@ -77,9 +77,13 @@ DEFAULT_MODEL_PROFILES: dict[str, dict[str, Any]] = {
         "kind": "chat",
         "provider": "deepseek",
         "model": "deepseek-v4-flash",
-        "max_tokens": 1200,
+        "max_tokens": 3000,
         "temperature": 0.0,
         "timeout_ms": 30000,
+        # DeepSeek refuses json_schema, and with reasoning on it spends the whole
+        # output budget thinking.
+        "structured_output": "json_object",
+        "reasoning": {"enabled": False},
     },
 }
 

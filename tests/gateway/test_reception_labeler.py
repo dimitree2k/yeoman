@@ -9,6 +9,7 @@ from pathlib import Path
 import pytest
 from yeoman_gateway.processing.model_route import RouteReply
 from yeoman_gateway.reception.labeler import (
+    LABEL_RESPONSE_FORMAT,
     LABEL_SYSTEM_PROMPT,
     PROMPT_VERSION,
     DayWindow,
@@ -103,6 +104,21 @@ def test_parse_labels_keeps_only_valid_items() -> None:
         crossed, arvid_ids={"a1": "a", "a2": "b"}, message_ids={"m1": "m"},
         pairs={"a1": frozenset({"m1"})},
     ) == []
+
+
+def test_prompt_names_every_key_the_validator_requires() -> None:
+    # json_object and prompt_only modes see no schema: the prompt alone must name the keys.
+    item = LABEL_RESPONSE_FORMAT["json_schema"]["schema"]["properties"]["labels"]["items"]
+    for key in item["required"]:
+        assert key in LABEL_SYSTEM_PROMPT
+
+
+def test_label_without_arvid_message_id_is_dropped() -> None:
+    raw = json.dumps({"labels": [
+        {"id": "m1", "responds_to_arvid": "yes", "stance": "playful",
+         "signals": [], "confidence": 0.8},
+    ]})
+    assert parse_labels(raw, arvid_ids={"a1": "a"}, message_ids={"m1": "m"}) == []
 
 
 def test_identifiers_are_stripped_before_the_model_sees_text() -> None:
