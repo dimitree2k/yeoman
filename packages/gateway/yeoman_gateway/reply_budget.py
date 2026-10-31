@@ -18,6 +18,9 @@ DEFAULT_REPLY_BUDGET_TARGETS: dict[str, int] = {
     "ack": 180,
 }
 DEFAULT_REPLY_BUDGET_HARD_MAX_CHARS = 600
+#: Shapes the runtime chose structurally (an acknowledgement, a social beat, a one-line
+#: follow-up): their target is also their ceiling, so a longer draft is rewritten shorter.
+_TARGET_IS_CEILING: frozenset[str] = frozenset({"ack", "social_one_liner", "one_liner"})
 DEFAULT_REPLY_BUDGET_LONG_FORM_MAX_CHARS = 2200
 #: Tools whose results are evidence the answer has to carry. A turn that called one is
 #: budgeted like a researched answer, whatever shape the request was filed under.
@@ -135,15 +138,13 @@ def derive_reply_budget(
         )
     )
     hard_max_chars = int(str(cfg["hard_max_chars"]))
-    if shape == "ack":
-        # An acknowledgement is a status line by construction, never the work itself:
-        # its target is also its ceiling.
+    if shape in _TARGET_IS_CEILING:
         hard_max_chars = min(hard_max_chars, target_chars)
     long_form_max_chars = int(str(cfg["long_form_max_chars"]))
     long_form_bypass = str(cfg["long_form_bypass"])
     # Who may get long answers is policy; whether this answer needs the room is the
     # writing model's judgment, made while it writes - no keyword guess, no extra call.
-    long_form_allowed = shape != "ack" and (
+    long_form_allowed = shape not in _TARGET_IS_CEILING and (
         long_form_bypass == "always" or (long_form_bypass == "owner_only" and is_owner)
     )
     hard_cap_enabled = not long_form_allowed
@@ -190,8 +191,8 @@ def enforce_reply_budget(
     if not original or not isinstance(budget, dict) or not bool(budget.get("enabled", False)):
         return original, {"over_budget": False, "reason": "disabled"}
 
-    acknowledgement = budget.get("answer_shape") == "ack"
-    if (research_used and not acknowledgement) or bool(budget.get("long_form_allowed", False)):
+    fixed_shape = budget.get("answer_shape") in _TARGET_IS_CEILING
+    if (research_used and not fixed_shape) or bool(budget.get("long_form_allowed", False)):
         limit = int(budget.get("long_form_max_chars") or DEFAULT_REPLY_BUDGET_LONG_FORM_MAX_CHARS)
         reason = "long_form_max_chars"
     else:

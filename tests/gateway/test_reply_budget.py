@@ -440,3 +440,20 @@ def test_research_tool_turn_gets_the_long_form_limit() -> None:
     assert researched == _LONG_REPLY
     assert result["over_budget"] is False
 
+
+
+@pytest.mark.parametrize("shape", ["ack", "social_one_liner", "one_liner"])
+def test_structural_short_shapes_use_their_target_as_ceiling(shape: str) -> None:
+    from yeoman_gateway.reply_budget import derive_reply_budget, enforce_reply_budget
+
+    budget = derive_reply_budget(
+        policy={"enabled": True, "targets": {shape: 150}, "hard_max_chars": 600,
+                "long_form_bypass": "always"},
+        answer_shape=shape,
+        is_owner=True,
+    )
+    assert budget is not None and not budget.long_form_allowed
+    assert budget.hard_max_chars == 150
+    reply, result = enforce_reply_budget("x" * 200, budget.as_metadata(), research_used=True)
+    assert reply == "x" * 200
+    assert result["over_budget"] is True and result["limit"] == 150
