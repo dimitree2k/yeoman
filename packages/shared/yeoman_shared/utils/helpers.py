@@ -26,6 +26,7 @@ OPERATIONAL_STORE_PATHS = {
     "poll_guard": "ops/poll-guard.json",
     "group_reminder_quota": "ops/group-reminder-quota.json",
     "group_decisions": "ops/group-decisions.db",
+    "sentiment": "ops/sentiment.db",
 }
 
 

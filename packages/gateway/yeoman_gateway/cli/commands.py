@@ -23,6 +23,7 @@ from . import people_commands as _people_commands  # noqa: F401
 from . import policy_commands as _policy_commands  # noqa: F401
 from . import processing_commands as _processing_commands  # noqa: F401
 from . import raw_commands as _raw_commands  # noqa: F401
+from . import sentiment_commands as _sentiment_commands  # noqa: F401
 from . import status_commands as _status_commands  # noqa: F401
 from . import trends_commands as _trends_commands  # noqa: F401
 from .core import app, console

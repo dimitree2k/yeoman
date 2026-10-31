@@ -83,6 +83,10 @@ class ParticipationMaintenance:
         #: Weekly group reaction digest job (``GroupDigestJob``); ticked after each pass,
         #: outside the pass's history turn so its model call never holds a lease.
         self._group_digest: Any = None
+        #: Reception measurement ticks (deterministic weekly rows, nightly labels, owner DM).
+        self._reception_weekly: Any = None
+        self._reception_label: Any = None
+        self._reception_owner: Any = None
         self._ledger = ledger
         self._reconciler = reconciler
         self._archive = archive
@@ -128,6 +132,7 @@ class ParticipationMaintenance:
                     "participation_maintenance_tick_failed error_type={}", type(exc).__name__
                 )
             await self.run_group_digest()
+            await self.run_reception()
             try:
                 await asyncio.sleep(self._interval_seconds)
             except asyncio.CancelledError:
@@ -148,6 +153,31 @@ class ParticipationMaintenance:
         except Exception as exc:  # noqa: BLE001 - the digest is advisory
             logger.warning("group_digest_tick_failed error_type={}", type(exc).__name__)
             return None
+
+    async def run_reception(self, *, now_ms: int | None = None) -> None:
+        """Reception ticks: weekly rows, nightly labels, then the owner digest.
+
+        Each tick is isolated: an unconfigured label route or a failed provider call
+        must never stop maintenance or the deterministic weekly computation.
+        """
+        import asyncio
+
+        moment = int(now_ms if now_ms is not None else self._clock_ms())
+        for name, job in (
+            ("weekly", self._reception_weekly),
+            ("label", self._reception_label),
+            ("owner", self._reception_owner),
+        ):
+            if job is None:
+                continue
+            try:
+                await job.tick(now_ms=moment)
+            except asyncio.CancelledError:
+                raise
+            except Exception as exc:  # noqa: BLE001 - reception is advisory
+                logger.warning(
+                    "reception_tick_failed stage={} error_type={}", name, type(exc).__name__
+                )
 
     @secondary_consumer
     async def run_once(self, *, now_ms: int | None = None) -> MaintenanceReport:

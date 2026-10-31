@@ -139,6 +139,7 @@ class EffectivePolicy:
     polls: bool = False
     group_reminders: bool = False
     decisions: bool = False
+    reception_metrics: bool = False
     trends: TrendsPolicy = field(default_factory=TrendsPolicy)
 
 
@@ -308,6 +309,7 @@ class _CompiledPolicy:
     polls: bool = False
     group_reminders: bool = False
     decisions: bool = False
+    reception_metrics: bool = False
     trends: TrendsPolicy = field(default_factory=TrendsPolicy)
 
 
@@ -425,6 +427,7 @@ class PolicyEngine:
             polls=bool(resolved.polls),
             group_reminders=bool(resolved.group_reminders),
             decisions=bool(resolved.decisions),
+            reception_metrics=bool(resolved.reception_metrics),
             session_history_limit=resolved.session_history_limit,
             participation=ParticipationPolicy.model_validate(
                 resolved.participation.model_dump()
@@ -445,6 +448,22 @@ class PolicyEngine:
 
         self._resolved_cache[key] = compiled
         return compiled
+
+    def reception_enabled(self, channel: str, chat_id: str) -> bool:
+        """Whether this chat opted into reception measurement."""
+        return bool(self.resolve_compiled_policy(channel, chat_id).reception_metrics)
+
+    def reception_chats(self, channel: str = "whatsapp") -> tuple[str, ...]:
+        """Every explicitly enabled chat id of one channel, in policy order.
+
+        Only chat overrides are listed: enabling a channel default would silently
+        measure every future group, while the owner wants a one-line opt-in per chat.
+        """
+        return tuple(
+            chat_id
+            for (rule_channel, chat_id), rule in self._chat_rules.items()
+            if rule_channel == channel and rule.reception_metrics
+        )
 
     def validate(self, known_tools: set[str]) -> None:
         """Validate high-risk policy issues at startup."""
@@ -612,6 +631,7 @@ class PolicyEngine:
             polls=resolved.polls,
             group_reminders=resolved.group_reminders,
             decisions=resolved.decisions,
+            reception_metrics=resolved.reception_metrics,
             session_history_limit=resolved.session_history_limit,
             participation=ParticipationPolicy.model_validate(
                 resolved.participation.model_dump()

@@ -652,20 +652,587 @@ def _arvid_effect(
     )
 
 
+# ── reception (P1) ───────────────────────────────────────────────────────────
+
+#: A direct answer may arrive later than the first conversational follow-up.
+DIRECT_WINDOW_MS = 30 * 60_000
+#: The addressed person writing again, or anyone else replying, is the first reaction.
+INDIRECT_WINDOW_MS = 5 * 60_000
+#: No human message at all in this window is silence.
+SILENCE_WINDOW_MS = 10 * 60_000
+#: A week below both floors is stored as ``insufficient_data``.
+MIN_ARVID_MESSAGES = 5
+MIN_HUMAN_MESSAGES = 50
+#: Deterministic baseline sample: every k-th human quote-reply, capped per week.
+BASELINE_EVERY = 5
+BASELINE_MAX = 200
+
+_WORD = re.compile(r"[^\W\d_]+")
+
+
+@dataclass(frozen=True, slots=True)
+class ReceptionWindow:
+    """What followed one Arvid text message, by response kind.
+
+    ``direct`` and ``indirect`` may both be true; ``category`` is the strongest
+    non-overlapping label used by the report so its percentages add up.
+    """
+
+    message_id: str
+    native_message_id: str
+    sent_ms: int
+    addressed: bool
+    direct: bool
+    indirect: bool
+    others: bool
+    silent: bool
+    direct_people: tuple[str, ...]
+    indirect_people: tuple[str, ...]
+    other_people: tuple[str, ...]
+    reactions: int
+    negative_reactions: int
+    emojis: tuple[str, ...]
+    emoji_counts: tuple[tuple[str, int], ...] = ()
+    action_type: str = "unknown"
+    persona_sha: str = "unknown"
+    kind: str = "text"
+
+    @property
+    def category(self) -> str:
+        if self.direct:
+            return "direct"
+        if self.indirect:
+            return "indirect"
+        if self.others:
+            return "others"
+        return "silence" if self.silent else "quiet"
+
+    def descriptor(self) -> dict[str, object]:
+        """Ids, flags and counts only: safe for ``metrics_json``."""
+        return {
+            "message_id": self.message_id,
+            "native_message_id": self.native_message_id,
+            "sent_ms": self.sent_ms,
+            "addressed": self.addressed,
+            "direct": self.direct,
+            "indirect": self.indirect,
+            "others": self.others,
+            "silent": self.silent,
+            "category": self.category,
+            "direct_people": list(self.direct_people),
+            "indirect_people": list(self.indirect_people),
+            "other_people": list(self.other_people),
+            "reactions": self.reactions,
+            "negative_reactions": self.negative_reactions,
+            "emojis": list(self.emojis),
+            "emoji_counts": [[emoji, count] for emoji, count in self.emoji_counts],
+            "action_type": self.action_type,
+            "persona_sha": self.persona_sha,
+            "kind": self.kind,
+        }
+
+
+@dataclass(frozen=True, slots=True)
+class BaselineWindow:
+    """The same window rules applied to one human quote-reply."""
+
+    message_id: str
+    direct: bool
+    indirect: bool
+    others: bool
+    silent: bool
+
+    @property
+    def category(self) -> str:
+        if self.direct:
+            return "direct"
+        if self.indirect:
+            return "indirect"
+        if self.others:
+            return "others"
+        return "silence" if self.silent else "quiet"
+
+
+@dataclass(frozen=True, slots=True)
+class ReceptionMetrics:
+    """One chat-week of deterministic reception numbers. Never any message text."""
+
+    chat_id: str
+    week: DigestWeek
+    arvid_messages: int
+    human_messages: int
+    addressed: int
+    unprompted: int
+    direct: int
+    indirect: int
+    others: int
+    silence: int
+    reactions_received: int
+    negative_reactions: int
+    arvid_reactions_given: int
+    human_reactions: int
+    engaged_people: tuple[str, ...]
+    top_person_id: str
+    top_person_share: float
+    task_requests: int
+    baseline_sampled: int
+    baseline_direct: int
+    baseline_indirect: int
+    baseline_silence: int
+    windows: tuple[ReceptionWindow, ...]
+    baseline_windows: tuple[BaselineWindow, ...] = ()
+    min_arvid_messages: int = MIN_ARVID_MESSAGES
+    min_human_messages: int = MIN_HUMAN_MESSAGES
+
+    @property
+    def sufficient(self) -> bool:
+        """Both activity floors are below their minimum: too little to read."""
+        return not (
+            self.arvid_messages < self.min_arvid_messages
+            and self.human_messages < self.min_human_messages
+        )
+
+    @property
+    def status(self) -> str:
+        return "ok" if self.sufficient else "insufficient_data"
+
+    @staticmethod
+    def _rate(count: int, total: int) -> float:
+        return round(count / total, 4) if total else 0.0
+
+    def metrics(self) -> dict[str, object]:
+        """Numbers and contact ids only; safe for ``metrics_json``."""
+        total = self.arvid_messages
+        return {
+            "arvid_messages": total,
+            "human_messages": self.human_messages,
+            "addressed": self.addressed,
+            "unprompted": self.unprompted,
+            "direct": self.direct,
+            "indirect": self.indirect,
+            "others": self.others,
+            "silence": self.silence,
+            "direct_rate": self._rate(self.direct, total),
+            "indirect_rate": self._rate(self.indirect, total),
+            "others_rate": self._rate(self.others, total),
+            "silence_rate": self._rate(self.silence, total),
+            "reactions_received": self.reactions_received,
+            "reactions_per_arvid": self._rate(self.reactions_received, total),
+            "negative_reactions": self.negative_reactions,
+            "arvid_reactions_given": self.arvid_reactions_given,
+            "human_reactions": self.human_reactions,
+            "reactions_per_human": self._rate(self.human_reactions, self.human_messages),
+            "engaged_people": list(self.engaged_people),
+            "breadth": len(self.engaged_people),
+            "top_person_id": self.top_person_id,
+            "top_person_share": self.top_person_share,
+            "task_requests": self.task_requests,
+            "baseline_sampled": self.baseline_sampled,
+            "baseline_direct_rate": self._rate(self.baseline_direct, self.baseline_sampled),
+            "baseline_indirect_rate": self._rate(
+                self.baseline_indirect, self.baseline_sampled
+            ),
+            "baseline_silence_rate": self._rate(
+                self.baseline_silence, self.baseline_sampled
+            ),
+            "minimum": {
+                "arvid_messages": self.min_arvid_messages,
+                "human_messages": self.min_human_messages,
+                "met": self.sufficient,
+            },
+            "status": self.status,
+            "windows": [item.descriptor() for item in self.windows],
+        }
+
+
+def _mentions_identity(row: Mapping[str, Any], identifiers: frozenset[str]) -> bool:
+    """True when a mention entry names one of Arvid's strong identifiers."""
+    if not identifiers:
+        return False
+    raw = row.get("mentions_json")
+    if isinstance(raw, str) and raw:
+        try:
+            raw = json.loads(raw)
+        except json.JSONDecodeError:
+            raw = None
+    values = raw if isinstance(raw, list) else ()
+    local = {value.split("@", 1)[0] for value in identifiers if "@" in value}
+    for value in values:
+        if not isinstance(value, str):
+            continue
+        candidate = value.lstrip("@")
+        candidate = candidate.rsplit(":", 1)[-1] if ":" in candidate else candidate
+        if candidate in identifiers or candidate.split("@", 1)[0] in local:
+            return True
+    text = _text(row)
+    if text:
+        if any(identifier in text for identifier in identifiers):
+            return True
+        if any(f"@{number}" in text for number in local if len(number) >= 5):
+            return True
+    return False
+
+
+def _name_patterns(names: Iterable[str]) -> tuple[re.Pattern[str], ...]:
+    terms: set[str] = set()
+    for name in names:
+        full = " ".join(str(name).split())
+        if full:
+            terms.add(full)
+        terms.update(token for token in _WORD.findall(full) if len(token) >= 3)
+    return tuple(
+        re.compile(rf"(?<!\w){re.escape(term)}(?!\w)", re.IGNORECASE)
+        for term in sorted(terms, key=lambda value: (-len(value), value))
+    )
+
+
+def _named(row: Mapping[str, Any], patterns: Iterable[re.Pattern[str]]) -> bool:
+    text = _text(row)
+    return bool(text) and any(pattern.search(text) for pattern in patterns)
+
+
+def _addressed_to(
+    row: Mapping[str, Any],
+    *,
+    native_ids: frozenset[str],
+    identifiers: frozenset[str],
+    patterns: tuple[re.Pattern[str], ...],
+) -> bool:
+    if str(row.get("reply_to_native_id") or "") in native_ids:
+        return True
+    return _mentions_identity(row, identifiers) or _named(row, patterns)
+
+
+def _text_row(row: Mapping[str, Any]) -> bool:
+    """Arvid's text messages: non-empty text without media."""
+    if row.get("media_json"):
+        return False
+    return bool(_text(row))
+
+
+def _window_for(
+    target: Mapping[str, Any],
+    humans: list[Mapping[str, Any]],
+    *,
+    quoted_author: str,
+    identifiers: frozenset[str],
+    patterns: tuple[re.Pattern[str], ...],
+    direct_window_ms: int = DIRECT_WINDOW_MS,
+    indirect_window_ms: int = INDIRECT_WINDOW_MS,
+    silence_window_ms: int = SILENCE_WINDOW_MS,
+) -> tuple[bool, bool, bool, bool, tuple[str, ...], tuple[str, ...], tuple[str, ...]]:
+    """Direct/indirect/others/silence for one target, plus the people involved."""
+    target_native = str(target.get("native_message_id") or "")
+    sent = int(target["sent_ms"])
+    direct = indirect = others = False
+    silent = True
+    direct_people: set[str] = set()
+    indirect_people: set[str] = set()
+    other_people: set[str] = set()
+    for row in humans:
+        moment = int(row["sent_ms"])
+        if moment <= sent:
+            continue
+        if moment <= sent + silence_window_ms:
+            silent = False
+        if moment > sent + direct_window_ms:
+            break
+        sender = _sender_key(row)
+        quoted = str(row.get("reply_to_native_id") or "")
+        is_direct = quoted == target_native or _mentions_identity(
+            row, identifiers
+        ) or _named(row, patterns)
+        if is_direct:
+            direct = True
+            if sender:
+                direct_people.add(sender)
+            continue
+        if moment > sent + indirect_window_ms:
+            continue
+        if quoted_author and sender == quoted_author:
+            indirect = True
+            indirect_people.add(sender)
+        else:
+            others = True
+            if sender:
+                other_people.add(sender)
+    return (
+        direct, indirect, others, silent,
+        tuple(sorted(direct_people)), tuple(sorted(indirect_people)),
+        tuple(sorted(other_people)),
+    )
+
+
+def _baseline_windows(
+    humans: list[Mapping[str, Any]],
+    by_native: Mapping[str, Mapping[str, Any]],
+    *,
+    contact_names: Mapping[str, str],
+    every: int,
+    maximum: int,
+    direct_window_ms: int = DIRECT_WINDOW_MS,
+    indirect_window_ms: int = INDIRECT_WINDOW_MS,
+    silence_window_ms: int = SILENCE_WINDOW_MS,
+) -> tuple[BaselineWindow, ...]:
+    """Every k-th human quote-reply, deterministic and capped."""
+    candidates = [row for row in humans if row.get("reply_to_native_id")]
+    windows: list[BaselineWindow] = []
+    for index in range(0, len(candidates), max(1, int(every))):
+        if len(windows) >= maximum:
+            break
+        row = candidates[index]
+        author = str(row.get("sender_contact_id") or "")
+        quoted = by_native.get(str(row.get("reply_to_native_id") or ""))
+        quoted_author = _sender_key(quoted) if quoted is not None else ""
+        name = contact_names.get(author, "")
+        patterns = _name_patterns((name,)) if name else ()
+        identifiers = frozenset(
+            value for value in (str(row.get("sender_identifier") or ""),) if value
+        )
+        direct, indirect, others, silent, *_ = _window_for(
+            row, humans, quoted_author=quoted_author, identifiers=identifiers,
+            patterns=patterns, direct_window_ms=direct_window_ms,
+            indirect_window_ms=indirect_window_ms,
+            silence_window_ms=silence_window_ms,
+        )
+        windows.append(BaselineWindow(
+            message_id=str(row.get("message_id") or ""), direct=direct,
+            indirect=indirect, others=others, silent=silent,
+        ))
+    return tuple(windows)
+
+
+def compute_reception(
+    rows: Iterable[Mapping[str, Any]],
+    reactions: Iterable[Mapping[str, Any]],
+    *,
+    chat_id: str,
+    week: DigestWeek,
+    arvid_identifiers: Iterable[str] = (),
+    arvid_names: Iterable[str] = (),
+    outbound_meta: Mapping[str, Mapping[str, Any]] | None = None,
+    assistant_contact_ids: Iterable[str] = (),
+    contact_names: Mapping[str, str] | None = None,
+    min_arvid_messages: int = MIN_ARVID_MESSAGES,
+    min_human_messages: int = MIN_HUMAN_MESSAGES,
+    baseline_every: int = BASELINE_EVERY,
+    baseline_max: int = BASELINE_MAX,
+    direct_window_ms: int = DIRECT_WINDOW_MS,
+    indirect_window_ms: int = INDIRECT_WINDOW_MS,
+    silence_window_ms: int = SILENCE_WINDOW_MS,
+) -> ReceptionMetrics:
+    """Deterministic reception numbers for one chat-week; pure (rows in, numbers out)."""
+    identifiers = frozenset(str(item) for item in arvid_identifiers if str(item))
+    patterns = _name_patterns(arvid_names)
+    names = dict(contact_names or {})
+    meta = dict(outbound_meta or {})
+    timed = [
+        row for row in rows
+        if isinstance(row.get("sent_ms"), int)
+        and week.start_ms <= int(row["sent_ms"]) < week.end_ms
+        and str(row.get("chat_id") or "") == str(chat_id)
+    ]
+    timed.sort(key=lambda row: (int(row["sent_ms"]), str(row.get("message_id") or "")))
+    humans = [row for row in timed if row.get("direction") != "out"]
+    arvid_rows = [
+        row for row in timed if row.get("direction") == "out" and _text_row(row)
+    ]
+    by_native = {
+        str(row.get("native_message_id")): row
+        for row in timed if row.get("native_message_id")
+    }
+    arvid_native = frozenset(
+        str(row.get("native_message_id"))
+        for row in timed
+        if row.get("direction") == "out" and row.get("native_message_id")
+    )
+    current = _current_reactions(reactions)
+    own = frozenset(str(item) for item in assistant_contact_ids if str(item))
+
+    windows: list[ReceptionWindow] = []
+    for row in arvid_rows:
+        quoted = by_native.get(str(row.get("reply_to_native_id") or ""))
+        quoted_author = _sender_key(quoted) if quoted is not None and quoted.get("direction") != "out" else ""
+        direct, indirect, others, silent, direct_people, indirect_people, other_people = (
+            _window_for(
+                row, humans, quoted_author=quoted_author, identifiers=identifiers,
+                patterns=patterns, direct_window_ms=direct_window_ms,
+                indirect_window_ms=indirect_window_ms,
+                silence_window_ms=silence_window_ms,
+            )
+        )
+        addressed = quoted is not None and _addressed_to(
+            quoted, native_ids=arvid_native - {str(row.get("native_message_id") or "")},
+            identifiers=identifiers, patterns=patterns,
+        )
+        entries = current.get(str(row.get("message_id") or ""), ())
+        counts = Counter(emoji for _actor, emoji in entries)
+        emojis = tuple(sorted(counts, key=lambda emoji: (-counts[emoji], emoji)))
+        native = str(row.get("native_message_id") or "")
+        detail = meta.get(native) or meta.get(str(row.get("message_id") or "")) or {}
+        windows.append(ReceptionWindow(
+            message_id=str(row.get("message_id") or ""),
+            native_message_id=native,
+            sent_ms=int(row["sent_ms"]),
+            addressed=bool(addressed),
+            direct=direct,
+            indirect=indirect,
+            others=others,
+            silent=silent,
+            direct_people=direct_people,
+            indirect_people=indirect_people,
+            other_people=other_people,
+            reactions=len(entries),
+            negative_reactions=sum(1 for _actor, emoji in entries if emoji in NEGATIVE_EMOJIS),
+            emojis=emojis,
+            emoji_counts=tuple((emoji, counts[emoji]) for emoji in emojis),
+            action_type=str(detail.get("action_type") or "unknown"),
+            persona_sha=str(detail.get("persona_sha") or "unknown"),
+        ))
+
+    direct = sum(1 for item in windows if item.category == "direct")
+    indirect = sum(1 for item in windows if item.category == "indirect")
+    others = sum(1 for item in windows if item.category == "others")
+    silence = sum(1 for item in windows if item.category == "silence")
+
+    engagement: Counter[str] = Counter()
+    for item in windows:
+        for person in (*item.direct_people, *item.indirect_people):
+            engagement[person] += 1
+    engaged = tuple(sorted(engagement))
+    top_id = ""
+    top_share = 0.0
+    if engagement:
+        top_id, top_count = max(engagement.items(), key=lambda pair: (pair[1], pair[0]))
+        top_share = round(top_count / sum(engagement.values()), 4)
+
+    human_reaction_total = sum(
+        len(current.get(str(row.get("message_id") or ""), ())) for row in humans
+    )
+    arvid_reaction_total = sum(item.reactions for item in windows)
+    given = sum(
+        1
+        for entries in current.values()
+        for actor, _emoji in entries
+        if actor in own
+    )
+    baseline = _baseline_windows(
+        humans, by_native, contact_names=names, every=baseline_every,
+        maximum=baseline_max, direct_window_ms=direct_window_ms,
+        indirect_window_ms=indirect_window_ms, silence_window_ms=silence_window_ms,
+    )
+    task_requests = sum(
+        1 for row in humans if _addressed_to(
+            row, native_ids=arvid_native, identifiers=identifiers, patterns=patterns,
+        )
+    )
+    return ReceptionMetrics(
+        chat_id=str(chat_id),
+        week=week,
+        arvid_messages=len(windows),
+        human_messages=len(humans),
+        addressed=sum(1 for item in windows if item.addressed),
+        unprompted=sum(1 for item in windows if not item.addressed),
+        direct=direct,
+        indirect=indirect,
+        others=others,
+        silence=silence,
+        reactions_received=arvid_reaction_total,
+        negative_reactions=sum(item.negative_reactions for item in windows),
+        arvid_reactions_given=given,
+        human_reactions=human_reaction_total,
+        engaged_people=engaged,
+        top_person_id=top_id,
+        top_person_share=top_share,
+        task_requests=task_requests,
+        baseline_sampled=len(baseline),
+        baseline_direct=sum(1 for item in baseline if item.category == "direct"),
+        baseline_indirect=sum(1 for item in baseline if item.category == "indirect"),
+        baseline_silence=sum(1 for item in baseline if item.category == "silence"),
+        windows=tuple(windows),
+        baseline_windows=baseline,
+        min_arvid_messages=int(min_arvid_messages),
+        min_human_messages=int(min_human_messages),
+    )
+
+
+def read_reception_signals(
+    queries: HistoryQueries,
+    chat_id: str,
+    week: DigestWeek,
+    *,
+    outbound_meta: Mapping[str, Mapping[str, Any]] | None = None,
+    max_rows: int = MAX_WEEK_ROWS,
+    min_arvid_messages: int = MIN_ARVID_MESSAGES,
+    min_human_messages: int = MIN_HUMAN_MESSAGES,
+    baseline_every: int = BASELINE_EVERY,
+    baseline_max: int = BASELINE_MAX,
+    direct_window_ms: int = DIRECT_WINDOW_MS,
+    indirect_window_ms: int = INDIRECT_WINDOW_MS,
+    silence_window_ms: int = SILENCE_WINDOW_MS,
+) -> ReceptionMetrics:
+    """Read one chat's week from history (inside the caller's history turn) and compute."""
+    rows, _truncated = _week_rows(queries, chat_id, week, max_rows=max_rows)
+    events = _week_reactions(
+        queries, tuple(str(row["message_id"]) for row in rows), until_ms=week.end_ms - 1
+    )
+    identifiers, names = queries.assistant_identity()
+    contacts = {
+        str(row.get("sender_contact_id"))
+        for row in rows if row.get("direction") != "out" and row.get("sender_contact_id")
+    }
+    if not identifiers:
+        identifiers = tuple(sorted({
+            str(row.get("sender_identifier"))
+            for row in rows
+            if row.get("direction") == "out" and row.get("sender_identifier")
+        }))
+    if not names:
+        out_contacts = {
+            str(row.get("sender_contact_id"))
+            for row in rows
+            if row.get("direction") == "out" and row.get("sender_contact_id")
+        }
+        names = tuple(sorted(queries.contact_names(out_contacts).values(), key=str.casefold))
+    return compute_reception(
+        rows, events, chat_id=chat_id, week=week, arvid_identifiers=identifiers,
+        arvid_names=names, outbound_meta=outbound_meta,
+        assistant_contact_ids=queries.assistant_contact_ids(),
+        contact_names=queries.contact_names(contacts),
+        min_arvid_messages=min_arvid_messages,
+        min_human_messages=min_human_messages,
+        baseline_every=baseline_every, baseline_max=baseline_max,
+        direct_window_ms=direct_window_ms,
+        indirect_window_ms=indirect_window_ms,
+        silence_window_ms=silence_window_ms,
+    )
+
+
 __all__ = [
     "ARVID_EXAMPLES",
+    "BASELINE_EVERY",
+    "BASELINE_MAX",
+    "DIRECT_WINDOW_MS",
     "EXCERPT_CHARS",
+    "INDIRECT_WINDOW_MS",
+    "MIN_ARVID_MESSAGES",
     "MIN_CONVERSATIONS",
+    "MIN_HUMAN_MESSAGES",
     "MIN_REACTIONS",
     "NEGATIVE_EMOJIS",
+    "SILENCE_WINDOW_MS",
     "TOP_CONVERSATIONS",
     "TOP_MESSAGES",
     "ArvidEffect",
     "ArvidMessage",
+    "BaselineWindow",
     "ConversationSignal",
     "DigestWeek",
     "GroupSignals",
     "ReactedMessage",
+    "ReceptionMetrics",
+    "ReceptionWindow",
+    "compute_reception",
     "compute_signals",
     "excerpt",
     "iso_week",
@@ -673,6 +1240,7 @@ __all__ = [
     "message_kind",
     "previous_week",
     "read_group_signals",
+    "read_reception_signals",
     "time_of_day",
     "week_moment_ms",
     "week_of",
