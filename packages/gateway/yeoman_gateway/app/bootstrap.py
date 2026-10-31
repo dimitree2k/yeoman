@@ -10,6 +10,7 @@ import time
 from collections.abc import Awaitable, Callable, Iterable, Mapping
 from dataclasses import dataclass, replace
 from datetime import UTC, datetime
+from functools import lru_cache
 from pathlib import Path
 from typing import TYPE_CHECKING, Any, assert_never, cast
 from uuid import uuid4 as _uuid4
@@ -1982,6 +1983,207 @@ def build_group_digest_job(
         directory_terms=directory_terms,
     )
     return GroupDigestJob(runner=runner, knowledge=knowledge, chats=chats)
+
+
+def reception_persona_sha(
+    policy_engine: object, workspace: Path, chat_id: str
+) -> str:
+    """sha256 of the persona active for one chat, ``unknown`` when unreadable.
+
+    Cached by file path, mtime and size so the per-send metadata hook stays O(1):
+    hashing a multi-kilobyte persona on every outbound message would not be.
+    """
+    from yeoman_gateway.policy.persona import resolve_persona_path
+    from yeoman_gateway.reception.metrics import persona_sha
+
+    try:
+        policy = policy_engine.resolve_policy("whatsapp", chat_id)
+        persona_file = getattr(policy, "persona_file", None)
+        if not persona_file:
+            return persona_sha(None)
+        path = resolve_persona_path(persona_file, workspace)
+        stat = path.stat()
+        return _cached_persona_sha(str(path), stat.st_mtime_ns, stat.st_size)
+    except Exception:  # noqa: BLE001 - metadata must not block a send
+        return "unknown"
+
+
+@lru_cache(maxsize=64)
+def _cached_persona_sha(path: str, mtime_ns: int, size: int) -> str:
+    from yeoman_gateway.reception.metrics import persona_sha
+
+    del mtime_ns, size
+    try:
+        return persona_sha(Path(path).read_text(encoding="utf-8"))
+    except (OSError, UnicodeError):
+        return "unknown"
+
+
+def reception_chat_policy_context(
+    policy_engine: object, workspace: Path, chat_id: str
+) -> tuple[str, str, dict[str, object]]:
+    """Persona file, sha and the reception-only policy snapshot for one chat."""
+    from yeoman_gateway.reception.metrics import reception_policy_snapshot
+
+    policy = policy_engine.resolve_policy("whatsapp", chat_id)
+    sha = reception_persona_sha(policy_engine, workspace, chat_id)
+    persona_file = str(getattr(policy, "persona_file", "") or "")
+    return persona_file, sha, reception_policy_snapshot(policy, persona_sha_value=sha)
+
+
+def build_reception_jobs(
+    config: "Config",
+    *,
+    policy_engine: object,
+    history: object,
+    send_owner: Callable[[str], Any],
+    workspace: Path,
+    store: object | None = None,
+):
+    """Build the P1/P2/P3 ticks and the best-effort outbound recorder.
+
+    Deterministic weekly rows are always built when participation maintenance runs.
+    The labeler and the owner digest are skipped when ``processing.reception.enabled``
+    is false, but the recorder stays a no-op because no chat opted in anyway.
+    """
+    from yeoman_gateway.reception.labeler import (
+        LABEL_ROUTE,
+        ReceptionLabelJob,
+        ReceptionLabelRunner,
+    )
+    from yeoman_gateway.reception.metrics import (
+        ReceptionBounds,
+        ReceptionMetricsService,
+        ReceptionWeeklyJob,
+    )
+    from yeoman_gateway.reception.outbound import ReceptionOutboundRecorder
+    from yeoman_gateway.reception.owner import OwnerDigestJob, alert_sender
+    from yeoman_gateway.reception.store import SentimentStore
+
+    reception_config = config.processing.reception
+    sentiment_store = store if isinstance(store, SentimentStore) else SentimentStore()
+
+    def chats() -> tuple[str, ...]:
+        return tuple(policy_engine.reception_chats("whatsapp"))
+
+    def labels() -> dict[str, str]:
+        return policy_chat_labels(policy_engine)
+
+    def sha_for(chat_id: str) -> str:
+        return reception_persona_sha(policy_engine, workspace, chat_id)
+
+    def policy_context(chat_id: str) -> tuple[str, str, dict[str, object]]:
+        return reception_chat_policy_context(policy_engine, workspace, chat_id)
+
+    def bounds() -> ReceptionBounds:
+        return ReceptionBounds.from_config(config)
+
+    service = ReceptionMetricsService(
+        store=sentiment_store, history=history, bounds=bounds,
+        policy_context=policy_context,
+    )
+    weekly = ReceptionWeeklyJob(
+        service=service, chats=chats, run_hour=int(reception_config.digest_hour)
+    )
+    recorder = ReceptionOutboundRecorder(
+        store=sentiment_store,
+        enabled=lambda chat_id: policy_engine.reception_enabled("whatsapp", chat_id),
+        persona_sha=sha_for,
+    )
+    if not bool(reception_config.enabled):
+        return sentiment_store, weekly, None, None, recorder
+
+    from yeoman_gateway.processing.model_route import RouteClient
+
+    clients: dict[str, object] = {}
+
+    def client() -> object:
+        if "client" not in clients:
+            clients["client"] = RouteClient(
+                config=config, route_key=str(reception_config.label_route or LABEL_ROUTE)
+            )
+        return clients["client"]
+
+    label_runner = ReceptionLabelRunner(
+        store=sentiment_store,
+        history=history,
+        client_factory=client,
+        max_attempts=int(reception_config.max_attempts),
+        max_input_tokens=int(reception_config.max_input_tokens),
+        max_output_tokens=int(reception_config.max_output_tokens),
+        timeout_seconds=float(reception_config.timeout_seconds),
+        batch_messages=int(reception_config.batch_messages),
+        baseline_every=int(reception_config.baseline_every),
+        baseline_max=int(reception_config.baseline_max),
+        min_arvid_messages=int(reception_config.min_arvid_messages),
+        min_human_messages=int(reception_config.min_human_messages),
+        direct_window_ms=int(reception_config.direct_window_minutes) * 60_000,
+        indirect_window_ms=int(reception_config.indirect_window_minutes) * 60_000,
+        silence_window_ms=int(reception_config.silence_window_minutes) * 60_000,
+    )
+    label_job = ReceptionLabelJob(
+        runner=label_runner, chats=chats, run_hour=int(reception_config.label_hour),
+        alert_sender=alert_sender(
+            store=sentiment_store, chat_labels=labels, send=send_owner
+        ),
+        alert_threshold=int(reception_config.alert_threshold),
+        alert_window_hours=int(reception_config.alert_window_hours),
+    )
+    owner_job = OwnerDigestJob(
+        store=sentiment_store, chats=chats, chat_labels=labels, send=send_owner,
+        quotes=_reception_quotes(config, history=history, store=sentiment_store),
+        run_hour=int(reception_config.digest_hour),
+    )
+    return sentiment_store, weekly, label_job, owner_job, recorder
+
+
+def policy_chat_labels(policy_engine: object) -> dict[str, str]:
+    """Reception-enabled chat ids to their owner-written ``comment`` label."""
+    policy = getattr(policy_engine, "policy", None)
+    channels = getattr(policy, "channels", None) or {}
+    channel = channels.get("whatsapp") if hasattr(channels, "get") else None
+    if channel is None:
+        return {}
+    result: dict[str, str] = {}
+    for chat_id, override in getattr(channel, "chats", {}).items():
+        if not getattr(override, "reception_metrics", False):
+            continue
+        result[str(chat_id)] = str(getattr(override, "comment", "") or chat_id)
+    return result
+
+
+def _reception_quotes(
+    config: "Config", *, history: object, store: object
+) -> Callable[[str, str], Any]:
+    """Live quote reader used only at owner-DM send time; nothing is stored."""
+    from yeoman_gateway.history.group_signals import iso_week, read_reception_signals
+
+    async def quotes(chat_id: str, week_label: str) -> list[str]:
+        from yeoman_gateway.history.context import history_turn
+        from yeoman_gateway.history.queries import HistoryQueries
+
+        week = iso_week(week_label)
+        async with history_turn(history) as snapshot:
+            queries = HistoryQueries(snapshot)
+            signals = read_reception_signals(queries, chat_id, week)
+            result: list[str] = []
+            for window in signals.windows:
+                if not (window.direct or window.indirect):
+                    continue
+                row = queries.message(window.message_id)
+                if row is None or row.get("direction") == "out":
+                    continue
+                text = " ".join(
+                    str(row.get("current_text") or row.get("text") or "").split()
+                )
+                if text:
+                    result.append(text[:240])
+                if len(result) >= 3:
+                    break
+            return result
+
+    return quotes
+
 
 
 def build_group_notes_read_path(
@@ -4107,6 +4309,86 @@ def build_gateway_runtime(
             now_ms=int(time.time() * 1000),
         )
 
+    async def ipc_sentiment_run(args: dict[str, Any]) -> dict[str, Any]:
+        """Owner backfill: P1 weeks plus P2 daily labels, all inside the gateway."""
+        from datetime import date
+
+        from yeoman_gateway.processing.model_route import RouteClient
+        from yeoman_gateway.reception.labeler import (
+            LABEL_ROUTE,
+            ReceptionLabelRunner,
+            day_window,
+        )
+        from yeoman_gateway.reception.metrics import (
+            ReceptionBounds,
+            ReceptionMetricsService,
+        )
+        from yeoman_gateway.reception.store import SentimentStore
+
+        try:
+            since = date.fromisoformat(str(args["since"]))
+        except ValueError:
+            return {"status": "error", "code": "INVALID_DATE"}
+        now = int(time.time() * 1000)
+        since_ms = int(datetime(since.year, since.month, since.day).timestamp() * 1000)
+        chat_arg = str(args.get("chat") or "").strip()
+        chats = [chat_arg] if chat_arg else list(policy_engine.reception_chats("whatsapp"))
+        if not chats:
+            return {"status": "ok", "weeks": 0, "labels": 0}
+        store = SentimentStore()
+        try:
+            service = ReceptionMetricsService(
+                store=store,
+                history=history_projector,
+                bounds=lambda: ReceptionBounds.from_config(config),
+                policy_context=lambda chat_id: reception_chat_policy_context(
+                    policy_engine, Path(workspace), chat_id
+                ),
+            )
+            reception_config = config.processing.reception
+            clients: dict[str, object] = {}
+
+            def client() -> object:
+                if "client" not in clients:
+                    clients["client"] = RouteClient(
+                        config=config,
+                        route_key=str(reception_config.label_route or LABEL_ROUTE),
+                    )
+                return clients["client"]
+
+            runner = ReceptionLabelRunner(
+                store=store, history=history_projector, client_factory=client,
+                max_attempts=int(reception_config.max_attempts),
+                max_input_tokens=int(reception_config.max_input_tokens),
+                max_output_tokens=int(reception_config.max_output_tokens),
+                timeout_seconds=float(reception_config.timeout_seconds),
+                batch_messages=int(reception_config.batch_messages),
+                baseline_every=int(reception_config.baseline_every),
+                baseline_max=int(reception_config.baseline_max),
+                min_arvid_messages=int(reception_config.min_arvid_messages),
+                min_human_messages=int(reception_config.min_human_messages),
+                direct_window_ms=int(reception_config.direct_window_minutes) * 60_000,
+                indirect_window_ms=(
+                    int(reception_config.indirect_window_minutes) * 60_000
+                ),
+                silence_window_ms=int(reception_config.silence_window_minutes) * 60_000,
+            )
+            weeks = 0
+            labels = 0
+            for chat_id in chats:
+                outcomes = await service.backfill(
+                    chat_id=chat_id, since_ms=since_ms, until_ms=now
+                )
+                weeks += len(outcomes)
+                day = day_window(since_ms)
+                while day.end_ms <= now:
+                    outcome = await runner.label_day(chat_id, day)
+                    labels += outcome.labels
+                    day = day_window(day.end_ms)
+            return {"status": "ok", "weeks": weeks, "labels": labels, "chats": len(chats)}
+        finally:
+            store.close()
+
     gateway_socket = GatewaySocket(
         path=socket_path,
         send_message_handler=ipc_send_message,
@@ -4123,6 +4405,7 @@ def build_gateway_runtime(
         history_read_handler=ipc_history_read,
         history_control_handler=history_projector.control,
         send_poll_handler=ipc_send_poll,
+        sentiment_run_handler=ipc_sentiment_run,
         rate_limit=ipc_config.command_rate_limit,
     )
 
@@ -4365,6 +4648,32 @@ def build_gateway_runtime(
                 return result
             return {"status": "skipped"}
 
+        async def _send_reception_owner(content: str) -> None:
+            target = _cron_owner_dm()
+            if target is None:
+                logger.warning("reception: no owner DM configured")
+                return
+            channel, chat_id = target
+            await channels.send_now(
+                OutboundMessage(channel=channel, chat_id=chat_id, content=content)
+            )
+
+        (
+            _reception_store,
+            reception_weekly,
+            reception_label,
+            reception_owner,
+            reception_recorder,
+        ) = build_reception_jobs(
+            config,
+            policy_engine=policy_engine,
+            history=history_projector,
+            send_owner=_send_reception_owner,
+            workspace=Path(workspace),
+        )
+        if effect_router is not None:
+            effect_router.set_reception_recorder(reception_recorder)
+
         if participation_maintenance is not None:
             participation_maintenance._config = config
             participation_maintenance._history_projector = history_projector
@@ -4378,6 +4687,9 @@ def build_gateway_runtime(
                 chats=lambda: participation_group_chats(config, _participation_active),
                 directory_terms=people.deny_terms,
             )
+            participation_maintenance._reception_weekly = reception_weekly
+            participation_maintenance._reception_label = reception_label
+            participation_maintenance._reception_owner = reception_owner
         burst_observer = BurstObserver(
             config=config,
             state_path=get_operational_store_path("burst_state"),

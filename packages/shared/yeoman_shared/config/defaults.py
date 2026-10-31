@@ -73,6 +73,14 @@ DEFAULT_MODEL_PROFILES: dict[str, dict[str, Any]] = {
         "temperature": 0.0,
         "timeout_ms": 10000,
     },
+    "reception_label": {
+        "kind": "chat",
+        "provider": "deepseek",
+        "model": "deepseek-v4-flash",
+        "max_tokens": 1200,
+        "temperature": 0.0,
+        "timeout_ms": 30000,
+    },
 }
 
 DEFAULT_MODEL_ROUTES: dict[str, str] = {
@@ -91,6 +99,7 @@ DEFAULT_MODEL_ROUTES: dict[str, str] = {
     "memory.capture.extract": "memory_capture_fast",
     "security.classify": "security_classifier",
     "meme.background": "meme_background",
+    "reception.label": "reception_label",
 }
 
 DEFAULT_WHATSAPP_MEDIA: dict[str, Any] = {

@@ -845,6 +845,8 @@ class IntentEffectRouter:
         # was frozen with is remembered per source message and preferred over that heuristic.
         self._frozen_turns: OrderedDict[str, Any] = OrderedDict()
         self._frozen_turn_cap = 256
+        #: Optional best-effort recorder for reception measurement; never changes routing.
+        self._reception_recorder: Callable[..., None] | None = None
         processing = getattr(config, "processing", None)
         budgets = getattr(processing, "budgets", None)
         self._budget = budget or (
@@ -895,6 +897,10 @@ class IntentEffectRouter:
     def set_direct_transport(self, outbound: Any, reaction: Any) -> None:
         """Install the confirming channel transport on the gateway's executor."""
         self._gateway.set_direct_senders(outbound, reaction)
+
+    def set_reception_recorder(self, recorder: Callable[..., None] | None) -> None:
+        """Install the best-effort outbound metadata hook (reception measurement)."""
+        self._reception_recorder = recorder
 
     def effect_covers(self, effect_id: str, channel: str, chat_id: str) -> bool:
         """True only for a real persisted effect whose target is this chat."""
@@ -1223,6 +1229,7 @@ class IntentEffectRouter:
                     now_ms=self._clock(),
                 )
         self._confirm_quotable_message(envelope, result, now=now)
+        self._record_reception_metadata(envelope, admission, result, now=now)
         logger.info(
             "routing_effect effect_id={} state={} chat={} turn_id={} revision={} detail={}",
             receipt.effect_id,
@@ -1288,6 +1295,21 @@ class IntentEffectRouter:
             attach(envelope.effect_id, provider_id, int(now))
         except Exception as exc:  # pragma: no cover - defensive
             logger.debug("thread_message_confirm_skipped effect={} error={}", envelope.effect_id, exc)
+
+    def _record_reception_metadata(
+        self, envelope: EffectEnvelope, admission: Any, result: Any, *, now: int
+    ) -> None:
+        """Best effort only: a metadata failure must never affect the send."""
+        recorder = self._reception_recorder
+        if recorder is None:
+            return
+        try:
+            recorder(envelope, admission, result, int(now))
+        except Exception as exc:  # noqa: BLE001 - reception metadata is advisory
+            logger.debug(
+                "reception_outbound_hook_skipped effect={} error_type={}",
+                envelope.effect_id, type(exc).__name__,
+            )
 
     def _close_ambient_turn(self, turn_id: str, *, now: int) -> None:
         """An ambient order ends with its answer: turn and thread close right away.

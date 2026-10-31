@@ -1000,6 +1000,40 @@ class ProcessingShortReplyConfig(BaseModel):
         return self.mode
 
 
+class ProcessingReceptionConfig(BaseModel):
+    """Reception measurement: deterministic windows, labels, and owner reporting.
+
+    The per-chat opt-in stays in policy (``receptionMetrics``); these are the global
+    thresholds, budgets and schedule.
+    """
+
+    model_config = ConfigDict(extra="forbid", populate_by_name=True)
+
+    enabled: bool = True
+    label_route: str = Field(default="reception.label", alias="labelRoute")
+    direct_window_minutes: int = Field(default=30, alias="directWindowMinutes", ge=1)
+    indirect_window_minutes: int = Field(default=5, alias="indirectWindowMinutes", ge=1)
+    silence_window_minutes: int = Field(default=10, alias="silenceWindowMinutes", ge=1)
+    min_arvid_messages: int = Field(default=5, alias="minArvidMessages", ge=0)
+    min_human_messages: int = Field(default=50, alias="minHumanMessages", ge=0)
+    baseline_every: int = Field(default=5, alias="baselineEvery", ge=1)
+    baseline_max: int = Field(default=200, alias="baselineMax", ge=1, le=500)
+    #: Labeler batching and call bounds.
+    label_hour: int = Field(default=3, alias="labelHour", ge=0, le=23)
+    batch_messages: int = Field(default=6, alias="batchMessages", ge=1, le=20)
+    max_input_tokens: int = Field(default=6_000, alias="maxInputTokens", ge=512)
+    max_output_tokens: int = Field(default=1_200, alias="maxOutputTokens", ge=128)
+    timeout_seconds: float = Field(default=30.0, alias="timeoutSeconds", gt=0, le=120)
+    max_attempts: int = Field(default=2, alias="maxAttempts", ge=1, le=5)
+    #: Weekly owner report and alerting.
+    digest_hour: int = Field(default=5, alias="digestHour", ge=0, le=23)
+    alert_hour: int = Field(default=8, alias="alertHour", ge=0, le=23)
+    alert_threshold: int = Field(default=3, alias="alertThreshold", ge=1, le=20)
+    alert_window_hours: int = Field(default=24, alias="alertWindowHours", ge=1, le=168)
+    #: Sticker vision is deliberately not implemented; the switch stays off.
+    sticker_vision: bool = Field(default=False, alias="stickerVision")
+
+
 class ProcessingConfig(BaseModel):
     """State-aware message processing (spec section 4).
 
@@ -1038,6 +1072,7 @@ class ProcessingConfig(BaseModel):
     participation: ProcessingParticipationConfig = Field(
         default_factory=ProcessingParticipationConfig
     )
+    reception: ProcessingReceptionConfig = Field(default_factory=ProcessingReceptionConfig)
     participation_maintenance: ProcessingParticipationMaintenanceConfig = Field(
         default_factory=ProcessingParticipationMaintenanceConfig
     )

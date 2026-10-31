@@ -439,6 +439,8 @@ class ChatPolicy(PolicyModel):
     group_reminders: bool = Field(default=False, alias="groupReminders")
     #: Opt-in switch for the decisions tool; off unless a chat or channel enables it.
     decisions: bool = False
+    #: Opt-in switch for reception measurement (sentiment.db); off unless a chat enables it.
+    reception_metrics: bool = Field(default=False, alias="receptionMetrics")
     session_history_limit: int | None = Field(default=None, alias="sessionHistoryLimit")
 
 
@@ -469,6 +471,8 @@ class ChatPolicyOverride(PolicyModel):
     polls: bool | None = None
     group_reminders: bool | None = Field(default=None, alias="groupReminders")
     decisions: bool | None = None
+    #: Per-chat reception measurement opt-in; the owner sets it for selected groups.
+    reception_metrics: bool | None = Field(default=None, alias="receptionMetrics")
     session_history_limit: int | None = Field(default=None, alias="sessionHistoryLimit", ge=1, le=100)
 
 

@@ -42,6 +42,7 @@ class GatewaySocket:
     history_read_handler: Callable[[dict[str, Any]], Awaitable[dict[str, Any]]] | None = None
     history_control_handler: Callable[[str, Mapping[str, Any]], Awaitable[dict[str, Any]]] | None = None
     send_poll_handler: Callable[[dict[str, Any]], Awaitable[dict[str, Any]]] | None = None
+    sentiment_run_handler: Callable[[dict[str, Any]], Awaitable[dict[str, Any]]] | None = None
     rate_limit: int = 10  # commands per second
     _server: asyncio.Server | None = field(default=None, init=False)
     _request_timestamps: list[float] = field(default_factory=list, init=False)
@@ -100,7 +101,7 @@ class GatewaySocket:
                     if (not isinstance(request, dict) or not isinstance(request.get('cmd'), str) or
                             not isinstance(request.get('args', {}), dict)):
                         raise ValueError('invalid frame')
-                    if request['cmd'] in {'history_control', 'history_read', 'knowledge_read', 'history_chats', 'knowledge_accounting', 'knowledge_statements', 'send_poll'} and not self._peer_is_owner(writer):
+                    if request['cmd'] in {'history_control', 'history_read', 'knowledge_read', 'history_chats', 'knowledge_accounting', 'knowledge_statements', 'send_poll', 'sentiment_run'} and not self._peer_is_owner(writer):
                         response = {'status': 'error', 'code': 'OWNER_REQUIRED'}
                     elif not self._check_rate_limit():
                         response = {"status": "error", "message": "Rate limit exceeded"}
@@ -198,6 +199,20 @@ class GatewaySocket:
                 return {'status': 'error', 'code': 'INVALID_OPERATION'}
             except Exception:
                 return {'status': 'error', 'code': 'HISTORY_CONTROL_FAILED'}
+
+        if cmd == 'sentiment_run':
+            fields = {'since', 'chat'}
+            if (set(request) != {'cmd', 'args'} or set(args) != fields
+                    or not isinstance(args['since'], str) or not args['since']
+                    or not isinstance(args['chat'], str)
+                    or (args['chat'] and '@' not in args['chat'])):
+                return {'status': 'error', 'code': 'INVALID_SENTIMENT'}
+            if self.sentiment_run_handler is None:
+                return {'status': 'disabled'}
+            try:
+                return await self.sentiment_run_handler(args)
+            except Exception:
+                return {'status': 'error', 'code': 'SENTIMENT_RUN_FAILED'}
 
         if cmd == 'send_poll':
             fields = {'chat_id', 'question', 'options', 'multi_select', 'request_id'}

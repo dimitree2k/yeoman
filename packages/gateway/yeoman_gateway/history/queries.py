@@ -6,6 +6,7 @@ import hashlib
 import json
 import re
 import unicodedata
+from collections.abc import Iterable
 from typing import TYPE_CHECKING, Any
 
 from yeoman_gateway.knowledge import EvidenceAudience
@@ -689,6 +690,55 @@ class HistoryQueries:
         """
         names, phones, _ = self.participant_deny_terms(chat_id=chat_id)
         return names, phones
+
+    def assistant_identity(self) -> tuple[tuple[str, ...], tuple[str, ...]]:
+        """Arvid's identifiers and display-name tokens from the contacts table.
+
+        Identifiers are the strong JID/LID values the assistant contact owns, so a
+        mention can be matched without guessing. Names are the whole display name and
+        every push name, split by the caller into case-insensitive whole words.
+        """
+        ids = self.assistant_contact_ids()
+        if not ids:
+            return (), ()
+        rows = self._rows(
+            "SELECT kind, value FROM identifier_history WHERE channel='whatsapp'"
+            " AND contact_id IN (SELECT value FROM json_each(?))",
+            (json.dumps(sorted(ids)),),
+        )
+        identifiers = {
+            str(row["value"]) for row in rows if row["kind"] in ("lid", "pn_jid") and row["value"]
+        }
+        names = {
+            str(row["display_name"]).strip()
+            for row in self._rows(
+                "SELECT display_name FROM contacts WHERE contact_id IN"
+                " (SELECT value FROM json_each(?))",
+                (json.dumps(sorted(ids)),),
+            )
+            if row["display_name"]
+        }
+        names.update(str(row["value"]).strip() for row in rows if row["kind"] == "push_name")
+        return (
+            tuple(sorted(identifiers)),
+            tuple(sorted((name for name in names if name), key=str.casefold)),
+        )
+
+    def contact_names(self, contact_ids: Iterable[str]) -> dict[str, str]:
+        """Terminal contact id to display name, for whole-word name matching only."""
+        wanted = {str(item) for item in contact_ids if str(item)}
+        if not wanted:
+            return {}
+        rows = self._rows(
+            "SELECT contact_id, display_name FROM contacts WHERE contact_id IN"
+            " (SELECT value FROM json_each(?))",
+            (json.dumps(sorted(wanted)),),
+        )
+        return {
+            str(row["contact_id"]): str(row["display_name"])
+            for row in rows
+            if row["display_name"]
+        }
 
     def participant_deny_terms(
         self, *, chat_id: str
