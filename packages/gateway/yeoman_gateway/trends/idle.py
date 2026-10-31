@@ -50,8 +50,9 @@ class TrendIdleWatcher:
                 continue
             raw = self._trigger(channel, chat_id)
             if inspect.isawaitable(raw):
-                await raw
-            fired.append(chat_id)
+                raw = await raw
+            if raw is not None:  # None: no fresh cards, nothing was offered
+                fired.append(chat_id)
         return fired
 
     async def _run(self) -> None:

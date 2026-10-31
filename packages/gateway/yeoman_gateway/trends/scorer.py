@@ -73,7 +73,7 @@ class ChatRoute(Protocol):
 class TrendScorer:
     """Rates a batch of trend items in one call and validates every verdict."""
 
-    def __init__(self, *, client: ChatRoute, language: str = "de", max_tokens: int = 3000) -> None:
+    def __init__(self, *, client: ChatRoute, language: str = "de", max_tokens: int = 6000) -> None:
         self._client = client
         self._language = {"de": "German", "en": "English"}.get(language, language)
         self._max_tokens = max_tokens

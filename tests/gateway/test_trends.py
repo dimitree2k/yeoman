@@ -306,3 +306,42 @@ async def test_service_rewrites_from_the_article_and_drops_stale_foreign_or_unre
     assert "Grillen im Tourbus" in system["content"] and "German" in system["content"]
     assert "Article:\nBody." in user["content"]
     await service.stop()
+
+
+def test_news_feeds_rss_and_atom_become_items_with_their_link() -> None:
+    from yeoman_gateway.trends.sources import parse_news_feed
+
+    rss = """<rss><channel>
+      <item><title>Mann klaut  Bagger</title><link>https://ex.de/a</link>
+        <pubDate>Sat, 31 Oct 2026 18:17:07 +0100</pubDate></item>
+      <item><title>ohne link</title></item>
+      <item><title>kein web</title><link>javascript:alert(1)</link></item>
+    </channel></rss>"""
+    atom = """<feed xmlns="http://www.w3.org/2005/Atom"><entry><title>Florida man</title>
+      <link href="https://ex.com/b"/><published>2026-10-31T10:00:00+00:00</published>
+      </entry></feed>"""
+    items = parse_news_feed(rss, source="rss:ex.de")
+    assert [(item.title, item.urls) for item in items] == [("Mann klaut Bagger", {"https://ex.de/a"})]
+    assert items[0].key == "rss:ex.de:https://ex.de/a"
+    from datetime import UTC, datetime
+
+    assert items[0].published_at_ms == int(datetime(2026, 10, 31, 17, 17, 7, tzinfo=UTC).timestamp() * 1000)
+    assert [item.title for item in parse_news_feed(atom, source="rss:ex.com")] == ["Florida man"]
+
+
+def test_configured_feeds_are_sources_next_to_google() -> None:
+    from yeoman_gateway.trends.service import build_trends_service
+    from yeoman_shared.config.schema import Config
+
+    config = Config.model_validate({
+        "models": {"profiles": {"w": {"kind": "chat", "model": "m", "provider": "openrouter"}},
+                   "routes": {"trends.score": "w"}},
+        "trends": {"enabled": True, "rssFeeds": ["https://www.n-tv.de/panorama/rss"]},
+    })
+    import os
+
+    os.environ.setdefault("OPENROUTER_API_KEY", "test")
+    service = build_trends_service(config, store_path=__import__("pathlib").Path(
+        __import__("tempfile").mkdtemp()) / "t.db")
+    assert [source.name for source in service.sources] == ["google_trends:DE", "rss:n-tv.de"]
+    service.store.close()

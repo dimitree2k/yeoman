@@ -578,7 +578,10 @@ def test_ledger_counts_sent_comments_that_carried_a_card(tmp_path: Path) -> None
 async def test_idle_watcher_triggers_only_long_silent_groups_it_may_post_in() -> None:
     from yeoman_gateway.trends.idle import TrendIdleWatcher
 
-    last = {"quiet": NOW_MS - 5 * HOUR_MS, "chatty": NOW_MS - HOUR_MS, "capped": 0, "new": None}
+    last = {
+        "quiet": NOW_MS - 5 * HOUR_MS, "quiet-no-cards": NOW_MS - 5 * HOUR_MS,
+        "chatty": NOW_MS - HOUR_MS, "capped": 0, "new": None,
+    }
     triggered: list[str] = []
 
     async def last_activity(channel: str, chat_id: str) -> int | None:
@@ -588,9 +591,11 @@ async def test_idle_watcher_triggers_only_long_silent_groups_it_may_post_in() ->
         chats=lambda: [(CHANNEL, chat, None) for chat in last],
         last_activity_ms=last_activity,
         may_post=lambda channel, chat_id: chat_id != "capped",
-        trigger=lambda channel, chat_id: triggered.append(chat_id),
+        trigger=lambda channel, chat_id: triggered.append(chat_id) or (
+            None if chat_id == "quiet-no-cards" else {"status": "offered"}
+        ),
         idle_ms=4 * HOUR_MS,
         clock=lambda: NOW_MS / 1000,
     )
     assert await watcher.tick() == ["quiet"]
-    assert triggered == ["quiet"]
+    assert triggered == ["quiet", "quiet-no-cards"]
