@@ -31,7 +31,11 @@ _REPAIR_FEEDBACK_RE = re.compile(
     r")\b"
 )
 _RESEARCH_REQUEST_RE = re.compile(
-    r"(?i)\b(deep\s+search|deep\s+research|recherch|quellen?|sources?|such(?:e|st)?|prüf|pruef)\b"
+    r"(?i)\b("
+    r"deep\s+search|deep\s+research|recherch\w*|quellen?|sources?|such(?:e|st)?|"
+    r"prüf\w*|pruef\w*|studien?|umfragen?|find(?:e|et|est)?\s+(?:\w+\s+){0,4}?(?:he)?raus|"
+    r"find\s+out|look\s+up"
+    r")\b"
 )
 _SIDE_EFFECT_FOLLOWUP_RE = re.compile(
     r"(?i)\b("

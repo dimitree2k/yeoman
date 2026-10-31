@@ -328,3 +328,78 @@ def test_evidence_still_uses_long_form_limit(content: str) -> None:
     assert budget is not None
     reply, _ = enforce_reply_budget(content, budget.as_metadata())
     assert reply == content
+
+
+def _short_take_budget(target: int = 420) -> dict[str, object]:
+    from yeoman_gateway.reply_budget import derive_reply_budget
+
+    budget = derive_reply_budget(
+        policy={"enabled": True, "targets": {"short_take": target}},
+        answer_shape="short_take",
+        content="Kennst du die Umfragen?",
+        is_owner=False,
+    )
+    assert budget is not None and budget.hard_cap_enabled
+    return budget.as_metadata()
+
+
+def test_clip_keeps_every_sentence_that_fits_not_only_the_first() -> None:
+    from yeoman_gateway.reply_budget import enforce_reply_budget
+
+    # The Finanzgruppe failure: a one-line opener followed by the findings.
+    text = (
+        "Gefunden, was es gibt und was nicht. "
+        "Eine Umfrage von 2025 zeigt breite Ablehnung von KI-Models in der Modewerbung. "
+        "Eine zweite Erhebung findet vor allem bei Juengeren Skepsis. "
+        + "Danach kommt noch ein sehr langer Absatz, der nicht mehr in das Budget passt. " * 4
+    )
+    reply, result = enforce_reply_budget(text, _short_take_budget(200))
+
+    assert reply.startswith("Gefunden, was es gibt und was nicht. Eine Umfrage von 2025")
+    assert reply.endswith("Skepsis.")
+    assert result["after_chars"] == len(reply)
+
+
+def test_clip_preserves_line_breaks_and_drops_a_dangling_lead_in() -> None:
+    from yeoman_gateway.reply_budget import enforce_reply_budget
+
+    text = (
+        "Kurz vorweg, das ist duenn belegt.\n"
+        "Die ueblichen Verdaechtigen:\n"
+        "- *Morning Consult 2023*: 57 von 100 befragten Gen Z wollen Influencer werden, "
+        "bei allen Erwachsenen deutlich weniger, und die Stichprobe ist klein."
+    )
+    reply, _ = enforce_reply_budget(text, _short_take_budget(80))
+
+    assert reply == "Kurz vorweg, das ist duenn belegt."
+
+
+def test_clip_keeps_bullet_lines_that_fit() -> None:
+    from yeoman_gateway.reply_budget import enforce_reply_budget
+
+    text = "Zwei Quellen:\n- Erste Studie zeigt Ablehnung\n- Zweite Studie zeigt Skepsis\n" + "x " * 300
+    reply, _ = enforce_reply_budget(text, _short_take_budget(120))
+
+    assert reply == "Zwei Quellen:\n- Erste Studie zeigt Ablehnung\n- Zweite Studie zeigt Skepsis"
+
+
+def test_research_tool_turn_gets_the_long_form_limit() -> None:
+    from yeoman_gateway.reply_budget import enforce_reply_budget
+
+    budget = _short_take_budget(80)
+    capped, _ = enforce_reply_budget(_LONG_REPLY, budget, tool_used=True)
+    researched, result = enforce_reply_budget(
+        _LONG_REPLY, budget, tool_used=True, research_used=True
+    )
+
+    assert capped == _SHORT_REPLY
+    assert researched == _LONG_REPLY
+    assert result["applied"] is False
+
+
+def test_percent_figures_count_as_current_data() -> None:
+    from yeoman_gateway.reply_budget import has_domain_sensitive_signal
+
+    assert has_domain_sensitive_signal("AMD fiel um 11,9% heute")
+    assert has_domain_sensitive_signal("57 % der Befragten")
+    assert not has_domain_sensitive_signal("Ganz normaler Satz ohne Zahlen")
