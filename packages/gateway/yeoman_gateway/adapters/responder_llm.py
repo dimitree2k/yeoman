@@ -72,7 +72,11 @@ from yeoman_gateway.processing.tool_context import (
     tool_in_group_chat,
 )
 from yeoman_gateway.providers.base import LLMProvider, LLMProviderError, ToolCallRequest
-from yeoman_gateway.reply_budget import derive_reply_budget, enforce_reply_budget
+from yeoman_gateway.reply_budget import (
+    RESEARCH_TOOL_NAMES,
+    derive_reply_budget,
+    enforce_reply_budget,
+)
 from yeoman_gateway.session.manager import SessionManager
 from yeoman_gateway.trends.seeds import is_trend_source
 
@@ -2057,6 +2061,8 @@ class LLMResponder(ResponderPort):
                 if tool_calls:
                     if current_metadata is not None:
                         current_metadata["reply_budget_tool_used"] = True
+                        if any(tc.name in RESEARCH_TOOL_NAMES for tc in tool_calls):
+                            current_metadata["reply_budget_research_used"] = True
                     tool_call_dicts: list[dict[str, Any]] = [
                         {
                             "id": tc.id,
@@ -3205,6 +3211,7 @@ class LLMResponder(ResponderPort):
             budget_metadata,
             user_content=content,
             tool_used=bool(metadata.get("reply_budget_tool_used", False)),
+            research_used=bool(metadata.get("reply_budget_research_used", False)),
         )
         if bool(budget_result.get("applied", False)):
             self._metric("reply_budget_enforced", labels=(("channel", channel),))

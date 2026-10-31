@@ -20,16 +20,33 @@ DEFAULT_REPLY_BUDGET_TARGETS: dict[str, int] = {
 }
 DEFAULT_REPLY_BUDGET_HARD_MAX_CHARS = 600
 DEFAULT_REPLY_BUDGET_LONG_FORM_MAX_CHARS = 2200
+#: Tools whose results are evidence the answer has to carry. A turn that called one is
+#: budgeted like a researched answer, whatever shape the request was filed under.
+RESEARCH_TOOL_NAMES: frozenset[str] = frozenset(
+    {
+        "web_search",
+        "web_fetch",
+        "web_map",
+        "web_crawl",
+        "deep_research",
+        "fact_check",
+        "browse",
+        "youtube_transcript",
+        "market_quote",
+        "market_intelligence",
+    }
+)
 
-_SENTENCE_SPLIT_RE = re.compile(r"(?<=[.!?])\s+")
+#: Places a reply may be cut: after a sentence end, or at a line break.
+_CLIP_BOUNDARY_RE = re.compile(r"(?<=[.!?])[ \t]+|\n+")
 _URL_RE = re.compile(r"(?i)\bhttps?://|www\.")
 _CODE_RE = re.compile(r"```|`[^`]+`|^\s{4,}\S", re.MULTILINE)
 _CURRENT_DATA_RE = re.compile(
     r"(?i)\b("
     r"kurs|quote|preis|rendite|zins|"
     r"price|market|stock|ticker|crypto|forex|yield|"
-    r"aktie|etf|index|börse|boerse|dax|nasdaq|s&p|bitcoin|btc|eth|%"
-    r")\b"
+    r"aktie|etf|index|börse|boerse|dax|nasdaq|s&p|bitcoin|btc|eth"
+    r")\b|\d\s?%"
 )
 _LEGAL_OR_CAVEAT_RE = re.compile(
     r"(?i)\b("
@@ -201,24 +218,31 @@ def enforce_reply_budget(
     *,
     user_content: str = "",
     tool_used: bool = False,
+    research_used: bool = False,
 ) -> tuple[str, dict[str, object]]:
     """Return final text plus enforcement metadata."""
-    # Tool use alone says nothing about how much explanation the answer needs.
+    # Tool use alone says nothing about how much explanation the answer needs; a research
+    # tool does, because its findings are what the answer exists to report.
     del tool_used
     original = str(text or "").strip()
     if not original or not isinstance(budget, dict) or not bool(budget.get("enabled", False)):
         return original, {"applied": False, "reason": "disabled"}
 
-    final_sensitive = has_domain_sensitive_signal(original) or has_domain_sensitive_signal(user_content)
+    final_sensitive = (
+        research_used
+        or has_domain_sensitive_signal(original)
+        or has_domain_sensitive_signal(user_content)
+    )
     if final_sensitive or bool(budget.get("long_form_allowed", False)):
         limit = int(budget.get("long_form_max_chars") or DEFAULT_REPLY_BUDGET_LONG_FORM_MAX_CHARS)
         if len(original) <= limit:
             return original, {"applied": False, "reason": "domain_sensitive_or_long_form"}
-        return _clip_at_sentence_or_word(original, limit), {
+        clipped = _clip_at_sentence_or_word(original, limit)
+        return clipped, {
             "applied": True,
             "reason": "long_form_max_chars",
             "before_chars": len(original),
-            "after_chars": min(len(original), limit),
+            "after_chars": len(clipped),
         }
 
     if not bool(budget.get("hard_cap_enabled", True)):
@@ -229,22 +253,28 @@ def enforce_reply_budget(
     limit = max(1, min(target, hard_max))
     if len(original) <= limit:
         return original, {"applied": False, "reason": "within_budget"}
-    return _clip_at_sentence_or_word(original, limit), {
+    clipped = _clip_at_sentence_or_word(original, limit)
+    return clipped, {
         "applied": True,
         "reason": "target_chars",
         "before_chars": len(original),
-        "after_chars": min(len(original), limit),
+        "after_chars": len(clipped),
     }
 
 
 def _clip_at_sentence_or_word(text: str, limit: int) -> str:
-    compact = " ".join(str(text or "").strip().split())
+    """Keep as many whole sentences or lines as fit, falling back to a word cut."""
+    lines = [" ".join(line.split()) for line in str(text or "").strip().splitlines()]
+    compact = re.sub(r"\n{3,}", "\n\n", "\n".join(lines)).strip()
     if len(compact) <= limit:
         return compact
 
-    first_sentence = _SENTENCE_SPLIT_RE.split(compact, maxsplit=1)[0].strip()
-    if first_sentence and len(first_sentence) <= limit:
-        return first_sentence
+    cuts = [match.start() for match in _CLIP_BOUNDARY_RE.finditer(compact) if match.start() <= limit]
+    # A kept prefix that ends on a lead-in ("die Studien:") promises what was cut away.
+    while cuts and compact[: cuts[-1]].rstrip().endswith(":"):
+        cuts.pop()
+    if cuts:
+        return compact[: cuts[-1]].rstrip()
 
     suffix = "..."
     clipped = compact[: max(1, limit - len(suffix))].rstrip()
