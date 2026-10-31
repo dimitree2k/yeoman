@@ -5,8 +5,10 @@ from __future__ import annotations
 from datetime import UTC, datetime
 from pathlib import Path
 
+import pytest
 from yeoman_gateway.history.group_signals import week_of
 from yeoman_gateway.reception.alerts import alert_reason
+from yeoman_gateway.reception.owner import OwnerDigestJob
 from yeoman_gateway.reception.report import (
     label_agreement,
     persona_before_after,
@@ -119,10 +121,12 @@ def test_weekly_digest_uses_live_quotes_without_storing_them(tmp_path: Path) -> 
     store.close()
 
 
-def test_label_agreement_reports_accuracy_and_confusion() -> None:
+def test_label_agreement_judges_each_reply_across_its_labels() -> None:
     actual = [
         LabelRow(CHAT, "2026-W41", "a-1", "m-1", "yes", "playful", (), 0.9, "fake", "v1", 1),
+        # m-2 followed two Arvid messages: the "yes" label speaks for the reply.
         LabelRow(CHAT, "2026-W41", "a-1", "m-2", "no", "neutral", (), 0.9, "fake", "v1", 1),
+        LabelRow(CHAT, "2026-W41", "a-2", "m-2", "yes", "annoyed", (), 0.6, "fake", "v1", 1),
     ]
     report = label_agreement(
         expected=[
@@ -133,10 +137,33 @@ def test_label_agreement_reports_accuracy_and_confusion() -> None:
         actual=actual,
     )
     assert report["rows"] == 3 and report["missing_labels"] == 1
-    assert report["responds_accuracy"] == round(1 / 3, 4)
-    assert report["stance_accuracy"] == round(2 / 3, 4)
-    assert report["responds_confusion"]["yes->no"] == 1
-    assert report["stance_confusion"]["hostile->missing"] == 1
+    assert report["responds_total"] == 2 and report["responds_accuracy"] == 1.0
+    assert report["stance_accuracy"] == 0.5
+    assert report["negative_accuracy"] == 0.5
+    assert report["stance_confusion"] == {"neutral->annoyed": 1, "playful->playful": 1}
+
+
+@pytest.mark.asyncio
+async def test_owner_digest_is_sent_once_per_week_across_restarts(tmp_path: Path) -> None:
+    store = _store(tmp_path)
+    _weekly(store, CHAT, "2026-W41", direct=0.5, silence=0.1)
+    sent: list[str] = []
+
+    async def send(text: str) -> None:
+        sent.append(text)
+
+    def job() -> OwnerDigestJob:
+        return OwnerDigestJob(
+            store=store, chats=lambda: [CHAT], chat_labels=lambda: {CHAT: "Ente"},
+            send=send, run_hour=0, tz=UTC,
+        )
+
+    monday = int(datetime(2026, 10, 12, 9, tzinfo=UTC).timestamp() * 1000)
+    assert (await job().tick(now_ms=monday)).sent
+    # A fresh job object stands in for a gateway restart.
+    assert not (await job().tick(now_ms=monday + 60_000)).sent
+    assert len(sent) == 1
+    store.close()
 
 
 def test_alert_reason_uses_signals_and_a_bounded_annoyance_cluster() -> None:

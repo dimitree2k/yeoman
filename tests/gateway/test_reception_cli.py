@@ -59,5 +59,25 @@ def test_validate_reports_agreement_from_a_csv(tmp_path: Path, monkeypatch) -> N
     result = runner.invoke(app, ["sentiment", "validate", "--labels", str(csv_path)])
     assert result.exit_code == 0, result.output
     assert "responds_accuracy" in result.output
-    assert "0.5" in result.output
-    assert "yes->missing" in result.output
+    assert "missing_labels" in result.output and "negative_accuracy" in result.output
+    assert "yes->missing" not in result.output
+
+
+def test_run_fails_loudly_when_days_got_no_labels(tmp_path: Path, monkeypatch) -> None:
+    from types import SimpleNamespace
+
+    from yeoman_shared.config import loader
+
+    monkeypatch.setattr(
+        loader, "load_config",
+        lambda: SimpleNamespace(ipc=SimpleNamespace(resolved_gateway_socket_path=tmp_path / "s")),
+    )
+    monkeypatch.setattr(sentiment_commands, "_policy_chat_maps", lambda: ({}, [CHAT]))
+
+    async def reply(_path, _args):
+        return {"status": "ok", "weeks": 2, "labels": 0, "failed_days": 3}
+
+    monkeypatch.setattr(sentiment_commands, "_request_sentiment_run", reply)
+    result = runner.invoke(app, ["sentiment", "run", "--since", "2026-10-16"])
+    assert result.exit_code == 1, result.output
+    assert "3 Tage ohne Labels" in result.output

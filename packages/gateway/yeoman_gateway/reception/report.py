@@ -217,16 +217,32 @@ def weekly_digest(
     return "Reception Wochenbericht\n" + "\n".join(lines), tuple(dict.fromkeys(used))
 
 
+_RESPONDS_RANK = {"yes": 2, "unclear": 1, "no": 0}
+_NEGATIVE_STANCES = frozenset({"annoyed", "hostile"})
+
+
+def _label_rank(item: LabelRow) -> tuple[int, float]:
+    return _RESPONDS_RANK.get(item.responds_to_arvid, -1), float(item.confidence)
+
+
 def label_agreement(
     *,
     expected: Sequence[Mapping[str, str]],
     actual: Sequence[LabelRow],
 ) -> dict[str, Any]:
-    """Accuracy and confusion counts for a CSV of ``message_id,expected_*`` rows."""
+    """Accuracy and confusion counts for a CSV of ``message_id,expected_*`` rows.
+
+    A reply can carry one label per Arvid message it followed; it is judged as a
+    whole: the strongest ``responds_to_arvid`` wins, and its most confident label
+    gives the stance.
+    """
     by_message: dict[str, LabelRow] = {}
     for item in actual:
-        by_message.setdefault(item.message_id, item)
+        current = by_message.get(item.message_id)
+        if current is None or _label_rank(item) > _label_rank(current):
+            by_message[item.message_id] = item
     responds_total = responds_match = stance_total = stance_match = 0
+    negative_match = 0
     responds_confusion: Counter[tuple[str, str]] = Counter()
     stance_confusion: Counter[tuple[str, str]] = Counter()
     missing = 0
@@ -240,11 +256,11 @@ def label_agreement(
         want_stance = str(expected_row.get("expected_stance") or "").strip()
         found = by_message.get(message_id)
         if found is None:
+            # Unlabelled replies (media, outside the window) are counted, not scored.
             missing += 1
-            found_responds = found_stance = "missing"
-        else:
-            found_responds = found.responds_to_arvid
-            found_stance = found.stance
+            continue
+        found_responds = found.responds_to_arvid
+        found_stance = found.stance
         if want_responds:
             responds_total += 1
             responds_confusion[(want_responds, found_responds)] += 1
@@ -253,6 +269,9 @@ def label_agreement(
             stance_total += 1
             stance_confusion[(want_stance, found_stance)] += 1
             stance_match += int(want_stance == found_stance)
+            negative_match += int(
+                (want_stance in _NEGATIVE_STANCES) == (found_stance in _NEGATIVE_STANCES)
+            )
     return {
         "rows": len(seen),
         "missing_labels": missing,
@@ -261,6 +280,8 @@ def label_agreement(
         if responds_total else 0.0,
         "stance_total": stance_total,
         "stance_accuracy": round(stance_match / stance_total, 4) if stance_total else 0.0,
+        "negative_accuracy": round(negative_match / stance_total, 4)
+        if stance_total else 0.0,
         "responds_confusion": {
             f"{want}->{got}": count for (want, got), count in sorted(responds_confusion.items())
         },

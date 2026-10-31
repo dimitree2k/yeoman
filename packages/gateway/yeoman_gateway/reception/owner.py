@@ -56,6 +56,9 @@ class OwnerDigestJob:
         target = previous_week(moment, tz=self._tz)
         if self._last_week == target.label:
             return OwnerDigestReport()
+        if not self._store.claim_digest(target.label):
+            self._last_week = target.label
+            return OwnerDigestReport()
         chat_ids = [str(item) for item in self._chats() if str(item)]
         quotes: dict[str, list[str]] = {}
         if self._quotes is not None:
