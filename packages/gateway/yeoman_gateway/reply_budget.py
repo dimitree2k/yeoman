@@ -43,8 +43,8 @@ _CURRENT_DATA_RE = re.compile(
     r"(?i)\b("
     r"kurs|quote|preis|rendite|zins|"
     r"price|market|stock|ticker|crypto|forex|yield|"
-    r"aktie|etf|index|börse|boerse|dax|nasdaq|s&p|bitcoin|btc|eth"
-    r")\b|\d\s?%"
+    r"aktie|etf|index|börse|boerse|dax|nasdaq|s&p|bitcoin|btc|eth|%"
+    r")\b"
 )
 _LEGAL_OR_CAVEAT_RE = re.compile(
     r"(?i)\b("
