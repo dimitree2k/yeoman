@@ -157,6 +157,7 @@ class ThreadPolicy:
     """The v1 thread defaults; read from config, never extended here."""
 
     followup_window_ms: int = 15_000
+    mention_continuation_window_ms: int = 7_200_000
     idle_ms: int = 1_800_000
     reopen_window_ms: int = 604_800_000
     pending_inputs_per_thread: int = 32
@@ -177,6 +178,9 @@ class ThreadPolicy:
             return cls()
         return cls(
             followup_window_ms=int(getattr(threads, "followup_window_seconds", 600)) * 1000,
+            mention_continuation_window_ms=int(
+                getattr(threads, "mention_continuation_window_seconds", 7200)
+            ) * 1000,
             idle_ms=int(getattr(threads, "idle_seconds", 1800)) * 1000,
             reopen_window_ms=int(getattr(threads, "reopen_window_seconds", 604800)) * 1000,
             pending_inputs_per_thread=int(getattr(threads, "pending_inputs_per_thread", 32)),

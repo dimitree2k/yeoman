@@ -13,6 +13,9 @@ from yeoman_gateway.core.models import ArchivedMessage, InboundEvent
 from yeoman_gateway.core.pipeline import NextFn, PipelineContext
 from yeoman_gateway.history.live import HistoryPaused
 
+#: How much of a replied-to message a window line quotes to name the reply's target.
+_REPLY_EXCERPT_CHARS = 60
+
 
 class ReplyContextMiddleware:
     """Enrich events with ambient and reply context windows."""
@@ -146,6 +149,7 @@ class ReplyContextMiddleware:
         return rows
 
     def _format_lines(self, rows: list[ArchivedMessage]) -> list[str]:
+        by_id = {row.message_id: row for row in rows if row.message_id}
         lines: list[str] = []
         for row in reversed(rows):
             compact = " ".join(row.text.split())
@@ -154,8 +158,36 @@ class ReplyContextMiddleware:
             if len(compact) > self._line_max_chars:
                 compact = compact[: self._line_max_chars] + "..."
             speaker = self._resolve_speaker(row)
+            replied = self._replied_to(row, by_id)
+            if replied is not None:
+                speaker += f", replying to {replied}"
             lines.append(f"[{speaker}] {compact}")
         return lines[: max(self._reply_window_limit, self._ambient_limit)]
+
+    def _replied_to(self, row: ArchivedMessage, by_id: dict[str, ArchivedMessage]) -> str | None:
+        """Who and what a quoted reply answers, so a flat window keeps its reply chains.
+
+        Without it "Gab Umfragen dazu" reads as an answer to whatever line sits above it.
+        """
+        target_id = (row.reply_to_message_id or "").strip()
+        if not target_id:
+            return None
+        target = by_id.get(target_id)
+        if target is None:
+            try:
+                target = self._archive.lookup_message(row.channel, row.chat_id, target_id)
+            except HistoryPaused:
+                raise
+            except Exception:
+                return None
+        if target is None:
+            return None
+        excerpt = " ".join(target.text.split())
+        if not excerpt:
+            return self._resolve_speaker(target)
+        if len(excerpt) > _REPLY_EXCERPT_CHARS:
+            excerpt = excerpt[:_REPLY_EXCERPT_CHARS] + "..."
+        return f'{self._resolve_speaker(target)}: "{excerpt}"'
 
     def _resolve_speaker(self, row: ArchivedMessage) -> str:
         return row.sender_name or row.sender_id or "unknown"

@@ -1125,15 +1125,16 @@ When a user asks you to send, create, or reply with a voice message / Sprachnach
         raw_ambient = metadata.get("ambient_context_window")
         ambient_lines: list[str] = []
         if isinstance(raw_ambient, list):
-            # ReplyContextMiddleware already applies the configured window size.
+            # ReplyContextMiddleware already applies the configured window size and line
+            # length; this cap leaves room for the "replying to" prefix on top of it.
             for item in raw_ambient:
                 if not isinstance(item, str):
                     continue
                 compact = " ".join(item.split())
                 if not compact:
                     continue
-                if len(compact) > 220:
-                    compact = compact[:220] + "..."
+                if len(compact) > 400:
+                    compact = compact[:400] + "..."
                 ambient_lines.append(compact)
 
         if not reply_to_message_id and not reply_to_text and not ambient_lines:

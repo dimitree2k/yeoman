@@ -533,6 +533,42 @@ async def test_semantic_continuation_never_guesses_authority(runtime, case):
         judge.choose.assert_not_awaited()
 
 
+@pytest.mark.parametrize(
+    ("minutes_later", "mentioned", "continues"),
+    [(65, True, True), (65, False, False), (121, True, False)],
+    ids=["mention_after_an_hour", "unaddressed_after_an_hour", "mention_after_two_hours"],
+)
+async def test_a_mention_picks_up_an_older_speak_up(runtime, minutes_later, mentioned, continues):
+    """Finanzgruppe, 2026-10-31: a mention an hour after Arvid's speak-up to the same
+    sender started an empty thread, because only the ten-minute follow-up window was
+    searched. A mention now looks back two hours; an unaddressed message does not."""
+    from unittest.mock import AsyncMock
+
+    from yeoman_gateway.processing.continuation import ContinuationResolver
+
+    _participation_anchor(runtime)
+    judge = AsyncMock()
+    judge.choose.return_value = "participation-bot"
+    runtime.gate._continuation = ContinuationResolver(
+        store=runtime.store, threads=runtime.registry, judge=judge,
+    )
+    runtime.gate._clock = _Clock(runtime.gate._clock() + minutes_later * 60_000)
+    result = await runtime.gate.admit_async(IngestRequest(
+        event_key="later", event_id="later", trace_id="later",
+        event=_event(message_id="later", content="Which survey did you mean?",
+                     mentioned=mentioned),
+    ))
+
+    if continues:
+        assert result.continuation_anchor_id == "participation-bot"
+        assert result.assignment.thread_id == runtime.store.resolve_reference(
+            "participation-bot"
+        )[0]
+    else:
+        assert result is None or not result.continuation_anchor_id
+        judge.choose.assert_not_awaited()
+
+
 async def test_participation_reply_keeps_its_sources_existing_thread(runtime):
     from unittest.mock import AsyncMock
 

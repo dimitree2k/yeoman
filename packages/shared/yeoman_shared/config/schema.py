@@ -724,6 +724,12 @@ class ProcessingThreadsConfig(BaseModel):
     #: Automatic continuation window (spec: "Fortsetzungsfenster"). Owner-set: ten
     #: minutes, changeable in config.json without a code change.
     followup_window_seconds: int = Field(default=600, ge=0)
+    #: How far back an explicit mention may pick up one of Arvid's own exchanges with the
+    #: same sender (a speak-up or a reply). Longer than the follow-up window, because a
+    #: mention says the sender is talking to Arvid again.
+    mention_continuation_window_seconds: int = Field(
+        default=7200, alias="mentionContinuationWindowSeconds", ge=0
+    )
     idle_seconds: int = Field(default=1800, ge=1)
     reopen_window_seconds: int = Field(default=604800, ge=0)
     pending_inputs_per_thread: int = Field(default=32, ge=1)
