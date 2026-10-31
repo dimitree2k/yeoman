@@ -565,6 +565,7 @@ class ReceptionLabelRunner:
         self, route: Any, batch: LabelBatch
     ) -> tuple[int, list[LabelItem] | None, str]:
         messages = label_messages(batch.payload)
+        reason = "invalid_output"
         for attempt in range(1, self._max_attempts + 1):
             try:
                 reply = await asyncio.wait_for(
@@ -580,12 +581,22 @@ class ReceptionLabelRunner:
             except asyncio.CancelledError:
                 raise
             except TimeoutError:
+                reason = "timeout"
                 continue
             except Exception as exc:  # noqa: BLE001 - one failed call is a bounded retry
                 logger.warning(
                     "reception_label_provider_failed error_type={} attempt={}",
                     type(exc).__name__, attempt,
                 )
+                reason = "provider_error"
+                continue
+            finish_reason = str(getattr(reply, "finish_reason", "") or "")
+            if finish_reason == "error":
+                # The provider wrapper logs the rejection and returns an empty error reply.
+                logger.warning(
+                    "reception_label_provider_failed error_type=error_reply attempt={}", attempt
+                )
+                reason = "provider_error"
                 continue
             parsed = parse_labels(
                 str(getattr(reply, "content", "") or ""),
@@ -594,8 +605,12 @@ class ReceptionLabelRunner:
             )
             if parsed is not None:
                 return attempt, parsed, ""
-            logger.warning("reception_label_invalid_json attempt={}", attempt)
-        return self._max_attempts, None, "invalid_output"
+            logger.warning(
+                "reception_label_invalid_json attempt={} finish_reason={}",
+                attempt, finish_reason or "-",
+            )
+            reason = "invalid_output"
+        return self._max_attempts, None, reason
 
 
 class ReceptionLabelJob:
