@@ -37,8 +37,6 @@ RESEARCH_TOOL_NAMES: frozenset[str] = frozenset(
     }
 )
 
-#: Places a reply may be cut: after a sentence end, or at a line break.
-_CLIP_BOUNDARY_RE = re.compile(r"(?<=[.!?])[ \t]+|\n+")
 _URL_RE = re.compile(r"(?i)\bhttps?://|www\.")
 _CODE_RE = re.compile(r"```|`[^`]+`|^\s{4,}\S", re.MULTILINE)
 _CURRENT_DATA_RE = re.compile(
@@ -220,13 +218,18 @@ def enforce_reply_budget(
     tool_used: bool = False,
     research_used: bool = False,
 ) -> tuple[str, dict[str, object]]:
-    """Return final text plus enforcement metadata."""
+    """Measure a reply against its budget; the text itself is never cut.
+
+    A reply over budget comes back unchanged with ``over_budget`` and the ``limit``
+    it missed, so the caller can ask the model for a shorter version. A sentence
+    sliced out of a written answer reads as a broken answer; the full one does not.
+    """
     # Tool use alone says nothing about how much explanation the answer needs; a research
     # tool does, because its findings are what the answer exists to report.
     del tool_used
     original = str(text or "").strip()
     if not original or not isinstance(budget, dict) or not bool(budget.get("enabled", False)):
-        return original, {"applied": False, "reason": "disabled"}
+        return original, {"over_budget": False, "reason": "disabled"}
 
     final_sensitive = (
         research_used
@@ -235,50 +238,47 @@ def enforce_reply_budget(
     )
     if final_sensitive or bool(budget.get("long_form_allowed", False)):
         limit = int(budget.get("long_form_max_chars") or DEFAULT_REPLY_BUDGET_LONG_FORM_MAX_CHARS)
-        if len(original) <= limit:
-            return original, {"applied": False, "reason": "domain_sensitive_or_long_form"}
-        clipped = _clip_at_sentence_or_word(original, limit)
-        return clipped, {
-            "applied": True,
-            "reason": "long_form_max_chars",
-            "before_chars": len(original),
-            "after_chars": len(clipped),
-        }
-
-    if not bool(budget.get("hard_cap_enabled", True)):
-        return original, {"applied": False, "reason": "hard_cap_disabled"}
-
-    target = int(budget.get("target_chars") or budget.get("hard_max_chars") or DEFAULT_REPLY_BUDGET_HARD_MAX_CHARS)
-    hard_max = int(budget.get("hard_max_chars") or DEFAULT_REPLY_BUDGET_HARD_MAX_CHARS)
-    limit = max(1, min(target, hard_max))
+        reason = "long_form_max_chars"
+    elif not bool(budget.get("hard_cap_enabled", True)):
+        return original, {"over_budget": False, "reason": "hard_cap_disabled"}
+    else:
+        target = int(
+            budget.get("target_chars")
+            or budget.get("hard_max_chars")
+            or DEFAULT_REPLY_BUDGET_HARD_MAX_CHARS
+        )
+        hard_max = int(budget.get("hard_max_chars") or DEFAULT_REPLY_BUDGET_HARD_MAX_CHARS)
+        limit = max(1, min(target, hard_max))
+        reason = "target_chars"
     if len(original) <= limit:
-        return original, {"applied": False, "reason": "within_budget"}
-    clipped = _clip_at_sentence_or_word(original, limit)
-    return clipped, {
-        "applied": True,
-        "reason": "target_chars",
+        return original, {"over_budget": False, "reason": "within_budget", "limit": limit}
+    return original, {
+        "over_budget": True,
+        "reason": reason,
+        "limit": limit,
         "before_chars": len(original),
-        "after_chars": len(clipped),
     }
 
 
-def _clip_at_sentence_or_word(text: str, limit: int) -> str:
-    """Keep as many whole sentences or lines as fit, falling back to a word cut."""
-    lines = [" ".join(line.split()) for line in str(text or "").strip().splitlines()]
-    compact = re.sub(r"\n{3,}", "\n\n", "\n".join(lines)).strip()
-    if len(compact) <= limit:
-        return compact
+def shorten_reply_messages(text: str, limit: int) -> list[dict[str, str]]:
+    """Prompt asking the model to rewrite its own reply within ``limit`` characters."""
+    return [
+        {
+            "role": "system",
+            "content": (
+                "You shorten a chat reply that is already written. Rewrite it in at most "
+                f"{limit} characters. Keep its language, voice and point. Keep every number, "
+                "name, source and link the answer depends on; drop filler and repetition "
+                "instead. Do not add anything new. Output only the rewritten reply."
+            ),
+        },
+        {"role": "user", "content": text},
+    ]
 
-    cuts = [match.start() for match in _CLIP_BOUNDARY_RE.finditer(compact) if match.start() <= limit]
-    # A kept prefix that ends on a lead-in ("die Studien:") promises what was cut away.
-    while cuts and compact[: cuts[-1]].rstrip().endswith(":"):
-        cuts.pop()
-    if cuts:
-        return compact[: cuts[-1]].rstrip()
 
-    suffix = "..."
-    clipped = compact[: max(1, limit - len(suffix))].rstrip()
-    boundary = clipped.rfind(" ")
-    if boundary >= limit // 2:
-        clipped = clipped[:boundary].rstrip()
-    return f"{clipped}{suffix}"
+def accept_shortened_reply(original: str, rewrite: str | None, limit: int) -> str | None:
+    """Return the rewrite when it really fits the budget, otherwise None."""
+    candidate = str(rewrite or "").strip()
+    if not candidate or len(candidate) > limit or len(candidate) >= len(original):
+        return None
+    return candidate

@@ -74,8 +74,10 @@ from yeoman_gateway.processing.tool_context import (
 from yeoman_gateway.providers.base import LLMProvider, LLMProviderError, ToolCallRequest
 from yeoman_gateway.reply_budget import (
     RESEARCH_TOOL_NAMES,
+    accept_shortened_reply,
     derive_reply_budget,
     enforce_reply_budget,
+    shorten_reply_messages,
 )
 from yeoman_gateway.session.manager import SessionManager
 from yeoman_gateway.trends.seeds import is_trend_source
@@ -3213,15 +3215,13 @@ class LLMResponder(ResponderPort):
             tool_used=bool(metadata.get("reply_budget_tool_used", False)),
             research_used=bool(metadata.get("reply_budget_research_used", False)),
         )
-        if bool(budget_result.get("applied", False)):
-            self._metric("reply_budget_enforced", labels=(("channel", channel),))
-            logger.info(
-                "reply_budget enforced channel={} chat={} before={} after={} reason={}",
-                channel,
-                chat_id,
-                budget_result.get("before_chars"),
-                budget_result.get("after_chars"),
-                budget_result.get("reason"),
+        if bool(budget_result.get("over_budget", False)):
+            final_content = await self._shorten_over_budget(
+                final_content,
+                budget_result,
+                profile=self._profile_for_name(model_profile),
+                channel=channel,
+                chat_id=chat_id,
             )
 
         # Only add messages if they weren't already added (for new sessions)
@@ -3615,14 +3615,14 @@ class LLMResponder(ResponderPort):
             session_history_limit=None,
             draft_only=True,
         )
-        return self._apply_draft_budget(
+        return await self._apply_draft_budget(
             _strip_reaction_markers(draft),
             metadata,
             channel=route_channel,
             chat_id=route_chat_id,
         )
 
-    def _apply_draft_budget(
+    async def _apply_draft_budget(
         self,
         draft: str | None,
         metadata: dict[str, object],
@@ -3644,16 +3644,69 @@ class LLMResponder(ResponderPort):
             metadata.get("reply_budget"),
             user_content="",
         )
-        if bool(result.get("applied", False)):
-            self._metric("reply_budget_enforced", labels=(("channel", channel),))
-            logger.info(
-                "participation reply_budget enforced chat={} before={} after={} reason={}",
-                chat_id,
-                result.get("before_chars"),
-                result.get("after_chars"),
-                result.get("reason"),
+        if not bool(result.get("over_budget", False)):
+            return final
+        return await self._shorten_over_budget(
+            final,
+            result,
+            profile=None,
+            channel=channel,
+            chat_id=chat_id,
+        )
+
+    async def _shorten_over_budget(
+        self,
+        text: str,
+        budget_result: dict[str, object],
+        *,
+        profile: object,
+        channel: str,
+        chat_id: str,
+    ) -> str:
+        """Ask the model for a version of ``text`` that fits; send ``text`` whole otherwise.
+
+        A reply is never cut: a rewrite that is missing, fails, or still runs long
+        leaves the full original as the answer.
+        """
+        limit = int(str(budget_result.get("limit") or 0))
+        if limit <= 0:
+            return text
+        model = str(getattr(profile, "model", "") or "").strip() or self.model
+        rewrite: str | None = None
+        try:
+            response = await asyncio.wait_for(
+                (self._provider_for_profile(profile) or self.provider).chat(
+                    messages=shorten_reply_messages(text, limit),
+                    tools=[],
+                    model=model,
+                    max_tokens=2048,
+                    temperature=0.3,
+                ),
+                timeout=30.0,
             )
-        return final
+            if not response.has_tool_calls and response.finish_reason != "error":
+                rewrite = response.content
+        except HistoryPaused:
+            raise
+        except Exception as exc:
+            logger.warning("reply_budget shorten failed chat={} error={}", chat_id, exc)
+        shortened = accept_shortened_reply(text, rewrite, limit)
+        outcome = "shortened" if shortened is not None else "kept_full"
+        self._metric(
+            "reply_budget_over",
+            labels=(("channel", channel), ("outcome", outcome)),
+        )
+        logger.info(
+            "reply_budget over channel={} chat={} limit={} before={} after={} outcome={} reason={}",
+            channel,
+            chat_id,
+            limit,
+            len(text),
+            len(shortened) if shortened is not None else len(text),
+            outcome,
+            budget_result.get("reason"),
+        )
+        return shortened if shortened is not None else text
 
     async def submit_participation_comment(
         self, *, admission: object, effect_id: str, content: str
