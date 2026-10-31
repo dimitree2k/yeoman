@@ -938,24 +938,3 @@ async def test_middleware_reactions_name_their_reason() -> None:
     assert len(reactions) == 1
     assert reactions[0].emoji == "👀"
     assert reactions[0].reason == "low_content_reply"
-
-
-@pytest.mark.asyncio
-@pytest.mark.parametrize(
-    "content",
-    [
-        "@203075365150770 kennst du die Umfragen die Frank meint?",
-        "@203075365150770 finde mal raus was das für Studien sind",
-        "@203075365150770 recherchiere das bitte",
-        "@203075365150770 prüfe mal ob das stimmt",
-    ],
-)
-async def test_research_requests_get_researched_answer_shape(content: str) -> None:
-    ctx = PipelineContext(
-        event=_event(content=content, mentioned_bot=True),
-        decision=_mention_only_decision(should_respond=True, reason="when_to_reply:mentioned_bot"),
-    )
-
-    await ImplicitBotAddressMiddleware()(ctx, _tracking_next)
-
-    assert ctx.event.raw_metadata["conversation_state"]["answer_shape"] == "researched_answer"

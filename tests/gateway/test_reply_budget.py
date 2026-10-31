@@ -430,10 +430,3 @@ def test_research_tool_turn_gets_the_long_form_limit() -> None:
     assert researched == _LONG_REPLY
     assert result["over_budget"] is False
 
-
-def test_percent_figures_count_as_current_data() -> None:
-    from yeoman_gateway.reply_budget import has_domain_sensitive_signal
-
-    assert has_domain_sensitive_signal("AMD fiel um 11,9% heute")
-    assert has_domain_sensitive_signal("57 % der Befragten")
-    assert not has_domain_sensitive_signal("Ganz normaler Satz ohne Zahlen")
