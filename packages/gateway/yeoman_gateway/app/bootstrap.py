@@ -2062,18 +2062,23 @@ def build_reception_jobs(
 
     reception_config = config.processing.reception
     sentiment_store = store if isinstance(store, SentimentStore) else SentimentStore()
+    # A policy reload swaps the engine object, so a callable is resolved on every use;
+    # a plain engine (tests) stays fixed.
+    engine = policy_engine if not hasattr(policy_engine, "resolve_policy") else (
+        lambda: policy_engine
+    )
 
     def chats() -> tuple[str, ...]:
-        return tuple(policy_engine.reception_chats("whatsapp"))
+        return tuple(engine().reception_chats("whatsapp"))
 
     def labels() -> dict[str, str]:
-        return policy_chat_labels(policy_engine)
+        return policy_chat_labels(engine())
 
     def sha_for(chat_id: str) -> str:
-        return reception_persona_sha(policy_engine, workspace, chat_id)
+        return reception_persona_sha(engine(), workspace, chat_id)
 
     def policy_context(chat_id: str) -> tuple[str, str, dict[str, object]]:
-        return reception_chat_policy_context(policy_engine, workspace, chat_id)
+        return reception_chat_policy_context(engine(), workspace, chat_id)
 
     def bounds() -> ReceptionBounds:
         return ReceptionBounds.from_config(config)
@@ -2087,7 +2092,7 @@ def build_reception_jobs(
     )
     recorder = ReceptionOutboundRecorder(
         store=sentiment_store,
-        enabled=lambda chat_id: policy_engine.reception_enabled("whatsapp", chat_id),
+        enabled=lambda chat_id: engine().reception_enabled("whatsapp", chat_id),
         persona_sha=sha_for,
     )
     if not bool(reception_config.enabled):
@@ -4332,7 +4337,10 @@ def build_gateway_runtime(
         now = int(time.time() * 1000)
         since_ms = int(datetime(since.year, since.month, since.day).timestamp() * 1000)
         chat_arg = str(args.get("chat") or "").strip()
-        chats = [chat_arg] if chat_arg else list(policy_engine.reception_chats("whatsapp"))
+        live_engine = policy_adapter.policy_engine()
+        if live_engine is None:
+            return {"status": "error", "code": "POLICY_UNAVAILABLE"}
+        chats = [chat_arg] if chat_arg else list(live_engine.reception_chats("whatsapp"))
         if not chats:
             return {"status": "ok", "weeks": 0, "labels": 0}
         store = SentimentStore()
@@ -4342,7 +4350,7 @@ def build_gateway_runtime(
                 history=history_projector,
                 bounds=lambda: ReceptionBounds.from_config(config),
                 policy_context=lambda chat_id: reception_chat_policy_context(
-                    policy_engine, Path(workspace), chat_id
+                    live_engine, Path(workspace), chat_id
                 ),
             )
             reception_config = config.processing.reception
@@ -4386,6 +4394,10 @@ def build_gateway_runtime(
                     labels += outcome.labels
                     day = day_window(day.end_ms)
             return {"status": "ok", "weeks": weeks, "labels": labels, "chats": len(chats)}
+        except Exception as exc:
+            # The socket answers only a code; the cause belongs in the gateway log.
+            logger.exception("sentiment_run_failed error_type={}", type(exc).__name__)
+            raise
         finally:
             store.close()
 
@@ -4666,7 +4678,7 @@ def build_gateway_runtime(
             reception_recorder,
         ) = build_reception_jobs(
             config,
-            policy_engine=policy_engine,
+            policy_engine=policy_adapter.policy_engine,
             history=history_projector,
             send_owner=_send_reception_owner,
             workspace=Path(workspace),

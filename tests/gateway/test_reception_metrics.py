@@ -76,3 +76,49 @@ async def test_compute_week_stores_numbers_and_never_text(tmp_path: Path) -> Non
     finally:
         history.close()
         store.close()
+
+
+@pytest.mark.asyncio
+async def test_backfill_never_stamps_todays_persona_on_past_weeks(tmp_path: Path) -> None:
+    history = await _history(tmp_path)
+    store = SentimentStore(tmp_path / "ops" / "sentiment.db")
+    service = ReceptionMetricsService(
+        store=store, history=history, bounds=ReceptionBounds(),
+        policy_context=lambda chat_id: ("personas/today.md", "today-sha", {"x": 1}),
+    )
+    try:
+        await service.backfill(
+            chat_id=CHAT, since_ms=WEEK.start_ms,
+            until_ms=week_moment_ms("2026-W41", hours=5, tz=UTC),
+        )
+        row = store.weekly(CHAT)[0]
+        assert row.persona_sha == "unknown" and row.persona_file == ""
+        assert not store.persona_changes(CHAT)
+    finally:
+        history.close()
+        store.close()
+
+
+def test_reception_jobs_follow_a_reloaded_policy_engine(tmp_path: Path) -> None:
+    from yeoman_gateway.app.bootstrap import build_reception_jobs
+    from yeoman_shared.config.schema import Config
+
+    class Engine:
+        def __init__(self, chats: tuple[str, ...]) -> None:
+            self.chats = chats
+
+        def reception_chats(self, channel: str) -> tuple[str, ...]:
+            return self.chats
+
+    current = {"engine": Engine(())}
+    store = SentimentStore(tmp_path / "ops" / "sentiment.db")
+    try:
+        _, weekly, _, _, _ = build_reception_jobs(
+            Config(), policy_engine=lambda: current["engine"], history=object(),
+            send_owner=lambda content: None, workspace=tmp_path, store=store,
+        )
+        assert tuple(weekly._chats()) == ()
+        current["engine"] = Engine((CHAT,))
+        assert tuple(weekly._chats()) == (CHAT,)
+    finally:
+        store.close()

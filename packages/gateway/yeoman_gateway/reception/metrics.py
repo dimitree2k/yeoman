@@ -3,7 +3,8 @@
 from __future__ import annotations
 
 import hashlib
-from collections.abc import Callable, Iterable
+from collections import Counter
+from collections.abc import Callable, Iterable, Mapping
 from dataclasses import dataclass
 from datetime import datetime, tzinfo
 from typing import Any
@@ -133,7 +134,12 @@ class ReceptionMetricsService:
     def store(self) -> SentimentStore:
         return self._store
 
-    async def compute_week(self, chat_id: str, week: DigestWeek) -> WeeklyOutcome:
+    async def compute_week(
+        self, chat_id: str, week: DigestWeek, *, live_policy: bool = True
+    ) -> WeeklyOutcome:
+        """One week's row. ``live_policy=False`` (backfill) never stamps today's persona
+        on a past week: the persona comes from that week's outbound metadata or stays
+        ``unknown``, so a later persona switch cannot fake a before/after comparison."""
         from yeoman_gateway.history.context import history_turn
         from yeoman_gateway.history.queries import HistoryQueries
 
@@ -158,6 +164,11 @@ class ReceptionMetricsService:
             if self._policy_context is not None
             else ("", "unknown", {})
         )
+        if not live_policy:
+            sent_sha = _majority_persona_sha(meta)
+            if sent_sha != sha:
+                persona_file, snapshot_fields = "", {}
+            sha = sent_sha
         self._store.store_weekly(
             chat_id=chat_id,
             iso_week=week.label,
@@ -168,7 +179,7 @@ class ReceptionMetricsService:
             policy_snapshot=snapshot_fields,
             metrics=metrics.metrics(),
         )
-        if sha and sha != "unknown":
+        if live_policy and sha and sha != "unknown":
             self._store.note_persona(chat_id=chat_id, persona_sha=sha, now_ms=_now_ms())
         logger.info(
             "reception_week chat={} week={} status={} arvid={} human={}",
@@ -191,9 +202,19 @@ class ReceptionMetricsService:
         outcomes: list[WeeklyOutcome] = []
         week = first
         while week.start_ms < last.start_ms and week.start_ms < moment:
-            outcomes.append(await self.compute_week(chat_id, week))
+            outcomes.append(await self.compute_week(chat_id, week, live_policy=False))
             week = week_of(week.end_ms, tz=self._tz)
         return outcomes
+
+
+def _majority_persona_sha(meta: Mapping[str, Mapping[str, Any]]) -> str:
+    """The persona sha most of a week's recorded sends carried, else ``unknown``."""
+    counts = Counter(
+        str(item.get("persona_sha") or "")
+        for item in meta.values()
+        if str(item.get("persona_sha") or "") not in ("", "unknown")
+    )
+    return counts.most_common(1)[0][0] if counts else "unknown"
 
 
 @dataclass(slots=True)
