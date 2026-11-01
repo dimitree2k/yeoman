@@ -345,3 +345,22 @@ def test_configured_feeds_are_sources_next_to_google() -> None:
         __import__("tempfile").mkdtemp()) / "t.db")
     assert [source.name for source in service.sources] == ["google_trends:DE", "rss:n-tv.de"]
     service.store.close()
+
+
+def test_google_trends_can_be_switched_off() -> None:
+    from yeoman_gateway.trends.service import build_trends_service
+    from yeoman_shared.config.schema import Config
+
+    config = Config.model_validate({
+        "models": {"profiles": {"w": {"kind": "chat", "model": "m", "provider": "openrouter"}},
+                   "routes": {"trends.score": "w"}},
+        "trends": {"enabled": True, "googleTrends": False,
+                   "rssFeeds": ["https://www.stern.de/feed/standard/panorama/"]},
+    })
+    import os
+
+    os.environ.setdefault("OPENROUTER_API_KEY", "test")
+    service = build_trends_service(config, store_path=__import__("pathlib").Path(
+        __import__("tempfile").mkdtemp()) / "t.db")
+    assert [source.name for source in service.sources] == ["rss:stern.de"]
+    service.store.close()
