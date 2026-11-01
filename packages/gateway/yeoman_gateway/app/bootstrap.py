@@ -476,6 +476,8 @@ class GatewayRuntime:
     people: PeopleResolver | None = None
     trends: Any | None = None
     decision_sweeper: Any | None = None
+    #: Shadow group-state scheduler; ``None`` unless ``processing.groupState.mode`` is on.
+    group_state: Any | None = None
 
     async def _start_processing_services(self) -> None:
         """Plan 04 start order: recover and reconcile before any channel consumes input.
@@ -511,6 +513,8 @@ class GatewayRuntime:
         try:
             await self._start_processing_services()
             await self.history_projector.start()
+            if self.group_state is not None:
+                await self.group_state.start()
             if self.source_catchup is not None:
                 await self.source_catchup.start()
             if self.people_sync is not None:
@@ -608,6 +612,9 @@ class GatewayRuntime:
                 await attempt_async(self.trends.stop)
             if self.decision_sweeper is not None:
                 await attempt_async(self.decision_sweeper.stop)
+            if self.group_state is not None:
+                await attempt_async(self.group_state.stop)
+                attempt_sync(self.group_state.close)
             if self.processing is not None:
                 attempt_sync(self.processing.close)
             if self.people is not None:
@@ -655,6 +662,13 @@ def _processing_store_path(config: "Config") -> Path:
     }:
         return get_operational_store_path("processing")
     path = Path(config.processing.db_path).expanduser()
+    return path if path.is_absolute() else get_data_path() / path
+
+
+def _group_state_store_path(settings: Any) -> Path:
+    from yeoman_shared.utils.helpers import get_data_path
+
+    path = Path(str(settings.db_path)).expanduser()
     return path if path.is_absolute() else get_data_path() / path
 
 
@@ -4770,6 +4784,16 @@ def build_gateway_runtime(
             observer._history_knowledge = knowledge_service
             observer._session_manager = SessionManager(workspace=responder.sessions.workspace, sessions_dir=responder.sessions.sessions_dir,
                 operational_store=responder.sessions.operational_store)
+    group_state_service = _build_group_state_service(
+        config,
+        history_projector=history_projector,
+        speakups=speakup_log,
+        processing=processing_store,
+        decisions=group_decisions,
+        cron=cron,
+        bus=bus,
+        effect_router=effect_router,
+    )
     return GatewayRuntime(
         orchestrator=orchestrator_service,
         channels=channels,
@@ -4807,7 +4831,59 @@ def build_gateway_runtime(
         ),
         trends=_build_trends(config, policy_adapter),
         decision_sweeper=decision_sweeper,
+        group_state=group_state_service,
     )
+
+
+def _build_group_state_service(
+    config: "Config",
+    *,
+    history_projector: "HistoryProjector",
+    speakups: Any | None,
+    processing: "ProcessingStore | None",
+    decisions: Any | None,
+    cron: CronService,
+    bus: MessageBus,
+    effect_router: "IntentEffectRouter | None",
+) -> Any | None:
+    """Build the shadow scheduler only when its mode is on; never at import time."""
+    settings = getattr(config.processing, "group_state", None)
+    if settings is None or getattr(settings, "mode", "off") == "off":
+        return None
+    from yeoman_gateway.agent.tools.poll import PollGuard
+    from yeoman_gateway.group_state.contract import ContributorRegistry, SourceReaders
+    from yeoman_gateway.group_state.sections import default_contributors
+    from yeoman_gateway.group_state.service import GroupStateService
+    from yeoman_gateway.group_state.store import GroupStateStore
+
+    registry = ContributorRegistry()
+    for contributor in default_contributors():
+        registry.register(contributor)
+    store = GroupStateStore(
+        _group_state_store_path(settings), snapshots_kept=int(settings.snapshots_kept)
+    )
+    service = GroupStateService(
+        store=store,
+        registry=registry,
+        settings=settings,
+        history_projector=history_projector,
+        sources=SourceReaders(
+            speakups=speakups,
+            processing=processing,
+            decisions=decisions,
+            polls=PollGuard(),
+            cron=cron,
+        ),
+        consciousness=config.consciousness,
+    )
+
+    async def _mark_from_observed(event: Any) -> None:
+        service.mark_dirty(str(getattr(event, "channel", "")), str(getattr(event, "chat_id", "")))
+
+    bus.subscribe_event("InboundObservedEvent", _mark_from_observed)
+    if effect_router is not None:
+        effect_router.add_post_send_listener(service.mark_dirty)
+    return service
 
 
 def _build_meme_service(

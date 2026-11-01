@@ -2,7 +2,7 @@
 
 from __future__ import annotations
 
-from typing import Protocol
+from typing import Any, Protocol
 
 from yeoman_gateway.core.models import ArchivedMessage, InboundEvent, PolicyDecision, SecurityResult
 
@@ -73,6 +73,17 @@ class SecurityPort(Protocol):
 
     def check_output(self, text: str, context: dict[str, object] | None = None) -> SecurityResult:
         """Evaluate assistant output before outbound send."""
+
+
+class GroupStateReadPort(Protocol):
+    """Read-only access to one chat's group state.
+
+    The document type stays ``Any`` so the core does not import the group-state
+    package; concrete stores return a ``GroupState``.
+    """
+
+    def get(self, channel: str, chat_id: str) -> Any | None:
+        """Return this chat's state, or ``None``."""
 
 
 class RuntimeSupervisorPort(Protocol):

@@ -1045,6 +1045,23 @@ class ProcessingReceptionConfig(BaseModel):
     sticker_vision: bool = Field(default=False, alias="stickerVision")
 
 
+class GroupStateConfig(BaseModel):
+    """Shadow group-state scheduler (P1: observe only, no output path reads it)."""
+
+    model_config = ConfigDict(extra="forbid", populate_by_name=True)
+
+    mode: Literal["off", "shadow"] = "off"
+    #: ``"channel:chat_id"`` entries; an empty list manages no chat.
+    chats: list[str] = Field(default_factory=list)
+    min_interval_seconds: int = Field(default=30, alias="minIntervalSeconds", ge=1)
+    rebuild_every_seconds: int = Field(default=600, alias="rebuildEverySeconds", ge=1)
+    window_hours: int = Field(default=24, alias="windowHours", ge=1, le=168)
+    people_window_days: int = Field(default=7, alias="peopleWindowDays", ge=1, le=30)
+    actions_limit: int = Field(default=20, alias="actionsLimit", ge=1, le=200)
+    snapshots_kept: int = Field(default=20, alias="snapshotsKept", ge=1, le=200)
+    db_path: str = Field(default="data/ops/group-state.db", alias="dbPath")
+
+
 class ProcessingConfig(BaseModel):
     """State-aware message processing (spec section 4).
 
@@ -1084,6 +1101,7 @@ class ProcessingConfig(BaseModel):
         default_factory=ProcessingParticipationConfig
     )
     reception: ProcessingReceptionConfig = Field(default_factory=ProcessingReceptionConfig)
+    group_state: GroupStateConfig = Field(default_factory=GroupStateConfig, alias="groupState")
     participation_maintenance: ProcessingParticipationMaintenanceConfig = Field(
         default_factory=ProcessingParticipationMaintenanceConfig
     )

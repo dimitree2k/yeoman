@@ -117,6 +117,14 @@ class PollGuard:
             return None
         return str(max(sent, key=lambda entry: int(entry.get("opened_ms", 0)))["poll_id"])
 
+    def open_for(self, chat_id: str, now_ms: int) -> list[dict[str, Any]]:
+        """Read-only copy of this chat's open poll entries within the window."""
+        return [
+            dict(entry)
+            for entry in self._read(now_ms)
+            if entry.get("chat") == chat_id and entry.get("closed_ms") is None
+        ]
+
     async def close(self, chat_id: str, now_ms: int) -> bool:
         """Close this chat's open poll; False when none was open."""
         async with self._lock:
