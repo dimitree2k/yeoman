@@ -223,7 +223,7 @@ def build_trends_service(
     client = RouteClient(config=config, route_key=trends.route)
     return TrendsService(
         sources=[
-            GoogleTrendsSource(geo=trends.google_trends_geo),
+            *([GoogleTrendsSource(geo=trends.google_trends_geo)] if trends.google_trends else []),
             *(RssFeedSource(url=url) for url in trends.rss_feeds),
         ],
         scorer=TrendScorer(client=client, language=trends.language),

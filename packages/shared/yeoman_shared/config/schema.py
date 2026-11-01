@@ -643,8 +643,10 @@ class TrendsConfig(BaseModel):
 
     enabled: bool = False
     interval_minutes: int = Field(default=180, alias="intervalMinutes", ge=15)
+    # Sources: Google's trending searches for one country, and news feeds (RSS or Atom).
+    # Each story from any source is scored like a trending topic.
+    google_trends: bool = Field(default=True, alias="googleTrends")
     google_trends_geo: str = Field(default="DE", alias="googleTrendsGeo")
-    # Extra news feeds (RSS or Atom); each story is scored like a trending topic.
     rss_feeds: list[str] = Field(
         default_factory=lambda: [
             "https://www.n-tv.de/panorama/rss",
