@@ -33,7 +33,7 @@ from loguru import logger
 from yeoman_shared.reactions import allowed_reaction
 from yeoman_shared.telemetry import tracing
 
-from yeoman_gateway.processing.model_route import RouteClient
+from yeoman_gateway.processing.model_route import RouteCallError, RouteClient
 from yeoman_gateway.processing.participation_memes import MAX_PROMPT_CHARS, MemePlan
 from yeoman_gateway.trends.seeds import is_trend_source
 
@@ -235,33 +235,82 @@ _MEME_SCHEMA_PROPERTIES: dict[str, Any] = {
 }
 
 
-def _meme_response_format() -> dict[str, Any]:
-    schema = JUDGE_RESPONSE_FORMAT["json_schema"]["schema"]
-    action = {"type": "string", "enum": list(_ALL_ACTIONS)}
+def _with_enums(
+    base: dict[str, Any],
+    *,
+    name: str,
+    actions: Sequence[str] | None,
+    intents: Sequence[str] | None,
+    extra_properties: Mapping[str, Any] | None = None,
+) -> dict[str, Any]:
+    """Copy a response-format template, replacing only the offered enums.
+
+    The module-level templates are shared by every opportunity, so this always
+    builds new dicts instead of mutating them in place.
+    """
+    source = base["json_schema"]["schema"]
+    properties = dict(source["properties"])
+    if actions is not None:
+        properties["action"] = {**properties["action"], "enum": list(actions)}
+    if intents is not None:
+        properties["intent"] = {**properties["intent"], "enum": list(intents)}
+    required = list(source["required"])
+    if extra_properties:
+        properties.update(extra_properties)
+        required.extend(extra_properties)
     return {
         "type": "json_schema",
         "json_schema": {
-            "name": "participation_judge_decision_memes",
+            "name": name,
             "strict": True,
-            "schema": {
-                **schema,
-                "properties": {**schema["properties"], "action": action, **_MEME_SCHEMA_PROPERTIES},
-                "required": [*schema["required"], *_MEME_SCHEMA_PROPERTIES],
-            },
+            "schema": {**source, "properties": properties, "required": required},
         },
     }
+
+
+def _meme_response_format(
+    *,
+    actions: Sequence[str] | None = None,
+    intents: Sequence[str] | None = None,
+) -> dict[str, Any]:
+    return _with_enums(
+        JUDGE_RESPONSE_FORMAT,
+        name="participation_judge_decision_memes",
+        actions=_ALL_ACTIONS if actions is None else actions,
+        intents=intents,
+        extra_properties=_MEME_SCHEMA_PROPERTIES,
+    )
 
 
 JUDGE_MEME_RESPONSE_FORMAT: dict[str, Any] = _meme_response_format()
 
 
-def response_format_for(mode: str, *, memes: bool = False) -> dict[str, Any] | None:
-    """Choose provider-side JSON formatting; trusted validation remains unchanged."""
+def response_format_for(
+    mode: str,
+    *,
+    memes: bool = False,
+    actions: Sequence[str] | None = None,
+    intents: Sequence[str] | None = None,
+) -> dict[str, Any] | None:
+    """Choose provider-side JSON formatting; trusted validation remains unchanged.
+
+    ``actions`` and ``intents`` narrow the strict schema to what this opportunity
+    actually offers. ``None`` keeps the full template enums.
+    """
     if mode == "json_object":
         return {"type": "json_object"}
     if mode == "prompt_only":
         return None
-    return JUDGE_MEME_RESPONSE_FORMAT if memes else JUDGE_RESPONSE_FORMAT
+    if memes:
+        return _meme_response_format(actions=actions, intents=intents)
+    if actions is None and intents is None:
+        return JUDGE_RESPONSE_FORMAT
+    return _with_enums(
+        JUDGE_RESPONSE_FORMAT,
+        name=str(JUDGE_RESPONSE_FORMAT["json_schema"]["name"]),
+        actions=actions,
+        intents=intents,
+    )
 
 
 JUDGE_USER_TEMPLATE = (
@@ -533,6 +582,7 @@ class ParticipationJudge:
                 detail="context_budget_exceeded",
             )
         memes = view.offers_images
+        actions, intents = self._offered(view)
         try:
             reply = await asyncio.wait_for(
                 self._client.chat_with_usage(
@@ -542,12 +592,24 @@ class ParticipationJudge:
                     response_format=response_format_for(
                         str(getattr(self._client, "structured_output", "json_schema_strict")),
                         memes=memes,
+                        actions=actions,
+                        intents=intents,
                     ),
                 ),
                 timeout=self._timeout_seconds,
             )
         except asyncio.CancelledError:
             raise
+        except RouteCallError as exc:
+            if exc.reason == "timeout":
+                raise ParticipationDecisionError("timeout") from exc
+            logger.warning(
+                "participation_judge_failed route={} error_type={} error_reason={}",
+                self.route_key,
+                type(exc).__name__,
+                exc.reason,
+            )
+            raise ParticipationDecisionError("provider_error") from exc
         except TimeoutError as exc:
             raise ParticipationDecisionError("timeout") from exc
         except Exception as exc:
@@ -562,10 +624,10 @@ class ParticipationJudge:
         )
         logger.info(
             "participation_judge_completion opportunity={} route={} model={} "
-            "finish_reason={} native_finish_reason={} usage={} diagnostics={}",
+            "finish_reason={} native_finish_reason={} usage={} latency_ms={} diagnostics={}",
             opportunity.opportunity_id, self.route_key, reply.model,
             reply.finish_reason, native_finish_reason, dict(reply.usage),
-            dict(reply.diagnostics),
+            reply.latency_ms, dict(reply.diagnostics),
         )
         tracing.log_generation(
             parent=trace,
@@ -600,8 +662,7 @@ class ParticipationJudge:
     def _build_messages(
         self, opportunity: ParticipationOpportunity, view: "_JudgeContext"
     ) -> list[dict[str, str]]:
-        granted = set(view.allowed_actions)
-        allowed = [action for action in _ALL_ACTIONS if action in granted] or ["silence"]
+        actions, intents = self._offered(view)
         system = (
             JUDGE_SYSTEM_PROMPT
             + (
@@ -617,8 +678,8 @@ class ParticipationJudge:
                 "role": "user",
                 "content": JUDGE_USER_TEMPLATE.format(
                     guidance=view.guidance or "(none)",
-                    allowed_actions=", ".join(allowed),
-                    allowed_intents=", ".join(self._allowed_intents(view)),
+                    allowed_actions=", ".join(actions),
+                    allowed_intents=", ".join(intents),
                     allowed_contribution_types=(
                         ", ".join(sorted(view.allowed_contribution_types)) or "(none)"
                     ),
@@ -634,6 +695,26 @@ class ParticipationJudge:
                 ),
             },
         ]
+
+    def _offered(self, view: "_JudgeContext") -> tuple[tuple[str, ...], tuple[str, ...]]:
+        """The actions and intents this opportunity actually offers.
+
+        The prompt lines and the provider schema both come from here, so the model is
+        never shown a comment in one place and denied it in the other. A comment
+        without any coherent intent is not offered at all; ``initiate`` remains only
+        as the schema's non-null placeholder because silence and reactions ignore it.
+        """
+        granted = set(view.allowed_actions)
+        if not view.offers_images:
+            # Without a meme offer the plain schema carries no meme fields, so an image
+            # action could only come back as an invalid plan.
+            granted -= IMAGE_ACTIONS
+        actions = tuple(action for action in _ALL_ACTIONS if action in granted) or ("silence",)
+        intents = self._allowed_intents(view)
+        if not intents:
+            actions = tuple(action for action in actions if action != "comment")
+            intents = ("initiate",)
+        return actions, intents
 
     @staticmethod
     def _allowed_intents(view: "_JudgeContext") -> tuple[str, ...]:

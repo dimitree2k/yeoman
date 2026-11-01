@@ -538,6 +538,25 @@ class _TalkativeCooldownState:
     cooldown_until: float = 0.0
 
 
+#: Returned by the cooldown check when the notice is disabled: the turn stays silent.
+TALKATIVE_SILENT = object()
+
+
+def _usage_count(value: object) -> int:
+    """A provider may omit usage, or send a non-count value; both count as zero."""
+    return value if isinstance(value, int) and not isinstance(value, bool) else 0
+
+
+@dataclass
+class _ReplyUsage:
+    """Per-turn provider-call accumulator; missing usage counts as zero."""
+
+    iterations: int = 0
+    prompt_tokens_total: int = 0
+    completion_tokens_total: int = 0
+    latency_ms_total: int = 0
+
+
 @dataclass(frozen=True, slots=True)
 class _ParticipationSubmitOutcome:
     """Local submission outcome. Only a provider state counts as acceptance."""
@@ -1889,8 +1908,16 @@ class LLMResponder(ResponderPort):
         never had the tool.
         """
         called: list[str] = []
+        usage = _ReplyUsage()
+        outcome = "error"
         try:
-            return await self._run_chat_loop(called_tools=called, **kwargs)
+            result = await self._run_chat_loop(called_tools=called, usage=usage, **kwargs)
+        except BaseException:
+            outcome = "error"
+            raise
+        else:
+            outcome = "completed" if result else "empty"
+            return result
         finally:
             offered = sorted(
                 name
@@ -1903,6 +1930,16 @@ class LLMResponder(ResponderPort):
                 ",".join(offered) or "-",
                 ",".join(called) or "-",
             )
+            logger.info(
+                "reply_turn_usage chat={} iterations={} prompt_tokens_total={} "
+                "completion_tokens_total={} latency_ms_total={} outcome={}",
+                kwargs.get("current_chat_id") or "-",
+                usage.iterations,
+                usage.prompt_tokens_total,
+                usage.completion_tokens_total,
+                usage.latency_ms_total,
+                outcome,
+            )
 
     async def _run_chat_loop(
         self,
@@ -1910,6 +1947,7 @@ class LLMResponder(ResponderPort):
         called_tools: list[str],
         messages: list[dict[str, Any]],
         allowed_tools: set[str],
+        usage: _ReplyUsage | None = None,
         security_context: dict[str, object] | None = None,
         is_owner: bool = False,
         model: str | None = None,
@@ -1929,6 +1967,7 @@ class LLMResponder(ResponderPort):
     ) -> str | None:
         iteration = 0
         final_content: str | None = None
+        usage = usage if usage is not None else _ReplyUsage()
         chat_provider = provider or self.provider
         deferred_work_repair_attempted = False
         #: Set once a tool handed work off to run in the background. From that point the
@@ -1943,6 +1982,7 @@ class LLMResponder(ResponderPort):
         _send_tools = frozenset({"message", "send_voice", "send_media", "delete_message"})
         while iteration < self.max_iterations:
             iteration += 1
+            usage.iterations = iteration
             # A turn that already handed work off answers only; the provider sees no tools.
             active_tools = set() if async_handoff is not None else allowed_tools
             iter_span = lf.start_span(
@@ -1963,6 +2003,7 @@ class LLMResponder(ResponderPort):
                     "reasoning": reasoning,
                 },
             )
+            call_started = time.monotonic()
             try:
                 from yeoman_gateway.history.context import history_effect_metadata
                 history_effect_metadata()
@@ -1973,6 +2014,25 @@ class LLMResponder(ResponderPort):
                     temperature=temperature if temperature is not None else 0.7,
                     reasoning=reasoning,
                     max_tokens=max_tokens,
+                )
+                call_latency_ms = int((time.monotonic() - call_started) * 1000)
+                raw_usage = getattr(response, "usage", None) or {}
+                prompt_tokens = _usage_count(raw_usage.get("prompt_tokens"))
+                completion_tokens = _usage_count(raw_usage.get("completion_tokens"))
+                usage.prompt_tokens_total += prompt_tokens
+                usage.completion_tokens_total += completion_tokens
+                usage.latency_ms_total += call_latency_ms
+                logger.info(
+                    "reply_llm_call chat={} iteration={} model={} prompt_tokens={} "
+                    "completion_tokens={} latency_ms={} finish_reason={} tool_calls={}",
+                    current_chat_id or "-",
+                    iteration,
+                    model or self.model,
+                    prompt_tokens,
+                    completion_tokens,
+                    call_latency_ms,
+                    str(getattr(response, "finish_reason", "") or ""),
+                    len(getattr(response, "tool_calls", None) or ()),
                 )
                 if response.finish_reason == "error":
                     logger.warning(
@@ -2624,7 +2684,8 @@ class LLMResponder(ResponderPort):
         cooldown_seconds: int,
         delay_seconds: float,
         use_llm_message: bool,
-    ) -> str | None:
+        notice: bool = True,
+    ) -> str | None | object:
         if not enabled:
             return None
         if not bool(metadata.get("is_group", False)):
@@ -2666,6 +2727,8 @@ class LLMResponder(ResponderPort):
         state.streak = 0
         self._talkative_state[session_key] = state
 
+        if not notice:
+            return TALKATIVE_SILENT
         if delay_seconds > 0:
             await asyncio.sleep(float(delay_seconds))
         if use_llm_message:
@@ -2714,6 +2777,7 @@ class LLMResponder(ResponderPort):
         talkative_cooldown_cooldown_seconds: int = 900,
         talkative_cooldown_delay_seconds: float = 2.5,
         talkative_cooldown_use_llm_message: bool = False,
+        talkative_cooldown_notice: bool = True,
         is_owner: bool = False,
         model_profile: str | None = None,
         session_history_limit: int | None = None,
@@ -2742,6 +2806,7 @@ class LLMResponder(ResponderPort):
                 talkative_cooldown_cooldown_seconds=talkative_cooldown_cooldown_seconds,
                 talkative_cooldown_delay_seconds=talkative_cooldown_delay_seconds,
                 talkative_cooldown_use_llm_message=talkative_cooldown_use_llm_message,
+                talkative_cooldown_notice=talkative_cooldown_notice,
                 is_owner=is_owner,
                 model_profile=model_profile,
                 session_history_limit=session_history_limit,
@@ -2892,6 +2957,7 @@ class LLMResponder(ResponderPort):
         talkative_cooldown_cooldown_seconds: int = 900,
         talkative_cooldown_delay_seconds: float = 2.5,
         talkative_cooldown_use_llm_message: bool = False,
+        talkative_cooldown_notice: bool = True,
         is_owner: bool = False,
         model_profile: str | None = None,
         session_history_limit: int | None = None,
@@ -3084,8 +3150,22 @@ class LLMResponder(ResponderPort):
             cooldown_seconds=talkative_cooldown_cooldown_seconds,
             delay_seconds=talkative_cooldown_delay_seconds,
             use_llm_message=talkative_cooldown_use_llm_message,
+            notice=talkative_cooldown_notice,
         )
-        if talkative_reply is not None:
+        if talkative_reply is TALKATIVE_SILENT:
+            if not _user_message_already_added:
+                session.add_message("user", content, **self._session_user_metadata(sender_id, metadata))
+            self.sessions.save(session)
+            self._metric("talkative_cooldown_silent")
+            logger.info(
+                "talkative_cooldown_silent chat={} sender={}",
+                chat_id,
+                sender_id,
+            )
+            lf.end_span(trace, output={"outcome": "talkative_cooldown_silent"})
+            self._current_trace = None
+            return None
+        if isinstance(talkative_reply, str):
             final_content = talkative_reply
         else:
             # Append contacts roster if present
@@ -3546,6 +3626,7 @@ class LLMResponder(ResponderPort):
             talkative_cooldown_cooldown_seconds=decision.talkative_cooldown_cooldown_seconds,
             talkative_cooldown_delay_seconds=decision.talkative_cooldown_delay_seconds,
             talkative_cooldown_use_llm_message=decision.talkative_cooldown_use_llm_message,
+            talkative_cooldown_notice=decision.talkative_cooldown_notice,
             is_owner=decision.is_owner,
             model_profile=decision.model_profile,
             session_history_limit=decision.session_history_limit,
@@ -3605,6 +3686,7 @@ class LLMResponder(ResponderPort):
             talkative_cooldown_cooldown_seconds=900,
             talkative_cooldown_delay_seconds=2.5,
             talkative_cooldown_use_llm_message=False,
+            talkative_cooldown_notice=True,
             is_owner=False,
             model_profile=model_profile,
             session_history_limit=None,
@@ -3920,6 +4002,7 @@ class LLMResponder(ResponderPort):
             talkative_cooldown_cooldown_seconds=900,
             talkative_cooldown_delay_seconds=2.5,
             talkative_cooldown_use_llm_message=False,
+            talkative_cooldown_notice=True,
             is_owner=is_owner,
             model_profile=model_profile,
             raise_provider_errors=raise_provider_errors,

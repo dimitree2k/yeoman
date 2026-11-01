@@ -160,6 +160,8 @@ class TalkativeCooldownPolicy(PolicyModel):
     cooldown_seconds: int = Field(default=900, alias="cooldownSeconds", ge=10, le=86_400)
     delay_seconds: float = Field(default=2.5, alias="delaySeconds", ge=0.0, le=30.0)
     use_llm_message: bool = Field(default=False, alias="useLlmMessage")
+    #: Send the playful cooldown notice; False makes the cooldown silent but still active.
+    notice: bool = True
 
 
 class TalkativeCooldownPolicyOverride(PolicyModel):
@@ -173,6 +175,7 @@ class TalkativeCooldownPolicyOverride(PolicyModel):
     cooldown_seconds: int | None = Field(default=None, alias="cooldownSeconds", ge=10, le=86_400)
     delay_seconds: float | None = Field(default=None, alias="delaySeconds", ge=0.0, le=30.0)
     use_llm_message: bool | None = Field(default=None, alias="useLlmMessage")
+    notice: bool | None = None
 
 
 class ReplyBudgetPolicy(PolicyModel):

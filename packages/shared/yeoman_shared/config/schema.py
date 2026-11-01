@@ -675,10 +675,6 @@ class ConsciousnessConfig(BaseModel):
 
     enabled: bool = False
     owner_dm_default_enabled: bool = Field(default=False, alias="ownerDmDefaultEnabled")
-    cron_hour: int = Field(default=19, alias="cronHour", ge=0, le=23)
-    cron_minute: int = Field(default=0, alias="cronMinute", ge=0, le=59)
-    agent_max_iterations: int = Field(default=3, alias="agentMaxIterations", ge=1, le=8)
-    agent_max_input_tokens: int = Field(default=10000, alias="agentMaxInputTokens", ge=1000)
     max_speakup_length_chars: int = Field(default=500, alias="maxSpeakupLengthChars", ge=1)
     default_daily_cap: int = Field(default=1, alias="defaultDailyCap", ge=0, le=10)
     dynamic_daily_cap_enabled: bool = Field(default=False, alias="dynamicDailyCapEnabled")

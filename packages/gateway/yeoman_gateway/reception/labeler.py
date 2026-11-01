@@ -577,6 +577,7 @@ class ReceptionLabelRunner:
                         response_format=response_format_for(
                             str(getattr(route, "structured_output", "json_schema_strict"))
                         ),
+                        timeout_ms=int(self._timeout_seconds * 1000),
                     ),
                     timeout=self._timeout_seconds,
                 )

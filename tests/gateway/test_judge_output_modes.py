@@ -80,6 +80,43 @@ def test_response_format_for(mode: str, expected: Any) -> None:
     assert response_format_for(mode) == expected
 
 
+def test_default_response_format_unchanged() -> None:
+    assert response_format_for("json_schema_strict") == JUDGE_RESPONSE_FORMAT
+
+
+def test_schema_enums_follow_allowed_actions() -> None:
+    schema = response_format_for(
+        "json_schema_strict",
+        actions=("silence", "react"),
+        intents=("initiate",),
+    )
+    assert schema is not None
+    properties = schema["json_schema"]["schema"]["properties"]
+    assert properties["action"]["enum"] == ["silence", "react"]
+    assert properties["intent"]["enum"] == ["initiate"]
+    # The module-level template is never mutated by a per-opportunity schema.
+    assert JUDGE_RESPONSE_FORMAT["json_schema"]["schema"]["properties"]["action"]["enum"] == [
+        "silence",
+        "react",
+        "comment",
+    ]
+
+
+def test_meme_schema_keeps_meme_fields_with_restricted_enum() -> None:
+    schema = response_format_for(
+        "json_schema_strict",
+        memes=True,
+        actions=("silence", "meme"),
+        intents=("initiate",),
+    )
+    assert schema is not None
+    properties = schema["json_schema"]["schema"]["properties"]
+    assert properties["action"]["enum"] == ["silence", "meme"]
+    assert properties["intent"]["enum"] == ["initiate"]
+    assert "meme_source" in properties
+    assert "meme_prompt" in properties
+
+
 async def test_judge_uses_the_client_mode() -> None:
     captured: dict[str, Any] = {}
 
@@ -114,3 +151,42 @@ async def test_judge_uses_the_client_mode() -> None:
     }
     await judge.decide(opportunity, context)
     assert captured["response_format"] is None
+
+
+async def test_decide_sends_restricted_schema() -> None:
+    captured: dict[str, Any] = {}
+
+    class _Client:
+        route_key = "eval.judge"
+        structured_output = "json_schema_strict"
+
+        async def chat_with_usage(
+            self, messages, *, max_tokens, response_format=None, max_retries=None
+        ):
+            captured["response_format"] = response_format
+            return RouteReply(
+                content='{"action": "silence", "intent": "initiate", "reason": "q"}',
+                finish_reason="stop",
+            )
+
+    judge = ParticipationJudge(client=_Client())  # type: ignore[arg-type]
+    opportunity = ParticipationOpportunity(
+        opportunity_id="o",
+        channel="whatsapp",
+        chat_id="c",
+        trigger="inbound",
+        source_event_ids=("m",),
+        observed_revision=1,
+        activation_epoch=1,
+        created_at_ms=NOW,
+    )
+    context = {
+        "messages": [{"event_id": "m", "sender": "A", "text": "hi", "timestamp": NOW // 1000}],
+        "current_source_ids": ["m"],
+        "allowed_actions": ["silence", "react", "comment"],
+        "allowed_intents": [],
+    }
+    await judge.decide(opportunity, context)
+    properties = captured["response_format"]["json_schema"]["schema"]["properties"]
+    assert properties["action"]["enum"] == ["silence", "react"]
+    assert properties["intent"]["enum"] == ["initiate"]

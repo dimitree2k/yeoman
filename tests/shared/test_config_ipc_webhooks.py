@@ -94,8 +94,6 @@ def test_consciousness_config_defaults_disabled() -> None:
     cfg = ConsciousnessConfig()
     assert cfg.enabled is False
     assert cfg.owner_dm_default_enabled is False
-    assert cfg.cron_hour == 19
-    assert cfg.cron_minute == 0
     assert cfg.default_daily_cap == 1
     assert cfg.burst_enabled is False
 
@@ -105,10 +103,6 @@ def test_consciousness_config_accepts_aliases() -> None:
         {
             "enabled": True,
             "ownerDmDefaultEnabled": True,
-            "cronHour": 8,
-            "cronMinute": 30,
-            "agentMaxIterations": 4,
-            "agentMaxInputTokens": 12000,
             "maxSpeakupLengthChars": 240,
             "defaultDailyCap": 2,
             "approvalTimeoutSeconds": 900,
@@ -119,7 +113,6 @@ def test_consciousness_config_accepts_aliases() -> None:
     )
     assert cfg.enabled is True
     assert cfg.owner_dm_default_enabled is True
-    assert cfg.cron_hour == 8
     assert cfg.burst_enabled is True
 
 
@@ -128,10 +121,6 @@ def test_consciousness_config_accepts_snake_case_from_loader() -> None:
         {
             "enabled": True,
             "owner_dm_default_enabled": True,
-            "cron_hour": 8,
-            "cron_minute": 30,
-            "agent_max_iterations": 4,
-            "agent_max_input_tokens": 12000,
             "max_speakup_length_chars": 240,
             "default_daily_cap": 2,
             "approval_timeout_seconds": 900,
@@ -142,20 +131,39 @@ def test_consciousness_config_accepts_snake_case_from_loader() -> None:
     )
     assert cfg.enabled is True
     assert cfg.owner_dm_default_enabled is True
-    assert cfg.cron_hour == 8
     assert cfg.default_daily_cap == 2
     assert cfg.burst_enabled is True
     assert cfg.burst_threshold_messages == 6
     assert cfg.burst_window_minutes == 10
 
 
+def test_consciousness_config_ignores_removed_keys() -> None:
+    """Runtime configs may still carry the retired keys; loading must not break."""
+    cfg = ConsciousnessConfig.model_validate(
+        {
+            "enabled": True,
+            "cronHour": 8,
+            "cronMinute": 30,
+            "agentMaxIterations": 4,
+            "agentMaxInputTokens": 12000,
+            "cron_hour": 8,
+            "cron_minute": 30,
+            "agent_max_iterations": 4,
+            "agent_max_input_tokens": 12000,
+        }
+    )
+
+    assert cfg.enabled is True
+    assert not hasattr(cfg, "cron_hour")
+    assert not hasattr(cfg, "cron_minute")
+    assert not hasattr(cfg, "agent_max_iterations")
+    assert not hasattr(cfg, "agent_max_input_tokens")
+
+
 @pytest.mark.parametrize(
     "payload",
     [
-        {"cronHour": 24},
-        {"cronMinute": 60},
         {"defaultDailyCap": 11},
-        {"agentMaxIterations": 0},
         {"burstThresholdMessages": 1},
     ],
 )
