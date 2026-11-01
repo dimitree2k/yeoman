@@ -1821,6 +1821,20 @@ class ProcessingStore:
                 (str(outcome), emoji, int(now_ms), str(channel), str(chat_id), str(message_id)),
             )
 
+    def short_reply_decisions_since(
+        self, channel: str, chat_id: str, since_ms: int
+    ) -> list[dict[str, Any]]:
+        """Recorded short-reply decisions of one chat, oldest first, ids and no text."""
+        with self._lock:
+            rows = self._conn.execute(
+                "SELECT message_id, mode, status, emoji, created_ms, updated_ms "
+                "FROM short_reply_decisions "
+                "WHERE channel = ? AND chat_id = ? AND created_ms >= ? "
+                "ORDER BY created_ms, message_id",
+                (str(channel), str(chat_id), int(since_ms)),
+            ).fetchall()
+        return [dict(row) for row in rows]
+
     def count_effects(self) -> int:
         with self._lock:
             row = self._conn.execute("SELECT COUNT(*) AS n FROM effects").fetchone()

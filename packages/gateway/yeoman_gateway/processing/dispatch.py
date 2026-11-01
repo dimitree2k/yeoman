@@ -847,6 +847,8 @@ class IntentEffectRouter:
         self._frozen_turn_cap = 256
         #: Optional best-effort recorder for reception measurement; never changes routing.
         self._reception_recorder: Callable[..., None] | None = None
+        #: Best-effort listeners called with ``(channel, chat_id)`` after a confirmed send.
+        self._post_send_listeners: list[Callable[[str, str], None]] = []
         processing = getattr(config, "processing", None)
         budgets = getattr(processing, "budgets", None)
         self._budget = budget or (
@@ -901,6 +903,29 @@ class IntentEffectRouter:
     def set_reception_recorder(self, recorder: Callable[..., None] | None) -> None:
         """Install the best-effort outbound metadata hook (reception measurement)."""
         self._reception_recorder = recorder
+
+    def add_post_send_listener(self, listener: Callable[[str, str], None]) -> None:
+        """Install a best-effort hook run with ``(channel, chat_id)`` after a sent effect."""
+        self._post_send_listeners.append(listener)
+
+    def _notify_post_send(self, envelope: EffectEnvelope, result: Any) -> None:
+        """A listener failure must never affect the send or the other listeners."""
+        if str(getattr(result, "state", "")) != "sent" or not self._post_send_listeners:
+            return
+        target = getattr(envelope, "target", None)
+        channel = str(getattr(target, "channel", "") or "")
+        chat_id = str(getattr(target, "chat_id", "") or "")
+        if not channel or not chat_id:
+            return
+        for listener in tuple(self._post_send_listeners):
+            try:
+                listener(channel, chat_id)
+            except Exception as exc:  # noqa: BLE001 - listeners are advisory
+                logger.debug(
+                    "group_state_post_send_skipped effect={} error_type={}",
+                    envelope.effect_id,
+                    type(exc).__name__,
+                )
 
     def effect_covers(self, effect_id: str, channel: str, chat_id: str) -> bool:
         """True only for a real persisted effect whose target is this chat."""
@@ -1230,6 +1255,7 @@ class IntentEffectRouter:
                 )
         self._confirm_quotable_message(envelope, result, now=now)
         self._record_reception_metadata(envelope, admission, result, now=now)
+        self._notify_post_send(envelope, result)
         logger.info(
             "routing_effect effect_id={} state={} chat={} turn_id={} revision={} detail={}",
             receipt.effect_id,
