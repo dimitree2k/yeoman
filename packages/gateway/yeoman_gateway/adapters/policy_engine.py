@@ -793,6 +793,7 @@ class EnginePolicyAdapter(PolicyPort):
                 talkative_cooldown_cooldown_seconds=900,
                 talkative_cooldown_delay_seconds=2.5,
                 talkative_cooldown_use_llm_message=False,
+                talkative_cooldown_notice=True,
                 reply_budget={},
                 session_history_limit=None,
                 source="disabled",
@@ -825,6 +826,7 @@ class EnginePolicyAdapter(PolicyPort):
         talkative_cooldown_cooldown_seconds = 900
         talkative_cooldown_delay_seconds = 2.5
         talkative_cooldown_use_llm_message = False
+        talkative_cooldown_notice = True
         contacts_disclosure = False
         session_history_limit: int | None = None
         reply_budget: dict[str, object] = {}
@@ -850,6 +852,7 @@ class EnginePolicyAdapter(PolicyPort):
                 talkative_cooldown_cooldown_seconds = effective.talkative_cooldown_cooldown_seconds
                 talkative_cooldown_delay_seconds = effective.talkative_cooldown_delay_seconds
                 talkative_cooldown_use_llm_message = effective.talkative_cooldown_use_llm_message
+                talkative_cooldown_notice = effective.talkative_cooldown_notice
                 contacts_disclosure = effective.contacts_disclosure
                 session_history_limit = effective.session_history_limit
                 reply_budget = dict(effective.reply_budget)
@@ -894,6 +897,7 @@ class EnginePolicyAdapter(PolicyPort):
             talkative_cooldown_cooldown_seconds=talkative_cooldown_cooldown_seconds,
             talkative_cooldown_delay_seconds=talkative_cooldown_delay_seconds,
             talkative_cooldown_use_llm_message=talkative_cooldown_use_llm_message,
+            talkative_cooldown_notice=talkative_cooldown_notice,
             reply_budget=reply_budget,
             model_profile=model_profile,
             contacts_disclosure=contacts_disclosure,
@@ -976,6 +980,7 @@ class EnginePolicyAdapter(PolicyPort):
                         "cooldownSeconds": effective.talkative_cooldown_cooldown_seconds,
                         "delaySeconds": effective.talkative_cooldown_delay_seconds,
                         "useLlmMessage": effective.talkative_cooldown_use_llm_message,
+                        "notice": effective.talkative_cooldown_notice,
                     },
                     "replyBudget": effective.reply_budget,
                 }

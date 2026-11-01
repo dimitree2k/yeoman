@@ -16,8 +16,6 @@ from yeoman_gateway.media.document_cache import DocumentCache
 from yeoman_gateway.media.memes.service import MemeService
 from yeoman_gateway.policy.schema import ParticipationPolicy, ParticipationPolicyOverride
 from yeoman_gateway.processing.participation import (
-    JUDGE_MEME_RESPONSE_FORMAT,
-    JUDGE_RESPONSE_FORMAT,
     ParticipationDecision,
     ParticipationDecisionError,
     ParticipationJudge,
@@ -279,7 +277,16 @@ async def test_judge_parses_a_template_meme_and_sees_the_offer() -> None:
     assert "Memes and stickers" in system
     assert "[Meme options]" in user and "drake: Drakeposting" in user
     assert 'id="m1": a burnt pizza on a plate' in user
-    assert client.response_formats[0] == JUDGE_MEME_RESPONSE_FORMAT
+    properties = client.response_formats[0]["json_schema"]["schema"]["properties"]
+    assert properties["action"]["enum"] == [
+        "silence",
+        "react",
+        "comment",
+        "meme",
+        "sticker",
+    ]
+    assert properties["intent"]["enum"] == ["initiate", "continue"]
+    assert "meme_source" in properties
     assert client.max_tokens[0] >= 384
 
 
@@ -290,7 +297,10 @@ async def test_judge_without_meme_offer_keeps_the_old_prompt_and_schema() -> Non
     await judge.decide(_judge_opportunity(), _context())
     assert "Memes and stickers" not in client.calls[0][0]["content"]
     assert "[Meme options]" not in client.calls[0][1]["content"]
-    assert client.response_formats[0] == JUDGE_RESPONSE_FORMAT
+    properties = client.response_formats[0]["json_schema"]["schema"]["properties"]
+    assert properties["action"]["enum"] == ["silence", "react", "comment"]
+    assert properties["intent"]["enum"] == ["initiate", "continue"]
+    assert "meme_source" not in properties
 
 
 @pytest.mark.asyncio

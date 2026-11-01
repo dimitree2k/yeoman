@@ -45,6 +45,19 @@ def _decision(*, is_owner: bool = False) -> PolicyDecision:
     )
 
 
+def _talkative_decision(*, notice: bool) -> PolicyDecision:
+    return PolicyDecision(
+        accept_message=True,
+        should_respond=True,
+        allowed_tools=frozenset(),
+        reason="test",
+        talkative_cooldown_enabled=True,
+        talkative_cooldown_streak_threshold=2,
+        talkative_cooldown_delay_seconds=0,
+        talkative_cooldown_notice=notice,
+    )
+
+
 
 @pytest.fixture(autouse=True)
 def _project_whatsapp_responder_history(monkeypatch, request, tmp_path):
@@ -457,6 +470,82 @@ async def test_group_talkative_cooldown_sets_blunt_boundary(tmp_path: Path) -> N
             talkative_cooldown_streak_threshold=2,
             talkative_cooldown_delay_seconds=0,
         ),
+    )
+
+    await responder.aclose()
+
+    assert first == "Tesla bleibt volatil."
+    assert second == "Bro, du nervst gerade mit dem gleichen Thema. Kurz Pause."
+    assert provider.calls == 1
+
+
+@pytest.mark.asyncio
+async def test_silent_cooldown_returns_none_without_provider_call(tmp_path: Path) -> None:
+    workspace = tmp_path / "ws"
+    workspace.mkdir()
+    provider = _SequenceProvider(["Tesla bleibt volatil."])
+    responder = LLMResponder(bus=MessageBus(), provider=provider, workspace=workspace)
+
+    first = await responder.generate_reply(
+        InboundEvent(
+            channel="telegram",
+            chat_id="group",
+            sender_id="10001",
+            content="Arvid check Tesla Aktie bitte",
+            is_group=True,
+        ),
+        _talkative_decision(notice=False),
+    )
+    second = await responder.generate_reply(
+        InboundEvent(
+            channel="telegram",
+            chat_id="group",
+            sender_id="10001",
+            content="Arvid check Tesla Aktie nochmal",
+            is_group=True,
+        ),
+        _talkative_decision(notice=False),
+    )
+    session = responder.sessions.get_or_create("telegram:group")
+
+    await responder.aclose()
+
+    assert first == "Tesla bleibt volatil."
+    assert second is None
+    assert provider.calls == 1
+    assert any(
+        message.get("role") == "user"
+        and message.get("content") == "Arvid check Tesla Aktie nochmal"
+        for message in session.messages
+    )
+
+
+@pytest.mark.asyncio
+async def test_notice_true_keeps_message(tmp_path: Path) -> None:
+    workspace = tmp_path / "ws"
+    workspace.mkdir()
+    provider = _SequenceProvider(["Tesla bleibt volatil."])
+    responder = LLMResponder(bus=MessageBus(), provider=provider, workspace=workspace)
+
+    first = await responder.generate_reply(
+        InboundEvent(
+            channel="telegram",
+            chat_id="group",
+            sender_id="10001",
+            content="Arvid check Tesla Aktie bitte",
+            is_group=True,
+        ),
+        _talkative_decision(notice=True),
+    )
+    second = await responder.generate_reply(
+        InboundEvent(
+            channel="telegram",
+            chat_id="group",
+            sender_id="10001",
+            content="Arvid check Tesla Aktie nochmal",
+            is_group=True,
+        ),
+        _talkative_decision(notice=True),
     )
 
     await responder.aclose()

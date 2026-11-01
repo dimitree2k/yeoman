@@ -602,6 +602,44 @@ async def test_prompt_offers_only_coherent_intents() -> None:
 
 
 @pytest.mark.asyncio
+async def test_comment_removed_when_no_intent() -> None:
+    client = _Client(_payload())
+    judge = ParticipationJudge(client=client, allowed_emojis=(EMOJI,))
+    await judge.decide(
+        _opportunity(),
+        _context(
+            anchors=[],
+            direct_addressed=False,
+            allowed_actions=["silence", "react", "comment"],
+            allowed_intents=[],
+        ),
+    )
+    prompt = client.calls[0][1]["content"]
+    assert "Allowed actions for this opportunity: silence, react" in prompt
+    assert "Allowed intents for this opportunity: initiate" in prompt
+    schema = client.response_formats[0]
+    properties = schema["json_schema"]["schema"]["properties"]
+    assert properties["action"]["enum"] == ["silence", "react"]
+    assert properties["intent"]["enum"] == ["initiate"]
+
+
+@pytest.mark.asyncio
+async def test_image_actions_not_offered_without_meme_templates() -> None:
+    # A chat may allow memes while no template is available: the plain schema has no meme
+    # fields, so offering the action could only produce an invalid plan.
+    client = _Client(_payload())
+    judge = ParticipationJudge(client=client, allowed_emojis=(EMOJI,))
+    await judge.decide(
+        _opportunity(),
+        _context(allowed_actions=["silence", "react", "comment", "meme", "sticker"]),
+    )
+    prompt = client.calls[0][1]["content"]
+    assert "Allowed actions for this opportunity: silence, react, comment\n" in prompt
+    properties = client.response_formats[0]["json_schema"]["schema"]["properties"]
+    assert properties["action"]["enum"] == ["silence", "react", "comment"]
+
+
+@pytest.mark.asyncio
 async def test_evidence_ids_are_labelled_so_the_model_cannot_copy_brackets() -> None:
     client = _Client(_payload())
     judge = ParticipationJudge(client=client, allowed_emojis=(EMOJI,))
