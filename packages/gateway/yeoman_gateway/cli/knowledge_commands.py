@@ -1608,3 +1608,149 @@ def digest_show(
         for job in jobs:
             table.add_row(job.week, job.chat_id, job.state, job.reason, str(job.attempts))
         console.print(table)
+
+
+person_notes_app = typer.Typer(help="Person notes: counts, one build, or purge")
+knowledge_app.add_typer(person_notes_app, name="person-notes")
+
+
+@person_notes_app.command("list")
+def person_notes_list(
+    chat: str | None = typer.Option(None, "--chat", help="Only this group chat id"),
+    person: str | None = typer.Option(None, "--person", help="Only this person id"),
+    show: bool = typer.Option(False, "--show", help="Print line text; default is counts/kinds"),
+) -> None:
+    """Active notes for the owner: counts and line kinds, or the lines with --show."""
+    _config, knowledge, processing = _open_capture_runtime()
+    try:
+        rows = knowledge.person_note_counts(channel="whatsapp", chat_id=chat)
+        if person:
+            rows = tuple(item for item in rows if item["person_id"] == person)
+        if not rows:
+            _line("no person notes stored")
+            return
+        table = Table(title="person notes", show_edge=False)
+        for column in ("chat", "person", "status", "lines", "kinds"):
+            table.add_column(column)
+        for item in rows:
+            kinds = ", ".join(
+                f"{kind}={count}" for kind, count in sorted(item["kinds"].items())
+            )
+            table.add_row(
+                item["chat_id"], item["person_id"], item["status"],
+                str(item["line_count"]), kinds or "-",
+            )
+        console.print(table)
+        if not show:
+            return
+        for item in rows:
+            note = knowledge.latest_person_note(
+                channel="whatsapp", chat_id=item["chat_id"], person_id=item["person_id"]
+            )
+            if note is None:
+                continue
+            _line(f"[{note.chat_id}] {note.person_id}", style="bold")
+            for line in note.lines:
+                _line(f"  {line.kind}: {line.text}")
+    finally:
+        knowledge.close()
+        processing.close()
+
+
+@person_notes_app.command("build")
+def person_notes_build(
+    chat: str = typer.Option(..., "--chat", help="Group chat id"),
+    person: str | None = typer.Option(None, "--person", help="Only this person id"),
+    dry_run: bool = typer.Option(
+        False, "--dry-run", help="Read and estimate only: no model call, no write"
+    ),
+) -> None:
+    """Build one group's notes (or one person's); --dry-run makes no call or write."""
+    import asyncio
+    import time
+
+    from yeoman_gateway.processing.model_route import RouteUnavailableError
+    from yeoman_gateway.processing.person_notes import (
+        PERSON_NOTES_ROUTE,
+        PersonNotesRunner,
+    )
+
+    config, knowledge, processing = _open_capture_runtime()
+    history = _digest_history()
+    try:
+        settings = config.processing.person_notes
+        route_key = str(settings.route or PERSON_NOTES_ROUTE)
+
+        async def _run() -> int:
+            from yeoman_gateway.processing.model_route import RouteClient
+
+            runner = PersonNotesRunner(
+                knowledge=knowledge,
+                history=history,
+                client_factory=lambda: RouteClient(config=config, route_key=route_key),
+                max_lines=int(settings.max_lines_per_person),
+            )
+            if person:
+                candidates = ((person, person),)
+            else:
+                candidates = await runner.candidates(
+                    chat, now_ms=int(time.time() * 1000),
+                    limit=int(settings.max_people_per_chat),
+                )
+            calls = 0
+            for person_id, _name in candidates:
+                plan = await runner.plan(
+                    chat, person_id, now_ms=int(time.time() * 1000)
+                )
+                if plan is None:
+                    _line(f"{person_id}: no readable context")
+                    continue
+                _line(
+                    f"{person_id}: stated={len(plan.stated)} observed="
+                    f"{len(plan.observed.messages)} estimated_tokens={plan.estimated_tokens}"
+                )
+                if dry_run:
+                    continue
+                client = runner.client()
+                outcome = await runner.execute(plan, client=client)
+                calls += outcome.model_calls
+                _line(
+                    f"{person_id}: {outcome.state}"
+                    + (f" ({outcome.reason})" if outcome.reason else "")
+                )
+            return calls
+
+        try:
+            calls = asyncio.run(_run())
+        except RouteUnavailableError as exc:
+            _fail(
+                "source_error",
+                f"{exc}; add models.routes['{route_key}'] (for example person_notes)",
+            )
+        _line(f"model calls: {calls}" + (" (dry run)" if dry_run else ""))
+    finally:
+        history.close()
+        knowledge.close()
+        processing.close()
+
+
+@person_notes_app.command("purge")
+def person_notes_purge(
+    chat: str | None = typer.Option(None, "--chat", help="Delete notes of this chat"),
+    person: str | None = typer.Option(None, "--person", help="Delete notes of this person"),
+    yes: bool = typer.Option(False, "--yes", help="Required: actually delete"),
+) -> None:
+    """Delete stored notes; without --yes nothing is removed."""
+    if not yes:
+        _fail("source_error", "purge requires --yes")
+    if not chat and not person:
+        _fail("source_error", "purge requires --chat or --person")
+    _config, knowledge, processing = _open_capture_runtime()
+    try:
+        removed = knowledge.purge_person_notes(
+            channel="whatsapp", chat_id=chat, person_id=person, context=None
+        )
+    finally:
+        knowledge.close()
+        processing.close()
+    _line(f"purged {removed} note(s)")

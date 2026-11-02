@@ -961,6 +961,26 @@ class ProcessingParticipationMaintenanceConfig(BaseModel):
     batch_size: int = Field(default=20, alias="batchSize", gt=0, le=100)
 
 
+class ProcessingPersonNotesConfig(BaseModel):
+    """Per-person notes in groups: precomputed in the background, read by later tasks.
+
+    ``off`` builds, queues and reads nothing and leaves every live prompt unchanged.
+    ``build`` only stores notes; nothing on the reply or writer path reads them yet.
+    """
+
+    model_config = ConfigDict(extra="forbid", populate_by_name=True)
+
+    mode: Literal["off", "build"] = "off"
+    #: A models.routes key: lowercase and dotted, so the camelCase config round-trip
+    #: never rewrites it (``knowledge.notes`` stays itself).
+    route: str = "knowledge.notes"
+    max_people_per_chat: int = Field(default=30, alias="maxPeoplePerChat", ge=1, le=500)
+    min_new_messages: int = Field(default=5, alias="minNewMessages", ge=1)
+    rebuild_every_seconds: int = Field(default=86_400, alias="rebuildEverySeconds", ge=60)
+    daily_prompt_token_cap: int = Field(default=300_000, alias="dailyPromptTokenCap", ge=0)
+    max_lines_per_person: int = Field(default=6, alias="maxLinesPerPerson", ge=1, le=20)
+
+
 class ProcessingShortReplyRateLimitConfig(BaseModel):
     """Burst guard for short-reply reactions, read from durable effect history."""
 
@@ -1151,6 +1171,9 @@ class ProcessingConfig(BaseModel):
         default_factory=ProcessingParticipationConfig
     )
     reception: ProcessingReceptionConfig = Field(default_factory=ProcessingReceptionConfig)
+    person_notes: ProcessingPersonNotesConfig = Field(
+        default_factory=ProcessingPersonNotesConfig, alias="personNotes"
+    )
     group_state: GroupStateConfig = Field(default_factory=GroupStateConfig, alias="groupState")
     participation_maintenance: ProcessingParticipationMaintenanceConfig = Field(
         default_factory=ProcessingParticipationMaintenanceConfig

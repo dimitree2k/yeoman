@@ -73,6 +73,16 @@ DEFAULT_MODEL_PROFILES: dict[str, dict[str, Any]] = {
         "temperature": 0.0,
         "timeout_ms": 10000,
     },
+    "person_notes": {
+        "kind": "chat",
+        "provider": "deepseek",
+        "model": "deepseek-v4-flash",
+        "max_tokens": 2000,
+        "temperature": 0.0,
+        "timeout_ms": 30000,
+        "structured_output": "json_object",
+        "reasoning": {"enabled": False},
+    },
     "reception_label": {
         "kind": "chat",
         "provider": "deepseek",
@@ -104,6 +114,7 @@ DEFAULT_MODEL_ROUTES: dict[str, str] = {
     "security.classify": "security_classifier",
     "meme.background": "meme_background",
     "reception.label": "reception_label",
+    "knowledge.notes": "person_notes",
 }
 
 DEFAULT_WHATSAPP_MEDIA: dict[str, Any] = {

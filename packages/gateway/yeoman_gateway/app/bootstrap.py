@@ -478,6 +478,8 @@ class GatewayRuntime:
     decision_sweeper: Any | None = None
     #: Shadow group-state scheduler; ``None`` unless ``processing.groupState.mode`` is on.
     group_state: Any | None = None
+    #: Person-notes scheduler; ``None`` unless ``processing.personNotes.mode`` is build.
+    person_notes: Any | None = None
 
     async def _start_processing_services(self) -> None:
         """Plan 04 start order: recover and reconcile before any channel consumes input.
@@ -515,6 +517,8 @@ class GatewayRuntime:
             await self.history_projector.start()
             if self.group_state is not None:
                 await self.group_state.start()
+            if self.person_notes is not None:
+                await self.person_notes.start()
             if self.source_catchup is not None:
                 await self.source_catchup.start()
             if self.people_sync is not None:
@@ -615,6 +619,8 @@ class GatewayRuntime:
             if self.group_state is not None:
                 await attempt_async(self.group_state.stop)
                 attempt_sync(self.group_state.close)
+            if self.person_notes is not None:
+                await attempt_async(self.person_notes.stop)
             if self.processing is not None:
                 attempt_sync(self.processing.close)
             if self.people is not None:
@@ -2017,6 +2023,56 @@ def build_group_digest_job(
         directory_terms=directory_terms,
     )
     return GroupDigestJob(runner=runner, knowledge=knowledge, chats=chats)
+
+
+def build_person_notes_job(
+    config: "Config",
+    *,
+    knowledge: object | None,
+    history: object | None,
+    chats: Callable[[], Iterable[str]],
+    tz: Any | None = None,
+):
+    """Person notes scheduler; ``None`` while ``processing.personNotes.mode`` is off.
+
+    Independent of the group-state service: a store and a history projector are the
+    only requirements, and nothing is built at import time.
+    """
+    settings = getattr(config.processing, "person_notes", None)
+    if settings is None or getattr(settings, "mode", "off") != "build":
+        return None
+    if knowledge is None or history is None:
+        return None
+    from yeoman_gateway.processing.model_route import RouteClient
+    from yeoman_gateway.processing.person_notes import (
+        PERSON_NOTES_ROUTE,
+        PersonNotesJob,
+        PersonNotesRunner,
+    )
+
+    route_key = str(getattr(settings, "route", "") or PERSON_NOTES_ROUTE)
+    clients: dict[str, object] = {}
+
+    def _client() -> object:
+        if "client" not in clients:
+            clients["client"] = RouteClient(config=config, route_key=route_key)
+        return clients["client"]
+
+    runner = PersonNotesRunner(
+        knowledge=knowledge,
+        history=history,
+        client_factory=_client,
+        tz=tz,
+        max_lines=int(getattr(settings, "max_lines_per_person", 6)),
+    )
+    return PersonNotesJob(
+        runner=runner,
+        knowledge=knowledge,
+        chats=chats,
+        settings=settings,
+        max_attempts=3,
+        jobs_per_tick=4,
+    )
 
 
 def reception_persona_sha(
@@ -4817,6 +4873,12 @@ def build_gateway_runtime(
         "on" if observed_sources is not None else "off",
     )
 
+    person_notes_job = build_person_notes_job(
+        config,
+        knowledge=knowledge_service,
+        history=history_projector,
+        chats=lambda: tuple(config.processing.chats),
+    )
     for observer in (burst_observer, lull_observer):
         if observer is not None:
             observer._history_projector = history_projector
@@ -4861,6 +4923,7 @@ def build_gateway_runtime(
         trends=_build_trends(config, policy_adapter, history_projector),
         decision_sweeper=decision_sweeper,
         group_state=group_state_service,
+        person_notes=person_notes_job,
     )
 
 

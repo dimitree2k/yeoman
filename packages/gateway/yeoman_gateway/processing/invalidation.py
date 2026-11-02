@@ -125,6 +125,20 @@ class SignalInvalidator:
                     type(exc).__name__,
                 )
 
+        mark_notes = getattr(self._statements, "mark_person_notes_stale", None)
+        if callable(mark_notes) and result.source_event_ids:
+            try:
+                mark_notes(
+                    [("message", event_id) for event_id in result.source_event_ids],
+                    reason=f"source_{kind}",
+                )
+            except Exception as exc:  # pragma: no cover - defensive
+                logger.warning(
+                    "person note invalidation failed kind={} error_type={}",
+                    kind,
+                    type(exc).__name__,
+                )
+
         logger.info(
             "signal invalidation kind={} message={} turn={} revision={} cancelled={}",
             kind,

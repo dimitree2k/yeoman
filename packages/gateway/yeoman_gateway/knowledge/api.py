@@ -81,6 +81,9 @@ from yeoman_gateway.knowledge.models import (
     MaintenanceReport,
     NameObservation,
     PersonLinkCandidate,
+    PersonNoteJob,
+    PersonNoteSeed,
+    PersonNoteView,
     PersonProfile,
     PersonResolution,
     RecallQuery,
@@ -478,6 +481,7 @@ class KnowledgeService:
             workspace_id=self.workspace_id,
         )
         self._group_digest_store: Any | None = None
+        self._person_note_store: Any | None = None
 
     @contextmanager
     def history_scope(self, queries: HistoryQueries, sources: HistoryKnowledgeSources) -> Iterator[None]:
@@ -961,7 +965,14 @@ class KnowledgeService:
         self, source: SourceRef, *, context: TrustedCaptureContext
     ) -> ChangeReceipt:
         with self._store.transaction():
-            return self._statements.invalidate_source(source, context=context)
+            receipt = self._statements.invalidate_source(source, context=context)
+        self.mark_person_notes_stale(
+            [("message", source.event_id), *(
+                ("statement", str(item)) for item in receipt.changed_ids
+            )],
+            reason="source_revoked",
+        )
+        return receipt
 
     def invalidate_event_sources(
         self, event_ids: Iterable[str], *, reason: str = "source_revoked"
@@ -972,8 +983,17 @@ class KnowledgeService:
         it authorized and persisted the revocation.  It grants nothing: it only makes the
         statements that rested on the revoked revision stop being readable.
         """
+        wanted = tuple(str(item) for item in event_ids if str(item))
         with self._store.transaction():
-            return self._statements.invalidate_event_ids(event_ids, reason=str(reason))
+            changed = self._statements.invalidate_event_ids(wanted, reason=str(reason))
+        self.mark_person_notes_stale(
+            [
+                *(("message", event_id) for event_id in wanted),
+                *(("statement", str(item)) for item in changed),
+            ],
+            reason=str(reason),
+        )
+        return changed
 
     def correct_statement(
         self,
@@ -984,12 +1004,16 @@ class KnowledgeService:
         context: TrustedCaptureContext,
     ) -> ChangeReceipt:
         with self._store.transaction():
-            return self._statements.correct_statement(
+            receipt = self._statements.correct_statement(
                 statement_id,
                 replacement,
                 expected_source=expected_source,
                 context=context,
             )
+        self.mark_person_notes_stale(
+            [("statement", statement_id)], reason="statement_corrected"
+        )
+        return receipt
 
     def confirm_statement(
         self,
@@ -1019,7 +1043,7 @@ class KnowledgeService:
     ) -> ChangeReceipt:
         """End one facet by superseding the statement that carries it."""
         with self._store.transaction():
-            return self._statements.end_attribute(
+            receipt = self._statements.end_attribute(
                 statement_id=statement_id,
                 person_id=person_id,
                 attribute_key=attribute_key,
@@ -1031,14 +1055,22 @@ class KnowledgeService:
                 context=context,
                 reason=reason,
             )
+        self.mark_person_notes_stale(
+            [("statement", statement_id)], reason="statement_superseded"
+        )
+        return receipt
 
     def erase_statement(
         self, statement_id: str, *, expected_source: SourceRef, context: TrustedAdminContext
     ) -> ChangeReceipt:
         with self._store.transaction():
-            return self._statements.erase_statement(
+            receipt = self._statements.erase_statement(
                 statement_id, expected_source=expected_source, context=context
             )
+        self.mark_person_notes_stale(
+            [("statement", statement_id)], reason="statement_erased"
+        )
+        return receipt
 
     # ── jobs ─────────────────────────────────────────────────────────────────
 
@@ -1393,6 +1425,172 @@ class KnowledgeService:
         return self._group_digests.digests(
             chat_id=chat_id, source_present=source_present, limit=limit
         )
+
+    # ── person notes ─────────────────────────────────────────────────────────
+    #
+    # Derived context about one person in one group: deterministic ``stated`` lines
+    # from permitted statements plus a validated model observation of that person's
+    # own messages.  Rebuilding supersedes, never rewrites.  Nothing on the reply or
+    # writer path reads these rows yet (Task 4 owns that).
+
+    @property
+    def _person_notes(self) -> Any:
+        if self._person_note_store is None:
+            from yeoman_gateway.knowledge._person_notes import PersonNoteStore
+
+            self._person_note_store = PersonNoteStore(
+                self._store, workspace_id=self.workspace_id
+            )
+        return self._person_note_store
+
+    def store_person_note(self, seed: PersonNoteSeed) -> PersonNoteView:
+        """Store one validated note version; it supersedes the person's active note."""
+        return self._person_notes.store_note(seed)
+
+    def has_person_note_hash(
+        self, *, channel: str, chat_id: str, person_id: str, input_hash: str
+    ) -> bool:
+        return self._person_notes.has_hash(
+            channel=channel, chat_id=chat_id, person_id=person_id, input_hash=input_hash
+        )
+
+    def latest_person_note(
+        self, *, channel: str, chat_id: str, person_id: str
+    ) -> PersonNoteView | None:
+        return self._person_notes.latest(
+            channel=channel, chat_id=chat_id, person_id=person_id
+        )
+
+    def person_notes(
+        self,
+        *,
+        channel: str,
+        chat_id: str,
+        person_ids: Iterable[str] = (),
+        context: TrustedReadContext,
+        source_present: Callable[[str], bool] | None = None,
+        include_superseded: bool = False,
+        limit: int = 100,
+    ) -> tuple[PersonNoteView, ...]:
+        """Active notes for a reader; every read re-checks staleness before rendering.
+
+        A group reader may read notes for the chat it is currently reading.  The
+        admin-only ``include_superseded`` path exposes old versions for audit and
+        still never returns stale content.
+        """
+        checked = self._read_context(context)
+        if include_superseded:
+            self._require_admin_read(checked)
+        else:
+            self._retrieval.require_read(checked)
+        if str(checked.channel) != str(channel) or str(checked.chat_id) != str(chat_id):
+            raise KnowledgeError("unauthorized", "read context names another chat")
+        return self._person_notes.notes(
+            channel=channel,
+            chat_id=chat_id,
+            person_ids=person_ids,
+            source_present=source_present,
+            include_superseded=include_superseded,
+            limit=limit,
+        )
+
+    def mark_person_notes_stale(
+        self, sources: Iterable[tuple[str, str]], *, reason: str = "stale_source"
+    ) -> int:
+        """Persist staleness of notes that rest on these statements/messages.
+
+        A store that never built a note has no person-note tables; invalidation stays a
+        no-op there instead of creating them as a side effect.
+        """
+        if not (
+            self._store.has_table("knowledge_person_notes")
+            and self._store.has_table("knowledge_person_note_sources")
+        ):
+            return 0
+        return self._person_notes.mark_stale(sources, reason=reason)
+
+    def purge_person_notes(
+        self,
+        *,
+        channel: str,
+        chat_id: str | None = None,
+        person_id: str | None = None,
+        context: TrustedReadContext | None = None,
+    ) -> int:
+        """Owner-only deletion of stored notes (the CLI passes ``None`` after --yes)."""
+        if context is not None:
+            self._require_admin_read(context)
+        if not chat_id and not person_id:
+            raise ValidationError("purge requires a chat or a person")
+        return self._person_notes.purge(
+            channel=channel, chat_id=chat_id, person_id=person_id
+        )
+
+    def person_note_counts(
+        self, *, channel: str = "whatsapp", chat_id: str | None = None
+    ) -> tuple[dict[str, Any], ...]:
+        """Counts and line kinds only; never line text."""
+        return self._person_notes.counts(channel=channel, chat_id=chat_id)
+
+    def person_note_tokens(self, *, day: str) -> int:
+        return self._person_notes.tokens_used(day=day)
+
+    def add_person_note_tokens(self, *, day: str, tokens: int) -> int:
+        return self._person_notes.add_tokens(day=day, tokens=tokens)
+
+    def enqueue_person_note(
+        self,
+        *,
+        channel: str,
+        chat_id: str,
+        person_id: str,
+        input_hash: str,
+        now_ms: int | None = None,
+        due_ms: int | None = None,
+    ) -> PersonNoteJob:
+        moment = self._now() if now_ms is None else int(now_ms)
+        return self._person_notes.enqueue(
+            channel=channel, chat_id=chat_id, person_id=person_id,
+            input_hash=input_hash, now_ms=moment, due_ms=due_ms,
+        )
+
+    def due_person_note_jobs(
+        self, *, max_attempts: int, now_ms: int | None = None, limit: int = 8
+    ) -> tuple[PersonNoteJob, ...]:
+        moment = self._now() if now_ms is None else int(now_ms)
+        return self._person_notes.due(now_ms=moment, max_attempts=max_attempts, limit=limit)
+
+    def claim_person_note_job(
+        self, job_id: str, *, max_attempts: int, now_ms: int | None = None
+    ) -> PersonNoteJob | None:
+        moment = self._now() if now_ms is None else int(now_ms)
+        return self._person_notes.claim(job_id, now_ms=moment, max_attempts=max_attempts)
+
+    def finish_person_note_job(
+        self, job_id: str, *, state: str, reason: str = "", now_ms: int | None = None,
+        due_ms: int | None = None, refund_attempt: bool = False,
+    ) -> PersonNoteJob | None:
+        moment = self._now() if now_ms is None else int(now_ms)
+        return self._person_notes.finish(
+            job_id, state=state, reason=reason, now_ms=moment, due_ms=due_ms,
+            refund_attempt=refund_attempt,
+        )
+
+    def recover_person_note_jobs(
+        self, *, updated_before_ms: int, now_ms: int | None = None
+    ) -> tuple[str, ...]:
+        moment = self._now() if now_ms is None else int(now_ms)
+        return self._person_notes.recover_stale(
+            updated_before_ms=updated_before_ms, now_ms=moment
+        )
+
+    def person_note_job(self, job_id: str) -> PersonNoteJob | None:
+        return self._person_notes.job(job_id)
+
+    def person_note_jobs(
+        self, *, channel: str = "whatsapp", chat_id: str | None = None, limit: int = 50
+    ) -> tuple[PersonNoteJob, ...]:
+        return self._person_notes.jobs(channel=channel, chat_id=chat_id, limit=limit)
 
     # ── administration and diagnostics ───────────────────────────────────────
 
