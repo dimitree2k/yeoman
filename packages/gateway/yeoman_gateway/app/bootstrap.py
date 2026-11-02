@@ -1120,6 +1120,7 @@ def _build_participation_runtime(
     approval_tools: object | None = None,
     knowledge: object | None = None,
     trend_seeds: object | None = None,
+    group_state_views: object | None = None,
 ) -> tuple[object | None, object | None, object | None]:
     """Build the disabled-by-default participation runtime and scheduler.
 
@@ -1192,6 +1193,7 @@ def _build_participation_runtime(
         source_authorizer=_source_authorized,
         thread_lookup=getattr(processing_store, "thread_for_message", None),
         group_notes=group_notes,
+        group_state_views=group_state_views,
         knowledge_selector=knowledge_selector,
         knowledge_context_supplier=knowledge_context_supplier,
         trend_rows=getattr(trend_seeds, "row", None),
@@ -4473,6 +4475,23 @@ def build_gateway_runtime(
             and not (callable(pause_reason) and pause_reason(channel, chat_id))
         )
 
+    # The state service and its read-only view reader are built together, before the
+    # participation runtime that consumes the writer view. Every view mode stays off
+    # live, so the reader is only attached when the owner switches one on.
+    group_state_service = _build_group_state_service(
+        config,
+        history_projector=history_projector,
+        speakups=speakup_log,
+        processing=processing_store,
+        decisions=group_decisions,
+        cron=cron,
+        bus=bus,
+        effect_router=effect_router,
+    )
+    group_state_views = _build_group_state_view_reader(config, group_state_service)
+    if group_state_views is not None:
+        responder.set_group_state_views(group_state_views)
+
     if social_runtime_enabled and speakup_log is not None:
         assert policy_engine is not None
         from yeoman_gateway.consciousness.burst import BurstObserver
@@ -4536,6 +4555,7 @@ def build_gateway_runtime(
                     approval_tools=consciousness_tools,
                     knowledge=knowledge_service,
                     trend_seeds=trend_seeds,
+                    group_state_views=group_state_views,
                 )
             )
         else:
@@ -4802,16 +4822,6 @@ def build_gateway_runtime(
             observer._history_knowledge = knowledge_service
             observer._session_manager = SessionManager(workspace=responder.sessions.workspace, sessions_dir=responder.sessions.sessions_dir,
                 operational_store=responder.sessions.operational_store)
-    group_state_service = _build_group_state_service(
-        config,
-        history_projector=history_projector,
-        speakups=speakup_log,
-        processing=processing_store,
-        decisions=group_decisions,
-        cron=cron,
-        bus=bus,
-        effect_router=effect_router,
-    )
     return GatewayRuntime(
         orchestrator=orchestrator_service,
         channels=channels,
@@ -4917,6 +4927,29 @@ def _build_group_state_service(
     if effect_router is not None:
         effect_router.add_post_send_listener(service.mark_dirty)
     return service
+
+
+def _build_group_state_view_reader(config: "Config", service: Any | None) -> Any | None:
+    """The hot-path reader, or ``None`` when both views are off or no state exists."""
+    if service is None:
+        return None
+    settings = getattr(config.processing, "group_state", None)
+    views = getattr(settings, "views", None) if settings is not None else None
+    if views is None:
+        return None
+    if (
+        getattr(views.reply, "mode", "off") == "off"
+        and getattr(views.writer, "mode", "off") == "off"
+    ):
+        return None
+    from yeoman_gateway.group_state.view_reader import GroupStateViewReader
+
+    lull_minutes = int(getattr(config.consciousness, "lull_silence_minutes", 25) or 25)
+    return GroupStateViewReader(
+        store=service.store,
+        settings=settings,
+        lull_ms=max(1, lull_minutes) * 60_000,
+    )
 
 
 def _build_meme_service(

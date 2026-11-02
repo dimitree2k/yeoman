@@ -1067,6 +1067,29 @@ class GroupStateLabelsConfig(BaseModel):
     timeout_seconds: float = Field(default=30.0, alias="timeoutSeconds", gt=0, le=300)
 
 
+class GroupStateViewConfig(BaseModel):
+    """One text path's bounded group-state view; off keeps today's prompt byte-identical."""
+
+    model_config = ConfigDict(extra="forbid", populate_by_name=True)
+
+    mode: Literal["off", "shadow", "on"] = "off"
+    #: ``"channel:chat_id"`` entries; a chat must also be managed by the build.
+    chats: list[str] = Field(default_factory=list)
+    max_chars: int = Field(default=700, alias="maxChars", ge=1, le=4_000)
+    max_state_age_seconds: int = Field(
+        default=900, alias="maxStateAgeSeconds", ge=1, le=86_400
+    )
+
+
+class GroupStateViewsConfig(BaseModel):
+    """The reply and writer views are independent of each other and of the build mode."""
+
+    model_config = ConfigDict(extra="forbid", populate_by_name=True)
+
+    reply: GroupStateViewConfig = Field(default_factory=GroupStateViewConfig)
+    writer: GroupStateViewConfig = Field(default_factory=GroupStateViewConfig)
+
+
 class GroupStateConfig(BaseModel):
     """Shadow group-state scheduler (P1: observe only, no output path reads it)."""
 
@@ -1083,6 +1106,7 @@ class GroupStateConfig(BaseModel):
     snapshots_kept: int = Field(default=20, alias="snapshotsKept", ge=1, le=200)
     db_path: str = Field(default="data/ops/group-state.db", alias="dbPath")
     labels: GroupStateLabelsConfig = Field(default_factory=GroupStateLabelsConfig)
+    views: GroupStateViewsConfig = Field(default_factory=GroupStateViewsConfig)
 
 
 class ProcessingConfig(BaseModel):
