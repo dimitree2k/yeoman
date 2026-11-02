@@ -258,6 +258,7 @@ def eval_participation_context(
         REPORT_DIR,
         FrozenHistory,
         UsageCapture,
+        background_reader,
         captured_usage,
         chat_subjects,
         label_check,
@@ -377,7 +378,10 @@ def eval_participation_context(
                     consciousness=config.consciousness,
                 )
                 return render_judge_view(
-                    state, now_ms=item.at_ms, unavailable=UNAVAILABLE_IN_REPLAY
+                    state,
+                    reader=background_reader(item),
+                    now_ms=item.at_ms,
+                    unavailable=UNAVAILABLE_IN_REPLAY,
                 )
 
         records = asyncio.run(replay(

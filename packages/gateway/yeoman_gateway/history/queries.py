@@ -95,6 +95,23 @@ class HistoryQueries:
         return hashlib.sha256(json.dumps(payload, sort_keys=True, separators=(",", ":"),
                                          ensure_ascii=False).encode()).hexdigest()
 
+    def content_events_after(
+        self, *, chat_id: str, after_ms: int, after_event_id: str, limit: int = 500
+    ) -> list[Row]:
+        """Edit and delete events after a stable ``(occurred_ms, event_id)`` cursor."""
+        _limit(limit)
+        _time(after_ms)
+        if not isinstance(after_event_id, str):
+            raise ValueError("after_event_id must be a string")
+        return self._rows(
+            "SELECT event_id, target_message_id, kind, occurred_ms FROM message_events"
+            " WHERE channel='whatsapp' AND chat_id=? AND kind IN ('edit','delete')"
+            " AND occurred_ms IS NOT NULL"
+            " AND (occurred_ms>? OR (occurred_ms=? AND event_id>?))"
+            " ORDER BY occurred_ms, event_id LIMIT ?",
+            (chat_id, after_ms, after_ms, after_event_id, limit),
+        )
+
     def window(self, *, chat_id: str, after_ms: int, before_ms: int, limit: int) -> list[Row]:
         _limit(limit)
         _time(after_ms)

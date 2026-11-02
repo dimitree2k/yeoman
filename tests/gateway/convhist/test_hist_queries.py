@@ -184,3 +184,54 @@ def test_fts_search_ranks_terms_and_ignores_fts_syntax(case):
     assert q.search(chat_ids=("g@g.us",), query="*** : ()", limit=10) == []
     assert [r["message_id"] for r in q.search(chat_ids=("other@g.us",), query="haus", limit=1)] == ["foreign"]
     assert [r["message_id"] for r in q.search(chat_ids=("g@g.us",), query="grüße", limit=1, after_ms=100, before_ms=201)] == ["weak"]
+
+
+def test_content_events_after_orders_and_caps(case):
+    db, snapshot = case
+    for mid in ("m1", "m2", "m3"):
+        message(db, mid)
+    event(db, "e3", "edit", 200, {"text": "edited"}, target="m1")
+    event(db, "e2", "delete", 200, {}, target="m2")
+    event(db, "e1", "edit", 300, {"text": "later"}, target="m3")
+    event(db, "r1", "reaction", 100, {"emoji": "x"}, target="m1")
+    event(db, "foreign", "delete", 150, {}, target="m1", chat="other@g.us")
+    event(db, "null-time", "delete", None, {}, target="m1")
+    q = queries(snapshot)
+    rows = q.content_events_after(chat_id="g@g.us", after_ms=0, after_event_id="")
+    assert [(row["event_id"], row["kind"], row["target_message_id"]) for row in rows] == [
+        ("e2", "delete", "m2"),
+        ("e3", "edit", "m1"),
+        ("e1", "edit", "m3"),
+    ]
+    assert [
+        row["event_id"]
+        for row in q.content_events_after(chat_id="g@g.us", after_ms=200, after_event_id="e2")
+    ] == ["e3", "e1"]
+    assert [
+        row["event_id"]
+        for row in q.content_events_after(chat_id="g@g.us", after_ms=200, after_event_id="e3")
+    ] == ["e1"]
+    assert [
+        row["event_id"]
+        for row in q.content_events_after(
+            chat_id="g@g.us", after_ms=0, after_event_id="", limit=1
+        )
+    ] == ["e2"]
+    with pytest.raises(ValueError, match="limit"):
+        q.content_events_after(chat_id="g@g.us", after_ms=0, after_event_id="", limit=501)
+
+    message(db, "cap", chat="cap@g.us")
+    for index in range(505):
+        event(
+            db,
+            f"cap-{index:03d}",
+            "edit",
+            index + 1,
+            {"text": "edited"},
+            target="cap",
+            chat="cap@g.us",
+        )
+    capped = q.content_events_after(chat_id="cap@g.us", after_ms=0, after_event_id="")
+    assert len(capped) == 500
+    assert capped[0]["event_id"] == "cap-000"
+    assert capped[-1]["event_id"] == "cap-499"

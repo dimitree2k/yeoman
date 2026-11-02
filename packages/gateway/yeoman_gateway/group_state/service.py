@@ -11,7 +11,6 @@ from __future__ import annotations
 import asyncio
 import time
 from collections.abc import Callable
-from dataclasses import replace
 from typing import Any
 
 from loguru import logger
@@ -22,8 +21,11 @@ from yeoman_gateway.history.live import HistoryPaused
 from yeoman_gateway.history.queries import HistoryQueries
 
 from .contract import BuildContext, ContributorRegistry, SourceReaders
-from .models import SCHEMA_VERSION, GroupState, Section
+from .models import GroupState, Section
 from .store import GroupStateStore
+
+#: Message sources checked for a purge per invalidation pass.
+PURGE_CHECK_LIMIT = 200
 
 
 class GroupStateService:
@@ -57,6 +59,7 @@ class GroupStateService:
         self._dirty: set[tuple[str, str]] = set()
         self._locks: dict[tuple[str, str], asyncio.Lock] = {}
         self._last_rebuild: dict[tuple[str, str], int] = {}
+        self._last_purge_check: dict[tuple[str, str], int] = {}
         self._last_full = int(clock_ms())
         self._task: asyncio.Task[None] | None = None
 
@@ -91,6 +94,7 @@ class GroupStateService:
             started = time.perf_counter()
             existing = self._store.get(*key)
             sections: dict[str, Section] = {}
+            remove: set[str] = set()
             now_ms = int(self._clock())
             chat_kind = getattr(classify(chat_id), "kind", "unknown")
             #: Waiting for the history lease yields the loop; section builds do not.
@@ -123,6 +127,8 @@ class GroupStateService:
                             )
                             if previous is not None:
                                 sections[contributor.key] = previous
+                            else:
+                                remove.add(contributor.key)
                         section_ms = int((time.perf_counter() - section_started) * 1000)
                         build_ms += section_ms
                         if section_ms > slowest[1]:
@@ -146,34 +152,18 @@ class GroupStateService:
                 )
                 return None
 
-            revision = (existing.revision if existing else 0) + 1
-            state = GroupState(
-                channel=key[0],
-                chat_id=key[1],
-                schema_version=SCHEMA_VERSION,
-                revision=revision,
-                history_cursor=_newest_cursor(sections),
-                updated_ms=now_ms,
-                sections=sections,
-            )
-            expected = existing.revision if existing else None
             store_started = time.perf_counter()
-            if not self._store.put(state, expected_revision=expected):
-                current = self._store.get(*key)
-                retry_revision = (current.revision if current else 0) + 1
-                retry = replace(state, revision=retry_revision)
-                if not self._store.put(
-                    retry, expected_revision=current.revision if current else None
-                ):
-                    logger.warning(
-                        "group_state_conflict_give_up chat={}:{} revision={}",
-                        key[0],
-                        key[1],
-                        retry_revision,
-                    )
-                    self._dirty.add(key)
-                    return None
-                state = retry
+            state = self._store.merge_sections(
+                key[0],
+                key[1],
+                sections,
+                remove=remove,
+                updated_ms=now_ms,
+            )
+            if state is None:
+                logger.warning("group_state_conflict_give_up chat={}:{}", key[0], key[1])
+                self._dirty.add(key)
+                return None
             store_ms = int((time.perf_counter() - store_started) * 1000)
             self._dirty.discard(key)
             self._last_rebuild[key] = now_ms
@@ -196,6 +186,9 @@ class GroupStateService:
     async def tick_once(self) -> None:
         """One scheduler pass; exposed for tests and deterministic callers."""
         now_ms = int(self._clock())
+        # Invalidate before rebuilding: a rebuild must not re-add a deleted source's item.
+        for channel, chat_id in self.managed_chats():
+            await self._invalidate_chat(channel, chat_id, now_ms)
         min_interval_ms = max(1, int(self._settings.min_interval_seconds)) * 1000
         full = now_ms - self._last_full >= max(1, int(self._settings.rebuild_every_seconds)) * 1000
         targets = self.managed_chats() if full else tuple(sorted(self._dirty))
@@ -209,6 +202,73 @@ class GroupStateService:
             await self.rebuild(channel, chat_id)
         if full:
             self._last_full = now_ms
+
+    async def _invalidate_chat(self, channel: str, chat_id: str, now_ms: int) -> None:
+        """Drop derived items whose source message was deleted, edited or purged."""
+        key = (str(channel), str(chat_id))
+        cursor_ms, cursor_event = self._store.invalidation_cursor(*key)
+        state = self._store.get(*key)
+        purge_interval_ms = max(1, int(self._settings.rebuild_every_seconds)) * 1000
+        last_check = self._last_purge_check.get(key)
+        check_purge = last_check is None or now_ms - last_check >= purge_interval_ms
+        sources: tuple[str, ...] = ()
+        if check_purge and state is not None:
+            sources = tuple(
+                sorted(
+                    {
+                        str(source)
+                        for section in state.sections.values()
+                        for item in section.items
+                        for source in item.sources
+                    }
+                )[:PURGE_CHECK_LIMIT]
+            )
+        try:
+            async with history_turn(self._history_projector) as snapshot:
+                queries = HistoryQueries(snapshot)
+                events = queries.content_events_after(
+                    chat_id=key[1],
+                    after_ms=cursor_ms,
+                    after_event_id=cursor_event,
+                )
+                targets = {
+                    str(row["target_message_id"]) for row in events if row["target_message_id"]
+                }
+                targets.update(
+                    source for source in sources if queries.content_fingerprint(source) is None
+                )
+        except HistoryPaused as exc:
+            logger.warning(
+                "group_state_invalidation_skipped_paused chat={}:{} reason={}",
+                key[0],
+                key[1],
+                str(exc) or "paused",
+            )
+            return
+        except Exception as exc:  # noqa: BLE001 - a tick failure must not stop the loop
+            logger.warning(
+                "group_state_invalidation_failed chat={}:{} error_type={}",
+                key[0],
+                key[1],
+                type(exc).__name__,
+            )
+            return
+        if check_purge:
+            self._last_purge_check[key] = now_ms
+        removed = self._store.scrub_items(key[0], key[1], targets) if targets else 0
+        if events:
+            last = events[-1]
+            self._store.set_invalidation_cursor(
+                key[0], key[1], int(last["occurred_ms"]), str(last["event_id"])
+            )
+        if events or removed:
+            logger.info(
+                "group_state_invalidated chat={}:{} events={} items_removed={}",
+                key[0],
+                key[1],
+                len(events),
+                removed,
+            )
 
     async def start(self) -> None:
         if self._task is None or self._task.done():
@@ -237,15 +297,3 @@ class GroupStateService:
                 raise
             except Exception as exc:  # noqa: BLE001 - a tick failure must not stop the loop
                 logger.warning("group_state_tick_failed error_type={}", type(exc).__name__)
-
-
-def _newest_cursor(sections: dict[str, Section]) -> str:
-    """The newest known message id, preferring the widest observation window."""
-    for key in ("presence", "conversations", "people_activity", "arvid_actions", "budgets"):
-        section = sections.get(key)
-        if section is not None and section.source_cursor:
-            return section.source_cursor
-    return next(
-        (section.source_cursor for section in sections.values() if section.source_cursor),
-        "",
-    )

@@ -7,11 +7,14 @@ ids, opportunity ids or instructions.
 
 from __future__ import annotations
 
-from collections.abc import Mapping
+from collections.abc import Callable, Mapping
 from dataclasses import dataclass
 from typing import Any
 
-from .models import GroupState, Section
+from yeoman_gateway.history.ids import classify
+
+from .contract import ReaderContext
+from .models import GroupState, Item, Section
 
 MINUTE_MS = 60_000
 HOUR_MS = 3_600_000
@@ -20,6 +23,8 @@ DAY_MS = 24 * HOUR_MS
 ACTIVE_WINDOW_MS = 30 * MINUTE_MS
 DEFAULT_MAX_AGE_MS = 600_000
 DEFAULT_MAX_CHARS = 1_200
+#: The sections every rendered state needs; their oldest write is the state's age.
+REQUIRED_SECTIONS: tuple[str, ...] = ("presence", "budgets")
 
 #: Render order; the last section is dropped first when the budget is short.
 SECTION_ORDER: tuple[str, ...] = (
@@ -42,6 +47,8 @@ class RenderedState:
     sections: tuple[str, ...]
     dropped: tuple[str, ...]
     fallback: str | None
+    #: Non-expired, fingerprint-current item ids; step B renders their content.
+    items: tuple[str, ...] = ()
 
 
 def _int(value: Any) -> int | None:
@@ -199,21 +206,55 @@ def _chat_active(state: GroupState, now_ms: int) -> bool:
     return False
 
 
+def _live_items(
+    state: GroupState,
+    now_ms: int,
+    fingerprint_of: Callable[[str], str | None] | None,
+) -> tuple[str, ...]:
+    """Item ids whose own age and source fingerprints still hold."""
+    visible: list[str] = []
+    for section in state.sections.values():
+        for item in section.items:
+            if item.expired(now_ms):
+                continue
+            if fingerprint_of is not None and not _fingerprints_match(item, fingerprint_of):
+                continue
+            visible.append(item.id)
+    return tuple(visible)
+
+
+def _fingerprints_match(item: Item, fingerprint_of: Callable[[str], str | None]) -> bool:
+    return all(
+        fingerprint_of(source) == expected for source, expected in item.source_fingerprints.items()
+    )
+
+
 def render_judge_view(
     state: GroupState | None,
     *,
+    reader: ReaderContext,
     now_ms: int,
     max_age_ms: int = DEFAULT_MAX_AGE_MS,
     max_chars: int = DEFAULT_MAX_CHARS,
     unavailable: frozenset[str] = frozenset(),
+    fingerprint_of: Callable[[str], str | None] | None = None,
 ) -> RenderedState:
     """The bounded ``[Group State]`` block, or a recorded reason not to render it."""
     if state is None:
         return RenderedState("", None, None, (), (), "no_state")
-    age_ms = state.age_ms(now_ms)
+    if (reader.channel, reader.chat_id) != (state.channel, state.chat_id):
+        return RenderedState("", state.revision, None, (), (), "reader_mismatch")
+    if getattr(classify(reader.chat_id), "kind", None) != "group":
+        return RenderedState("", state.revision, None, (), (), "dm")
+    if any(key not in state.sections for key in REQUIRED_SECTIONS):
+        return RenderedState("", state.revision, None, (), (), "no_state")
+    age_ms = state.required_age_ms(now_ms, REQUIRED_SECTIONS)
+    if age_ms is None:
+        return RenderedState("", state.revision, None, (), (), "no_state")
+    items = _live_items(state, now_ms, fingerprint_of)
     if age_ms > max_age_ms and _chat_active(state, now_ms):
         # A quiet chat keeps its old state; a chat that is talking again needs a rebuild.
-        return RenderedState("", state.revision, age_ms, (), (), "stale")
+        return RenderedState("", state.revision, age_ms, (), (), "stale", items)
 
     dropped: list[str] = []
     candidates: list[tuple[str, str]] = []
@@ -230,10 +271,10 @@ def render_judge_view(
         if line:
             candidates.append((key, line))
 
-    header = f"[Group State] revision {state.revision}, {_age(now_ms, state.updated_ms)} old"
+    header = f"[Group State] revision {state.revision}, {_age(now_ms, now_ms - age_ms)} old"
     if len(header) > max_chars:
         dropped.extend(key for key, _ in candidates)
-        return RenderedState("", state.revision, age_ms, (), tuple(dropped), None)
+        return RenderedState("", state.revision, age_ms, (), tuple(dropped), None, items)
     while candidates:
         text = "\n".join([header, *(line for _, line in candidates)])
         if len(text) <= max_chars:
@@ -248,6 +289,7 @@ def render_judge_view(
         sections=tuple(key for key, _ in candidates),
         dropped=tuple(dropped),
         fallback=None,
+        items=items,
     )
 
 
