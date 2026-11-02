@@ -111,7 +111,7 @@ async def test_period_narrows_a_keyword_search_and_needs_query_or_period():
         p.close()
     assert both == "No matching messages found for 'gestern' in period 'today'."
     assert 'gestern war Ruhe' in anytime
-    assert missing == 'Error: supply a query, a period, or both.'
+    assert missing == 'Error: supply a query, a period, or both (a person alone also works).'
     assert invalid.startswith('Error: period must be')
 
 

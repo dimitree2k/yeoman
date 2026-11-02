@@ -184,8 +184,9 @@ class RecallConversationTool(Tool):
 
         query = str(kwargs.get("query") or "").strip().lower()
         period = str(kwargs.get("period") or "").strip()
-        if not query and not period:
-            return "Error: supply a query, a period, or both."
+        # A person alone is a complete request ("what did Alex say?").
+        if not query and not period and not str(kwargs.get("person") or "").strip():
+            return "Error: supply a query, a period, or both (a person alone also works)."
 
         max_messages = int(kwargs.get("max_messages") or 30)
         max_messages = max(1, min(50, max_messages))
@@ -299,7 +300,9 @@ class RecallConversationTool(Tool):
                 )
             if not rows:
                 if not query:
-                    return f"No messages found for period '{period}'."
+                    return f"No messages found for period '{period}'." if period else (
+                        "No messages found."
+                    )
                 scope = f" in period '{period}'" if period else ""
                 return f"No matching messages found for '{query}'{scope}."
             query_warning = (
@@ -351,6 +354,8 @@ class RecallConversationTool(Tool):
                 )
             if query:
                 header = f"Found {len(lines)} matching message(s):\n"
+            elif not period:
+                header = f"Found {len(lines)} message(s):\n"
             else:
                 header = f"Found {len(lines)} message(s) for period '{period}', oldest first:\n"
                 if len(lines) >= max_messages:
