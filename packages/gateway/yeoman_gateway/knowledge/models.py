@@ -49,6 +49,10 @@ __all__ = [
     "MAX_NAME_LENGTH",
     "MAX_PEOPLE_PER_STATEMENT",
     "MAX_SOURCES_PER_STATEMENT",
+    "PERSON_NOTE_JOB_KIND",
+    "PERSON_NOTE_LINE_KINDS",
+    "PERSON_NOTE_SOURCE_KINDS",
+    "PERSON_NOTE_STATUSES",
     "PERSON_ROLES",
     "PERSON_ROLE_STATUSES",
     "READ_PURPOSES",
@@ -64,6 +68,10 @@ __all__ = [
     "CaptureResult",
     "GroupDigestJob",
     "GroupDigestView",
+    "PersonNoteJob",
+    "PersonNoteLine",
+    "PersonNoteSeed",
+    "PersonNoteView",
     "ChangeReceipt",
     "ConversationMembership",
     "ConversationMembershipReceipt",
@@ -178,6 +186,14 @@ GROUP_DIGEST_SOURCE_ROLES: Final[tuple[str, ...]] = ("approval", "engagement", "
 GROUP_DIGEST_CONFIDENCES: Final[tuple[str, ...]] = ("low", "medium", "high")
 #: Job kind recorded in the existing ``knowledge_jobs`` table.
 GROUP_DIGEST_JOB_KIND: Final[str] = "group_digest"
+
+#: Per-(group, person) notes (person-notes spec).  A note is derived context: every
+#: line is either a deterministic stated fact or a validated model observation, and
+#: every line carries the statements or messages it rests on.
+PERSON_NOTE_STATUSES: Final[tuple[str, ...]] = ("active", "superseded", "stale")
+PERSON_NOTE_SOURCE_KINDS: Final[tuple[str, ...]] = ("statement", "message")
+PERSON_NOTE_LINE_KINDS: Final[tuple[str, ...]] = ("stated", "observed")
+PERSON_NOTE_JOB_KIND: Final[str] = "person_note"
 
 ERROR_CODES: Final[tuple[str, ...]] = (
     "history_identity_read_only",
@@ -1138,6 +1154,79 @@ class GroupDigestJob:
     channel: str
     chat_id: str
     week: str
+    state: str
+    reason: str = ""
+    attempts: int = 0
+    due_ms: int = 0
+    created_ms: int = 0
+    updated_ms: int = 0
+    created: bool = False
+
+
+@dataclass(frozen=True, slots=True)
+class PersonNoteLine:
+    """One stored line of a person note, with the sources it rests on."""
+
+    kind: str
+    text: str
+    author: str | None = None
+    #: Statement ids (``stated``) or history message ids (``observed``).
+    refs: tuple[str, ...] = ()
+
+
+@dataclass(frozen=True, slots=True)
+class PersonNoteSeed:
+    """One validated note version offered to the store."""
+
+    channel: str
+    chat_id: str
+    person_id: str
+    input_hash: str
+    input_cut_ms: int
+    lines: tuple[PersonNoteLine, ...]
+    #: ``(kind, ref, revision)`` rows; ``revision`` is the statement ``updated_ms`` or
+    #: ``0`` for a message.
+    sources: tuple[tuple[str, str, int], ...] = ()
+
+
+@dataclass(frozen=True, slots=True)
+class PersonNoteView:
+    """One stored note version.  A stale note renders no lines."""
+
+    note_id: str
+    channel: str
+    chat_id: str
+    person_id: str
+    status: str = "active"
+    input_hash: str = ""
+    built_ms: int = 0
+    input_cut_ms: int = 0
+    lines: tuple[PersonNoteLine, ...] = ()
+    superseded_by: str | None = None
+    stale_reason: str = ""
+    sources: tuple[tuple[str, str, int], ...] = ()
+    reason: str = "ok"
+
+    @property
+    def stale(self) -> bool:
+        return self.status == "stale"
+
+    @property
+    def rendered(self) -> str:
+        if self.status == "stale":
+            return ""
+        return "\n".join(line.text for line in self.lines)
+
+
+@dataclass(frozen=True, slots=True)
+class PersonNoteJob:
+    """One ``person_note`` row of ``knowledge_jobs``: one chat, one person, one input."""
+
+    job_id: str
+    channel: str
+    chat_id: str
+    person_id: str
+    input_hash: str
     state: str
     reason: str = ""
     attempts: int = 0

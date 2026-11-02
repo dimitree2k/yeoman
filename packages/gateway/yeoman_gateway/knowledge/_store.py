@@ -768,6 +768,45 @@ GROUP_DIGEST_SCHEMA: tuple[str, ...] = (
 )
 
 
+#: Person notes for one (group, person), modelled on the digest tables.  Additive in
+#: the same way: created on first use, never by rewriting an existing table.
+PERSON_NOTE_SCHEMA: tuple[str, ...] = (
+    """
+    CREATE TABLE IF NOT EXISTS knowledge_person_notes (
+        note_id TEXT PRIMARY KEY,
+        workspace_id TEXT NOT NULL,
+        channel TEXT NOT NULL,
+        chat_id TEXT NOT NULL,
+        person_id TEXT NOT NULL,
+        status TEXT NOT NULL DEFAULT 'active'
+            CHECK(status IN ('active','superseded','stale')),
+        input_hash TEXT NOT NULL,
+        built_ms INTEGER NOT NULL,
+        input_cut_ms INTEGER NOT NULL DEFAULT 0,
+        lines_json TEXT NOT NULL DEFAULT '[]',
+        superseded_by TEXT REFERENCES knowledge_person_notes(note_id),
+        stale_reason TEXT
+    )
+    """,
+    "CREATE INDEX IF NOT EXISTS knowledge_person_notes_by_person"
+    " ON knowledge_person_notes (workspace_id, channel, chat_id, person_id, status, built_ms DESC)",
+    "CREATE INDEX IF NOT EXISTS knowledge_person_notes_by_hash"
+    " ON knowledge_person_notes (workspace_id, channel, chat_id, person_id, input_hash)",
+    """
+    CREATE TABLE IF NOT EXISTS knowledge_person_note_sources (
+        note_id TEXT NOT NULL REFERENCES knowledge_person_notes(note_id)
+            ON DELETE CASCADE,
+        kind TEXT NOT NULL CHECK(kind IN ('statement','message')),
+        ref TEXT NOT NULL,
+        revision INTEGER NOT NULL DEFAULT 0,
+        PRIMARY KEY (note_id, kind, ref)
+    )
+    """,
+    "CREATE INDEX IF NOT EXISTS knowledge_person_note_sources_by_ref"
+    " ON knowledge_person_note_sources (kind, ref)",
+)
+
+
 class StorageUnavailable(KnowledgeError):  # noqa: N818 - domain name from the design
     """The knowledge database cannot serve the request."""
 
@@ -900,6 +939,12 @@ class KnowledgeStore:
         """Create the group digest tables if missing; never touches an existing table."""
         with self.transaction():
             for statement in GROUP_DIGEST_SCHEMA:
+                self._conn.execute(statement)
+
+    def ensure_person_note_schema(self) -> None:
+        """Create the person-note tables if missing; never touches an existing table."""
+        with self.transaction():
+            for statement in PERSON_NOTE_SCHEMA:
                 self._conn.execute(statement)
 
     def table_names(self) -> tuple[str, ...]:
@@ -1104,6 +1149,8 @@ class KnowledgeStore:
             "knowledge_episode_sources",
             "knowledge_group_digests",
             "knowledge_group_digest_sources",
+            "knowledge_person_notes",
+            "knowledge_person_note_sources",
             "memory2_nodes",
             "memory2_facts",
             "memory2_fact_sources",
