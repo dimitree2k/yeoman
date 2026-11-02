@@ -133,6 +133,7 @@ class ParticipationContextBuilder:
         source_authorizer: Callable[[Mapping[str, Any]], bool] | None = None,
         thread_lookup: Callable[[str], object] | None = None,
         group_notes: Any | None = None,
+        group_state_views: Any | None = None,
         knowledge_selector: Any | None = None,
         knowledge_context_supplier: Callable[[ParticipationOpportunity, Mapping[str, Any]], Any]
         | None = None,
@@ -148,6 +149,9 @@ class ParticipationContextBuilder:
         self._thread_lookup = thread_lookup
         # Weekly group note reader (``GroupNotesReader``); same chat only, by mode.
         self._group_notes = group_notes
+        # Optional writer-view reader; ``None`` (and every ``off`` mode) leaves the
+        # context exactly as it was.
+        self._group_state_views = group_state_views
         # Same-chat Knowledge for trigger authors proven on the current roster; both or
         # neither, and absent means the judge and writer see no Knowledge at all.
         self._knowledge_selector = knowledge_selector
@@ -450,6 +454,7 @@ class ParticipationContextBuilder:
             (time.monotonic() - selection_started) * 1000
         )
         self._attach_group_note(context, opportunity, now_ms=moment)
+        self._attach_group_state_view(context, opportunity)
         return context
 
     def _attach_group_note(
@@ -483,6 +488,40 @@ class ParticipationContextBuilder:
             context["group_notes_digest_id"] = note.digest_id
         else:
             context[SHADOW_NOTE_KEY] = note.as_mapping()
+
+    def _attach_group_state_view(
+        self, context: dict[str, object], opportunity: ParticipationOpportunity
+    ) -> None:
+        """Add the writer view for this chat and target; shadow returns no text."""
+        if self._group_state_views is None:
+            return
+        from yeoman_gateway.group_state.contract import ReaderContext
+        from yeoman_gateway.group_state.views import ViewTarget
+
+        source_ids = tuple(
+            str(item)
+            for item in (context.get("current_source_ids") or opportunity.source_event_ids)
+            if str(item)
+        )
+        try:
+            text, _ = self._group_state_views.render(
+                "writer",
+                reader=ReaderContext(
+                    principal="arvid",
+                    is_owner=False,
+                    channel=str(opportunity.channel),
+                    chat_id=str(opportunity.chat_id),
+                    audience="group",
+                ),
+                target=ViewTarget(
+                    message_id=source_ids[-1] if source_ids else None,
+                    reply_to_message_id=None,
+                ),
+            )
+        except Exception:  # noqa: BLE001 - a view never breaks a participation decision
+            return
+        if text:
+            context["writer_state_text"] = text
 
     # -- conversation view ---------------------------------------------------------------
 

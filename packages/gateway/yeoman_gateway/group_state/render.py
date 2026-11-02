@@ -229,6 +229,33 @@ def _fingerprints_match(item: Item, fingerprint_of: Callable[[str], str | None])
     )
 
 
+def _guard_state(
+    state: GroupState | None,
+    *,
+    reader: ReaderContext,
+    now_ms: int,
+    max_age_ms: int,
+    quiet_stale_ok: bool,
+) -> tuple[str | None, int | None]:
+    """The shared reader/dm/required-section/staleness gate; ``(fallback, age_ms)``."""
+    if state is None:
+        return "no_state", None
+    if (reader.channel, reader.chat_id) != (state.channel, state.chat_id):
+        return "reader_mismatch", None
+    if getattr(classify(reader.chat_id), "kind", None) != "group":
+        return "dm", None
+    if any(key not in state.sections for key in REQUIRED_SECTIONS):
+        return "no_state", None
+    age_ms = state.required_age_ms(now_ms, REQUIRED_SECTIONS)
+    if age_ms is None:
+        return "no_state", None
+    if age_ms > max_age_ms and not (quiet_stale_ok and not _chat_active(state, now_ms)):
+        # The judge may keep a quiet chat's old state; a view never shows old presence
+        # as current. Otherwise a chat that is talking again needs a rebuild.
+        return "stale", age_ms
+    return None, age_ms
+
+
 def render_judge_view(
     state: GroupState | None,
     *,
@@ -240,21 +267,25 @@ def render_judge_view(
     fingerprint_of: Callable[[str], str | None] | None = None,
 ) -> RenderedState:
     """The bounded ``[Group State]`` block, or a recorded reason not to render it."""
-    if state is None:
-        return RenderedState("", None, None, (), (), "no_state")
-    if (reader.channel, reader.chat_id) != (state.channel, state.chat_id):
-        return RenderedState("", state.revision, None, (), (), "reader_mismatch")
-    if getattr(classify(reader.chat_id), "kind", None) != "group":
-        return RenderedState("", state.revision, None, (), (), "dm")
-    if any(key not in state.sections for key in REQUIRED_SECTIONS):
-        return RenderedState("", state.revision, None, (), (), "no_state")
-    age_ms = state.required_age_ms(now_ms, REQUIRED_SECTIONS)
-    if age_ms is None:
-        return RenderedState("", state.revision, None, (), (), "no_state")
-    items = _live_items(state, now_ms, fingerprint_of)
-    if age_ms > max_age_ms and _chat_active(state, now_ms):
-        # A quiet chat keeps its old state; a chat that is talking again needs a rebuild.
-        return RenderedState("", state.revision, age_ms, (), (), "stale", items)
+    fallback, age_ms = _guard_state(
+        state,
+        reader=reader,
+        now_ms=now_ms,
+        max_age_ms=max_age_ms,
+        quiet_stale_ok=True,
+    )
+    if fallback is not None:
+        # Only a stale state used to carry item ids; the other fallbacks did not.
+        items = (
+            _live_items(state, now_ms, fingerprint_of)
+            if fallback == "stale" and state is not None
+            else ()
+        )
+        return RenderedState(
+            "", state.revision if state is not None else None, age_ms, (), (), fallback, items
+        )
+    items = _live_items(state, now_ms, fingerprint_of) if state is not None else ()
+    assert age_ms is not None
 
     dropped: list[str] = []
     candidates: list[tuple[str, str]] = []

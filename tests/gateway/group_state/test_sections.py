@@ -410,6 +410,7 @@ async def test_conversations_section() -> None:
                 "thread_ids": ["t1"],
                 "first_message_id": "m1",
                 "last_message_id": "m4",
+                "message_ids": ["m1", "m2", "m3", "m4"],
             },
             {
                 "conversation_id": second,
@@ -424,9 +425,27 @@ async def test_conversations_section() -> None:
                 "thread_ids": [],
                 "first_message_id": "m5",
                 "last_message_id": "m6",
+                "message_ids": ["m5", "m6"],
             },
         ]
     }
+
+
+@pytest.mark.asyncio
+async def test_conversations_section_stores_message_ids_capped_at_200() -> None:
+    now = 12_000_000
+    history = FakeHistory(
+        [row(f"m{index}", sent_ms=10_000_000 + index, contact="c1") for index in range(1, 206)]
+    )
+    section = await build(
+        ConversationsSection(), context(history, now_ms=now, processing=FakeProcessing())
+    )
+
+    entry = section.data["conversations"][0]
+    assert entry["first_message_id"] == "m1"
+    assert entry["last_message_id"] == "m205"
+    assert len(entry["message_ids"]) == 200
+    assert entry["message_ids"] == [f"m{index}" for index in range(6, 206)]
 
 
 @pytest.mark.asyncio

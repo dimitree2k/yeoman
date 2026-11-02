@@ -658,6 +658,27 @@ def _render_participation_transcript(context: dict[str, object], *, limit: int =
         context["group_notes_status"] = "budget_dropped"
     if sum(map(len, fixed)) + len(fixed) - 1 > limit:
         raise ValueError("required participation context exceeds writer budget")
+    state_text = str(context.get("writer_state_text") or "").strip()
+    if state_text:
+        with_state = [*fixed, state_text]
+        probe = "\n".join(with_state)
+        fits_all_entries = True
+        for _entry_id, line in context_lines:
+            candidate = f"{probe}\n{line}"
+            if len(candidate) > limit:
+                fits_all_entries = False
+                break
+            probe = candidate
+        if (
+            fits_all_entries
+            and sum(map(len, with_state)) + len(with_state) - 1 <= limit
+        ):
+            fixed = with_state
+            context["writer_state_status"] = "rendered"
+        else:
+            context["writer_state_status"] = "budget_dropped"
+    else:
+        context["writer_state_status"] = "absent"
     rendered = "\n".join(fixed)
     dropped: list[str] = []
     for entry_id, line in context_lines:
@@ -769,6 +790,8 @@ class LLMResponder(ResponderPort):
         self._session_history_limit_group = whatsapp_session_history_limit_group
         self._talkative_state: dict[str, _TalkativeCooldownState] = {}
         self._pending_hidden_assistant_messages: list[str] = []
+        #: Optional reply-view reader; ``None`` keeps today's prompt byte-identical.
+        self._group_state_views: Any | None = None
 
         self.effective_restrict_to_workspace = restrict_to_workspace or (
             self.exec_config.isolation.enabled
@@ -1501,6 +1524,58 @@ class LLMResponder(ResponderPort):
         return metadata
 
     @staticmethod
+    def _history_message_id(channel: str, chat_id: str, value: object) -> str | None:
+        """Resolve a platform message id to a history id when the format allows it."""
+        raw = str(value or "").strip()
+        if not raw:
+            return None
+        if raw.startswith(f"{channel}:"):
+            return raw
+        if channel == "whatsapp":
+            return f"{channel}:{chat_id}:{raw}"
+        return None
+
+    def _attach_group_state_reply(
+        self,
+        metadata: dict[str, object],
+        *,
+        channel: str,
+        chat_id: str,
+        sender_id: str | None,
+        is_owner: bool,
+    ) -> None:
+        """Put the rendered reply view into the turn metadata; shadow leaves it out."""
+        reader = self._group_state_views
+        if reader is None:
+            return
+        from yeoman_gateway.group_state.contract import ReaderContext
+        from yeoman_gateway.group_state.views import ViewTarget
+
+        try:
+            text, _ = reader.render(
+                "reply",
+                reader=ReaderContext(
+                    principal=str(sender_id or ""),
+                    is_owner=bool(is_owner),
+                    channel=str(channel),
+                    chat_id=str(chat_id),
+                    audience="group",
+                ),
+                target=ViewTarget(
+                    message_id=self._history_message_id(
+                        channel, chat_id, metadata.get("message_id")
+                    ),
+                    reply_to_message_id=self._history_message_id(
+                        channel, chat_id, metadata.get("reply_to_message_id")
+                    ),
+                ),
+            )
+        except Exception:  # noqa: BLE001 - a view never breaks the reply path
+            return
+        if text:
+            metadata["group_state_block"] = text
+
+    @staticmethod
     def _session_user_metadata(sender_id: str | None, metadata: dict[str, object]) -> dict[str, object]:
         values: dict[str, object] = {
             "sender_id": sender_id or metadata.get("sender_id"),
@@ -1812,6 +1887,10 @@ class LLMResponder(ResponderPort):
     def set_poll_results(self, lookup: "PollResultsLookup | None") -> None:
         """Install the read-only lookup the poll tool gets vote counts from."""
         self._poll_results = lookup
+
+    def set_group_state_views(self, reader: Any | None) -> None:
+        """Attach the optional reply-view reader; ``None`` disables it."""
+        self._group_state_views = reader
 
     def _should_enable_grants(self, is_owner: bool) -> bool:
         """Check whether grants should be activated for tool execution.
@@ -3193,6 +3272,13 @@ class LLMResponder(ResponderPort):
             ) if channel == "whatsapp" and chat_id.endswith("@g.us") else None
             if thread_frame:
                 metadata["thread_frame"] = thread_frame
+            self._attach_group_state_reply(
+                metadata,
+                channel=channel,
+                chat_id=chat_id,
+                sender_id=sender_id,
+                is_owner=is_owner,
+            )
             messages = self.context.build_messages(
                 history=history,
                 current_message=content,

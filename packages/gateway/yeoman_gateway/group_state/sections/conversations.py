@@ -97,6 +97,9 @@ class ConversationsSection:
                     "thread_ids": thread_ids,
                     "first_message_id": conversation.message_ids[0],
                     "last_message_id": conversation.message_ids[-1],
+                    # History ids only; the reply/writer views find a conversation by
+                    # the message they are answering. The section stays schema v1.
+                    "message_ids": list(conversation.message_ids[-200:]),
                 }
             )
         return make_section(

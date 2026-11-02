@@ -828,6 +828,7 @@ When a user asks you to send, create, or reply with a voice message / Sprachnach
         """Build user message content with optional base64-encoded images."""
         text_with_context = self._with_reply_context(text, metadata)
         text_with_context = self._with_conversation_state(text_with_context, metadata)
+        text_with_context = self._with_group_state(text_with_context, metadata)
         text_with_context = self._with_private_handoff_context(text_with_context, metadata)
         text_with_context = self._with_input_modality_context(text_with_context, metadata)
         text_with_context = self._with_temporary_media_retrieval(text_with_context, metadata)
@@ -1096,6 +1097,16 @@ When a user asks you to send, create, or reply with a voice message / Sprachnach
             f"guidance: {guidance}",
         ]
         return f"{text}\n\n" + "\n".join(lines)
+
+    @staticmethod
+    def _with_group_state(text: str, metadata: dict[str, Any] | None) -> str:
+        """Append one already-rendered group-state block, or leave the text untouched."""
+        if not metadata:
+            return text
+        block = metadata.get("group_state_block")
+        if not isinstance(block, str) or not block.strip():
+            return text
+        return f"{text}\n\n{block}"
 
     def _with_reply_context(self, text: str, metadata: dict[str, Any] | None) -> str:
         """Append compact reply metadata so models can resolve quoted-message intent."""
