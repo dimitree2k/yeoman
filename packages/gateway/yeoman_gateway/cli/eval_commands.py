@@ -242,6 +242,10 @@ def eval_participation_context(
         1, "--judge-repeats", min=1, max=10,
         help="Ask the B Judge N times per opportunity; the majority decides",
     ),
+    with_state: bool = typer.Option(
+        False, "--with-state",
+        help="Also measure the [Group State] block (S) and a B/B2 noise floor",
+    ),
 ) -> None:
     """Replay recorded Judge opportunities with the window (A) and conversation (B) views."""
     import time
@@ -260,6 +264,7 @@ def eval_participation_context(
         load_opportunities,
         looks_like_chat_id,
         read_labels,
+        read_only_source_readers,
         read_records,
         record_opportunity,
         render_markdown,
@@ -331,12 +336,54 @@ def eval_participation_context(
                 timeout_seconds=float(participation.judge_timeout_seconds),
                 max_output_tokens=int(participation.judge_max_output_tokens),
             )
-            calls = (1 + judge_repeats) * len(opportunities)
+            calls = (judge_repeats + 2 if with_state else 1 + judge_repeats) * len(
+                opportunities
+            )
             typer.echo(f"model calls: up to {calls} ({concurrency} in parallel)")
+
+        state_for = None
+        if with_state:
+            from yeoman_gateway.app.bootstrap import _processing_store_path
+            from yeoman_gateway.group_state.as_of import (
+                UNAVAILABLE_IN_REPLAY,
+                build_state_as_of,
+            )
+            from yeoman_gateway.group_state.contract import ContributorRegistry
+            from yeoman_gateway.group_state.render import render_judge_view
+            from yeoman_gateway.group_state.sections import default_contributors
+            from yeoman_gateway.history.context import current_history_snapshot
+            from yeoman_gateway.history.queries import HistoryQueries
+
+            registry = ContributorRegistry()
+            for contributor in default_contributors():
+                registry.register(contributor)
+            sources = read_only_source_readers(
+                speakups_db=speakups,
+                processing_db=_processing_store_path(config),
+                decisions_db=get_operational_store_path("group_decisions", create=False),
+            )
+
+            async def state_for(item):
+                snapshot = current_history_snapshot()
+                queries = HistoryQueries(snapshot) if snapshot is not None else None
+                state = await build_state_as_of(
+                    registry=registry,
+                    channel=item.channel,
+                    chat_id=item.chat_id,
+                    at_ms=item.at_ms,
+                    history=queries,
+                    sources=sources,
+                    settings=config.processing.group_state,
+                    consciousness=config.consciousness,
+                )
+                return render_judge_view(
+                    state, now_ms=item.at_ms, unavailable=UNAVAILABLE_IN_REPLAY
+                )
 
         records = asyncio.run(replay(
             opportunities, history=history, judge=judge, usage=captured_usage,
-            concurrency=concurrency, judge_repeats=judge_repeats, **setup.replay_args,
+            concurrency=concurrency, judge_repeats=judge_repeats, state_for=state_for,
+            **setup.replay_args,
         ))
     finally:
         history.close()

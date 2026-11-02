@@ -504,9 +504,15 @@ class ParticipationJudge:
         notes_block = render_group_notes_block(
             context.get("group_notes_week"), context.get("group_notes_text")
         )
-        # Budget order: required sources > Knowledge > group notes > optional entries.
-        # Group notes are dropped whole, and before Knowledge, when the budget is short.
-        fixed_length = max_target + len(knowledge_block) + len(notes_block)
+        state_block = str(context.get("group_state_text") or "").strip()
+        # Budget order: required sources > Knowledge > group notes > optional entries > group
+        # state. Group state is dropped whole, and before notes and Knowledge, when the
+        # budget is short.
+        fixed_length = max_target + len(knowledge_block) + len(notes_block) + len(state_block)
+        if fixed_length + 2 > 4000 and state_block:
+            _drop_group_state(context)
+            state_block = ""
+            fixed_length = max_target + len(knowledge_block) + len(notes_block)
         if fixed_length + 2 > 4000 and notes_block:
             _drop_group_notes(context)
             notes_block = ""
@@ -539,6 +545,11 @@ class ParticipationJudge:
                 ),
                 None,
             )
+            # The state block goes before any message: a judge with state never sees
+            # fewer messages than the same judge without it.
+            if str(context.get("group_state_text") or "").strip():
+                _drop_group_state(context)
+                continue
             if optional is not None:
                 messages.remove(optional)
                 dropped.append(str(optional.get("event_id") or optional.get("message_id") or ""))
@@ -567,6 +578,9 @@ class ParticipationJudge:
         context["knowledge_rendered_to_judge"] = bool(context.get("selected_knowledge_text"))
         context["group_notes_rendered_to_judge"] = bool(
             str(context.get("group_notes_text") or "").strip()
+        )
+        context["group_state_rendered_to_judge"] = bool(
+            str(context.get("group_state_text") or "").strip()
         )
 
     async def _decide(
@@ -950,6 +964,7 @@ class _JudgeContext:
     rendered: str
     group_notes_text: str = ""
     group_notes_week: str = ""
+    group_state_text: str = ""
     meme_templates: frozenset[str] = frozenset()
     meme_photo_ids: frozenset[str] = frozenset()
     meme_backgrounds: bool = False
@@ -1087,6 +1102,7 @@ class _JudgeContext:
             rendered="\n".join(lines) if lines else "(no retained context)",
             group_notes_text=str(context.get("group_notes_text") or ""),
             group_notes_week=str(context.get("group_notes_week") or ""),
+            group_state_text=str(context.get("group_state_text") or ""),
             **_meme_view(context),
         )
 
@@ -1104,6 +1120,9 @@ class _JudgeContext:
         notes = render_group_notes_block(self.group_notes_week, self.group_notes_text)
         if notes:
             blocks.append(notes)
+        state = self.group_state_text.strip()
+        if state:
+            blocks.append(state)
         if self.offers_images and self.meme_text:
             blocks.append(self.meme_text)
         return "\n\n".join(blocks)
@@ -1152,6 +1171,12 @@ def _drop_group_notes(context: dict[str, Any]) -> None:
     """Remove the group-notes block whole; its identity stays for the record."""
     context.pop("group_notes_text", None)
     context["group_notes_status"] = "budget_dropped"
+
+
+def _drop_group_state(context: dict[str, Any]) -> None:
+    """Remove the group-state block whole; its identity stays for the record."""
+    context.pop("group_state_text", None)
+    context["group_state_status"] = "budget_dropped"
 
 
 def _message_sort_key(message: Mapping[str, Any]) -> tuple[float, str]:
