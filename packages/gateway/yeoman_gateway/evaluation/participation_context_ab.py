@@ -426,7 +426,8 @@ def _estimate_tokens(
     return estimator._estimate_tokens(estimator._build_messages(opportunity, view))  # noqa: SLF001
 
 
-def _opportunity(item: RecordedOpportunity) -> ParticipationOpportunity:
+def to_live_opportunity(item: RecordedOpportunity) -> ParticipationOpportunity:
+    """The live opportunity a recorded one stands for, as the context builder needs it."""
     return ParticipationOpportunity(
         opportunity_id=item.opportunity_id, channel=item.channel, chat_id=item.chat_id,
         trigger=item.trigger,  # type: ignore[arg-type]
@@ -563,7 +564,7 @@ async def replay(
             record["skipped"] = "no_history_sources"
             records.append(record)
             continue
-        opportunity = _opportunity(item)
+        opportunity = to_live_opportunity(item)
         guidance = guidance_for(item.channel, item.chat_id)
         if set_as_of is not None:
             set_as_of(item.at_ms)
@@ -674,7 +675,7 @@ async def rebuild_views(
     Same as-of rebuild as :func:`replay`; the B header line is part of the view.
     """
     item = record_opportunity(record)
-    opportunity = _opportunity(item)
+    opportunity = to_live_opportunity(item)
     guidance = guidance_for(item.channel, item.chat_id)
     if set_as_of is not None:
         set_as_of(item.at_ms)

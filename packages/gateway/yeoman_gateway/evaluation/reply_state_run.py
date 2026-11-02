@@ -34,6 +34,7 @@ from yeoman_gateway.evaluation.participation_context_ab import (
     _inputs,
     load_opportunities,
     read_only_source_readers,
+    to_live_opportunity,
 )
 from yeoman_gateway.evaluation.reply_state import (
     DEFAULT_SEED,
@@ -1030,6 +1031,11 @@ class ReplyStateRunner:
                     queries, record.item.chat_id, record.history_id, record.item.at_ms
                 )
         except Exception as exc:  # noqa: BLE001 - one item must not stop the run
+            logger.warning(
+                "reply_state_prepare_failed kind=reply item={} error_type={}",
+                record.item.item_id,
+                type(exc).__name__,
+            )
             self._prepare_failures[type(exc).__name__] += 1
             return None
         return _PreparedReply(
@@ -1060,7 +1066,7 @@ class ReplyStateRunner:
                 if self._participation_builder is None or self._bounds is None:
                     return None
                 context = await self._participation_builder.build(
-                    record.opportunity,
+                    to_live_opportunity(record.opportunity),
                     inputs=_inputs(
                         self._bounds,
                         self._guidance_for("whatsapp", record.item.chat_id),
@@ -1071,7 +1077,18 @@ class ReplyStateRunner:
                 transcript = self._transcript(
                     queries, record.item.chat_id, record.target_history_id, record.item.at_ms
                 )
+            # Live sets the judge's chosen target right before drafting, as the id the
+            # judge saw in the context (the native message id); the recorded target
+            # stands in for it here.
+            context = dict(context)
+            context["target_message_id"] = record.target_native_id or record.target_history_id
+            base_prompt = _writer_prompt(context)
         except Exception as exc:  # noqa: BLE001 - one item must not stop the run
+            logger.warning(
+                "reply_state_prepare_failed kind=writer item={} error_type={}",
+                record.item.item_id,
+                type(exc).__name__,
+            )
             self._prepare_failures[type(exc).__name__] += 1
             return None
         return _PreparedWriter(
@@ -1082,9 +1099,9 @@ class ReplyStateRunner:
             oracle_input=oracle,
             label_time_ms=label_time,
             transcript=transcript,
-            context=dict(context),
+            context=context,
             target=target,
-            base_prompt=_writer_prompt(context),
+            base_prompt=base_prompt,
             rendered_ms=[],
         )
 

@@ -542,10 +542,16 @@ async def test_writer_arms_use_the_extracted_prompt(tmp_path: Path) -> None:
 
     class FakeBuilder:
         async def build(self, opportunity, *, inputs, now_ms):
+            # The real builder needs a live opportunity, not the recorded row.
+            from yeoman_gateway.processing.participation import ParticipationOpportunity
+
+            assert isinstance(opportunity, ParticipationOpportunity)
+            assert tuple(opportunity.source_event_ids) == (history_id,)
+            # Like the real builder: no target here; the runner sets it, as live does.
             return {
-                "target_message_id": history_id,
                 "messages": [
-                    {"event_id": history_id, "sender": "anna", "text": "the item message"}
+                    # The real context carries native message ids, as the judge saw them.
+                    {"event_id": "item", "sender": "anna", "text": "the item message"}
                 ],
                 "anchors": [],
             }
