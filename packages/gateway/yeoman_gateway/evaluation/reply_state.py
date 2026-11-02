@@ -290,21 +290,42 @@ def build_placebo(view_text: str, *, seed: int) -> str:
     return rendered
 
 
+#: Added only when background is shown, so grader prompts without it stay unchanged.
+GRADER_BACKGROUND_NOTE = (
+    "Background is what the assistant could know from earlier, outside this transcript; "
+    "it may be incomplete or outdated. A claim that the background supports is not "
+    "invented and does not contradict the transcript. Judge fit to this conversation "
+    "as before; using background is not a merit by itself."
+)
+
+
 def build_grader_messages(
-    *, transcript: str, candidate_one: str, candidate_two: str
+    *, transcript: str, candidate_one: str, candidate_two: str, background: str = ""
 ) -> list[dict[str, str]]:
-    """The blind grader prompt: transcript plus candidates labelled 1 and 2."""
-    user = "\n\n".join(
+    """The blind grader prompt: transcript plus candidates labelled 1 and 2.
+
+    ``background`` is the long-term context one arm of the item could use.  It is shown
+    for every pair of that item, both orders, so the grader can tell a remembered fact
+    from an invented one without learning which candidate had it.
+    """
+    parts = [
+        "Conversation transcript:\n"
+        + wrap_external_content("conversation-transcript", str(transcript or "")),
+    ]
+    if str(background or "").strip():
+        parts.append("Background:\n" + wrap_external_content("background", str(background)))
+    parts.extend(
         (
-            "Conversation transcript:\n"
-            + wrap_external_content("conversation-transcript", str(transcript or "")),
             "Candidate 1:\n" + wrap_external_content("candidate-1", str(candidate_one or "")),
             "Candidate 2:\n" + wrap_external_content("candidate-2", str(candidate_two or "")),
         )
     )
+    system = GRADER_SYSTEM_PROMPT
+    if str(background or "").strip():
+        system = f"{GRADER_SYSTEM_PROMPT}\n{GRADER_BACKGROUND_NOTE}"
     return [
-        {"role": "system", "content": GRADER_SYSTEM_PROMPT},
-        {"role": "user", "content": user},
+        {"role": "system", "content": system},
+        {"role": "user", "content": "\n\n".join(parts)},
     ]
 
 

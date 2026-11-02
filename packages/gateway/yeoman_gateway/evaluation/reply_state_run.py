@@ -19,7 +19,7 @@ import time
 from collections import Counter
 from collections.abc import Callable, Mapping, Sequence
 from contextlib import nullcontext
-from dataclasses import dataclass, replace
+from dataclasses import dataclass, field, replace
 from pathlib import Path
 from typing import Any, Protocol
 
@@ -218,6 +218,8 @@ class _PreparedReply:
     base_messages: list[dict[str, str]]
     recall_text: str
     rendered_ms: list[float]
+    #: The inputs of ``base_messages``, so R/P_R can rebuild it with recall in place.
+    reply_inputs: dict[str, Any] = field(default_factory=dict)
 
 
 @dataclass(slots=True)
@@ -337,8 +339,13 @@ def build_reply_base_messages(
     chat_id: str,
     ambient: Sequence[str],
     reply_to: Mapping[str, object] | None,
+    retrieved_memory_text: str | None = None,
 ) -> list[dict[str, Any]]:
-    """The live reply prompt as of the item, with an empty session history."""
+    """The live reply prompt as of the item, with an empty session history.
+
+    ``retrieved_memory_text`` goes where the live reply puts Knowledge recall: its own
+    system message with the retrieved-context caveat, not into the user turn.
+    """
     metadata: dict[str, Any] = {"ambient_context_window": list(ambient)}
     if reply_to:
         metadata.update(dict(reply_to))
@@ -350,6 +357,7 @@ def build_reply_base_messages(
         channel=str(channel),
         chat_id=str(chat_id),
         allowed_tools=set(),
+        retrieved_memory_text=retrieved_memory_text or None,
     )
 
 
@@ -1484,15 +1492,15 @@ class ReplyStateRunner:
                 if window:
                     reply_to["reply_context_window"] = window
                     reply_to["reply_context_source"] = "history"
-                base_messages = build_reply_base_messages(
-                    self._context_builder,
-                    text=record.text,
-                    persona_text=self._persona_for("whatsapp", record.item.chat_id),
-                    channel="whatsapp",
-                    chat_id=record.item.chat_id,
-                    ambient=ambient,
-                    reply_to=reply_to,
-                )
+                reply_inputs: dict[str, Any] = {
+                    "text": record.text,
+                    "persona_text": self._persona_for("whatsapp", record.item.chat_id),
+                    "channel": "whatsapp",
+                    "chat_id": record.item.chat_id,
+                    "ambient": ambient,
+                    "reply_to": reply_to,
+                }
+                base_messages = build_reply_base_messages(self._context_builder, **reply_inputs)
                 transcript = self._transcript(
                     queries, record.item.chat_id, record.history_id, record.item.at_ms
                 )
@@ -1518,6 +1526,7 @@ class ReplyStateRunner:
             base_messages=base_messages,
             recall_text=recall_text,
             rendered_ms=[],
+            reply_inputs=reply_inputs,
         )
 
     async def _prepare_writer(self, record: WriterRecord) -> _PreparedWriter | None:
@@ -1734,6 +1743,7 @@ class ReplyStateRunner:
         hard_case: bool,
         transcript: str,
         candidates: Mapping[str, _CallResult],
+        background: str = "",
     ) -> dict[str, Any] | None:
         first = candidates.get(first_arm)
         second = candidates.get(second_arm)
@@ -1743,7 +1753,10 @@ class ReplyStateRunner:
         preferences: list[str] = []
         for order, (one, two) in enumerate(((first, second), (second, first)), start=1):
             messages = build_grader_messages(
-                transcript=transcript, candidate_one=one.text, candidate_two=two.text
+                transcript=transcript,
+                candidate_one=one.text,
+                candidate_two=two.text,
+                background=background,
             )
 
             async def call(sent: list[dict[str, str]]) -> str:
@@ -1958,10 +1971,10 @@ class ReplyStateRunner:
         if "Sx" in requested and run.oracle:
             arms["Sx"] = arm_messages(prepared.base_messages, oracle_text)
         if "R" in requested:
-            arms["R"] = arm_messages(prepared.base_messages, prepared.recall_text)
+            arms["R"] = self._recall_messages(prepared, prepared.recall_text)
         if "P_R" in requested:
-            arms["P_R"] = arm_messages(
-                prepared.base_messages,
+            arms["P_R"] = self._recall_messages(
+                prepared,
                 build_placebo(prepared.recall_text, seed=int(record.item.at_ms) + int(run.seed)),
             )
         generated: dict[str, _CallResult] = {}
@@ -1987,6 +2000,7 @@ class ReplyStateRunner:
             transcript=prepared.transcript,
             generated=generated,
             run=run,
+            background=prepared.recall_text if "R" in _requested_arms(run) else "",
         )
         return not self._budget.exhausted
 
@@ -2085,6 +2099,14 @@ class ReplyStateRunner:
         )
         return not self._budget.exhausted
 
+    def _recall_messages(self, prepared: _PreparedReply, block: str) -> list[dict[str, Any]]:
+        """The base prompt rebuilt with ``block`` in the live recall position."""
+        if not block or not prepared.reply_inputs:
+            return copy.deepcopy(prepared.base_messages)
+        return build_reply_base_messages(
+            self._context_builder, **prepared.reply_inputs, retrieved_memory_text=block
+        )
+
     async def _grade_item(
         self,
         *,
@@ -2092,6 +2114,7 @@ class ReplyStateRunner:
         transcript: str,
         generated: Mapping[str, _CallResult],
         run: RunConfig,
+        background: str = "",
     ) -> None:
         pairs = _pairs_for_arms(_requested_arms(run), oracle=run.oracle)
         for first_arm, second_arm, pair in pairs:
@@ -2107,6 +2130,7 @@ class ReplyStateRunner:
                 hard_case=item.hard_case,
                 transcript=transcript,
                 candidates=generated,
+                background=background,
             )
 
     def _record_item(

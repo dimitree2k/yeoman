@@ -706,20 +706,35 @@ async def test_r_arm_recall_built_as_of_item_time(tmp_path: Path) -> None:
     history = _history(tmp_path, count=35)
     knowledge = FakeRecallKnowledge()
     reply = RecordingClient(text="reply candidate", route_key=REPLY_ROUTE)
-    runner = _runner(tmp_path, history, reply=reply, knowledge=knowledge)
+    grader = RecordingClient(text=GRADE, route_key=GRADER_ROUTE)
+    runner = _runner(tmp_path, history, reply=reply, grader=grader, knowledge=knowledge)
     try:
         outcome = await runner.run(
-            RunConfig(replies=1, writer=0, seed=7, yes=True, arms=("A", "R")),
+            RunConfig(replies=1, writer=0, seed=7, yes=True, arms=("A", "A2", "R")),
             report_dir=tmp_path / "run",
         )
     finally:
         history.close()
 
     assert outcome.summary is not None
-    assert len(reply.calls) == 2  # A, R
-    base, recall = reply.calls
-    assert recall[:-1] == base[:-1]
-    assert "before-item plan" in recall[-1]["content"]
+    assert len(reply.calls) == 3  # A, A2, R
+    base, _base2, recall = reply.calls
+    # Recall rides the live position: its own system message before the user turn,
+    # never inside the user turn, and nothing else in the prompt changes.
+    assert recall[-1] == base[-1]
+    assert "before-item plan" not in recall[-1]["content"]
+    def unclocked(messages: list[dict[str, str]]) -> list[dict[str, str]]:
+        return [m for m in messages if not m["content"].startswith("# Temporal Grounding")]
+
+    extra = [message for message in unclocked(recall) if message not in unclocked(base)]
+    assert len(extra) == 1 and extra[0]["role"] == "system"
+    assert "before-item plan" in extra[0]["content"]
+    assert recall.index(extra[0]) < len(recall) - 1
+    # Every pair of the item shows the grader the same background, both orders.
+    assert grader.calls
+    for sent in grader.calls:
+        assert "Background:" in sent[-1]["content"]
+        assert "before-item plan" in sent[-1]["content"]
     assert len(knowledge.queries) == 1
     query, _context, kwargs = knowledge.queries[0]
     assert query.as_of_ms == T0 + 35_000
@@ -755,3 +770,19 @@ async def test_measure_only_makes_no_generation_calls(tmp_path: Path) -> None:
     assert payload["overall"]["items"] == 1
     assert payload["overall"]["as_of_recall_hit"] == 1
     assert "before-item plan" not in (report_dir / "measure.json").read_text()
+
+
+def test_grader_prompt_without_background_is_unchanged() -> None:
+    from yeoman_gateway.evaluation.reply_state import (
+        GRADER_SYSTEM_PROMPT,
+        build_grader_messages,
+    )
+
+    plain = build_grader_messages(transcript="t", candidate_one="a", candidate_two="b")
+    empty = build_grader_messages(
+        transcript="t", candidate_one="a", candidate_two="b", background="  "
+    )
+
+    assert plain == empty
+    assert plain[0]["content"] == GRADER_SYSTEM_PROMPT
+    assert "Background" not in plain[1]["content"]
