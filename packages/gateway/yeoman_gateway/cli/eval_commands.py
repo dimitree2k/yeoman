@@ -427,6 +427,9 @@ def eval_reply_state(
     chats: list[str] | None = typer.Option(
         None, "--chat", help="Only this chat (id or exact group subject); repeatable"
     ),
+    concurrency: int = typer.Option(
+        1, "--concurrency", min=1, max=8, help="Items evaluated at the same time"
+    ),
 ) -> None:
     """Offline reply-state evaluation: as-of prompts, four arms and a blind grader."""
     from yeoman_shared.config.loader import load_config
@@ -485,7 +488,7 @@ def eval_reply_state(
 
         run = RunConfig(
             days=days, replies=replies, writer=writer, seed=seed, oracle=oracle,
-            limit_calls=limit_calls, yes=yes,
+            limit_calls=limit_calls, yes=yes, concurrency=concurrency,
         )
         runner = ReplyStateRunner(
             config=config, history=history,

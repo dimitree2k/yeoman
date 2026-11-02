@@ -646,3 +646,22 @@ def test_eval_route_keys_survive_config_key_round_trip() -> None:
 
     for route in (REPLY_ROUTE, WRITER_ROUTE, GRADER_ROUTE):
         assert camel_to_snake(snake_to_camel(route)) == route
+
+
+@pytest.mark.asyncio
+async def test_concurrent_run_matches_serial_summary(tmp_path: Path) -> None:
+    # Items in flight at once must not change what the report says.
+    summaries = []
+    for concurrency in (1, 4):
+        history = _history(tmp_path / f"c{concurrency}")
+        runner = _runner(tmp_path / f"c{concurrency}", history)
+        try:
+            outcome = await runner.run(
+                RunConfig(replies=1, writer=0, seed=7, yes=True, concurrency=concurrency),
+                report_dir=tmp_path / f"run{concurrency}",
+            )
+        finally:
+            history.close()
+        assert outcome.summary is not None
+        summaries.append({key: outcome.summary[key] for key in ("pairs", "calls")})
+    assert summaries[0] == summaries[1]

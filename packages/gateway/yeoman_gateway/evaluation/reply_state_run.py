@@ -155,6 +155,8 @@ class RunConfig:
     oracle: bool = False
     limit_calls: int | None = None
     yes: bool = False
+    #: Items in flight at once; each item still runs its own calls in order.
+    concurrency: int = 1
 
 
 @dataclass(frozen=True, slots=True)
@@ -1318,26 +1320,43 @@ class ReplyStateRunner:
         cache = LabelCache(report_dir / LABEL_CACHE_FILE)
         self._reset_run_state(limit=run.limit_calls, oracle=bool(run.oracle))
         self._items_total = len(prepared.replies) + len(prepared.writer)
-        for record in prepared.replies:
-            if self._budget.exhausted:
-                self._partial = True
-                break
-            prepared_reply = await self._prepare_reply(record)
-            if prepared_reply is None:
-                continue
-            if not await self._run_reply(prepared_reply, cache, run):
-                break
-        for writer_record in prepared.writer:
-            if self._budget.exhausted:
-                self._partial = True
-                break
-            prepared_writer = await self._prepare_writer(writer_record)
-            if prepared_writer is None:
-                continue
-            if not await self._run_writer(prepared_writer, cache, run):
-                break
+        slots = asyncio.Semaphore(max(1, int(run.concurrency)))
+        stopped = False
+
+        async def _reply(record: ReplyRecord) -> None:
+            nonlocal stopped
+            async with slots:
+                if stopped or self._budget.exhausted:
+                    self._partial = self._partial or self._budget.exhausted
+                    return
+                prepared_reply = await self._prepare_reply(record)
+                if prepared_reply is not None and not await self._run_reply(
+                    prepared_reply, cache, run
+                ):
+                    stopped = True
+
+        async def _writer(record: WriterRecord) -> None:
+            nonlocal stopped
+            async with slots:
+                if stopped or self._budget.exhausted:
+                    self._partial = self._partial or self._budget.exhausted
+                    return
+                prepared_writer = await self._prepare_writer(record)
+                if prepared_writer is not None and not await self._run_writer(
+                    prepared_writer, cache, run
+                ):
+                    stopped = True
+
+        # One event loop, so the shared candidate/grade lists need no lock.
+        await asyncio.gather(
+            *(_reply(record) for record in prepared.replies),
+            *(_writer(record) for record in prepared.writer),
+        )
         if self._budget.exhausted:
             self._partial = True
+        # Concurrent items finish in any order; the seeded bootstrap needs a stable one.
+        self._grades.sort(key=lambda grade: (str(grade["item_id"]), str(grade["pair"])))
+        self._candidates.sort(key=lambda row: (str(row["item_id"]), str(row["arm"])))
         summary = self._summarize(prepared)
         self._write_outputs(report_dir, summary)
         return RunOutcome(
