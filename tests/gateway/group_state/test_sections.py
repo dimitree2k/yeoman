@@ -518,6 +518,40 @@ async def test_budgets_section() -> None:
 
 
 @pytest.mark.asyncio
+async def test_budgets_in_a_quiet_hour_keep_limit_and_last_comment() -> None:
+    now = 10 * DAY
+    speakups = FakeSpeakups(
+        [
+            {
+                "attempt_id": "a1",
+                "opportunity_id": "o1",
+                "created_at_ms": now - 3 * HOUR,
+                "outcome": "comment",
+                "detail_code": "",
+                "hourly_limit": 5,
+            },
+        ]
+    )
+    section = await build(BudgetsSection(), context(FakeHistory([]), now_ms=now, speakups=speakups))
+    assert section.data["judge_calls_last_hour"] == 0
+    assert section.data["judge_hourly_limit"] == 5
+    assert section.data["last_comment_ms"] == now - 3 * HOUR
+    assert section.data["comments_last_30m"] == 0
+
+
+@pytest.mark.asyncio
+async def test_budgets_without_any_attempt_report_unknown_not_zero() -> None:
+    now = 10 * DAY
+    section = await build(
+        BudgetsSection(),
+        context(FakeHistory([]), now_ms=now, speakups=FakeSpeakups([])),
+    )
+    assert section.data["judge_hourly_limit"] is None
+    assert section.data["last_comment_ms"] is None
+    assert section.data["judge_calls_last_hour"] == 0
+
+
+@pytest.mark.asyncio
 async def test_people_activity_section() -> None:
     now = 200_000_000
     history = FakeHistory(
