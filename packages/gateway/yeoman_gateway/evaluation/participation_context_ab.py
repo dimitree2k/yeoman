@@ -15,16 +15,21 @@ opportunity so its noise is visible.
 from __future__ import annotations
 
 import asyncio
+import copy
 import json
+import math
 import random
 import sqlite3
 from collections import Counter
-from collections.abc import Callable, Collection, Mapping
+from collections.abc import Awaitable, Callable, Collection, Mapping
 from contextvars import ContextVar
 from dataclasses import dataclass
 from pathlib import Path
+from types import SimpleNamespace
 from typing import Any
 
+from yeoman_gateway.group_state.contract import SourceReaders
+from yeoman_gateway.group_state.render import RenderedState
 from yeoman_gateway.history.context import history_turn
 from yeoman_gateway.history.live import HistoryBoundary, HistoryPaused
 from yeoman_gateway.history.queries import HistoryQueries
@@ -217,6 +222,139 @@ def registry_lookup(processing_db: Path | None) -> Callable[[str, int], object] 
     return lookup
 
 
+class _ReadOnlySpeakups:
+    """The judge-attempt read of ``speakups.db``, one query per call."""
+
+    def __init__(self, path: Path) -> None:
+        self._path = Path(path)
+
+    async def judge_attempts_since(
+        self, *, channel: str, chat_id: str, since_ms: int
+    ) -> list[dict[str, Any]]:
+        connection = _read_only(self._path)
+        try:
+            rows = connection.execute(
+                "SELECT * FROM judge_attempts WHERE channel = ? AND chat_id = ?"
+                " AND created_at_ms >= ? ORDER BY created_at_ms ASC",
+                (str(channel), str(chat_id), int(since_ms)),
+            ).fetchall()
+        finally:
+            connection.close()
+        return [dict(row) for row in rows]
+
+
+class _ReadOnlyProcessing:
+    """The few processing reads a group-state build needs, all read-only."""
+
+    def __init__(self, path: Path) -> None:
+        self._path = Path(path)
+
+    def short_reply_decisions_since(
+        self, channel: str, chat_id: str, since_ms: int
+    ) -> list[dict[str, Any]]:
+        connection = _read_only(self._path)
+        try:
+            rows = connection.execute(
+                "SELECT message_id, mode, status, emoji, created_ms, updated_ms"
+                " FROM short_reply_decisions WHERE channel = ? AND chat_id = ?"
+                " AND created_ms >= ? ORDER BY created_ms, message_id",
+                (str(channel), str(chat_id), int(since_ms)),
+            ).fetchall()
+        finally:
+            connection.close()
+        return [dict(row) for row in rows]
+
+    def recent_reactions(
+        self, *, channel: str, chat_id: str, since_ms: int, limit: int
+    ) -> list[dict[str, Any]]:
+        connection = _read_only(self._path)
+        try:
+            rows = connection.execute(
+                "SELECT payload_json, created_ms FROM effects"
+                " WHERE capability = 'send_reaction' AND state = 'sent'"
+                " AND json_extract(target_json, '$.channel') = ?"
+                " AND json_extract(target_json, '$.chat_id') = ?"
+                " AND created_ms >= ? ORDER BY created_ms DESC, effect_id DESC LIMIT ?",
+                (str(channel), str(chat_id), int(since_ms), max(1, int(limit))),
+            ).fetchall()
+        finally:
+            connection.close()
+        return [dict(row) for row in rows]
+
+    def thread_for_message_as_of(
+        self, message_id: str, at_ms: int
+    ) -> tuple[str, str | None] | None:
+        connection = _read_only(self._path)
+        try:
+            row = connection.execute(
+                "SELECT thread_id, turn_id FROM thread_messages"
+                " WHERE message_id = ? AND confirmed_ms IS NOT NULL AND confirmed_ms <= ?"
+                " LIMIT 1",
+                (str(message_id), int(at_ms)),
+            ).fetchone()
+        finally:
+            connection.close()
+        if row is None:
+            return None
+        return (str(row["thread_id"]), row["turn_id"])
+
+
+class _ReadOnlyDecisions:
+    """Decisions that were created by ``at_ms`` and are still open."""
+
+    def __init__(self, path: Path) -> None:
+        self._path = Path(path)
+
+    def list_open_as_of(self, chat_id: str, at_ms: int) -> list[Any]:
+        connection = _read_only(self._path)
+        try:
+            rows = connection.execute(
+                "SELECT id, chat_id, created_by, due_at_ms, created_at_ms, status"
+                " FROM group_decisions WHERE chat_id = ? AND status = 'open'"
+                " AND created_at_ms <= ? ORDER BY due_at_ms IS NULL, due_at_ms, created_at_ms",
+                (str(chat_id), int(at_ms)),
+            ).fetchall()
+        finally:
+            connection.close()
+        return [
+            SimpleNamespace(
+                id=str(row["id"]),
+                chat_id=str(row["chat_id"]),
+                created_by=str(row["created_by"]),
+                due_at_ms=row["due_at_ms"],
+                created_at_ms=int(row["created_at_ms"]),
+                status=str(row["status"]),
+            )
+            for row in rows
+        ]
+
+
+def read_only_source_readers(
+    *,
+    speakups_db: Path | None,
+    processing_db: Path | None,
+    decisions_db: Path | None,
+) -> SourceReaders:
+    """The live source readers opened read-only, for one offline group-state build."""
+
+    def existing(path: Path | None) -> Path | None:
+        if path is None:
+            return None
+        candidate = Path(path).expanduser()
+        return candidate if candidate.is_file() else None
+
+    speakups = existing(speakups_db)
+    processing = existing(processing_db)
+    decisions = existing(decisions_db)
+    return SourceReaders(
+        speakups=_ReadOnlySpeakups(speakups) if speakups is not None else None,
+        processing=_ReadOnlyProcessing(processing) if processing is not None else None,
+        decisions=_ReadOnlyDecisions(decisions) if decisions is not None else None,
+        polls=None,
+        cron=None,
+    )
+
+
 def _inputs(
     bounds: ParticipationContextBounds, guidance: str, sources: tuple[str, ...]
 ) -> ParticipationDecisionInputs:
@@ -317,6 +455,31 @@ async def _build_variant(
     return record, dict(context)
 
 
+def _state_measure(rendered: RenderedState) -> dict[str, Any]:
+    """What the replay keeps about one rendered block: no message or block text."""
+    return {
+        "revision": rendered.revision,
+        "sections": list(rendered.sections),
+        "dropped": list(rendered.dropped),
+        "fallback": rendered.fallback,
+        "chars": len(rendered.text),
+    }
+
+
+def _set_estimate(
+    record: dict[str, Any],
+    estimator: ParticipationJudge,
+    opportunity: ParticipationOpportunity,
+    context: Mapping[str, Any],
+) -> None:
+    """Fill a variant's prompt estimate, or record why it could not be measured."""
+    try:
+        record["estimated_prompt_tokens"] = _estimate_tokens(estimator, opportunity, context)
+    except ParticipationDecisionError as exc:
+        record["estimated_prompt_tokens"] = None
+        record["estimate_error"] = exc.reason
+
+
 async def _judge_variant(
     record: dict[str, Any],
     opportunity: ParticipationOpportunity,
@@ -358,6 +521,7 @@ async def replay(
     set_as_of: Callable[[int], None] | None = None,
     concurrency: int = 1,
     judge_repeats: int = 1,
+    state_for: Callable[[RecordedOpportunity], Awaitable[RenderedState]] | None = None,
 ) -> list[dict[str, Any]]:
     """One JSON-compatible record per opportunity: A (window) and B (conversation).
 
@@ -367,6 +531,11 @@ async def replay(
     ``judge_repeats`` above 1 the B Judge decides that many times per opportunity:
     the record keeps every repeat's action, the distribution, and the majority
     decision (ties: the earliest repeat) as its own ``action``.
+
+    With ``state_for`` the replay also measures the group-state block: ``S`` is the
+    B context plus ``group_state_text`` and ``B2`` is a second, unchanged B call, so
+    S/B disagreement can be read against the B/B2 noise floor. ``A`` is still built
+    for sizes and tokens but is not judged, which saves one call per opportunity.
     """
     repeats = max(1, min(int(judge_repeats), MAX_JUDGE_REPEATS))
     records: list[dict[str, Any]] = []
@@ -389,13 +558,18 @@ async def replay(
             set_as_of(item.at_ms)
         try:
             async with history_turn(history):
+                built: dict[str, dict[str, Any]] = {}
                 for key, bounds in (("A", window_bounds), ("B", conversation_bounds)):
                     variant, context = await _build_variant(
                         builder, opportunity, _inputs(bounds, guidance, item.source_ids),
                         at_ms=item.at_ms, estimator=estimator,
                     )
                     record[key] = variant
+                    if context is not None:
+                        built[key] = context
                     if judge is None or context is None:
+                        continue
+                    if state_for is not None and key == "A":
                         continue
                     if key == "B" and repeats > 1:
                         runs: list[dict[str, Any]] = [{} for _ in range(repeats)]
@@ -403,6 +577,25 @@ async def replay(
                         pending.extend((run, opportunity, context) for run in runs)
                     else:
                         pending.append((variant, opportunity, context))
+                if state_for is not None:
+                    rendered = await state_for(item)
+                    record["state"] = _state_measure(rendered)
+                    b_context = built.get("B")
+                    if (
+                        judge is not None
+                        and b_context is not None
+                        and record["B"].get("status") == "built"
+                    ):
+                        s_context = copy.deepcopy(b_context)
+                        s_context["group_state_text"] = rendered.text
+                        s_variant = copy.deepcopy(record["B"])
+                        _set_estimate(s_variant, estimator, opportunity, s_context)
+                        record["S"] = s_variant
+                        record["B2"] = copy.deepcopy(record["B"])
+                        pending.append((s_variant, opportunity, s_context))
+                        pending.append(
+                            (record["B2"], opportunity, copy.deepcopy(b_context))
+                        )
         except HistoryPaused as exc:
             record["skipped"] = f"history_paused:{exc}"
         records.append(record)
@@ -492,6 +685,108 @@ def _mean(values: list[float]) -> float | None:
     return round(sum(values) / len(values), 1) if values else None
 
 
+def _p95(values: list[int]) -> float | None:
+    """Nearest-rank 95th percentile, rounded like the other report numbers."""
+    if not values:
+        return None
+    ordered = sorted(values)
+    index = max(0, math.ceil(0.95 * len(ordered)) - 1)
+    return round(float(ordered[index]), 1)
+
+
+def _agreement(records: list[Mapping[str, Any]], left: str, right: str) -> float | None:
+    """Share of paired, decided variants with the same action."""
+    pairs = 0
+    equal = 0
+    for record in records:
+        first = _decided_action(record.get(left))
+        second = _decided_action(record.get(right))
+        if first is None or second is None:
+            continue
+        pairs += 1
+        equal += int(first == second)
+    return round(equal / pairs, 3) if pairs else None
+
+
+def _judge_error_rate(records: list[Mapping[str, Any]], variant: str) -> float | None:
+    attempts = 0
+    errors = 0
+    for record in records:
+        entry = record.get(variant)
+        status = entry.get("status") if isinstance(entry, Mapping) else None
+        if status not in {"decided", "judge_error"}:
+            continue
+        attempts += 1
+        errors += int(status == "judge_error")
+    return round(errors / attempts, 3) if attempts else None
+
+
+def _state_summary(
+    records: list[Mapping[str, Any]], *, judged: bool, seed: int
+) -> dict[str, Any]:
+    """The group-state block: render rate, S/B agreement against the B/B2 noise floor."""
+    total = len(records)
+    fallbacks = Counter(
+        str(record["state"].get("fallback"))
+        for record in records
+        if isinstance(record.get("state"), Mapping) and record["state"].get("fallback")
+    )
+    deltas = [
+        int(record["S"]["estimated_prompt_tokens"])
+        - int(record["B"]["estimated_prompt_tokens"])
+        for record in records
+        if isinstance(record.get("S"), Mapping)
+        and isinstance(record.get("B"), Mapping)
+        and isinstance(record["S"].get("estimated_prompt_tokens"), int)
+        and isinstance(record["B"].get("estimated_prompt_tokens"), int)
+    ]
+    summary: dict[str, Any] = {
+        "opportunities": total,
+        "rendered": sum(
+            1
+            for record in records
+            if isinstance(record.get("state"), Mapping)
+            and int(record["state"].get("chars") or 0) > 0
+        ),
+        "fallback_rate": {
+            reason: round(count / total, 3) for reason, count in sorted(fallbacks.items())
+        },
+        "estimated_token_delta_mean": _mean([float(delta) for delta in deltas]),
+        "estimated_token_delta_p95": _p95(deltas),
+    }
+    if not judged:
+        return summary
+    disagreements = [
+        str(record["opportunity_id"])
+        for record in records
+        if _decided_action(record.get("B")) is not None
+        and _decided_action(record.get("S")) is not None
+        and _decided_action(record.get("B")) != _decided_action(record.get("S"))
+    ]
+    sample = (
+        sorted(random.Random(seed).sample(disagreements, MAX_DISAGREEMENTS))
+        if len(disagreements) > MAX_DISAGREEMENTS
+        else sorted(disagreements)
+    )
+    summary.update({
+        "agreement_b_s": _agreement(records, "B", "S"),
+        "agreement_b_b2": _agreement(records, "B", "B2"),
+        "actions": {
+            variant: dict(Counter(
+                action for record in records
+                if (action := _decided_action(record.get(variant))) is not None
+            ))
+            for variant in ("B", "B2", "S")
+        },
+        "judge_error_rate": {
+            variant: _judge_error_rate(records, variant) for variant in ("B", "B2", "S")
+        },
+        "disagreement_count": len(disagreements),
+        "disagreement_ids": sample,
+    })
+    return summary
+
+
 def summarize(records: list[dict[str, Any]], *, judged: bool, seed: int = 0) -> dict[str, Any]:
     """Agreement, token delta and up to 30 disagreement ids. Ids and aggregates only."""
     built = [r for r in records if r.get("A", {}).get("status") in {"built", "decided", "judge_error"}
@@ -520,6 +815,9 @@ def summarize(records: list[dict[str, Any]], *, judged: bool, seed: int = 0) -> 
         )),
         "judged": judged,
     }
+    state_records = [r for r in records if isinstance(r.get("state"), Mapping)]
+    if state_records:
+        summary["state"] = _state_summary(state_records, judged=judged, seed=seed)
     if not judged:
         return summary
     decided = [r for r in built if r["A"]["status"] == "decided" and r["B"]["status"] == "decided"]
@@ -699,6 +997,27 @@ def render_markdown(
         f"| {key} | {json.dumps(value, ensure_ascii=False)} |"
         for key, value in summary.items() if key != "label_check"
     )
+    state_summary = summary.get("state")
+    if isinstance(state_summary, Mapping):
+        lines.extend([
+            "",
+            "## Group state (S vs B)",
+            "",
+            "B/S agreement is read against the B/B2 noise floor on the same contexts.",
+            "",
+            "| metric | value |",
+            "|---|---|",
+        ])
+        lines.extend(
+            f"| {key} | {json.dumps(state_summary[key], ensure_ascii=False)} |"
+            for key in (
+                "opportunities", "rendered", "fallback_rate", "agreement_b_s",
+                "agreement_b_b2", "actions", "judge_error_rate",
+                "estimated_token_delta_mean", "estimated_token_delta_p95",
+                "disagreement_count", "disagreement_ids",
+            )
+            if key in state_summary
+        )
     check = summary.get("label_check")
     if isinstance(check, Mapping):
         lines.extend([
@@ -755,6 +1074,7 @@ __all__ = [
     "load_opportunities",
     "looks_like_chat_id",
     "read_labels",
+    "read_only_source_readers",
     "read_records",
     "rebuild_views",
     "record_opportunity",

@@ -156,7 +156,8 @@ class _SlowFakeJudgeClient(_FakeJudgeClient):
 
 
 async def _run(tmp_path: Path, *, judged: bool, registry=None, client=None, concurrency: int = 1,
-               subject: str | None = None, judge_repeats: int = 1, floor: int = 0):
+               subject: str | None = None, judge_repeats: int = 1, floor: int = 0,
+               state_for=None):
     history = _history(tmp_path, subject=subject)
     opportunities = load_opportunities(
         _speakups(tmp_path / "speakups.db"), since_ms=T0, until_ms=T0 + 100 * MIN
@@ -188,7 +189,7 @@ async def _run(tmp_path: Path, *, judged: bool, registry=None, client=None, conc
             ) if judged else None,
             usage=captured_usage if capture else (lambda: last.get("usage") or {}),
             set_as_of=lambda moment: as_of.__setitem__("ms", moment),
-            concurrency=concurrency, judge_repeats=judge_repeats,
+            concurrency=concurrency, judge_repeats=judge_repeats, state_for=state_for,
         )
     finally:
         frozen.close()
@@ -637,3 +638,184 @@ def test_cli_from_report_replays_the_same_ids_and_checks_labels(
         "eval", "participation-context", "--from-report", str(tmp_path / "nope"), "--no-judge",
     ])
     assert missing.exit_code == 2 and "records.jsonl missing" in missing.output
+
+
+# -- group state variant S and noise floor B2 ------------------------------------------
+
+
+def _rendered_state(opportunity_id: str, *, fallback: str | None = None):
+    from yeoman_gateway.group_state.render import RenderedState
+
+    text = (
+        "" if fallback else f"[Group State] revision 1, 2 min old\npresence: STATE-{opportunity_id}"
+    )
+    return RenderedState(
+        text=text,
+        revision=1,
+        age_ms=120_000,
+        sections=("presence",) if text else (),
+        dropped=(),
+        fallback=fallback,
+    )
+
+
+@pytest.mark.asyncio
+async def test_replay_with_state_adds_s_and_b2_variants(tmp_path: Path) -> None:
+    seen: list[str] = []
+
+    async def state_for(item):
+        seen.append(item.opportunity_id)
+        return _rendered_state(item.opportunity_id)
+
+    _, records, _ = await _run(tmp_path, judged=True, state_for=state_for)
+    by_id = {record["opportunity_id"]: record for record in records}
+    assert seen == ["opp-2", "opp-1"]
+    for opportunity_id in ("opp-1", "opp-2"):
+        record = by_id[opportunity_id]
+        assert record["A"]["status"] == "built"
+        assert "action" not in record["A"]  # A is measured but never judged
+        assert record["S"]["status"] == "decided"
+        assert record["B2"]["status"] == "decided"
+        text = f"[Group State] revision 1, 2 min old\npresence: STATE-{opportunity_id}"
+        assert record["state"] == {
+            "revision": 1,
+            "sections": ["presence"],
+            "dropped": [],
+            "fallback": None,
+            "chars": len(text),
+        }
+        assert "text" not in record["state"]
+    assert "state" not in by_id["opp-3"]
+
+    summary = summarize(records, judged=True)
+    state = summary["state"]
+    assert state["opportunities"] == 2
+    assert state["rendered"] == 2
+    assert state["fallback_rate"] == {}
+    assert state["agreement_b_s"] == 1.0
+    assert state["agreement_b_b2"] == 1.0
+    assert state["actions"]["B"] == {"silence": 2}
+    assert state["actions"]["S"] == {"silence": 2}
+    assert state["judge_error_rate"] == {"B": 0.0, "B2": 0.0, "S": 0.0}
+
+
+@pytest.mark.asyncio
+async def test_replay_state_context_does_not_leak_into_b(tmp_path: Path) -> None:
+    async def state_for(item):
+        return _rendered_state(item.opportunity_id)
+
+    _, records, client = await _run(tmp_path, judged=True, state_for=state_for)
+    by_id = {record["opportunity_id"]: record for record in records}
+    assert len(client.prompts) == 6  # two opportunities x (B, S, B2)
+    assert sum("STATE-opp-1" in prompt for prompt in client.prompts) == 1
+    assert sum("STATE-opp-2" in prompt for prompt in client.prompts) == 1
+    for opportunity_id in ("opp-1", "opp-2"):
+        assert (
+            by_id[opportunity_id]["S"]["estimated_prompt_tokens"]
+            > by_id[opportunity_id]["B"]["estimated_prompt_tokens"]
+        )
+
+
+@pytest.mark.asyncio
+async def test_replay_without_state_unchanged(tmp_path: Path) -> None:
+    _, records, client = await _run(tmp_path, judged=True)
+    assert len(client.prompts) == 4  # A and B for two opportunities
+    for record in records:
+        assert "S" not in record and "B2" not in record and "state" not in record
+        if "skipped" not in record:
+            assert record["A"]["status"] == "decided"
+            assert record["B"]["status"] == "decided"
+    assert "state" not in summarize(records, judged=True)
+
+
+def _state_record(
+    opportunity_id: str,
+    *,
+    b: str,
+    s: str,
+    b2: str | None,
+    b2_status: str = "decided",
+    fallback: str | None = None,
+) -> dict:
+    def variant(action: str | None, *, status: str = "decided", tokens: int = 100) -> dict:
+        entry: dict = {"status": status, "estimated_prompt_tokens": tokens}
+        if action is not None:
+            entry["action"] = action
+        return entry
+
+    return {
+        "opportunity_id": opportunity_id,
+        "state": {
+            "revision": 1,
+            "sections": ["presence"],
+            "dropped": [],
+            "fallback": fallback,
+            "chars": 80,
+        },
+        "B": variant(b),
+        "S": variant(s, tokens=150),
+        "B2": variant(b2, status=b2_status),
+    }
+
+
+def test_summary_state_block_agreement_and_noise() -> None:
+    records = [
+        _state_record("s1", b="silence", s="react", b2="silence", fallback="stale"),
+        _state_record("s2", b="react", s="react", b2="silence"),
+        _state_record("s3", b="silence", s="silence", b2=None, b2_status="judge_error"),
+    ]
+    state = summarize(records, judged=True)["state"]
+    assert state["opportunities"] == 3
+    assert state["rendered"] == 3
+    assert state["fallback_rate"] == {"stale": 0.333}
+    assert state["agreement_b_s"] == 0.667
+    assert state["agreement_b_b2"] == 0.5
+    assert state["actions"] == {
+        "B": {"silence": 2, "react": 1},
+        "B2": {"silence": 2},
+        "S": {"react": 2, "silence": 1},
+    }
+    assert state["judge_error_rate"]["B2"] == 0.333
+    assert state["estimated_token_delta_mean"] == 50.0
+    assert state["estimated_token_delta_p95"] == 50.0
+    assert state["disagreement_ids"] == ["s1"]
+    assert state["disagreement_count"] == 1
+
+    many = [
+        _state_record(f"m{index:02d}", b="silence", s="react", b2="silence") for index in range(35)
+    ]
+    capped = summarize(many, judged=True)["state"]
+    assert capped["disagreement_count"] == 35
+    assert len(capped["disagreement_ids"]) == 30
+
+
+@pytest.mark.asyncio
+async def test_state_for_runs_inside_history_turn(tmp_path: Path) -> None:
+    from yeoman_gateway.history.context import current_history_snapshot
+
+    inside: list[bool] = []
+
+    async def state_for(item):
+        inside.append(current_history_snapshot() is not None)
+        return _rendered_state(item.opportunity_id)
+
+    _, records, _ = await _run(tmp_path, judged=False, state_for=state_for)
+    assert inside == [True, True]
+    assert [r["opportunity_id"] for r in records if "state" in r] == ["opp-2", "opp-1"]
+    assert all("S" not in record and "B2" not in record for record in records)
+
+
+def test_cli_with_state_measures_a_rendered_block(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    home = _cli_home(tmp_path, monkeypatch)
+    result = CliRunner().invoke(
+        app, ["eval", "participation-context", "--no-judge", "--with-state"]
+    )
+    assert result.exit_code == 0, result.output
+    [directory] = list((home / "var" / "eval" / "participation-context-ab").glob("*-replay"))
+    summary = json.loads((directory / "summary.json").read_text())
+    assert summary["state"]["opportunities"] == 2
+    assert summary["state"]["rendered"] == 2
+    records = [json.loads(line) for line in (directory / "records.jsonl").read_text().splitlines()]
+    assert all("S" not in record and "B2" not in record for record in records)
