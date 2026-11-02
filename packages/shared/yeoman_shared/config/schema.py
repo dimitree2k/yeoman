@@ -1054,7 +1054,9 @@ class GroupStateLabelsConfig(BaseModel):
     mode: Literal["off", "on"] = "off"
     #: ``"channel:chat_id"`` entries; each must also be a managed group-state chat.
     chats: list[str] = Field(default_factory=list)
-    route: str = "groupState.labels"
+    #: A models.routes key: lowercase and dotted, because config keys round-trip
+    #: through camel/snake conversion and "groupState.labels" would not survive it.
+    route: str = "conversation.labels"
     max_per_chat_day: int = Field(default=40, alias="maxPerChatDay", ge=0)
     max_global_day: int = Field(default=80, alias="maxGlobalDay", ge=0)
     max_tokens_day: int = Field(default=400_000, alias="maxTokensDay", ge=0)
