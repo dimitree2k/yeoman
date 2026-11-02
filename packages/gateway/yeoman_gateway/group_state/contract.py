@@ -45,6 +45,8 @@ class BuildContext:
     settings: Any
     #: ``config.consciousness`` bounds used for conversation segmentation.
     consciousness: Any | None = None
+    #: The store this document lives in; readers that only preserve stored items use it.
+    store: Any | None = None
 
 
 class GroupStateContributor(Protocol):

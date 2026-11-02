@@ -21,6 +21,7 @@ _SECTION_ORDER = (
     "commitments",
     "budgets",
     "people_activity",
+    "past",
 )
 
 
@@ -378,6 +379,89 @@ def group_state_label(
                 f" attempts={outcome.attempts}"
                 f" tokens={outcome.prompt_tokens + outcome.completion_tokens}"
             )
+        if outcome.outcome in {"unavailable", "error"}:
+            raise typer.Exit(1)
+    finally:
+        if store is not None:
+            store.close()
+        history.close()
+
+
+@group_state_app.command("summaries")
+def group_state_summaries(
+    chat: str | None = typer.Argument(None, help="Chat id or exact group subject"),
+    chat_option: str | None = typer.Option(
+        None, "--chat", help="Chat id or exact group subject (option form)"
+    ),
+    dry_run: bool = typer.Option(
+        False, "--dry-run", help="Print counts and a token estimate; make no call, write nothing"
+    ),
+    db_path: Path | None = typer.Option(None, "--db-path", help="Group-state database"),
+    history_db: Path | None = typer.Option(None, "--history-db", help="History database"),
+    channel: str = typer.Option("whatsapp", "--channel", help="Channel"),
+) -> None:
+    """Build missing ended-conversation and closed-week summaries now."""
+    import asyncio
+    import time
+
+    from yeoman_shared.config.loader import load_config
+
+    from yeoman_gateway.evaluation.participation_context_ab import FrozenHistory
+    from yeoman_gateway.group_state.store import GroupStateStore
+    from yeoman_gateway.group_state.summaries.runner import ConversationSummarizer
+    from yeoman_gateway.history.live import history_db_path
+    from yeoman_gateway.processing.model_route import RouteClient
+
+    target = str(chat_option or chat or "").strip()
+    if not target:
+        typer.echo("Pass a chat id or a group subject.", err=True)
+        raise typer.Exit(2)
+    config = load_config()
+    group_state = config.processing.group_state
+    summaries = group_state.summaries
+    history_path = Path(history_db).expanduser() if history_db is not None else history_db_path()
+    if not history_path.is_file():
+        typer.echo("No history yet.", err=True)
+        raise typer.Exit(1)
+    chat_id = _resolve_chat(target, history_path)
+    now_ms = int(time.time() * 1000)
+    history = FrozenHistory(history_path)
+    store = None
+    try:
+        path = _resolve_db(db_path)
+        if dry_run:
+            if path.is_file():
+                store = GroupStateStore(path, readonly=True)
+        else:
+            store = GroupStateStore(path)
+        summarizer = ConversationSummarizer(
+            store=store,
+            history_projector=history,
+            settings=summaries,
+            group_state_settings=group_state,
+            consciousness=config.consciousness,
+            client_factory=lambda: RouteClient(config=config, route_key=summaries.route),
+        )
+        if dry_run:
+            preview = asyncio.run(summarizer.preview(channel, chat_id, now_ms=now_ms))
+            typer.echo(
+                json.dumps(
+                    {
+                        "mode": summaries.mode,
+                        "conversations": preview.conversations,
+                        "weeks": preview.weeks,
+                        "estimated_prompt_tokens": preview.estimated_prompt_tokens,
+                    },
+                    sort_keys=True,
+                )
+            )
+            return
+        outcome = asyncio.run(summarizer.run(channel, chat_id, now_ms=now_ms))
+        typer.echo(
+            f"outcome={outcome.outcome} conversations={outcome.conversation_summaries}"
+            f" weeks={outcome.week_summaries} attempts={outcome.attempts}"
+            f" tokens={outcome.prompt_tokens + outcome.completion_tokens}"
+        )
         if outcome.outcome in {"unavailable", "error"}:
             raise typer.Exit(1)
     finally:

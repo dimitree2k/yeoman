@@ -53,12 +53,19 @@ class SignalInvalidator:
         statements: Any | None = None,
         mapper: WhatsAppSignalMapper | None = None,
         clock: Any = None,
+        group_state: Any | None = None,
     ) -> None:
         self._store = store
         self._actors = actors
         self._statements = statements
         self._mapper = mapper or WhatsAppSignalMapper()
         self._clock = clock
+        #: The group-state service is built after the channel manager; the setter closes
+        #: that ordering gap without a second invalidation path.
+        self._group_state = group_state
+
+    def set_group_state(self, group_state: Any | None) -> None:
+        self._group_state = group_state
 
     def __call__(self, kind: str, payload: Mapping[str, Any]) -> SignalInvalidation:
         if str(kind) not in INVALIDATING_KINDS:
@@ -70,6 +77,20 @@ class SignalInvalidator:
         target_message_id = str(signal.target_message_id or signal.source_message_id or "")
         if not target_message_id:
             return SignalInvalidation(kind=str(kind), refused="no_target_message")
+
+        # Derived summaries must disappear before the next read even when the signal is
+        # refused as authority over somebody else's turn. Only the derived item is
+        # removed here; the turn/statement decision below still follows the author rule.
+        invalidate_group_state = getattr(self._group_state, "invalidate_source", None)
+        if callable(invalidate_group_state) and signal.channel and signal.chat_id:
+            try:
+                invalidate_group_state(signal.channel, signal.chat_id, target_message_id)
+            except Exception as exc:  # pragma: no cover - defensive
+                logger.warning(
+                    "group state source invalidation failed kind={} error_type={}",
+                    kind,
+                    type(exc).__name__,
+                )
 
         originals = [
             event

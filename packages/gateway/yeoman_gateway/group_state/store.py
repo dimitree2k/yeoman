@@ -56,9 +56,10 @@ _DDL = (
     """CREATE TABLE IF NOT EXISTS group_state_cursors (
         channel TEXT NOT NULL,
         chat_id TEXT NOT NULL,
+        kind TEXT NOT NULL DEFAULT 'invalidation',
         occurred_ms INTEGER NOT NULL,
         event_id TEXT NOT NULL,
-        PRIMARY KEY (channel, chat_id)
+        PRIMARY KEY (channel, chat_id, kind)
     )""",
 )
 
@@ -112,6 +113,7 @@ class GroupStateStore:
                 raise RuntimeError(f"group-state.db schema {row[0]} is newer than {SCHEMA_VERSION}")
             for statement in _DDL[1:]:
                 conn.execute(statement)
+            GroupStateStore._migrate_cursors(conn)
             if stored < SCHEMA_VERSION:
                 GroupStateStore._rewrite_documents(conn)
             conn.execute(
@@ -122,6 +124,24 @@ class GroupStateStore:
         except BaseException:
             conn.execute("ROLLBACK")
             raise
+
+    @staticmethod
+    def _migrate_cursors(conn: sqlite3.Connection) -> None:
+        """Add the ``kind`` discriminator to a pre-summaries cursor table."""
+        columns = {
+            str(row[1]) for row in conn.execute("PRAGMA table_info(group_state_cursors)").fetchall()
+        }
+        if "kind" in columns:
+            return
+        # The old table held exactly one row per chat: the invalidation cursor.
+        conn.execute("ALTER TABLE group_state_cursors RENAME TO group_state_cursors_v1")
+        conn.execute(_DDL[-1])
+        conn.execute(
+            "INSERT INTO group_state_cursors(channel, chat_id, kind, occurred_ms, event_id)"
+            " SELECT channel, chat_id, 'invalidation', occurred_ms, event_id"
+            " FROM group_state_cursors_v1"
+        )
+        conn.execute("DROP TABLE group_state_cursors_v1")
 
     @staticmethod
     def _rewrite_documents(conn: sqlite3.Connection) -> None:
@@ -462,11 +482,15 @@ class GroupStateStore:
 
     def label_cache_hit(self, channel: str, chat_id: str, input_hash: str) -> bool:
         """True when this exact input was already written by an earlier attempt."""
+        return self.run_cache_hit(channel, chat_id, kind="labels", input_hash=input_hash)
+
+    def run_cache_hit(self, channel: str, chat_id: str, *, kind: str, input_hash: str) -> bool:
+        """True when this exact input was already written by an earlier attempt."""
         with self._lock:
             row = self._conn.execute(
                 "SELECT 1 FROM group_state_runs WHERE channel = ? AND chat_id = ?"
-                " AND kind = 'labels' AND input_hash = ? AND outcome = 'written' LIMIT 1",
-                (str(channel), str(chat_id), str(input_hash)),
+                " AND kind = ? AND input_hash = ? AND outcome = 'written' LIMIT 1",
+                (str(channel), str(chat_id), str(kind), str(input_hash)),
             ).fetchone()
         return row is not None
 
@@ -474,6 +498,18 @@ class GroupStateStore:
         self, channel: str, chat_id: str, *, start_ms: int, end_ms: int
     ) -> tuple[int, int, int]:
         """Current window's label rows for this chat, globally, and global tokens."""
+        return self.run_usage(channel, chat_id, kind="labels", start_ms=start_ms, end_ms=end_ms)
+
+    def run_usage(
+        self,
+        channel: str,
+        chat_id: str,
+        *,
+        kind: str,
+        start_ms: int,
+        end_ms: int,
+    ) -> tuple[int, int, int]:
+        """Rows for this chat, globally, and global tokens for one run kind."""
         with self._lock:
             row = self._conn.execute(
                 "SELECT"
@@ -481,28 +517,45 @@ class GroupStateStore:
                 " COUNT(*),"
                 " COALESCE(SUM(COALESCE(prompt_tokens, 0) + COALESCE(completion_tokens, 0)), 0)"
                 " FROM group_state_runs"
-                " WHERE kind = 'labels' AND started_ms >= ? AND started_ms < ?",
-                (str(channel), str(chat_id), int(start_ms), int(end_ms)),
+                " WHERE kind = ? AND started_ms >= ? AND started_ms < ?",
+                (str(channel), str(chat_id), str(kind), int(start_ms), int(end_ms)),
             ).fetchone()
         return int(row[0]), int(row[1]), int(row[2])
 
     def invalidation_cursor(self, channel: str, chat_id: str) -> tuple[int, str]:
-        with self._lock:
-            row = self._conn.execute(
-                "SELECT occurred_ms, event_id FROM group_state_cursors"
-                " WHERE channel = ? AND chat_id = ?",
-                (str(channel), str(chat_id)),
-            ).fetchone()
-        return (int(row["occurred_ms"]), str(row["event_id"])) if row is not None else (0, "")
+        return self._cursor(channel, chat_id, "invalidation")
 
     def set_invalidation_cursor(
         self, channel: str, chat_id: str, occurred_ms: int, event_id: str
     ) -> None:
+        self._set_cursor(channel, chat_id, "invalidation", occurred_ms, event_id)
+
+    def summary_cursor(self, channel: str, chat_id: str) -> tuple[int, str]:
+        """The newest ended conversation this chat has already processed."""
+        return self._cursor(channel, chat_id, "summary")
+
+    def set_summary_cursor(
+        self, channel: str, chat_id: str, ended_ms: int, conversation_id: str
+    ) -> None:
+        self._set_cursor(channel, chat_id, "summary", ended_ms, conversation_id)
+
+    def _cursor(self, channel: str, chat_id: str, kind: str) -> tuple[int, str]:
+        with self._lock:
+            row = self._conn.execute(
+                "SELECT occurred_ms, event_id FROM group_state_cursors"
+                " WHERE channel = ? AND chat_id = ? AND kind = ?",
+                (str(channel), str(chat_id), str(kind)),
+            ).fetchone()
+        return (int(row["occurred_ms"]), str(row["event_id"])) if row is not None else (0, "")
+
+    def _set_cursor(
+        self, channel: str, chat_id: str, kind: str, occurred_ms: int, event_id: str
+    ) -> None:
         with self._lock:
             self._conn.execute(
                 "INSERT OR REPLACE INTO group_state_cursors"
-                "(channel, chat_id, occurred_ms, event_id) VALUES (?, ?, ?, ?)",
-                (str(channel), str(chat_id), int(occurred_ms), str(event_id)),
+                "(channel, chat_id, kind, occurred_ms, event_id) VALUES (?, ?, ?, ?, ?)",
+                (str(channel), str(chat_id), str(kind), int(occurred_ms), str(event_id)),
             )
 
     def snapshots(self, channel: str, chat_id: str, limit: int) -> list[GroupState]:
@@ -533,6 +586,10 @@ class GroupStateStore:
                     "DELETE FROM group_state_runs WHERE channel = ? AND chat_id = ?",
                     (channel, chat_id),
                 )
+                conn.execute(
+                    "DELETE FROM group_state_cursors WHERE channel = ? AND chat_id = ?",
+                    (channel, chat_id),
+                )
                 conn.execute("COMMIT")
             except BaseException:
                 conn.execute("ROLLBACK")
@@ -552,20 +609,45 @@ class GroupStateStore:
 
 
 def _scrub_state(state: GroupState, wanted: set[str], removed: set[str]) -> GroupState | None:
-    """Drop items depending on ``wanted``; ``None`` when this state is unchanged."""
+    """Drop items depending on ``wanted`` and summaries depending on dropped ones.
+
+    A week summary has no message sources of its own (it is built only from
+    conversation summaries); its ``depends_on`` list names the conversations, so a
+    removed conversation cascades to the week instead of relying on a 500-source union.
+    """
     sections: dict[str, Section] = {}
     changed = False
+    removed_conversations: set[str] = set()
     for key, section in state.sections.items():
         kept = []
         for item in section.items:
             if wanted.intersection(item.sources):
                 removed.add(item.id)
+                if item.conversation_id:
+                    removed_conversations.add(item.conversation_id)
             else:
                 kept.append(item)
         if len(kept) != len(section.items):
             changed = True
             section = replace(section, items=tuple(kept))
         sections[key] = section
+    if removed_conversations:
+        for key, section in sections.items():
+            kept = []
+            for item in section.items:
+                depends_on = item.data.get("depends_on")
+                dependencies = (
+                    {str(value) for value in depends_on}
+                    if isinstance(depends_on, (list, tuple))
+                    else set()
+                )
+                if dependencies.intersection(removed_conversations):
+                    removed.add(item.id)
+                    changed = True
+                else:
+                    kept.append(item)
+            if len(kept) != len(section.items):
+                sections[key] = replace(section, items=tuple(kept))
     return replace(state, sections=sections) if changed else None
 
 

@@ -1090,6 +1090,26 @@ class GroupStateLabelsConfig(BaseModel):
     timeout_seconds: float = Field(default=30.0, alias="timeoutSeconds", gt=0, le=300)
 
 
+class GroupStateSummariesConfig(BaseModel):
+    """Ended-conversation and weekly summaries in the ``past`` section.
+
+    ``off`` builds and schedules nothing and leaves every live prompt unchanged.
+    ``build`` stores content-only summaries; nothing reads them on a reply path yet.
+    """
+
+    model_config = ConfigDict(extra="forbid", populate_by_name=True)
+
+    mode: Literal["off", "build"] = "off"
+    #: A models.routes key: lowercase and dotted, so the camelCase config round-trip
+    #: never rewrites it (``history.summaries`` stays itself).
+    route: str = "history.summaries"
+    min_messages: int = Field(default=4, alias="minMessages", ge=1)
+    daily_prompt_token_cap: int = Field(default=300_000, alias="dailyPromptTokenCap", ge=0)
+    keep_weeks: int = Field(default=12, alias="keepWeeks", ge=1, le=104)
+    max_input_chars: int = Field(default=12_000, alias="maxInputChars", ge=1)
+    timeout_seconds: float = Field(default=30.0, alias="timeoutSeconds", gt=0, le=300)
+
+
 class GroupStateViewConfig(BaseModel):
     """One text path's bounded group-state view; off keeps today's prompt byte-identical."""
 
@@ -1129,6 +1149,7 @@ class GroupStateConfig(BaseModel):
     snapshots_kept: int = Field(default=20, alias="snapshotsKept", ge=1, le=200)
     db_path: str = Field(default="data/ops/group-state.db", alias="dbPath")
     labels: GroupStateLabelsConfig = Field(default_factory=GroupStateLabelsConfig)
+    summaries: GroupStateSummariesConfig = Field(default_factory=GroupStateSummariesConfig)
     views: GroupStateViewsConfig = Field(default_factory=GroupStateViewsConfig)
 
 

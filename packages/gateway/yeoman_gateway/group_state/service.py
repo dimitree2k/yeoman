@@ -46,6 +46,7 @@ class GroupStateService:
         clock_ms: Callable[[], int] = lambda: int(time.time() * 1000),
         consciousness: Any | None = None,
         labeler: Any | None = None,
+        summarizer: Any | None = None,
     ) -> None:
         self._store = store
         self._registry = registry
@@ -55,6 +56,7 @@ class GroupStateService:
         self._clock = clock_ms
         self._consciousness = consciousness
         self._labels = labeler
+        self._summaries = summarizer
         self._managed = {
             (channel, chat_id)
             for channel, _, chat_id in (
@@ -75,6 +77,8 @@ class GroupStateService:
         self._label_dirty: set[tuple[str, str]] = set()
         #: Do not hammer a chat whose last label attempt did not write.
         self._label_retry_after: dict[tuple[str, str], int] = {}
+        self._summary_tasks: dict[tuple[str, str], asyncio.Task[None]] = {}
+        self._summary_retry_after: dict[tuple[str, str], int] = {}
         self._last_prune_day: str | None = None
 
     @property
@@ -125,6 +129,7 @@ class GroupStateService:
                         sources=self._sources,
                         settings=self._settings,
                         consciousness=self._consciousness,
+                        store=self._store,
                     )
                     for contributor in self._registry.for_chat(key[0], chat_kind):
                         previous = existing.sections.get(contributor.key) if existing else None
@@ -218,6 +223,7 @@ class GroupStateService:
             self._last_full = now_ms
         self._maybe_prune(now_ms)
         self._schedule_labels(now_ms)
+        self._schedule_summaries(now_ms)
 
     async def _invalidate_chat(self, channel: str, chat_id: str, now_ms: int) -> None:
         """Drop derived items whose source message was deleted, edited or purged."""
@@ -284,7 +290,10 @@ class GroupStateService:
 
     def _maybe_prune(self, now_ms: int) -> None:
         labels = getattr(self._settings, "labels", None)
-        if labels is None or getattr(labels, "mode", "off") != "on":
+        summaries = getattr(self._settings, "summaries", None)
+        labels_on = labels is not None and getattr(labels, "mode", "off") == "on"
+        summaries_on = summaries is not None and getattr(summaries, "mode", "off") != "off"
+        if not labels_on and not summaries_on:
             return
         day = self._local_day(now_ms)
         if day == self._last_prune_day:
@@ -389,6 +398,86 @@ class GroupStateService:
             interval_ms = max(1, int(getattr(self._settings, "min_interval_seconds", 30))) * 1000
             self._label_retry_after[key] = int(self._clock()) + interval_ms
 
+    def _schedule_summaries(self, now_ms: int) -> None:
+        """Start at most one tracked summary scan per chat, on a short cooldown."""
+        summaries = getattr(self._settings, "summaries", None)
+        if (
+            summaries is None
+            or getattr(summaries, "mode", "off") == "off"
+            or self._summaries is None
+        ):
+            return
+        for channel, chat_id in self.managed_chats():
+            key = (channel, chat_id)
+            if key in self._summary_tasks:
+                continue
+            retry_after = self._summary_retry_after.get(key)
+            if retry_after is not None and now_ms < retry_after:
+                continue
+            state = self._store.get(channel, chat_id)
+            if state is None:
+                continue
+            lock = self._locks.setdefault(key, asyncio.Lock())
+            task = asyncio.create_task(
+                self._run_summary(key, lock),
+                name=f"group-state-summaries:{channel}:{chat_id}",
+            )
+            self._summary_tasks[key] = task
+            task.add_done_callback(_forget_task(self._summary_tasks, key))
+
+    async def _run_summary(self, key: tuple[str, str], lock: asyncio.Lock) -> None:
+        summarizer = self._summaries
+        try:
+            outcome = await summarizer.run(key[0], key[1], lock=lock)
+        except asyncio.CancelledError:
+            raise
+        except Exception as exc:  # noqa: BLE001 - a summary failure must not stop the ticker
+            logger.warning(
+                "group_state_summaries_failed chat={}:{} error_type={}",
+                key[0],
+                key[1],
+                type(exc).__name__,
+            )
+            self._summary_retry_after[key] = int(self._clock()) + _interval_ms(
+                self._settings, "min_interval_seconds", 30
+            )
+            return
+        if outcome.outcome == "skipped_budget":
+            self._summary_retry_after[key] = int(self._clock()) + _interval_ms(
+                self._settings, "rebuild_every_seconds", 600
+            )
+            return
+        # Summaries are an on-demand derivation of the readable window. A short
+        # cooldown keeps a lull from opening history every five seconds; one run drains
+        # every pending ended conversation of that chat.
+        self._summary_retry_after[key] = int(self._clock()) + _interval_ms(
+            self._settings, "min_interval_seconds", 30
+        )
+
+    def invalidate_source(self, channel: str, chat_id: str, message_id: str) -> int:
+        """Synchronously drop items that depend on a deleted or edited message."""
+        key = (str(channel), str(chat_id))
+        try:
+            if not self.manages(*key):
+                return 0
+            wanted = {str(message_id)} if str(message_id) else set()
+            if message_id and ":" not in str(message_id):
+                wanted.add(f"{key[0]}:{key[1]}:{message_id}")
+            removed = self._store.scrub_items(key[0], key[1], wanted)
+        except Exception as exc:  # noqa: BLE001 - a signal must never break the sink
+            logger.warning(
+                "group_state_invalidate_source_failed chat={}:{} error_type={}",
+                key[0],
+                key[1],
+                type(exc).__name__,
+            )
+            return 0
+        if removed:
+            self._label_dirty.add(key)
+            self._label_written.pop(key, None)
+            self._summary_retry_after.pop(key, None)
+        return removed
+
     @staticmethod
     def _label_chats(labels: Any) -> tuple[tuple[str, str], ...]:
         chats: list[tuple[str, str]] = []
@@ -403,6 +492,12 @@ class GroupStateService:
             self._task = asyncio.create_task(self._run(), name="group-state")
 
     async def stop(self) -> None:
+        summary_tasks = list(self._summary_tasks.values())
+        for task in summary_tasks:
+            task.cancel()
+        if summary_tasks:
+            await asyncio.gather(*summary_tasks, return_exceptions=True)
+        self._summary_tasks.clear()
         label_tasks = list(self._label_tasks.values())
         for task in label_tasks:
             task.cancel()
@@ -450,3 +545,7 @@ def _forget_task(
             task.exception()
 
     return _done
+
+
+def _interval_ms(settings: Any, name: str, default: int) -> int:
+    return max(1, int(getattr(settings, name, default))) * 1000
