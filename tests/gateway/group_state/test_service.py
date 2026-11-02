@@ -2,45 +2,83 @@
 
 from __future__ import annotations
 
-from types import SimpleNamespace
+import json
+import sqlite3
 from typing import Any
 
 import pytest
 from yeoman_gateway.group_state.contract import ContributorRegistry, SourceReaders
-from yeoman_gateway.group_state.models import GroupState, Section
+from yeoman_gateway.group_state.models import GroupState, Item, Section
 from yeoman_gateway.group_state.service import GroupStateService
 from yeoman_gateway.group_state.store import GroupStateStore
 from yeoman_gateway.history.live import HistoryPaused
+from yeoman_gateway.history.reader import HistorySnapshot
+from yeoman_gateway.history.schema import create
 from yeoman_shared.config.schema import GroupStateConfig
 
 CHAT_A = "group-a@g.us"
 CHAT_B = "group-b@g.us"
 
 
-class FakeSnapshot:
-    generation = 1
-    _closed = False
-
-    def __init__(self) -> None:
-        self.connection = SimpleNamespace(total_changes=0)
-        self.closed = False
-
-    def close(self) -> None:
-        self.closed = True
-
-
 class FakeProjector:
+    """A real in-memory history database behind the projector's read lease."""
+
+    generation = 1
+
     def __init__(self) -> None:
         self.calls = 0
         self.paused = False
-        self.snapshot: FakeSnapshot | None = None
+        self.snapshot: HistorySnapshot | None = None
+        self.db = sqlite3.connect(":memory:")
+        create(self.db)
 
-    async def read_turn(self) -> FakeSnapshot:
+    def add_message(
+        self, message_id: str, *, chat_id: str = CHAT_A, text: str = "synthetic text"
+    ) -> None:
+        self.db.execute(
+            "INSERT INTO messages VALUES (?, 'whatsapp', ?, ?, NULL, NULL,"
+            " 'unknown', 'in', 1, 'native', ?, NULL, NULL, NULL, 'native', '[]')",
+            (message_id, chat_id, message_id, text),
+        )
+        self.db.commit()
+
+    def add_event(
+        self,
+        event_id: str,
+        kind: str,
+        occurred_ms: int,
+        *,
+        target_message_id: str,
+        chat_id: str = CHAT_A,
+    ) -> None:
+        self.db.execute(
+            "INSERT INTO message_events (event_id,kind,channel,chat_id,target_message_id,"
+            "actor_basis,occurred_ms,time_certainty,payload_json,provenance,source_refs)"
+            " VALUES (?,?,'whatsapp',?,?,'unknown',?,'native',?,'native','[]')",
+            (
+                event_id,
+                kind,
+                chat_id,
+                target_message_id,
+                occurred_ms,
+                json.dumps({"text": "edited" if kind == "edit" else ""}),
+            ),
+        )
+        self.db.commit()
+
+    async def read_turn(self) -> HistorySnapshot:
         self.calls += 1
         if self.paused:
             raise HistoryPaused("paused")
-        self.snapshot = FakeSnapshot()
+        db = sqlite3.connect(":memory:")
+        self.db.backup(db)
+        self.snapshot = HistorySnapshot(self.generation, (), db)
         return self.snapshot
+
+    def close(self) -> None:
+        if self.snapshot is not None:
+            self.snapshot.close()
+        self.db.close()
 
 
 class StubContributor:
@@ -83,6 +121,36 @@ class StubContributor:
         return data
 
 
+def _section_with_item(
+    *, item_id: str = "label-1", source: str = "m1", key: str = "conversations"
+) -> Section:
+    item = Item(
+        id=item_id,
+        kind="label",
+        data={"label": "synthetic"},
+        sources=(source,),
+        source_fingerprints={source: "fingerprint"},
+        produced_at_ms=1_000_000,
+        ttl_ms=600_000,
+        trust="derived",
+        conversation_id="conversation-1",
+    )
+    return Section(
+        key=key,
+        schema_version=1,
+        trust="derived",
+        layer="conversation",
+        produced_at_ms=1_000_000,
+        ttl_ms=600_000,
+        source_cursor=source,
+        period_start_ms=None,
+        period_end_ms=None,
+        sources=(source,),
+        data={"conversations": []},
+        items=(item,),
+    )
+
+
 def _registry(*contributors: StubContributor) -> ContributorRegistry:
     registry = ContributorRegistry()
     for contributor in contributors:
@@ -102,9 +170,10 @@ def _service(
     registry: ContributorRegistry,
     clock: list[int],
     settings: GroupStateConfig | None = None,
+    projector: FakeProjector | None = None,
 ) -> tuple[GroupStateService, GroupStateStore, FakeProjector]:
     store = GroupStateStore(tmp_path / "group-state.db")
-    projector = FakeProjector()
+    projector = projector or FakeProjector()
     service = GroupStateService(
         store=store,
         registry=registry,
@@ -241,35 +310,198 @@ async def test_two_chats_isolated(tmp_path) -> None:
 
 
 @pytest.mark.asyncio
-async def test_cas_conflict_retries_once(tmp_path) -> None:
+async def test_rebuild_does_not_overwrite_foreign_section(tmp_path) -> None:
     clock = [1_000_000]
     service, store, _ = _service(
         tmp_path, registry=_registry(StubContributor("presence")), clock=clock
     )
-    real_put = store.put
+    real_merge = store.merge_sections
     raced = [False]
 
-    def racing_put(state, *, expected_revision):
+    def racing_merge(channel, chat_id, sections, **kwargs):
         if not raced[0]:
             raced[0] = True
-            competitor = GroupState(
-                channel=state.channel,
-                chat_id=state.chat_id,
-                schema_version=1,
-                revision=1,
-                history_cursor="competing",
-                updated_ms=clock[0],
-                sections={},
-            )
-            assert real_put(competitor, expected_revision=None) is True
-            return False
-        return real_put(state, expected_revision=expected_revision)
+            foreign = _section_with_item(item_id="foreign-label", source="m9")
+            assert real_merge(channel, chat_id, {"label": foreign}, updated_ms=clock[0]) is not None
+        return real_merge(channel, chat_id, sections, **kwargs)
 
-    store.put = racing_put  # type: ignore[method-assign]
+    store.merge_sections = racing_merge  # type: ignore[method-assign]
     try:
         state = await service.rebuild("whatsapp", CHAT_A)
         assert state is not None
         assert state.revision == 2
+        assert set(state.sections) == {"label", "presence"}
+        assert state.sections["label"].items[0].id == "foreign-label"
         assert store.get("whatsapp", CHAT_A) == state
     finally:
         store.close()
+
+
+@pytest.mark.asyncio
+async def test_rebuild_after_purge_inserts_fresh(tmp_path) -> None:
+    clock = [1_000_000]
+    service, store, _ = _service(
+        tmp_path, registry=_registry(StubContributor("presence")), clock=clock
+    )
+    real_merge = store.merge_sections
+
+    stale = GroupState(
+        channel="whatsapp",
+        chat_id=CHAT_A,
+        schema_version=2,
+        revision=4,
+        history_cursor="m9",
+        updated_ms=clock[0] - 1_000,
+        sections={"stale": _section_with_item(item_id="stale-label", source="m9")},
+    )
+    assert store.put(stale, expected_revision=None) is True
+
+    def purging_merge(channel, chat_id, sections, **kwargs):
+        store.purge_chat(channel, chat_id)
+        return real_merge(channel, chat_id, sections, **kwargs)
+
+    store.merge_sections = purging_merge  # type: ignore[method-assign]
+    try:
+        state = await service.rebuild("whatsapp", CHAT_A)
+        assert state is not None
+        assert state.revision == 1
+        assert set(state.sections) == {"presence"}
+        assert store.get("whatsapp", CHAT_A) == state
+    finally:
+        store.close()
+
+
+def _item_state(*, item_id: str = "label-1", source: str = "m1") -> Section:
+    return _section_with_item(item_id=item_id, source=source)
+
+
+@pytest.mark.asyncio
+async def test_invalidation_scrubs_deleted_source(tmp_path) -> None:
+    clock = [1_000_000]
+    projector = FakeProjector()
+    projector.add_message("m1")
+    projector.add_event("e-delete", "delete", 500, target_message_id="m1")
+    service, store, _ = _service(
+        tmp_path,
+        registry=_registry(StubContributor("presence")),
+        clock=clock,
+        projector=projector,
+    )
+    try:
+        assert (
+            store.merge_sections(
+                "whatsapp",
+                CHAT_A,
+                {"conversations": _item_state()},
+                updated_ms=clock[0],
+            )
+            is not None
+        )
+        await service.tick_once()
+        state = store.get("whatsapp", CHAT_A)
+        assert state is not None
+        assert state.sections["conversations"].items == ()
+        assert state.revision == 2
+        assert store.invalidation_cursor("whatsapp", CHAT_A) == (500, "e-delete")
+    finally:
+        store.close()
+        projector.close()
+
+
+@pytest.mark.asyncio
+async def test_invalidation_scrubs_edited_source(tmp_path) -> None:
+    clock = [1_000_000]
+    projector = FakeProjector()
+    projector.add_message("m1")
+    projector.add_event("e-edit", "edit", 600, target_message_id="m1")
+    service, store, _ = _service(
+        tmp_path,
+        registry=_registry(StubContributor("presence")),
+        clock=clock,
+        projector=projector,
+    )
+    try:
+        assert (
+            store.merge_sections(
+                "whatsapp",
+                CHAT_A,
+                {"conversations": _item_state()},
+                updated_ms=clock[0],
+            )
+            is not None
+        )
+        await service.tick_once()
+        state = store.get("whatsapp", CHAT_A)
+        assert state is not None
+        assert state.sections["conversations"].items == ()
+        assert store.invalidation_cursor("whatsapp", CHAT_A) == (600, "e-edit")
+    finally:
+        store.close()
+        projector.close()
+
+
+@pytest.mark.asyncio
+async def test_invalidation_scrubs_purged_source(tmp_path) -> None:
+    clock = [1_000_000]
+    projector = FakeProjector()
+    service, store, _ = _service(
+        tmp_path,
+        registry=_registry(StubContributor("presence")),
+        clock=clock,
+        projector=projector,
+    )
+    try:
+        assert (
+            store.merge_sections(
+                "whatsapp",
+                CHAT_A,
+                {"conversations": _item_state(source="gone")},
+                updated_ms=clock[0],
+            )
+            is not None
+        )
+        await service.tick_once()
+        state = store.get("whatsapp", CHAT_A)
+        assert state is not None
+        assert state.sections["conversations"].items == ()
+        assert store.invalidation_cursor("whatsapp", CHAT_A) == (0, "")
+    finally:
+        store.close()
+        projector.close()
+
+
+@pytest.mark.asyncio
+async def test_invalidation_cursor_advances_and_is_idempotent(tmp_path) -> None:
+    clock = [1_000_000]
+    projector = FakeProjector()
+    projector.add_message("m1")
+    projector.add_event("e-delete", "delete", 500, target_message_id="m1")
+    service, store, _ = _service(
+        tmp_path,
+        registry=_registry(StubContributor("presence")),
+        clock=clock,
+        projector=projector,
+    )
+    try:
+        assert (
+            store.merge_sections(
+                "whatsapp",
+                CHAT_A,
+                {"conversations": _item_state()},
+                updated_ms=clock[0],
+            )
+            is not None
+        )
+        await service.tick_once()
+        first = store.get("whatsapp", CHAT_A)
+        assert first is not None
+        assert first.revision == 2
+        assert store.invalidation_cursor("whatsapp", CHAT_A) == (500, "e-delete")
+        await service.tick_once()
+        second = store.get("whatsapp", CHAT_A)
+        assert second is not None
+        assert second.revision == 2
+        assert store.invalidation_cursor("whatsapp", CHAT_A) == (500, "e-delete")
+    finally:
+        store.close()
+        projector.close()

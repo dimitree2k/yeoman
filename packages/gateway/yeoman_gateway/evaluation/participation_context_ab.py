@@ -28,7 +28,7 @@ from pathlib import Path
 from types import SimpleNamespace
 from typing import Any
 
-from yeoman_gateway.group_state.contract import SourceReaders
+from yeoman_gateway.group_state.contract import ReaderContext, SourceReaders
 from yeoman_gateway.group_state.render import RenderedState
 from yeoman_gateway.history.context import history_turn
 from yeoman_gateway.history.live import HistoryBoundary, HistoryPaused
@@ -77,6 +77,17 @@ class RecordedOpportunity:
     observed_revision: int
     activation_epoch: int
     source_ids: tuple[str, ...]
+
+
+def background_reader(item: RecordedOpportunity) -> ReaderContext:
+    """The replay renders each opportunity as Arvid's owner background view."""
+    return ReaderContext(
+        principal="arvid",
+        is_owner=True,
+        channel=item.channel,
+        chat_id=item.chat_id,
+        audience="group",
+    )
 
 
 def _read_only(path: Path) -> sqlite3.Connection:

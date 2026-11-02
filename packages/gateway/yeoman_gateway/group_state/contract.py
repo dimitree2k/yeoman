@@ -10,6 +10,17 @@ from .models import Layer, Section, Trust
 
 
 @dataclass(frozen=True, slots=True)
+class ReaderContext:
+    """Who is asking for a rendered state, and from which chat."""
+
+    principal: str
+    is_owner: bool
+    channel: str
+    chat_id: str
+    audience: str
+
+
+@dataclass(frozen=True, slots=True)
 class SourceReaders:
     """Bounded readers a section may use; every field is optional."""
 
