@@ -1043,6 +1043,28 @@ class ProcessingReceptionConfig(BaseModel):
     sticker_vision: bool = Field(default=False, alias="stickerVision")
 
 
+class GroupStateLabelsConfig(BaseModel):
+    """Background conversation labels: model-derived topic, mood, questions and plans.
+
+    Ships off. While off the service constructs no model route and records no run rows.
+    """
+
+    model_config = ConfigDict(extra="forbid", populate_by_name=True)
+
+    mode: Literal["off", "on"] = "off"
+    #: ``"channel:chat_id"`` entries; each must also be a managed group-state chat.
+    chats: list[str] = Field(default_factory=list)
+    route: str = "groupState.labels"
+    max_per_chat_day: int = Field(default=40, alias="maxPerChatDay", ge=0)
+    max_global_day: int = Field(default=80, alias="maxGlobalDay", ge=0)
+    max_tokens_day: int = Field(default=400_000, alias="maxTokensDay", ge=0)
+    min_messages: int = Field(default=4, alias="minMessages", ge=1)
+    refresh_after_messages: int = Field(default=30, alias="refreshAfterMessages", ge=1)
+    max_input_chars: int = Field(default=6_000, alias="maxInputChars", ge=1)
+    max_conversations: int = Field(default=3, alias="maxConversations", ge=1)
+    timeout_seconds: float = Field(default=30.0, alias="timeoutSeconds", gt=0, le=300)
+
+
 class GroupStateConfig(BaseModel):
     """Shadow group-state scheduler (P1: observe only, no output path reads it)."""
 
@@ -1058,6 +1080,7 @@ class GroupStateConfig(BaseModel):
     actions_limit: int = Field(default=20, alias="actionsLimit", ge=1, le=200)
     snapshots_kept: int = Field(default=20, alias="snapshotsKept", ge=1, le=200)
     db_path: str = Field(default="data/ops/group-state.db", alias="dbPath")
+    labels: GroupStateLabelsConfig = Field(default_factory=GroupStateLabelsConfig)
 
 
 class ProcessingConfig(BaseModel):

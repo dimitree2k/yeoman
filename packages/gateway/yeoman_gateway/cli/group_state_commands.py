@@ -268,3 +268,119 @@ def group_state_purge(
     finally:
         store.close()
     typer.echo(f"purged {removed} row(s)")
+
+
+@group_state_app.command("label")
+def group_state_label(
+    chat: str | None = typer.Argument(None, help="Chat id or exact group subject"),
+    chat_option: str | None = typer.Option(
+        None, "--chat", help="Chat id or exact group subject (option form)"
+    ),
+    conversation: str | None = typer.Option(None, "--conversation", help="Conversation id"),
+    dry_run: bool = typer.Option(
+        False, "--dry-run", help="Print the validated labels and write nothing"
+    ),
+    db_path: Path | None = typer.Option(None, "--db-path", help="Group-state database"),
+    history_db: Path | None = typer.Option(None, "--history-db", help="History database"),
+    channel: str = typer.Option("whatsapp", "--channel", help="Channel"),
+) -> None:
+    """Run one conversation-label pass now, for owner review or a dry run."""
+    import asyncio
+    import time
+
+    from yeoman_shared.config.loader import load_config
+
+    from yeoman_gateway.evaluation.participation_context_ab import FrozenHistory
+    from yeoman_gateway.group_state.labels.runner import ConversationLabeler
+    from yeoman_gateway.group_state.store import GroupStateStore
+    from yeoman_gateway.history.context import history_turn
+    from yeoman_gateway.history.conversations import ConversationBounds, read_conversations
+    from yeoman_gateway.history.live import history_db_path
+    from yeoman_gateway.history.queries import HistoryQueries
+    from yeoman_gateway.processing.model_route import RouteClient
+
+    target = str(chat_option or chat or "").strip()
+    if not target:
+        typer.echo("Pass a chat id or a group subject.", err=True)
+        raise typer.Exit(2)
+    config = load_config()
+    group_state = config.processing.group_state
+    labels = group_state.labels
+    history_path = Path(history_db).expanduser() if history_db is not None else history_db_path()
+    if not history_path.is_file():
+        typer.echo("No history yet.", err=True)
+        raise typer.Exit(1)
+    chat_id = _resolve_chat(target, history_path)
+    now_ms = int(time.time() * 1000)
+    consciousness = config.consciousness
+    bounds = ConversationBounds(
+        window_ms=max(1, int(group_state.window_hours)) * 3_600_000,
+        max_rows=500,
+        lull_ms=max(1, int(getattr(consciousness, "lull_silence_minutes", 25))) * 60_000,
+        burst_n=max(1, int(getattr(consciousness, "burst_threshold_messages", 8))),
+        burst_ms=max(1, int(getattr(consciousness, "burst_window_minutes", 15))) * 60_000,
+    )
+    history = FrozenHistory(history_path)
+    store = None
+    try:
+
+        async def _read() -> list[Any]:
+            async with history_turn(history) as snapshot:
+                return read_conversations(HistoryQueries(snapshot), chat_id, now_ms, bounds)
+
+        conversations = asyncio.run(_read())
+        if conversation:
+            selected = next((item for item in conversations if item.id == conversation), None)
+        else:
+            selected = conversations[-1] if conversations else None
+        if selected is None:
+            typer.echo("No conversation to label.", err=True)
+            raise typer.Exit(1)
+        mapping = {
+            "conversation_id": selected.id,
+            "start_ms": selected.start_ms,
+            "last_ms": selected.last_ms,
+            "messages": selected.message_count,
+            "last_message_id": selected.message_ids[-1],
+        }
+        if not dry_run:
+            store = GroupStateStore(_resolve_db(db_path))
+        labeler = ConversationLabeler(
+            store=store,
+            history_projector=history,
+            settings=labels,
+            client_factory=lambda: RouteClient(config=config, route_key=labels.route),
+        )
+        if dry_run:
+            outcome, parsed = asyncio.run(labeler.preview(channel, chat_id, mapping))
+            payload: dict[str, Any] = {
+                "outcome": outcome.outcome,
+                "attempts": outcome.attempts,
+                "prompt_tokens": outcome.prompt_tokens,
+                "completion_tokens": outcome.completion_tokens,
+                "labels": (
+                    {
+                        "topic": parsed.topic,
+                        "mood": parsed.mood,
+                        "open_questions": list(parsed.open_questions),
+                        "plans": list(parsed.plans),
+                        "dropped": parsed.dropped,
+                    }
+                    if parsed is not None
+                    else None
+                ),
+            }
+            typer.echo(json.dumps(payload, sort_keys=True, ensure_ascii=False, indent=2))
+        else:
+            outcome = asyncio.run(labeler.label(channel, chat_id, mapping))
+            typer.echo(
+                f"outcome={outcome.outcome} items={outcome.items}"
+                f" attempts={outcome.attempts}"
+                f" tokens={outcome.prompt_tokens + outcome.completion_tokens}"
+            )
+        if outcome.outcome in {"unavailable", "error"}:
+            raise typer.Exit(1)
+    finally:
+        if store is not None:
+            store.close()
+        history.close()

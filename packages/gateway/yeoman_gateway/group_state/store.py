@@ -344,6 +344,23 @@ class GroupStateStore:
             ),
         )
 
+    def item_sources(self, channel: str, chat_id: str) -> set[str]:
+        """Every message id a derived item depends on, in the document or any snapshot."""
+        sources: set[str] = set()
+        with self._lock:
+            rows = self._conn.execute(
+                "SELECT document FROM group_state WHERE channel = ? AND chat_id = ?"
+                " UNION ALL SELECT document FROM group_state_snapshots"
+                " WHERE channel = ? AND chat_id = ?",
+                (str(channel), str(chat_id), str(channel), str(chat_id)),
+            ).fetchall()
+        for row in rows:
+            state = GroupState.from_json(row["document"])
+            for section in state.sections.values():
+                for item in section.items:
+                    sources.update(str(source) for source in item.sources)
+        return sources
+
     def scrub_items(self, channel: str, chat_id: str, message_ids: Collection[str]) -> int:
         """Remove items that depend on these messages from the document and snapshots."""
         channel = str(channel)
@@ -442,6 +459,32 @@ class GroupStateStore:
                 "DELETE FROM group_state_runs WHERE started_ms < ?", (int(older_than_ms),)
             ).rowcount
         return int(removed)
+
+    def label_cache_hit(self, channel: str, chat_id: str, input_hash: str) -> bool:
+        """True when this exact input was already written by an earlier attempt."""
+        with self._lock:
+            row = self._conn.execute(
+                "SELECT 1 FROM group_state_runs WHERE channel = ? AND chat_id = ?"
+                " AND kind = 'labels' AND input_hash = ? AND outcome = 'written' LIMIT 1",
+                (str(channel), str(chat_id), str(input_hash)),
+            ).fetchone()
+        return row is not None
+
+    def label_usage(
+        self, channel: str, chat_id: str, *, start_ms: int, end_ms: int
+    ) -> tuple[int, int, int]:
+        """Current window's label rows for this chat, globally, and global tokens."""
+        with self._lock:
+            row = self._conn.execute(
+                "SELECT"
+                " COALESCE(SUM(CASE WHEN channel = ? AND chat_id = ? THEN 1 ELSE 0 END), 0),"
+                " COUNT(*),"
+                " COALESCE(SUM(COALESCE(prompt_tokens, 0) + COALESCE(completion_tokens, 0)), 0)"
+                " FROM group_state_runs"
+                " WHERE kind = 'labels' AND started_ms >= ? AND started_ms < ?",
+                (str(channel), str(chat_id), int(start_ms), int(end_ms)),
+            ).fetchone()
+        return int(row[0]), int(row[1]), int(row[2])
 
     def invalidation_cursor(self, channel: str, chat_id: str) -> tuple[int, str]:
         with self._lock:

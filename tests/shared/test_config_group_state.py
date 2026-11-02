@@ -54,3 +54,58 @@ def test_unknown_keys_and_bad_mode_are_rejected() -> None:
         GroupStateConfig.model_validate({"mode": "enforce"})
     with pytest.raises(ValidationError):
         GroupStateConfig.model_validate({"enabled": True})
+
+
+def test_labels_config_defaults_off() -> None:
+    labels = Config().processing.group_state.labels
+    assert labels.mode == "off"
+    assert labels.chats == []
+    assert labels.route == "groupState.labels"
+    assert labels.max_per_chat_day == 40
+    assert labels.max_global_day == 80
+    assert labels.max_tokens_day == 400_000
+    assert labels.min_messages == 4
+    assert labels.refresh_after_messages == 30
+    assert labels.max_input_chars == 6_000
+    assert labels.max_conversations == 3
+    assert labels.timeout_seconds == 30
+
+
+def test_labels_config_accepts_camel_case() -> None:
+    labels = GroupStateConfig.model_validate(
+        convert_keys(
+            {
+                "labels": {
+                    "mode": "on",
+                    "chats": ["whatsapp:group@g.us"],
+                    "route": "custom.labels",
+                    "maxPerChatDay": 10,
+                    "maxGlobalDay": 20,
+                    "maxTokensDay": 1_000,
+                    "minMessages": 2,
+                    "refreshAfterMessages": 5,
+                    "maxInputChars": 500,
+                    "maxConversations": 2,
+                    "timeoutSeconds": 5,
+                }
+            }
+        )
+    ).labels
+    assert labels.mode == "on"
+    assert labels.chats == ["whatsapp:group@g.us"]
+    assert labels.route == "custom.labels"
+    assert labels.max_per_chat_day == 10
+    assert labels.max_global_day == 20
+    assert labels.max_tokens_day == 1_000
+    assert labels.min_messages == 2
+    assert labels.refresh_after_messages == 5
+    assert labels.max_input_chars == 500
+    assert labels.max_conversations == 2
+    assert labels.timeout_seconds == 5
+
+
+def test_labels_config_forbids_unknown_keys() -> None:
+    with pytest.raises(ValidationError):
+        GroupStateConfig.model_validate({"labels": {"enabled": True}})
+    with pytest.raises(ValidationError):
+        GroupStateConfig.model_validate({"labels": {"mode": "maybe"}})
