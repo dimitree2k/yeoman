@@ -503,11 +503,15 @@ class ParticipationContextBuilder:
             for item in (context.get("current_source_ids") or opportunity.source_event_ids)
             if str(item)
         )
+        messages = context.get("messages")
+        newest = messages[-1] if isinstance(messages, list) and messages else {}
+        sender = str(newest.get("sender_id") or "") if isinstance(newest, dict) else ""
+        mentioned = newest.get("mentioned_jids") if isinstance(newest, dict) else ()
         try:
             text, _ = self._group_state_views.render(
                 "writer",
                 reader=ReaderContext(
-                    principal="arvid",
+                    principal=sender or "arvid",
                     is_owner=False,
                     channel=str(opportunity.channel),
                     chat_id=str(opportunity.chat_id),
@@ -516,6 +520,12 @@ class ParticipationContextBuilder:
                 target=ViewTarget(
                     message_id=source_ids[-1] if source_ids else None,
                     reply_to_message_id=None,
+                    sender_principal=sender or None,
+                    mentioned_principals=tuple(
+                        str(value)
+                        for value in (mentioned if isinstance(mentioned, (list, tuple)) else ())
+                        if str(value or "").strip()
+                    ),
                 ),
             )
         except Exception:  # noqa: BLE001 - a view never breaks a participation decision

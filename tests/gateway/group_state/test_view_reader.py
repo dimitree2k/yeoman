@@ -274,4 +274,5 @@ def test_responder_reply_metadata_has_block_only_when_on(tmp_path: Path) -> None
     assert target == ViewTarget(
         message_id=f"whatsapp:{CHAT}:native-current",
         reply_to_message_id=f"whatsapp:{CHAT}:native-quoted",
+        sender_principal="c1",
     )

@@ -1122,6 +1122,10 @@ class GroupStateViewConfig(BaseModel):
     max_state_age_seconds: int = Field(
         default=900, alias="maxStateAgeSeconds", ge=1, le=86_400
     )
+    #: The long-term layers, independent of each other and of the state view modes.
+    #: ``off`` reads no Knowledge and renders no past block.
+    people: Literal["off", "on"] = "off"
+    past: Literal["off", "on"] = "off"
 
 
 class GroupStateViewsConfig(BaseModel):

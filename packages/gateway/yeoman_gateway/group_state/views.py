@@ -11,15 +11,16 @@ envelope. Runtime facts (presence, counts, ages) stay plain lines outside it.
 
 from __future__ import annotations
 
-from collections.abc import Mapping
-from dataclasses import dataclass
+from collections.abc import Iterable, Mapping, Sequence
+from dataclasses import dataclass, field
 from typing import Any
 
 from yeoman_gateway.agent.untrusted import neutralize_markers, wrap_external_content
+from yeoman_gateway.knowledge.models import PersonNoteView
 from yeoman_gateway.reception.labeler import strip_identifiers
 
 from .contract import ReaderContext
-from .models import GroupState, Item
+from .models import GroupState, Item, Section
 from .render import (
     SECTION_ORDER,
     RenderedState,
@@ -35,15 +36,216 @@ MAX_VIEW_TEXT_CHARS = 120
 MAX_VIEW_NAMES = 6
 MAX_SOURCE_REFS = 3
 MAX_ACTIONS = 3
+MAX_PEOPLE_CHARS = 700
+MAX_PAST_CHARS = 600
+MAX_PAST_CONVERSATIONS = 3
+MAX_TURN_PEOPLE = 4
+_ARVID = "arvid"
 _DERIVED_KINDS = frozenset({"topic", "mood", "open_question", "plan"})
 
 
 @dataclass(frozen=True, slots=True)
 class ViewTarget:
-    """The message this view is about, as history ids when they are known."""
+    """The message this view is about, as history ids when they are known.
 
-    message_id: str | None
-    reply_to_message_id: str | None
+    The three principal fields are filled by the caller from the event it already has.
+    They are deliberately untyped strings: a roster principal, a phone jid and a LID
+    all arrive here, and the reader resolves each through proven identity only.
+    """
+
+    message_id: str | None = None
+    reply_to_message_id: str | None = None
+    sender_principal: str | None = None
+    reply_to_principal: str | None = None
+    mentioned_principals: tuple[str, ...] = field(default_factory=tuple)
+
+    def __post_init__(self) -> None:
+        object.__setattr__(
+            self,
+            "mentioned_principals",
+            tuple(str(item) for item in self.mentioned_principals if str(item or "")),
+        )
+
+
+def select_turn_people(
+    target: ViewTarget,
+    conversation_speakers: Sequence[str],
+    *,
+    cap: int = MAX_TURN_PEOPLE,
+) -> tuple[str, ...]:
+    """The people the turn is about, in order, without any history read.
+
+    Sender first, then the replied-to author, then explicit mentions, then the latest
+    speakers from the stored conversation section.  Arvid is never a "person here".
+    """
+    ordered: list[str] = []
+    for value in (
+        target.sender_principal,
+        target.reply_to_principal,
+        *target.mentioned_principals,
+        *conversation_speakers,
+    ):
+        text = str(value or "").strip()
+        if not text:
+            continue
+        if text.casefold() == _ARVID or text.casefold().startswith(f"whatsapp:{_ARVID}"):
+            continue
+        if text not in ordered:
+            ordered.append(text)
+        if len(ordered) >= max(1, int(cap)):
+            break
+    return tuple(ordered)
+
+
+def conversation_speakers(state: GroupState) -> tuple[str, ...]:
+    """Participants of the newest stored conversation, newest row only."""
+    rows = _conversation_rows(state)
+    if not rows:
+        return ()
+    newest = max(rows, key=lambda row: _int(row.get("last_ms")) or 0)
+    return tuple(str(value) for value in newest.get("participants") or () if str(value))
+
+
+def _linked_conversation_ids(state: GroupState, target: ViewTarget) -> tuple[str, ...]:
+    """Stored conversations that contain the quoted message, in section order."""
+    if not target.reply_to_message_id:
+        return ()
+    found: list[str] = []
+    for row in _conversation_rows(state):
+        if target.reply_to_message_id not in _message_ids(row):
+            continue
+        conversation_id = str(row.get("conversation_id") or "")
+        if conversation_id and conversation_id not in found:
+            found.append(conversation_id)
+    return tuple(found)
+
+
+def _person_lines(name: str, note: PersonNoteView) -> list[str]:
+    rendered: list[str] = []
+    prefix = f"{name}: "
+    for line in note.lines:
+        text = _clean_text(line.text, MAX_VIEW_TEXT_CHARS)
+        if not text:
+            continue
+        if text.casefold().startswith(prefix.casefold()):
+            text = text[len(prefix) :].strip()
+        if text and text not in rendered:
+            rendered.append(text)
+    return rendered
+
+
+def render_people_block(
+    notes: Iterable[PersonNoteView],
+    *,
+    names: Mapping[str, str] | None = None,
+    max_chars: int = MAX_PEOPLE_CHARS,
+) -> str:
+    """Render active notes for the selected turn people inside ``[People here]``.
+
+    A note without a group-safe display name is dropped, never rendered as a raw id.
+    Lines are dropped from the bottom whole; the block is never cut mid-line.
+    """
+    display = dict(names or {})
+    lines: list[str] = ["[People here]"]
+    seen: set[str] = set()
+    for note in notes:
+        if note.status != "active" or not note.lines:
+            continue
+        person_id = str(note.person_id)
+        if person_id in seen:
+            continue
+        name = _clean_name(display.get(person_id) or "")
+        if not name:
+            continue
+        body = _person_lines(name, note)
+        if not body:
+            continue
+        lines.append(f"- {name}: {'; '.join(body)}")
+        seen.add(person_id)
+    while len(lines) > 1 and len("\n".join(lines)) > max(0, int(max_chars)):
+        lines.pop()
+    text = "\n".join(lines)
+    return text if len(text) <= max(0, int(max_chars)) else ""
+
+
+def _summary_lines(item: Item, *, limit: int) -> list[str]:
+    raw = item.data.get("lines")
+    if not isinstance(raw, (list, tuple)):
+        return []
+    rendered: list[str] = []
+    for value in raw:
+        text = _clean_text(value, MAX_VIEW_TEXT_CHARS)
+        if text and text not in rendered:
+            rendered.append(text)
+        if len(rendered) >= max(1, int(limit)):
+            break
+    return rendered
+
+
+def render_past_block(
+    past: Iterable[Item],
+    *,
+    linked_conversation_ids: Sequence[str] = (),
+    older_than_ms: int | None = None,
+    exclude_conversation_ids: Sequence[str] = (),
+    now_ms: int | None = None,
+    max_chars: int = MAX_PAST_CHARS,
+) -> str:
+    """Render linked, then the last three older ended conversations, then a week.
+
+    All inputs are stored summaries; nothing here reads history.  Lines are dropped
+    from the bottom whole and the block is never cut mid-line.
+    """
+    items = tuple(past.items if isinstance(past, Section) else past)
+    conversations: dict[str, Item] = {}
+    weeks: list[Item] = []
+    for item in items:
+        if now_ms is not None and item.expired(int(now_ms)):
+            continue
+        if item.kind == "conversation_summary" and item.conversation_id:
+            conversations[str(item.conversation_id)] = item
+        elif item.kind == "week_summary":
+            weeks.append(item)
+
+    excluded = {str(value) for value in exclude_conversation_ids if str(value)}
+    chosen: list[Item] = []
+    seen: set[str] = set()
+    for conversation_id in linked_conversation_ids:
+        item = conversations.get(str(conversation_id))
+        if item is not None and str(conversation_id) not in seen:
+            chosen.append(item)
+            seen.add(str(conversation_id))
+
+    ended = sorted(
+        (item for key, item in conversations.items() if key not in seen and key not in excluded),
+        key=lambda item: (
+            _int(item.data.get("ended_ms")) or int(item.produced_at_ms),
+            str(item.conversation_id or ""),
+        ),
+        reverse=True,
+    )
+    for item in ended:
+        if len(chosen) >= len(seen) + MAX_PAST_CONVERSATIONS:
+            break
+        ended_ms = _int(item.data.get("ended_ms"))
+        if older_than_ms is not None and ended_ms is not None and ended_ms >= int(older_than_ms):
+            continue
+        chosen.append(item)
+
+    week = max(weeks, key=lambda item: str(item.data.get("iso_week") or ""), default=None)
+    lines: list[str] = ["[Earlier in this group]"]
+    for item in chosen:
+        body = _summary_lines(item, limit=3)
+        if body:
+            lines.append(f"- {'; '.join(body)}")
+    if week is not None:
+        body = _summary_lines(week, limit=5)
+        if body:
+            lines.append(f"- week {_clean_text(week.data.get('iso_week'), 16)}: {'; '.join(body)}")
+    while len(lines) > 1 and len("\n".join(lines)) > max(0, int(max_chars)):
+        lines.pop()
+    text = "\n".join(lines)
+    return text if len(text) <= max(0, int(max_chars)) else ""
 
 
 def _clean_text(value: object, limit: int) -> str:
@@ -339,6 +541,9 @@ def _render_view(
     max_age_ms: int,
     lull_ms: int,
     writer: bool,
+    people: Sequence[PersonNoteView] = (),
+    people_names: Mapping[str, str] | None = None,
+    past: Sequence[Item] = (),
 ) -> RenderedState:
     fallback, age_ms = _guard_state(
         state,
@@ -392,24 +597,56 @@ def _render_view(
                 names=names,
             )
 
-    def assemble(derived_count: int, runtime_count: int) -> str:
+    def assemble(derived_count: int, people_count: int, past_count: int, runtime_count: int) -> str:
         parts = [header]
         parts.extend(line for _, line in runtime[:runtime_count])
-        if derived_count:
-            parts.append(
-                wrap_external_content(
-                    "group-state", "\n".join(line for _, line in derived[:derived_count])
-                )
-            )
+        derived_lines = [line for _, line in derived[:derived_count]]
+        derived_lines.extend(people_lines[:people_count])
+        derived_lines.extend(past_lines[:past_count])
+        if derived_lines:
+            parts.append(wrap_external_content("group-state", "\n".join(derived_lines)))
         return "\n".join(parts)
 
+    people_lines: list[str] = []
+    if people:
+        people_text = render_people_block(people, names=people_names)
+        people_lines = people_text.splitlines() if people_text else []
+    past_lines: list[str] = []
+    if past:
+        conversation_id = (
+            str(conversation.get("conversation_id") or "") if conversation is not None else ""
+        )
+        start_ms = _int(conversation.get("start_ms")) if conversation is not None else None
+        past_text = render_past_block(
+            past,
+            linked_conversation_ids=_linked_conversation_ids(state, target),
+            older_than_ms=start_ms,
+            exclude_conversation_ids=(conversation_id,) if conversation_id else (),
+            now_ms=now_ms,
+        )
+        past_lines = past_text.splitlines() if past_text else []
+
     derived_count = len(derived)
+    people_count = len(people_lines)
+    past_count = len(past_lines)
     runtime_count = len(runtime)
-    while derived_count and len(assemble(derived_count, runtime_count)) > max_chars:
+    while people_count and (
+        len(assemble(derived_count, people_count, past_count, runtime_count)) > max_chars
+    ):
+        people_count -= 1
+    while past_count and (
+        len(assemble(derived_count, people_count, past_count, runtime_count)) > max_chars
+    ):
+        past_count -= 1
+    while derived_count and (
+        len(assemble(derived_count, people_count, past_count, runtime_count)) > max_chars
+    ):
         derived_count -= 1
-    while runtime_count and len(assemble(derived_count, runtime_count)) > max_chars:
+    while runtime_count and (
+        len(assemble(derived_count, people_count, past_count, runtime_count)) > max_chars
+    ):
         runtime_count -= 1
-    text = assemble(derived_count, runtime_count)
+    text = assemble(derived_count, people_count, past_count, runtime_count)
     if len(text) > max_chars:
         return RenderedState("", state.revision, age_ms, (), (), "budget")
 
@@ -417,6 +654,8 @@ def _render_view(
     items = tuple(item.id for item, _ in derived[:derived_count])
     dropped = tuple(
         [item.id for item, _ in derived[derived_count:]]
+        + (["people"] if people_count < len(people_lines) else [])
+        + (["past"] if past_count < len(past_lines) else [])
         + [key for key, _ in runtime[runtime_count:]]
     )
     return RenderedState(
@@ -439,6 +678,9 @@ def render_reply_view(
     max_chars: int,
     max_age_ms: int,
     lull_ms: int,
+    people: Sequence[PersonNoteView] = (),
+    people_names: Mapping[str, str] | None = None,
+    past: Sequence[Item] = (),
 ) -> RenderedState:
     """The reply-path block: what is happening now and in the replied-to conversation."""
     return _render_view(
@@ -450,6 +692,9 @@ def render_reply_view(
         max_age_ms=max_age_ms,
         lull_ms=lull_ms,
         writer=False,
+        people=people,
+        people_names=people_names,
+        past=past,
     )
 
 
@@ -462,6 +707,9 @@ def render_writer_view(
     max_chars: int,
     max_age_ms: int,
     lull_ms: int,
+    people: Sequence[PersonNoteView] = (),
+    people_names: Mapping[str, str] | None = None,
+    past: Sequence[Item] = (),
 ) -> RenderedState:
     """The writer-path block: the reply view plus Arvid's recent actions here."""
     return _render_view(
@@ -473,7 +721,18 @@ def render_writer_view(
         max_age_ms=max_age_ms,
         lull_ms=lull_ms,
         writer=True,
+        people=people,
+        people_names=people_names,
+        past=past,
     )
 
 
-__all__ = ["ViewTarget", "render_reply_view", "render_writer_view"]
+__all__ = [
+    "ViewTarget",
+    "conversation_speakers",
+    "render_past_block",
+    "render_people_block",
+    "render_reply_view",
+    "render_writer_view",
+    "select_turn_people",
+]
