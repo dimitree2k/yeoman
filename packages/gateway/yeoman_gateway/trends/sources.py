@@ -2,6 +2,8 @@
 
 from __future__ import annotations
 
+import html
+import re
 import time
 import xml.etree.ElementTree as ET
 from datetime import datetime
@@ -17,6 +19,8 @@ from .models import Headline, TrendItem
 MAX_FEED_BYTES = 1_000_000
 _HT = "{https://trends.google.com/trending/rss}"
 _ATOM = "{http://www.w3.org/2005/Atom}"
+# Reddit entries name the story they share as an anchor "[link]" in their content.
+_SHARED_LINK = re.compile(r'<a href="([^"]+)">\[link\]</a>')
 #: Newest items taken from one news feed per run; feeds list 20-40 stories.
 MAX_ITEMS_PER_FEED = 10
 
@@ -110,12 +114,13 @@ def parse_news_feed(payload: bytes | str, *, source: str) -> list[TrendItem]:
     """Stories of one RSS or Atom document; stories without title or link are skipped."""
     root = ET.fromstring(payload)
     outlet = source.removeprefix("rss:")
-    stories: list[tuple[str, str, int]] = []
+    stories: list[tuple[str, str, int, str]] = []
     for node in root.iter("item"):
         stories.append((
             node.findtext("title") or "",
             (node.findtext("link") or "").strip(),
             _published_ms(node.findtext("pubDate")),
+            "",
         ))
     for node in root.iter(f"{_ATOM}entry"):
         link = node.find(f"{_ATOM}link")
@@ -123,22 +128,40 @@ def parse_news_feed(payload: bytes | str, *, source: str) -> list[TrendItem]:
             node.findtext(f"{_ATOM}title") or "",
             (link.get("href") or "").strip() if link is not None else "",
             _iso_ms(node.findtext(f"{_ATOM}published") or node.findtext(f"{_ATOM}updated")),
+            _shared_link(node.findtext(f"{_ATOM}content") or ""),
         ))
     items: list[TrendItem] = []
-    for raw_title, url, published in stories:
+    for raw_title, url, published, shared in stories:
         title = " ".join(raw_title.split())
-        if not title or not url.startswith(("https://", "http://")):
+        if not title or not _is_web(url):
             continue
+        headlines = [Headline(title=title, url=url, outlet=outlet)]
+        if _is_web(shared) and shared != url:
+            # The shared story first: it is the link worth posting when it is readable.
+            headlines.insert(0, Headline(title=title, url=shared, outlet=_host(shared)))
         items.append(
             TrendItem(
                 source=source,
                 key=f"{source}:{url}",
                 title=title,
                 published_at_ms=published,
-                headlines=(Headline(title=title, url=url, outlet=outlet),),
+                headlines=tuple(headlines),
             )
         )
     return items
+
+
+def _shared_link(content_html: str) -> str:
+    match = _SHARED_LINK.search(content_html)
+    return html.unescape(match.group(1)).strip() if match else ""
+
+
+def _is_web(url: str) -> bool:
+    return url.startswith(("https://", "http://"))
+
+
+def _host(url: str) -> str:
+    return (urlsplit(url).hostname or "").removeprefix("www.")
 
 
 def _iso_ms(value: str | None) -> int:

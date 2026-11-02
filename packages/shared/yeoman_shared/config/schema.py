@@ -648,11 +648,7 @@ class TrendsConfig(BaseModel):
     google_trends: bool = Field(default=True, alias="googleTrends")
     google_trends_geo: str = Field(default="DE", alias="googleTrendsGeo")
     rss_feeds: list[str] = Field(
-        default_factory=lambda: [
-            "https://www.n-tv.de/panorama/rss",
-            "https://www.stern.de/feed/standard/panorama/",
-            "https://www.spiegel.de/panorama/index.rss",
-        ],
+        default_factory=lambda: ["https://www.reddit.com/r/popular/hot/.rss?geo_filter=DE"],
         alias="rssFeeds",
     )
     language: str = "de"

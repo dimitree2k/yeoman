@@ -164,7 +164,7 @@ async def test_service_scores_new_items_once_and_survives_a_broken_source(tmp_pa
 
     assert first.as_dict() == {
         "fetched": 1, "scored": 1, "cards": 1, "fitted_chats": 0, "articles_read": 0,
-        "dropped": 0,
+        "dropped": 0, "already_shared": 0,
         "failed_sources": ["broken"],
     }
     assert second.scored == 0
@@ -399,3 +399,60 @@ def test_scorer_tells_the_model_how_old_each_topic_is() -> None:
     prompt = scorer._messages([fresh, old])[1]["content"]
     assert "started: under 1 hour ago" in prompt
     assert "started: 30 hours ago" in prompt
+
+
+def test_reddit_entries_carry_the_shared_story_first() -> None:
+    from yeoman_gateway.trends.sources import parse_news_feed
+
+    feed = b"""<?xml version="1.0"?><feed xmlns="http://www.w3.org/2005/Atom">
+    <entry><title>Learjet 60 crashes near Greenacres</title>
+      <link href="https://www.reddit.com/r/aviation/comments/1/learjet/"/>
+      <published>2026-11-01T20:00:00+00:00</published>
+      <content type="html">&lt;a href=&quot;https://news.example/learjet?a=1&amp;amp;b=2&quot;&gt;[link]&lt;/a&gt;
+      &lt;a href=&quot;https://www.reddit.com/r/aviation/comments/1/learjet/&quot;&gt;[comments]&lt;/a&gt;</content>
+    </entry>
+    <entry><title>My cat</title><link href="https://www.reddit.com/r/cats/comments/2/cat/"/>
+      <content type="html">&lt;a href=&quot;https://i.redd.it/x.png&quot;&gt;[link]&lt;/a&gt;</content></entry>
+    </feed>"""
+
+    jet, cat = parse_news_feed(feed, source="rss:reddit.com")
+
+    assert [h.url for h in jet.headlines] == [
+        "https://news.example/learjet?a=1&b=2", "https://www.reddit.com/r/aviation/comments/1/learjet/"
+    ]
+    assert jet.headlines[0].outlet == "news.example"
+    assert jet.key == "rss:reddit.com:https://www.reddit.com/r/aviation/comments/1/learjet/"
+    assert cat.headlines[0].url == "https://i.redd.it/x.png"
+
+
+def test_posts_and_videos_keep_their_line_without_an_article() -> None:
+    from yeoman_gateway.trends.service import _has_article
+
+    assert not _has_article("https://i.redd.it/x.png")
+    assert not _has_article("https://www.reddit.com/r/a/comments/1/x/")
+    assert not _has_article("https://youtu.be/abc")
+    assert _has_article("https://www.n-tv.de/story")
+    assert _has_article("https://notreddit.com/story")
+
+
+def test_scorer_sees_recent_titles_as_buzz_context() -> None:
+    scorer = TrendScorer(client=None, clock=lambda: 0)  # type: ignore[arg-type]
+    content = scorer._messages([_item("jet")], recent=["learjet 60", "Learjet crash video"])[1][
+        "content"
+    ]
+    assert "Recently seen in the sources (context only, not to score):" in content
+    assert "- learjet 60" in content and "- Learjet crash video" in content
+    assert "Recently seen" not in scorer._messages([_item("jet")])[1]["content"]
+    assert "buzzing" in scorer._messages([_item("jet")])[0]["content"]
+
+
+def test_store_lists_recent_titles_newest_first_without_the_batch(tmp_path) -> None:
+    store = TrendStore(tmp_path / "t.db")
+    old, new, batch = _item("old"), _item("new"), _item("batch")
+    store.record([old], [], min_score=7, now_ms=1, ttl_ms=10)
+    store.record([old, new, batch], [
+        TrendVerdict(item_key=item.key, score=1, kind="none") for item in (old, new, batch)
+    ], min_score=7, now_ms=100, ttl_ms=10)
+    assert store.recent_titles(since_ms=50, exclude={batch.key}) in (["old", "new"], ["new", "old"])
+    assert store.recent_titles(since_ms=500) == []
+    store.close()

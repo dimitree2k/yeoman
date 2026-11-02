@@ -210,6 +210,35 @@ class TrendStore:
                 ],
             )
 
+    def fitting_unused_cards(
+        self, channel: str, chat_id: str, topics_key: str, *, now_ms: int
+    ) -> list[TrendCard]:
+        """Fresh cards that fit this chat and were never offered to it."""
+        with self._lock:
+            rows = self._conn.execute(
+                "SELECT * FROM cards WHERE expires_at_ms > ? AND card_id NOT IN "
+                "(SELECT card_id FROM card_uses WHERE channel = ? AND chat_id = ?) "
+                "AND card_id IN (SELECT card_id FROM card_fits WHERE channel = ? "
+                "AND chat_id = ? AND topics_key = ? AND fits = 1) "
+                "ORDER BY score DESC, created_at_ms DESC",
+                (now_ms, channel, chat_id, channel, chat_id, topics_key),
+            ).fetchall()
+        return [_card(row) for row in rows]
+
+    def recent_titles(
+        self, *, since_ms: int, exclude: Iterable[str] = (), limit: int = 60
+    ) -> list[str]:
+        """Titles scored lately, newest first: what the sources were talking about."""
+        skip = set(exclude)
+        with self._lock:
+            rows = self._conn.execute(
+                "SELECT item_key, title FROM scored_items WHERE scored_at_ms >= ? "
+                "ORDER BY scored_at_ms DESC",
+                (since_ms,),
+            ).fetchall()
+        titles = [str(row["title"]) for row in rows if row["item_key"] not in skip]
+        return list(dict.fromkeys(titles))[:limit]
+
     def fitting_card_ids(self, channel: str, chat_id: str, topics_key: str) -> set[str]:
         with self._lock:
             rows = self._conn.execute(
