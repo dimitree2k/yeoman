@@ -25,6 +25,7 @@ from typing import Any
 
 from loguru import logger
 
+from yeoman_gateway.history.ids import PN_SUFFIX
 from yeoman_gateway.knowledge.models import (
     PersonNoteLine,
     PersonNoteSeed,
@@ -224,17 +225,36 @@ def _own_messages(
     return own, new
 
 
+def _member_identifiers(principal: str) -> tuple[str, ...]:
+    """Identifier forms a roster principal can resolve under.
+
+    A roster principal is ``whatsapp:<number>`` while history resolves full identifiers,
+    so a bare number is tried as a phone jid first and then as a LID.
+    """
+    value = principal.partition(":")[2] or principal
+    if "@" in value:
+        return (value,)
+    return (value + PN_SUFFIX, value + "@lid")
+
+
 def _member_contacts(queries: Any, members: Iterable[str], *, at_ms: int) -> dict[str, str]:
     """Current member contact id -> display name, through proven identifier resolution."""
     out: dict[str, str] = {}
     for principal in members:
-        token = str(principal).partition(":")[2] or str(principal)
-        try:
-            contact = queries.resolve_identifier(token, at_ms=int(at_ms), time_basis="native")
-        except Exception:  # pragma: no cover - defensive
-            contact = None
+        contact = None
+        for identifier in _member_identifiers(str(principal)):
+            try:
+                contact = queries.resolve_identifier(
+                    identifier, at_ms=int(at_ms), time_basis="native"
+                )
+            except Exception:  # pragma: no cover - defensive
+                contact = None
+            if contact:
+                break
         if not contact:
             continue
+        # Senders are compared by their terminal contact, so members must be too.
+        contact = queries.terminal(str(contact)) or contact
         row = queries.contact(str(contact))
         if row is None:
             continue

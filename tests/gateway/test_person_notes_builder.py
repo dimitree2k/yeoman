@@ -392,3 +392,37 @@ def test_plan_reads_only_the_person_and_keeps_identifiers_off_the_wire(tmp_path)
         assert plan.stated and "group plan" in plan.stated[0].line.text
     finally:
         harness.close()
+
+
+class _RosterQueries:
+    """History stand-in that, like the live one, resolves only full identifiers."""
+
+    def __init__(self) -> None:
+        self.identifiers = {
+            "4915000000001@s.whatsapp.net": "c-tom",
+            "20002@lid": "c-ana-lid",
+        }
+        self.terminals = {"c-tom": "c-tom", "c-ana-lid": "c-ana"}
+        self.names = {"c-tom": "Tom", "c-ana": "Ana"}
+
+    def resolve_identifier(self, value: str, *, at_ms: int, time_basis: str) -> str | None:
+        return self.identifiers.get(value)
+
+    def terminal(self, contact: str) -> str | None:
+        return self.terminals.get(contact)
+
+    def contact(self, contact: str) -> dict[str, str] | None:
+        name = self.names.get(contact)
+        return None if name is None else {"display_name": name}
+
+
+def test_roster_principals_resolve_to_terminal_contacts() -> None:
+    from yeoman_gateway.processing.person_notes import _member_contacts
+
+    members = _member_contacts(
+        _RosterQueries(),
+        ("whatsapp:4915000000001", "whatsapp:20002", "whatsapp:999"),
+        at_ms=1,
+    )
+
+    assert members == {"c-tom": "Tom", "c-ana": "Ana"}
