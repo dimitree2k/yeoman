@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import json
+from dataclasses import replace
 from types import SimpleNamespace
 
 import pytest
@@ -364,3 +365,37 @@ def test_google_trends_can_be_switched_off() -> None:
         __import__("tempfile").mkdtemp()) / "t.db")
     assert [source.name for source in service.sources] == ["rss:stern.de"]
     service.store.close()
+
+
+def test_spectacular_cards_pass_the_tragedy_bar_but_live_only_six_hours(tmp_path) -> None:
+    from yeoman_gateway.trends.store import SPECTACULAR_TTL_MS
+
+    items = [_item("crash", "https://example.org/crash"), _item("odd", "https://example.org/odd")]
+    raw = json.dumps({"items": [
+        {"index": 0, "score": 9, "kind": "spectacular", "reject": "none", "reason": "crash video",
+         "hook": "A jet crashed.", "line": "Die Videos sind krass.",
+         "url": "https://example.org/crash"},
+        {"index": 1, "score": 8, "kind": "absurd", "reject": "none", "reason": "odd",
+         "hook": "Odd.", "line": "Logik.", "url": "https://example.org/odd"},
+    ]})
+    verdicts = parse_verdicts(raw, items)
+    assert [verdict.kind for verdict in verdicts] == ["spectacular", "absurd"]
+
+    store = TrendStore(tmp_path / "t.db")
+    day = 24 * 3600 * 1000
+    cards = {card.kind: card for card in store.record(
+        items, verdicts, min_score=7, now_ms=1_000, ttl_ms=day)}
+    assert cards["spectacular"].expires_at_ms == 1_000 + SPECTACULAR_TTL_MS
+    assert cards["absurd"].expires_at_ms == 1_000 + day
+    store.close()
+
+
+def test_scorer_tells_the_model_how_old_each_topic_is() -> None:
+
+    now_ms = 40 * 3600 * 1000
+    fresh = replace(_item("fresh"), published_at_ms=now_ms - 20 * 60 * 1000)
+    old = replace(_item("old"), published_at_ms=now_ms - 30 * 3600 * 1000)
+    scorer = TrendScorer(client=None, clock=lambda: now_ms / 1000)  # type: ignore[arg-type]
+    prompt = scorer._messages([fresh, old])[1]["content"]
+    assert "started: under 1 hour ago" in prompt
+    assert "started: 30 hours ago" in prompt
