@@ -61,6 +61,14 @@ def card_id_for(item_key: str) -> str:
     return hashlib.sha256(item_key.encode("utf-8")).hexdigest()[:16]
 
 
+# A spectacular event is news only while it is fresh.
+SPECTACULAR_TTL_MS = 6 * 3600 * 1000
+
+
+def _card_ttl_ms(kind: str, ttl_ms: int) -> int:
+    return min(ttl_ms, SPECTACULAR_TTL_MS) if kind == "spectacular" else ttl_ms
+
+
 class TrendStore:
     def __init__(self, path: Path) -> None:
         path.parent.mkdir(parents=True, exist_ok=True)
@@ -129,7 +137,7 @@ class TrendStore:
                     line=verdict.line,
                     url=verdict.url,
                     created_at_ms=now_ms,
-                    expires_at_ms=now_ms + ttl_ms,
+                    expires_at_ms=now_ms + _card_ttl_ms(verdict.kind, ttl_ms),
                     tags=verdict.tags,
                 )
                 self._conn.execute(
