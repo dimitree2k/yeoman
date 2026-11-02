@@ -93,8 +93,12 @@ class GroupStateService:
             sections: dict[str, Section] = {}
             now_ms = int(self._clock())
             chat_kind = getattr(classify(chat_id), "kind", "unknown")
+            #: Waiting for the history lease yields the loop; section builds do not.
+            wait_ms = build_ms = 0
+            slowest = ("-", 0)
             try:
                 async with history_turn(self._history_projector) as snapshot:
+                    wait_ms = int((time.perf_counter() - started) * 1000)
                     ctx = BuildContext(
                         channel=key[0],
                         chat_id=key[1],
@@ -106,6 +110,7 @@ class GroupStateService:
                     )
                     for contributor in self._registry.for_chat(key[0], chat_kind):
                         previous = existing.sections.get(contributor.key) if existing else None
+                        section_started = time.perf_counter()
                         try:
                             sections[contributor.key] = await contributor.build(ctx)
                         except HistoryPaused:
@@ -118,6 +123,10 @@ class GroupStateService:
                             )
                             if previous is not None:
                                 sections[contributor.key] = previous
+                        section_ms = int((time.perf_counter() - section_started) * 1000)
+                        build_ms += section_ms
+                        if section_ms > slowest[1]:
+                            slowest = (contributor.key, section_ms)
             except HistoryPaused as exc:
                 self._dirty.add(key)
                 logger.warning(
@@ -148,6 +157,7 @@ class GroupStateService:
                 sections=sections,
             )
             expected = existing.revision if existing else None
+            store_started = time.perf_counter()
             if not self._store.put(state, expected_revision=expected):
                 current = self._store.get(*key)
                 retry_revision = (current.revision if current else 0) + 1
@@ -164,15 +174,22 @@ class GroupStateService:
                     self._dirty.add(key)
                     return None
                 state = retry
+            store_ms = int((time.perf_counter() - store_started) * 1000)
             self._dirty.discard(key)
             self._last_rebuild[key] = now_ms
             logger.info(
-                "group_state_updated chat={}:{} revision={} sections={} elapsed_ms={}",
+                "group_state_updated chat={}:{} revision={} sections={} elapsed_ms={} "
+                "wait_ms={} build_ms={} store_ms={} slowest={}:{}",
                 key[0],
                 key[1],
                 state.revision,
                 len(state.sections),
                 int((time.perf_counter() - started) * 1000),
+                wait_ms,
+                build_ms,
+                store_ms,
+                slowest[0],
+                slowest[1],
             )
             return state
 
