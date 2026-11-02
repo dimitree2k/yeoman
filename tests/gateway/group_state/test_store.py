@@ -439,3 +439,38 @@ def test_registry_rejects_duplicate_key() -> None:
     with pytest.raises(ValueError, match="presence"):
         registry.register(_Contributor())
     assert registry.for_chat("whatsapp", "group") == (first,)
+
+
+def test_old_cursor_table_migrates_to_kinds(tmp_path) -> None:
+    path = tmp_path / "group-state.db"
+    connection = sqlite3.connect(path)
+    try:
+        connection.executescript(
+            """
+            CREATE TABLE meta (key TEXT PRIMARY KEY, value TEXT NOT NULL);
+            CREATE TABLE group_state_cursors (
+                channel TEXT NOT NULL,
+                chat_id TEXT NOT NULL,
+                occurred_ms INTEGER NOT NULL,
+                event_id TEXT NOT NULL,
+                PRIMARY KEY (channel, chat_id)
+            );
+            """
+        )
+        connection.execute("INSERT INTO meta VALUES ('schema_version', '2')")
+        connection.execute(
+            "INSERT INTO group_state_cursors VALUES ('whatsapp', 'group@g.us', 1234, 'event-1')"
+        )
+        connection.commit()
+    finally:
+        connection.close()
+
+    store = GroupStateStore(path)
+    try:
+        assert store.invalidation_cursor("whatsapp", "group@g.us") == (1234, "event-1")
+        assert store.summary_cursor("whatsapp", "group@g.us") == (0, "")
+        store.set_summary_cursor("whatsapp", "group@g.us", 5_000, "conv-1")
+        assert store.summary_cursor("whatsapp", "group@g.us") == (5_000, "conv-1")
+        assert store.invalidation_cursor("whatsapp", "group@g.us") == (1234, "event-1")
+    finally:
+        store.close()

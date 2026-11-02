@@ -3458,6 +3458,13 @@ def build_gateway_runtime(
     if admin_command_handler is None:
         admin_command_handler = getattr(policy_adapter, "maybe_handle_admin_command", None)
 
+    signal_invalidator: SignalInvalidator | None = None
+    if processing_store is not None and config.processing.enabled:
+        signal_invalidator = SignalInvalidator(
+            store=processing_store,
+            actors=thread_registry,
+            statements=knowledge_service,
+        )
     channels = ChannelManager(
         config,
         bus,
@@ -3472,15 +3479,7 @@ def build_gateway_runtime(
                 processing_store,
                 sources=observed_sources,
                 statements=knowledge_service,
-                invalidator=(
-                    SignalInvalidator(
-                        store=processing_store,
-                        actors=thread_registry,
-                        statements=knowledge_service,
-                    )
-                    if processing_store is not None and config.processing.enabled
-                    else None
-                ),
+                invalidator=signal_invalidator,
             )
             if processing_store is not None
             else None
@@ -4545,6 +4544,8 @@ def build_gateway_runtime(
         bus=bus,
         effect_router=effect_router,
     )
+    if signal_invalidator is not None:
+        signal_invalidator.set_group_state(group_state_service)
     group_state_views = _build_group_state_view_reader(config, group_state_service)
     if group_state_views is not None:
         responder.set_group_state_views(group_state_views)
@@ -4948,8 +4949,10 @@ def _build_group_state_service(
     from yeoman_gateway.group_state.service import GroupStateService
     from yeoman_gateway.group_state.store import GroupStateStore
 
+    summaries_settings = settings.summaries
+    summaries_on = getattr(summaries_settings, "mode", "off") != "off"
     registry = ContributorRegistry()
-    for contributor in default_contributors():
+    for contributor in default_contributors(include_past=summaries_on):
         registry.register(contributor)
     store = GroupStateStore(
         _group_state_store_path(settings), snapshots_kept=int(settings.snapshots_kept)
@@ -4968,6 +4971,21 @@ def _build_group_state_service(
                 config=config, route_key=labels_settings.route
             ),
         )
+    summarizer: Any | None = None
+    if summaries_on:
+        from yeoman_gateway.group_state.summaries.runner import ConversationSummarizer
+        from yeoman_gateway.processing.model_route import RouteClient
+
+        summarizer = ConversationSummarizer(
+            store=store,
+            history_projector=history_projector,
+            settings=summaries_settings,
+            group_state_settings=settings,
+            consciousness=config.consciousness,
+            client_factory=lambda: RouteClient(
+                config=config, route_key=summaries_settings.route
+            ),
+        )
     service = GroupStateService(
         store=store,
         registry=registry,
@@ -4982,6 +5000,7 @@ def _build_group_state_service(
         ),
         consciousness=config.consciousness,
         labeler=labeler,
+        summarizer=summarizer,
     )
 
     async def _mark_from_observed(event: Any) -> None:

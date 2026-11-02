@@ -132,3 +132,44 @@ def test_knowledge_group_reply_recall_defaults_off_and_round_trips() -> None:
     payload = convert_to_camel(Config().model_dump())
     assert payload["knowledge"]["groupReplyRecall"] == "off"
     assert convert_keys(payload)["knowledge"]["group_reply_recall"] == "off"
+
+
+def test_summaries_config_defaults_off_and_round_trips() -> None:
+    from yeoman_shared.config.defaults import DEFAULT_MODEL_PROFILES, DEFAULT_MODEL_ROUTES
+
+    summaries = Config().processing.group_state.summaries
+    assert summaries.mode == "off"
+    assert summaries.route == "history.summaries"
+    assert summaries.min_messages == 4
+    assert summaries.daily_prompt_token_cap == 300_000
+    assert summaries.keep_weeks == 12
+
+    configured = GroupStateConfig.model_validate(
+        convert_keys(
+            {
+                "summaries": {
+                    "mode": "build",
+                    "route": "history.summaries",
+                    "minMessages": 6,
+                    "dailyPromptTokenCap": 1_000,
+                    "keepWeeks": 8,
+                }
+            }
+        )
+    ).summaries
+    assert configured.mode == "build"
+    assert configured.min_messages == 6
+    assert configured.daily_prompt_token_cap == 1_000
+    assert configured.keep_weeks == 8
+
+    payload = convert_to_camel(Config().model_dump())
+    assert payload["processing"]["groupState"]["summaries"]["minMessages"] == 4
+    assert payload["processing"]["groupState"]["summaries"]["dailyPromptTokenCap"] == 300_000
+    assert payload["processing"]["groupState"]["summaries"]["keepWeeks"] == 12
+    assert convert_keys(payload)["processing"]["group_state"]["summaries"]["min_messages"] == 4
+
+    route = configured.route
+    assert route == route.lower() and "_" not in route
+    assert camel_to_snake(snake_to_camel(route)) == route
+    assert DEFAULT_MODEL_ROUTES[route] == "history_summaries"
+    assert DEFAULT_MODEL_PROFILES[DEFAULT_MODEL_ROUTES[route]]["structured_output"] == "json_object"
