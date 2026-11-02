@@ -4,9 +4,10 @@ from __future__ import annotations
 
 import asyncio
 import time
-from collections.abc import Callable, Sequence
+from collections.abc import Awaitable, Callable, Sequence
 from dataclasses import dataclass, field, replace
 from typing import Any
+from urllib.parse import urlsplit
 
 from loguru import logger
 
@@ -14,12 +15,21 @@ from .article import ArticleReader
 from .fit import TopicFitter, topics_key
 from .models import TrendItem, TrendVerdict
 from .scorer import TrendScorer
+from .shared import SharedCheck
 from .sources import GoogleTrendsSource, RssFeedSource, TrendSource
 from .store import TrendStore
 from .writer import LineWriter
 
 #: Articles in other languages make lines the group cannot follow.
 ARTICLE_LANGUAGES = frozenset({"de", "en", ""})
+#: Posts and videos on these hosts are the story themselves; there is no article to read.
+NO_ARTICLE_HOSTS = ("reddit.com", "redd.it", "youtube.com", "youtu.be")
+#: What the sources talked about lately tells the scorer which topics are buzzing.
+BUZZ_WINDOW_MS = 12 * 3600 * 1000
+#: How far back a group's own messages show what it has already seen.
+SHARED_WINDOW_MS = 48 * 3600 * 1000
+
+RecentMessages = Callable[[str, str, int], Awaitable[Sequence[str]]]
 
 
 def _now_ms() -> int:
@@ -34,6 +44,7 @@ class TrendsReport:
     fitted_chats: int = 0
     articles_read: int = 0
     dropped: int = 0
+    already_shared: int = 0
     failed_sources: list[str] = field(default_factory=list)
 
     def as_dict(self) -> dict[str, Any]:
@@ -44,6 +55,7 @@ class TrendsReport:
             "fitted_chats": self.fitted_chats,
             "articles_read": self.articles_read,
             "dropped": self.dropped,
+            "already_shared": self.already_shared,
             "failed_sources": list(self.failed_sources),
         }
 
@@ -64,6 +76,8 @@ class TrendsService:
         max_article_age_ms: int = 48 * 3600 * 1000,
         fitter: TopicFitter | None = None,
         chats: Callable[[], Sequence[tuple[str, str, Any]]] | None = None,
+        shared_check: SharedCheck | None = None,
+        recent_messages: RecentMessages | None = None,
         clock: Callable[[], int] = _now_ms,
     ) -> None:
         if interval_seconds <= 0:
@@ -80,6 +94,8 @@ class TrendsService:
         self.max_article_age_ms = max_article_age_ms
         self.fitter = fitter
         self.chats = chats
+        self.shared_check = shared_check
+        self.recent_messages = recent_messages
         self.clock = clock
         self._task: asyncio.Task[None] | None = None
 
@@ -99,7 +115,10 @@ class TrendsService:
         fresh = self.store.unseen(items)[: self.max_items_per_run]
         now = self.clock()
         if fresh:
-            verdicts = await self.scorer.score(fresh)
+            recent = self.store.recent_titles(
+                since_ms=now - BUZZ_WINDOW_MS, exclude={item.key for item in fresh}
+            )
+            verdicts = await self.scorer.score(fresh, recent=recent)
             report.scored = len(verdicts)
             verdicts = await self._rewrite_from_articles(fresh, verdicts, report, now_ms=now)
             cards = self.store.record(
@@ -135,6 +154,31 @@ class TrendsService:
                 continue
             self.store.record_fits(channel, chat_id, key, [c.card_id for c in cards], fitting)
             report.fitted_chats += 1
+        for channel, chat_id, policy in chats:
+            topics, avoid = str(policy.topics or ""), str(policy.avoid or "")
+            if topics.strip():
+                await self._drop_already_shared(
+                    channel, chat_id, topics_key(topics, avoid), report, now_ms=now_ms
+                )
+
+    async def _drop_already_shared(
+        self, channel: str, chat_id: str, key: str, report: TrendsReport, *, now_ms: int
+    ) -> None:
+        """Unfit every waiting card whose story the group has already seen."""
+        if self.shared_check is None or self.recent_messages is None:
+            return
+        cards = self.store.fitting_unused_cards(channel, chat_id, key, now_ms=now_ms)
+        if not cards:
+            return
+        try:
+            messages = await self.recent_messages(channel, chat_id, now_ms - SHARED_WINDOW_MS)
+            shared = await self.shared_check.shared(cards=cards, messages=messages)
+        except Exception as exc:  # noqa: BLE001 - checked again on the next run
+            logger.warning("trends shared check failed error_type={}", type(exc).__name__)
+            return
+        if shared:
+            self.store.record_fits(channel, chat_id, key, shared, set())
+            report.already_shared += len(shared)
 
     async def _rewrite_from_articles(
         self,
@@ -156,6 +200,9 @@ class TrendsService:
         for verdict in verdicts:
             item = by_key.get(verdict.item_key)
             if item is None or verdict.score < self.min_score or not verdict.url:
+                rewritten.append(verdict)
+                continue
+            if not _has_article(verdict.url):
                 rewritten.append(verdict)
                 continue
             article = await self.reader.read(verdict.url)
@@ -213,6 +260,7 @@ def build_trends_service(
     *,
     store_path: Any = None,
     chats: Callable[[], Sequence[tuple[str, str, Any]]] | None = None,
+    recent_messages: RecentMessages | None = None,
 ) -> TrendsService:
     """The configured service; raises ``RouteUnavailableError`` when the route is missing."""
     from yeoman_shared.utils.helpers import get_operational_store_path
@@ -237,4 +285,11 @@ def build_trends_service(
         max_items_per_run=trends.max_items_per_run,
         fitter=TopicFitter(client=client),
         chats=chats,
+        shared_check=SharedCheck(client=client),
+        recent_messages=recent_messages,
     )
+
+
+def _has_article(url: str) -> bool:
+    host = (urlsplit(url).hostname or "").lower()
+    return not any(host == name or host.endswith(f".{name}") for name in NO_ARTICLE_HOSTS)

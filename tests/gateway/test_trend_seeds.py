@@ -599,3 +599,52 @@ async def test_idle_watcher_triggers_only_long_silent_groups_it_may_post_in() ->
     )
     assert await watcher.tick() == ["quiet"]
     assert triggered == ["quiet", "quiet-no-cards"]
+
+
+@pytest.mark.asyncio
+async def test_cards_the_group_already_saw_stop_fitting(tmp_path: Path) -> None:
+    from yeoman_gateway.policy.schema import TrendsPolicy
+    from yeoman_gateway.trends.service import SHARED_WINDOW_MS, TrendsService
+    from yeoman_gateway.trends.shared import SharedCheck
+
+    store = _store(tmp_path, ("Learjet", 9, []), ("Katze im Bundestag", 8, []), ("Toaster XL", 8, []))
+    _fit_all(store, FINANCE)
+    asked: list[str] = []
+    since: list[int] = []
+
+    class _SharedClient:
+        async def chat_with_usage(self, messages: Any, **kwargs: Any) -> Any:
+            from yeoman_gateway.processing.model_route import RouteReply
+
+            asked.append(messages[1]["content"])
+            cards = messages[1]["content"].split("Cards:\n")[1].split("\n\n")[0].splitlines()
+            return RouteReply(content=json.dumps(
+                {"shared": [i for i, line in enumerate(cards) if "Katze" in line]}
+            ))
+
+    async def recent_messages(channel: str, chat_id: str, since_ms: int) -> list[str]:
+        since.append(since_ms)
+        return ["Schaut mal https://example.org/7", "Die Katze sitzt jetzt im Bundestag lol"]
+
+    class _NoSource:
+        name = "none"
+
+        async def fetch(self) -> list[TrendItem]:
+            return []
+
+    service = TrendsService(
+        sources=[_NoSource()], scorer=None, store=store,  # type: ignore[arg-type]
+        chats=lambda: [(CHANNEL, CHAT, TrendsPolicy.model_validate(FINANCE))],
+        fitter=TopicFitter(client=_SharedClient()),
+        shared_check=SharedCheck(client=_SharedClient()),
+        recent_messages=recent_messages,
+        clock=lambda: NOW_MS,
+    )
+    report = await service.run_once()
+
+    key = topics_key(FINANCE["topics"], FINANCE["avoid"])
+    assert store.fitting_card_ids(CHANNEL, CHAT, key) == {card_id_for("Toaster XL")}
+    assert report.already_shared == 2
+    assert since == [NOW_MS - SHARED_WINDOW_MS]
+    # The posted link alone is proof; only the other two cards go to the model.
+    assert len(asked) == 1 and "Learjet" not in asked[0] and "Katze" in asked[0]

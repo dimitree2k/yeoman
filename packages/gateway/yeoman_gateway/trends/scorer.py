@@ -47,8 +47,12 @@ SCORER_SYSTEM_PROMPT = (
     "only while it is fresh (started under 12 hours ago) and may score high even when "
     "people died. War, terror, crimes, violence against people, mass-casualty disasters "
     "and illness are never spectacular.\n"
-    "Fresher is better for every kind: a topic that started more than a day ago scores "
-    "at most 5.\n"
+    "Freshness and buzz matter most. A topic that started under 3 hours ago is best, "
+    "after 6 hours it loses points, and one that started more than a day ago scores at "
+    "most 5. A topic is buzzing when several items, or titles in the recently seen "
+    "list, are about the same event: people are talking about it right now, so it "
+    "scores higher. When several items are about the same event, give the best one "
+    "the score and the others 0 with reason \"duplicate\".\n"
     "Set reject to \"tragedy\" for deaths, disasters, violence, crime victims, "
     "illness of real people or anything people grieve over, unless the item is "
     "spectacular as defined above, and to \"partisan\" for "
@@ -100,17 +104,22 @@ class TrendScorer:
         self._language = {"de": "German", "en": "English"}.get(language, language)
         self._max_tokens = max_tokens
 
-    async def score(self, items: Sequence[TrendItem]) -> list[TrendVerdict]:
+    async def score(
+        self, items: Sequence[TrendItem], *, recent: Sequence[str] = ()
+    ) -> list[TrendVerdict]:
+        """``recent`` are titles the sources carried lately, shown only as buzz context."""
         if not items:
             return []
         reply = await self._client.chat_with_usage(
-            self._messages(items),
+            self._messages(items, recent=recent),
             max_tokens=self._max_tokens,
             response_format={"type": "json_object"},
         )
         return parse_verdicts(str(getattr(reply, "content", "") or ""), items)
 
-    def _messages(self, items: Sequence[TrendItem]) -> list[dict[str, str]]:
+    def _messages(
+        self, items: Sequence[TrendItem], *, recent: Sequence[str] = ()
+    ) -> list[dict[str, str]]:
         lines: list[str] = []
         now_ms = int(self._clock() * 1000)
         for index, item in enumerate(items):
@@ -121,9 +130,14 @@ class TrendScorer:
             for headline in item.headlines[:4]:
                 outlet = f" ({headline.outlet})" if headline.outlet else ""
                 lines.append(f"    - {headline.title}{outlet} url={headline.url}")
+        content = "Items:\n" + "\n".join(lines)
+        if recent:
+            content += "\n\nRecently seen in the sources (context only, not to score):\n" + (
+                "\n".join(f"- {title}" for title in recent)
+            )
         return [
             {"role": "system", "content": SCORER_SYSTEM_PROMPT.format(language=self._language)},
-            {"role": "user", "content": "Items:\n" + "\n".join(lines)},
+            {"role": "user", "content": content},
         ]
 
 

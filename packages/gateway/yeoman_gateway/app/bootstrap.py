@@ -630,7 +630,9 @@ class GatewayRuntime:
                 raise cleanup_errors[0]
 
 
-def _build_trends(config: Config, policy_adapter: object | None = None) -> Any | None:
+def _build_trends(
+    config: Config, policy_adapter: object | None = None, history_projector: object | None = None
+) -> Any | None:
     """The trends collector when enabled; a missing route disables it with a warning."""
     if not config.trends.enabled:
         return None
@@ -642,10 +644,26 @@ def _build_trends(config: Config, policy_adapter: object | None = None) -> Any |
         return build_trends_service(
             config,
             chats=(lambda: trend_chats(policy_engine())) if callable(policy_engine) else None,
+            recent_messages=(
+                _trend_recent_messages(history_projector) if history_projector is not None else None
+            ),
         )
     except RouteUnavailableError as exc:
         logger.warning("trends disabled: {}", exc)
         return None
+
+
+def _trend_recent_messages(history_projector: object) -> Callable[[str, str, int], Any]:
+    """A group's messages since a moment, members' and the bot's alike, oldest first."""
+    from yeoman_gateway.history.context import history_turn
+    from yeoman_gateway.history.queries import HistoryQueries
+
+    async def recent_messages(channel: str, chat_id: str, since_ms: int) -> list[str]:
+        async with history_turn(history_projector) as snapshot:
+            rows = HistoryQueries(snapshot).recent(chat_id=chat_id, limit=300, after_ms=since_ms)
+        return [str(row.get("current_text") or row.get("text") or "") for row in rows]
+
+    return recent_messages
 
 
 class ProcessingStoreUnavailableError(RuntimeError):
@@ -4829,7 +4847,7 @@ def build_gateway_runtime(
             PeopleSyncService(projector=history_projector, db_path=people_db_path(), people=people)
             if history_projector is not None else None
         ),
-        trends=_build_trends(config, policy_adapter),
+        trends=_build_trends(config, policy_adapter, history_projector),
         decision_sweeper=decision_sweeper,
         group_state=group_state_service,
     )

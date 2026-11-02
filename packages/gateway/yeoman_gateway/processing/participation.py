@@ -162,7 +162,8 @@ JUDGE_TREND_RULES = (
     "fixed, so purpose only says why it fits now. Post it when it fits the group's "
     "topics, nothing under Nicht für diese Gruppe applies, and the chat has gone quiet: "
     "no question still waiting for a member and no serious or sad topic the card would "
-    "trample. Otherwise choose silence. Never react to a card."
+    "trample, and its story was not already shared or talked about in the chat. "
+    "Otherwise choose silence. Never react to a card."
 )
 
 
