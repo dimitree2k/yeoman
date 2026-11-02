@@ -430,6 +430,16 @@ def eval_reply_state(
     concurrency: int = typer.Option(
         1, "--concurrency", min=1, max=8, help="Items evaluated at the same time"
     ),
+    arms: str = typer.Option(
+        "A,A2,R,P_R",
+        "--arms",
+        help="Comma list of arms: A, A2, R, P_R and the older S, P, Sx",
+    ),
+    measure: bool = typer.Option(
+        False,
+        "--measure",
+        help="Write measure.json with counts only; no generation and no grading",
+    ),
 ) -> None:
     """Offline reply-state evaluation: as-of prompts, four arms and a blind grader."""
     from yeoman_shared.config.loader import load_config
@@ -442,6 +452,7 @@ def eval_reply_state(
         resolve_chat,
     )
     from yeoman_gateway.evaluation.reply_state_run import (
+        ARMS,
         GRADER_ROUTE,
         REPLY_ROUTE,
         WRITER_ROUTE,
@@ -450,6 +461,19 @@ def eval_reply_state(
     )
     from yeoman_gateway.history.live import history_db_path
 
+    canonical_arms = {arm.upper(): arm for arm in ARMS}
+    requested_arms = tuple(
+        dict.fromkeys(
+            canonical_arms.get(part.strip().upper(), part.strip().upper())
+            for part in str(arms).split(",")
+            if part.strip()
+        )
+    )
+    unknown_arms = sorted(set(requested_arms) - set(ARMS))
+    if unknown_arms or not requested_arms:
+        typer.echo(f"error: --arms: unknown arm(s) {', '.join(unknown_arms) or '(empty)'}")
+        raise typer.Exit(2)
+    oracle = bool(oracle or "Sx" in requested_arms)
     config = load_config()
     if not history_db_path().is_file():
         typer.echo("error: history.db not found")
@@ -479,6 +503,32 @@ def eval_reply_state(
 
         engine, _policy_path = make_policy_engine(config)
 
+        from yeoman_gateway.knowledge import open_knowledge_store, workspace_id_for
+        from yeoman_gateway.knowledge.runtime import (
+            RuntimeKnowledgePolicy,
+            RuntimeKnowledgeSources,
+        )
+        from yeoman_gateway.people.resolver import PeopleResolver
+        from yeoman_gateway.people.schema import people_db_path
+
+        people = PeopleResolver(people_db_path(create=False))
+        knowledge = None
+        if bool(config.knowledge.enabled) and config.knowledge.resolved_db_path.is_file():
+            try:
+                knowledge = open_knowledge_store(
+                    config.knowledge.resolved_db_path,
+                    workspace_id=workspace_id_for(config.workspace_path),
+                    source_authority=RuntimeKnowledgeSources(),
+                    policy_authority=RuntimeKnowledgePolicy(engine=engine, policy_revision=1),
+                    create=False,
+                    readonly=True,
+                    people=people,
+                )
+            except Exception as exc:  # noqa: BLE001 - the R arm degrades to no recall
+                typer.echo(
+                    f"warning: knowledge recall unavailable: {type(exc).__name__}"
+                )
+
         def persona_for(channel: str, chat_id: str) -> str | None:
             try:
                 policy = engine.resolve_policy(channel, chat_id)
@@ -489,6 +539,7 @@ def eval_reply_state(
         run = RunConfig(
             days=days, replies=replies, writer=writer, seed=seed, oracle=oracle,
             limit_calls=limit_calls, yes=yes, concurrency=concurrency,
+            arms=requested_arms,
         )
         runner = ReplyStateRunner(
             config=config, history=history,
@@ -500,6 +551,8 @@ def eval_reply_state(
             processing_db=_processing_store_path(config),
             speakups_db=get_operational_store_path("speakups", create=False),
             decisions_db=get_operational_store_path("group_decisions", create=False),
+            knowledge=knowledge,
+            people=people,
         )
         prepared = asyncio.run(runner.prepare(run, chat_ids=chat_ids))
         planned = prepared.planned
@@ -514,6 +567,10 @@ def eval_reply_state(
             f"token estimate: prompt={planned.prompt_tokens} "
             f"completion={planned.completion_tokens}"
         )
+        if measure:
+            measured = asyncio.run(runner.measure(prepared, run))
+            typer.echo(f"measure: {measured.report_dir}")
+            return
         if not yes:
             typer.echo("no model calls; rerun with --yes")
             return
@@ -536,11 +593,14 @@ def eval_reply_state(
         outcome = asyncio.run(runner.execute(prepared, run))
     finally:
         history.close()
+        if knowledge is not None:
+            knowledge.close()
     summary = outcome.summary or {}
     gate = summary.get("gate") or {}
     typer.echo(
         f"partial={summary.get('partial')} s_gt_a={gate.get('s_gt_a')} "
-        f"s_gt_p={gate.get('s_gt_p')} report: {outcome.report_dir}"
+        f"s_gt_p={gate.get('s_gt_p')} r_gt_a={gate.get('r_gt_a')} "
+        f"r_gt_p_r={gate.get('r_gt_p_r')} report: {outcome.report_dir}"
     )
 
 

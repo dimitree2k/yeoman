@@ -44,8 +44,8 @@ from yeoman_gateway.evaluation.participation_context_ab import (
     _inputs,
     _judge_variant,
     _mean,
-    _opportunity,
     _read_only,
+    to_live_opportunity,
 )
 from yeoman_gateway.history.context import history_turn
 from yeoman_gateway.history.group_signals import DigestWeek, previous_week
@@ -358,7 +358,7 @@ async def replay(
         if note.status != "ready":
             record["skipped"] = note.skip_reason
             continue
-        opportunity = _opportunity(item)
+        opportunity = to_live_opportunity(item)
         if set_as_of is not None:
             set_as_of(item.at_ms)
         try:
@@ -415,7 +415,7 @@ async def rebuild_views(
     from yeoman_gateway.evaluation.participation_context_ab import record_opportunity
 
     item = record_opportunity(record)
-    opportunity = _opportunity(item)
+    opportunity = to_live_opportunity(item)
     if set_as_of is not None:
         set_as_of(item.at_ms)
     async with history_turn(history):

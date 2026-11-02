@@ -322,6 +322,7 @@ class RetrievalEngine:
         *,
         view: str = "current",
         group_wide: bool = False,
+        as_of_ms: int | None = None,
     ) -> tuple[str, list[Any]]:
         """SQL candidate filter: status, validity, revocation, source chat, audience.
 
@@ -433,6 +434,44 @@ class RetrievalEngine:
             )
             params.append("__no_recipient__")
             params.append(0)
+        as_of_sql, as_of_params = self._as_of_clause(as_of_ms)
+        if as_of_sql:
+            clauses.append(as_of_sql)
+            params.extend(as_of_params)
+        return " AND ".join(clauses), params
+
+    def _as_of_clause(self, as_of_ms: int | None) -> tuple[str, list[Any]]:
+        """SQL that hides anything not yet true at ``as_of_ms``.
+
+        A statement must not have been created, corrected or sourced after the instant.
+        Source time comes from the append-only ledger joined through the statement's
+        own source rows; a legacy store without a ledger falls back to the recorded
+        source timestamp.  ``None`` returns no clause, keeping live reads unchanged.
+        """
+        if as_of_ms is None:
+            return "", []
+        at_ms = int(as_of_ms)
+        clauses = [
+            "s.created_ms <= ?",
+            "s.updated_ms <= ?",
+            "s.valid_from_ms <= ?",
+        ]
+        params: list[Any] = [at_ms, at_ms, at_ms]
+        if self._store.has_table("knowledge_history_sources"):
+            clauses.append(
+                "NOT EXISTS (SELECT 1 FROM knowledge_statement_sources src"
+                " LEFT JOIN knowledge_history_sources h"
+                " ON h.event_id = src.event_id AND h.revision = src.revision"
+                " WHERE src.statement_id = s.statement_id"
+                " AND COALESCE(json_extract(h.source_json, '$.occurred_at_ms'),"
+                " src.occurred_at_ms) > ?)"
+            )
+        else:
+            clauses.append(
+                "NOT EXISTS (SELECT 1 FROM knowledge_statement_sources src"
+                " WHERE src.statement_id = s.statement_id AND src.occurred_at_ms > ?)"
+            )
+        params.append(at_ms)
         return " AND ".join(clauses), params
 
     def _owner_scope(self, context: TrustedReadContext) -> bool:
@@ -574,7 +613,7 @@ class RetrievalEngine:
         if not decision.allowed:
             return CandidateRows((), 0), decision
         clauses, params = self._gate_clause(
-            context, decision, view=view, group_wide=group_wide
+            context, decision, view=view, group_wide=group_wide, as_of_ms=query.as_of_ms
         )
         person_clause, person_params = self._person_filter_clause(query.person_ids, query.roles)
         if person_clause:
@@ -792,7 +831,12 @@ class RetrievalEngine:
                 reason=decision.reason,
             )
         allowed_ids = self._recheck_ids(
-            rows.statement_ids, context, decision, view=view, group_wide=group_wide
+            rows.statement_ids,
+            context,
+            decision,
+            view=view,
+            group_wide=group_wide,
+            as_of_ms=query.as_of_ms,
         )
         text, rendered_ids, source_refs, source_refs_by_statement, entry_texts = self._render(
             allowed_ids,
@@ -862,7 +906,10 @@ class RetrievalEngine:
                 break
             if statement_id not in merged:
                 merged.append(statement_id)
-        allowed_ids = self._recheck_ids(tuple(merged), context, decision, group_wide=group_wide)
+        allowed_ids = self._recheck_ids(
+            tuple(merged), context, decision, group_wide=group_wide,
+            as_of_ms=query.as_of_ms,
+        )
         text, rendered_ids, source_refs, source_refs_by_statement, entry_texts = self._render(
             allowed_ids, context, decision, max_chars=max_chars
         )
@@ -915,7 +962,9 @@ class RetrievalEngine:
         )
 
         decision = self.decide(context)
-        clause, params = self._gate_clause(context, decision, group_wide=group_wide)
+        clause, params = self._gate_clause(
+            context, decision, group_wide=group_wide, as_of_ms=query.as_of_ms
+        )
         person_clause, person_params = self._person_filter_clause(query.person_ids, query.roles)
         allowed = {str(row[0]) for row in self._store.query(
             f"SELECT s.statement_id FROM knowledge_statements s WHERE {clause}"
@@ -1256,6 +1305,7 @@ class RetrievalEngine:
         *,
         view: str = "current",
         group_wide: bool = False,
+        as_of_ms: int | None = None,
     ) -> tuple[str, ...]:
         """Final id recheck with *current* rows, immediately before rendering.
 
@@ -1265,7 +1315,7 @@ class RetrievalEngine:
         if not decision.allowed or not statement_ids:
             return ()
         clauses, params = self._gate_clause(
-            context, decision, view=view, group_wide=group_wide
+            context, decision, view=view, group_wide=group_wide, as_of_ms=as_of_ms
         )
         placeholders = ",".join("?" for _ in statement_ids)
         rows = self._store.query(

@@ -23,6 +23,12 @@ STRATA: tuple[str, ...] = (*REPLY_STRATA, *WRITER_STRATA)
 KINDS: tuple[str, ...] = ("reply", "writer")
 DEFAULT_SEED = 7
 HARD_CASE_FLOOR = 0.30
+#: Structural reasons an item needs context from outside the recent-message window.
+OLDER_CONTEXT_SIGNALS: tuple[str, ...] = (
+    "reply_outside_window",
+    "earlier_conversation_link",
+    "person_with_history",
+)
 BOOTSTRAP_RESAMPLES = 2_000
 
 #: Neutral statements true of any group chat. They carry no information about a
@@ -86,6 +92,17 @@ class ReplyStateItem:
     at_ms: int
     stratum: str
     hard_case: bool = False
+    older_context_signals: tuple[str, ...] = ()
+
+    def __post_init__(self) -> None:
+        signals = tuple(dict.fromkeys(str(item) for item in self.older_context_signals))
+        if any(item not in OLDER_CONTEXT_SIGNALS for item in signals):
+            raise ValueError("unknown older-context signal")
+        object.__setattr__(self, "older_context_signals", signals)
+
+    @property
+    def older_context(self) -> bool:
+        return bool(self.older_context_signals)
 
     @property
     def replies_like(self) -> bool:
@@ -161,16 +178,31 @@ def _stratified_pick(
 
 
 def _sample_kind(
-    pool: Sequence[ReplyStateItem], count: int, *, rng: random.Random, hard_floor: float
+    pool: Sequence[ReplyStateItem],
+    count: int,
+    *,
+    rng: random.Random,
+    hard_floor: float,
+    older_context_share: float = 0.0,
 ) -> list[ReplyStateItem]:
     wanted = min(max(0, int(count)), len(pool))
     if wanted <= 0:
         return []
-    hard = [item for item in pool if item.hard_case]
-    target_hard = min(len(hard), math.ceil(max(0.0, float(hard_floor)) * wanted))
-    selected = _stratified_pick(hard, target_hard, rng)
+    selected: list[ReplyStateItem] = []
+    share = min(1.0, max(0.0, float(older_context_share)))
+    older = [item for item in pool if item.older_context]
+    target_older = min(len(older), math.ceil(share * wanted))
+    selected.extend(_stratified_pick(older, target_older, rng))
     chosen = {item.item_id for item in selected}
     rest = [item for item in pool if item.item_id not in chosen]
+    hard = [item for item in rest if item.hard_case]
+    already_hard = sum(item.hard_case for item in selected)
+    target_hard = min(
+        len(hard), max(0, math.ceil(max(0.0, float(hard_floor)) * wanted) - already_hard)
+    )
+    selected.extend(_stratified_pick(hard, target_hard, rng))
+    chosen = {item.item_id for item in selected}
+    rest = [item for item in rest if item.item_id not in chosen]
     if target_hard > 0 and target_hard >= math.ceil(max(0.0, float(hard_floor)) * wanted):
         # The floor is met from the hard pool alone; the fill stays easy so the
         # hard share is exactly the planned floor rather than an accident of the fill.
@@ -196,6 +228,7 @@ def sample_items(
     writer: int,
     seed: int = DEFAULT_SEED,
     hard_floor: float = HARD_CASE_FLOOR,
+    older_context_share: float = 0.6,
 ) -> SampleSelection:
     """Seeded, stratified sample with the reply hard-case floor and a shortfall report."""
     reply_pool = [item for item in items if item.kind == "reply"]
@@ -204,14 +237,23 @@ def sample_items(
     # Independent seeded streams: changing --writer must not reshuffle --replies.
     reply_rng = random.Random(rng.getrandbits(64))
     writer_rng = random.Random(rng.getrandbits(64))
-    chosen_replies = _sample_kind(reply_pool, replies, rng=reply_rng, hard_floor=hard_floor)
+    chosen_replies = _sample_kind(
+        reply_pool,
+        replies,
+        rng=reply_rng,
+        hard_floor=hard_floor,
+        older_context_share=older_context_share,
+    )
     chosen_writer = _sample_kind(writer_pool, writer, rng=writer_rng, hard_floor=0.0)
     selected = (*chosen_replies, *chosen_writer)
     requested = {"replies": max(0, int(replies)), "writer": max(0, int(writer))}
     available = {"replies": len(reply_pool), "writer": len(writer_pool)}
+    requested_older = math.ceil(min(1.0, max(0.0, older_context_share)) * max(0, int(replies)))
+    chosen_older = sum(item.older_context for item in chosen_replies)
     shortfall = {
         "replies": max(0, requested["replies"] - len(chosen_replies)),
         "writer": max(0, requested["writer"] - len(chosen_writer)),
+        "older_context": max(0, requested_older - chosen_older),
     }
     return SampleSelection(
         items=selected,
@@ -388,6 +430,7 @@ __all__ = [
     "GraderParseError",
     "HARD_CASE_FLOOR",
     "KINDS",
+    "OLDER_CONTEXT_SIGNALS",
     "PLACEBO_LINES",
     "REPLY_STRATA",
     "ReplyStateItem",

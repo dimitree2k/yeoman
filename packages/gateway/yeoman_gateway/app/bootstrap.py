@@ -3330,6 +3330,7 @@ def build_gateway_runtime(
         knowledge=knowledge_service,
         people=people,
         knowledge_sources=knowledge_sources,
+        group_reply_recall=config.knowledge.group_reply_recall == "on",
         telemetry=telemetry,
         security=security,
         cron_service=cron,

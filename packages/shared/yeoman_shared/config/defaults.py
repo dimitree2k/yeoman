@@ -149,6 +149,7 @@ DEFAULT_KNOWLEDGE: dict[str, Any] = {
     "db_path": "~/.yeoman/data/knowledge/knowledge.db",
     "legacy_contacts_paths": ["~/.yeoman/data/contacts/contacts.db"],
     "legacy_memory_paths": ["~/.yeoman/data/memory/memory.db"],
+    "group_reply_recall": "off",
 }
 
 

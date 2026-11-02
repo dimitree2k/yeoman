@@ -18,6 +18,7 @@ import sqlite3
 import time
 from collections import Counter
 from collections.abc import Callable, Mapping, Sequence
+from contextlib import nullcontext
 from dataclasses import dataclass, replace
 from pathlib import Path
 from typing import Any, Protocol
@@ -67,6 +68,7 @@ from yeoman_gateway.group_state.views import (
     render_writer_view,
 )
 from yeoman_gateway.history.context import history_turn
+from yeoman_gateway.history.conversations import ConversationBounds, read_conversations
 from yeoman_gateway.history.queries import HistoryQueries
 from yeoman_gateway.pipeline.reply_context import ReplyContextMiddleware
 from yeoman_gateway.processing.participation_context import (
@@ -96,8 +98,17 @@ PAIR_ORDER: tuple[tuple[str, str, str], ...] = (
     ("P", "A", "P_vs_A"),
     ("S", "P", "S_vs_P"),
 )
+RECALL_PAIR_ORDER: tuple[tuple[str, str, str], ...] = (
+    ("R", "A", "R_vs_A"),
+    ("P_R", "A", "P_R_vs_A"),
+    ("R", "P_R", "R_vs_P_R"),
+)
 ORACLE_PAIR = ("Sx", "A", "Sx_vs_A")
-ARMS: tuple[str, ...] = ("A", "A2", "S", "P", "Sx")
+#: Every arm this offline runner can generate.  ``R`` and ``P_R`` are the recall
+#: layer; the older state arms stay available unchanged.
+ARMS: tuple[str, ...] = ("A", "A2", "S", "P", "Sx", "R", "P_R")
+DEFAULT_ARMS: tuple[str, ...] = ("A", "A2", "R", "P_R")
+MEASURE_FILE = "measure.json"
 DELIVERED_EFFECT_STATES = frozenset({"sent", "delivered", "transport_accepted"})
 DELIVERED_DISPOSITIONS = frozenset(
     {"comment_sent", "comment_delivered", "comment_transport_accepted"}
@@ -126,6 +137,8 @@ class ReplyRecord:
     text: str
     reply_to_history_id: str | None = None
     reply_to_native_id: str | None = None
+    #: The sender's roster principal as of the item, when membership proves it.
+    sender_principal: str | None = None
 
 
 @dataclass(frozen=True, slots=True)
@@ -158,6 +171,11 @@ class RunConfig:
     yes: bool = False
     #: Items in flight at once; each item still runs its own calls in order.
     concurrency: int = 1
+    #: Arms to generate.  Old callers keep the four state arms; the CLI defaults to
+    #: the recall layer.  ``Sx`` is only generated in oracle mode.
+    arms: tuple[str, ...] = ("A", "A2", "S", "P")
+    #: Reply sampling target for items that need context older than the window.
+    older_context_share: float = 0.6
 
 
 @dataclass(frozen=True, slots=True)
@@ -198,6 +216,7 @@ class _PreparedReply:
     reply_text: str | None
     reply_participant: str | None
     base_messages: list[dict[str, str]]
+    recall_text: str
     rendered_ms: list[float]
 
 
@@ -352,6 +371,20 @@ def _mean(values: Sequence[float | int]) -> float | None:
     return round(sum(float(value) for value in values) / len(values), 1) if values else None
 
 
+def _distribution(values: Sequence[int]) -> dict[str, Any]:
+    """Counts and percentiles of a bounded integer series; never any source text."""
+    if not values:
+        return {"count": 0, "min": None, "median": None, "p95": None, "max": None}
+    ordered = sorted(int(value) for value in values)
+    return {
+        "count": len(ordered),
+        "min": ordered[0],
+        "median": _percentile(ordered, 0.5),
+        "p95": _percentile(ordered, 0.95),
+        "max": ordered[-1],
+    }
+
+
 def _read_only(path: Path) -> sqlite3.Connection:
     connection = sqlite3.connect(f"{Path(path).expanduser().resolve().as_uri()}?mode=ro", uri=True)
     connection.row_factory = sqlite3.Row
@@ -440,6 +473,67 @@ def _reply_is_hard(
     return len(_human_participants(queries, chat_id, until_ms=at_ms - 1, assistant=assistant)) >= 3
 
 
+def _sender_principal(
+    queries: HistoryQueries, chat_id: str, sender_id: str | None, at_ms: int
+) -> str | None:
+    """The roster principal of the trigger sender, if membership proves it."""
+    if not sender_id:
+        return None
+    audience = queries.members(chat_id=chat_id, at_ms=int(at_ms))
+    if audience.status != "known" or not audience.members:
+        return None
+    return queries.member_principal(str(sender_id), frozenset(audience.members), at_ms=int(at_ms))
+
+
+def _reply_outside_window(
+    queries: HistoryQueries,
+    *,
+    chat_id: str,
+    history_id: str,
+    reply_to_native_id: str | None,
+    ambient_limit: int,
+) -> bool:
+    """True when the reply target is not in the last ``ambient_limit`` messages."""
+    if not reply_to_native_id or ambient_limit <= 0:
+        return False
+    target = queries.native_message(chat_id=chat_id, native_id=reply_to_native_id)
+    if target is None:
+        return False
+    rows = queries.recent(chat_id=chat_id, limit=ambient_limit, before_id=history_id)
+    return str(target["message_id"]) not in {str(row["message_id"]) for row in rows}
+
+
+def _earlier_conversation_link(
+    queries: HistoryQueries,
+    *,
+    chat_id: str,
+    history_id: str,
+    reply_to_native_id: str | None,
+    at_ms: int,
+    bounds: ConversationBounds,
+) -> bool:
+    """True when the reply points into a conversation that ended before this one."""
+    if not reply_to_native_id:
+        return False
+    target = queries.native_message(chat_id=chat_id, native_id=reply_to_native_id)
+    if target is None:
+        return False
+    conversations = read_conversations(queries, chat_id, int(at_ms), bounds)
+    item_conversation = next(
+        (item for item in conversations if history_id in item.message_ids), None
+    )
+    target_id = str(target["message_id"])
+    target_conversation = next(
+        (item for item in conversations if target_id in item.message_ids), None
+    )
+    if item_conversation is None or target_conversation is None:
+        return False
+    return bool(
+        target_conversation.id != item_conversation.id
+        and target_conversation.last_ms < item_conversation.start_ms
+    )
+
+
 async def load_reply_records(
     history: Any,
     processing_db: Path | None,
@@ -447,6 +541,11 @@ async def load_reply_records(
     since_ms: int,
     until_ms: int,
     chat_ids: Sequence[str] | None = None,
+    ambient_limit: int = 30,
+    lull_ms: int = 1_500_000,
+    burst_n: int = 8,
+    burst_ms: int = 900_000,
+    window_ms: int = 86_400_000,
 ) -> list[ReplyRecord]:
     """Group turns from ``processing.db`` joined with their as-of history message."""
     if processing_db is None:
@@ -458,6 +557,13 @@ async def load_reply_records(
     async with history_turn(history) as snapshot:
         queries = HistoryQueries(snapshot)
         assistant = queries.assistant_contact_ids()
+        bounds = ConversationBounds(
+            window_ms=max(1, int(window_ms)),
+            max_rows=500,
+            lull_ms=max(1, int(lull_ms)),
+            burst_n=max(1, int(burst_n)),
+            burst_ms=max(1, int(burst_ms)),
+        )
         for row in rows:
             stratum = _reply_stratum(row.get("outcome"))
             chat_id = str(row.get("chat_id") or "")
@@ -479,6 +585,24 @@ async def load_reply_records(
                 if reply_to_native is not None
                 else None
             )
+            signals: list[str] = []
+            if _reply_outside_window(
+                queries,
+                chat_id=chat_id,
+                history_id=history_id,
+                reply_to_native_id=reply_to_native,
+                ambient_limit=int(ambient_limit),
+            ):
+                signals.append("reply_outside_window")
+            if _earlier_conversation_link(
+                queries,
+                chat_id=chat_id,
+                history_id=history_id,
+                reply_to_native_id=reply_to_native,
+                at_ms=at_ms,
+                bounds=bounds,
+            ):
+                signals.append("earlier_conversation_link")
             result.append(
                 ReplyRecord(
                     item=ReplyStateItem(
@@ -495,12 +619,16 @@ async def load_reply_records(
                             reply_to_native_id=reply_to_native,
                             assistant=assistant,
                         ),
+                        older_context_signals=tuple(signals),
                     ),
                     history_id=history_id,
                     native_id=str(shaped.get("message_id") or ""),
                     text=text,
                     reply_to_history_id=str(target["event_id"]) if target else None,
                     reply_to_native_id=reply_to_native,
+                    sender_principal=_sender_principal(
+                        queries, chat_id, str(shaped.get("sender_id") or ""), at_ms
+                    ),
                 )
             )
     return result
@@ -613,20 +741,56 @@ async def load_writer_records(
     return result
 
 
-def _plan_calls(replies: int, writer: int, *, oracle: bool, labels_route: str) -> PlannedCalls:
-    arms = 5 if oracle else 4
-    pairs = len(PAIR_ORDER) + (1 if oracle else 0)
+def _requested_arms(run: "RunConfig") -> tuple[str, ...]:
+    """The arms this run generates: ``Sx`` joins automatically in oracle mode."""
+    arms = list(run.arms)
+    if run.oracle and "Sx" not in arms:
+        arms.append("Sx")
+    return tuple(arms)
+
+
+def _pairs_for_arms(arms: Sequence[str], *, oracle: bool) -> list[tuple[str, str, str]]:
+    """The pairs both of whose arms this run can actually generate."""
+    available = set(arms)
+    pairs = [
+        pair
+        for pair in (*PAIR_ORDER, *RECALL_PAIR_ORDER)
+        if pair[0] in available and pair[1] in available
+    ]
+    if oracle and {"Sx", "A"} <= available:
+        pairs.append(ORACLE_PAIR)
+    return pairs
+
+
+def _plan_calls(
+    replies: int,
+    writer: int,
+    *,
+    oracle: bool,
+    labels_route: str,
+    arms: Sequence[str] = ("A", "A2", "S", "P"),
+) -> PlannedCalls:
+    reply_arms = [arm for arm in arms if arm != "Sx" or oracle]
+    # The writer already has group recall live, so ``R`` is not applicable there.
+    writer_arms = [arm for arm in reply_arms if arm not in {"R", "P_R"}]
+    reply_pairs = _pairs_for_arms(reply_arms, oracle=oracle)
+    writer_pairs = _pairs_for_arms(writer_arms, oracle=oracle)
     total = replies + writer
+    needs_labels = any(arm in {"S", "P", "Sx"} for arm in reply_arms)
     routes = {
-        REPLY_ROUTE: replies * arms,
-        WRITER_ROUTE: writer * arms,
-        labels_route: total + (total if oracle else 0),
-        GRADER_ROUTE: total * pairs * 2,
+        REPLY_ROUTE: replies * len(reply_arms),
+        WRITER_ROUTE: writer * len(writer_arms),
+        labels_route: total * (1 if needs_labels else 0) + total * (1 if oracle else 0),
+        GRADER_ROUTE: 2 * (replies * len(reply_pairs) + writer * len(writer_pairs)),
     }
     prompt_tokens = (
-        total * arms * 900 + routes[labels_route] * LABEL_MAX_TOKENS + routes[GRADER_ROUTE] * 1_100
+        total * len(reply_arms) * 900
+        + routes[labels_route] * LABEL_MAX_TOKENS
+        + routes[GRADER_ROUTE] * 1_100
     )
-    completion_tokens = total * arms * 90 + routes[labels_route] * 160 + routes[GRADER_ROUTE] * 140
+    completion_tokens = (
+        total * len(reply_arms) * 90 + routes[labels_route] * 160 + routes[GRADER_ROUTE] * 140
+    )
     return PlannedCalls(
         routes={key: value for key, value in routes.items() if value},
         prompt_tokens=prompt_tokens,
@@ -670,6 +834,8 @@ class ReplyStateRunner:
         processing_db: Path | None = None,
         speakups_db: Path | None = None,
         decisions_db: Path | None = None,
+        knowledge: Any | None = None,
+        people: Any | None = None,
         reply_records: Sequence[ReplyRecord] | None = None,
         writer_records: Sequence[WriterRecord] | None = None,
     ) -> None:
@@ -684,6 +850,8 @@ class ReplyStateRunner:
         self._processing_db = processing_db
         self._speakups_db = speakups_db
         self._decisions_db = decisions_db
+        self._knowledge = knowledge
+        self._people = people
         self._reply_records = None if reply_records is None else tuple(reply_records)
         self._writer_records = None if writer_records is None else tuple(writer_records)
         self._group_state = getattr(getattr(config, "processing", None), "group_state", None)
@@ -723,6 +891,7 @@ class ReplyStateRunner:
         self._items_with_s_view = 0
         self._items_total = 0
         self._oracle = False
+        self._run_arms: tuple[str, ...] = ("A", "A2", "S", "P")
 
     # -- loading and planning ---------------------------------------------------------
 
@@ -737,6 +906,8 @@ class ReplyStateRunner:
         if self._reply_records is None or self._writer_records is None:
             now_ms = int(time.time() * 1000)
             since_ms = now_ms - max(1, int(run.days)) * 86_400_000
+            connection = getattr(getattr(self._config, "channels", None), "whatsapp", None)
+            consciousness = getattr(self._config, "consciousness", None)
             replies = (
                 await load_reply_records(
                     self._history,
@@ -744,6 +915,14 @@ class ReplyStateRunner:
                     since_ms=since_ms,
                     until_ms=now_ms,
                     chat_ids=chat_ids,
+                    ambient_limit=max(0, int(getattr(connection, "ambient_window_limit", 30))),
+                    lull_ms=max(1, int(getattr(consciousness, "lull_silence_minutes", 25)))
+                    * 60_000,
+                    burst_n=max(1, int(getattr(consciousness, "burst_threshold_messages", 8))),
+                    burst_ms=max(1, int(getattr(consciousness, "burst_window_minutes", 15)))
+                    * 60_000,
+                    window_ms=max(1, int(getattr(self._group_state, "window_hours", 24)))
+                    * 3_600_000,
                 )
                 if self._reply_records is None
                 else list(self._reply_records)
@@ -763,6 +942,7 @@ class ReplyStateRunner:
         else:
             replies = list(self._reply_records)
             writer = list(self._writer_records)
+        replies = await self._annotate_person_history(replies)
         by_id = {record.item.item_id: record for record in replies}
         writer_by_id = {record.item.item_id: record for record in writer}
         selection = sample_items(
@@ -770,6 +950,7 @@ class ReplyStateRunner:
             replies=run.replies,
             writer=run.writer,
             seed=run.seed,
+            older_context_share=run.older_context_share,
         )
         chosen_replies = tuple(
             by_id[item.item_id] for item in selection.items if item.kind == "reply"
@@ -782,6 +963,7 @@ class ReplyStateRunner:
             len(chosen_writer),
             oracle=run.oracle,
             labels_route=self._labels_route,
+            arms=_requested_arms(run),
         )
         return PreparedRun(
             selection=selection,
@@ -789,6 +971,67 @@ class ReplyStateRunner:
             writer=chosen_writer,
             planned=planned,
         )
+
+    async def _annotate_person_history(self, records: Sequence[ReplyRecord]) -> list[ReplyRecord]:
+        """Add the Knowledge-based ``person_with_history`` signal before sampling.
+
+        This is a read through the same gate as a reply: group membership must be
+        proven at the item time, and only a statement readable by that context counts.
+        """
+        if self._knowledge is None or not records:
+            return list(records)
+        from yeoman_gateway.adapters.responder_llm import build_group_read_context
+        from yeoman_gateway.history.context import history_knowledge_scope
+        from yeoman_gateway.knowledge.models import RecallQuery
+
+        annotated: list[ReplyRecord] = []
+        async with history_turn(self._history) as snapshot:
+            with history_knowledge_scope(snapshot, self._knowledge):
+                queries = HistoryQueries(snapshot)
+                for record in records:
+                    if (
+                        "person_with_history" in record.item.older_context_signals
+                        or not record.sender_principal
+                    ):
+                        annotated.append(record)
+                        continue
+                    context = build_group_read_context(
+                        queries=queries,
+                        channel="whatsapp",
+                        chat_id=record.item.chat_id,
+                        principal=record.sender_principal,
+                        is_owner=False,
+                        at_ms=record.item.at_ms,
+                        policy_revision=int(self._knowledge.policy_revision),
+                        purpose="reply",
+                    )
+                    found = False
+                    if context is not None:
+                        person_id = self._knowledge.person_for_principal(record.sender_principal)
+                        if person_id:
+                            statements = self._knowledge.recall(
+                                RecallQuery(
+                                    person_ids=(person_id,),
+                                    limit=1,
+                                    as_of_ms=record.item.at_ms,
+                                ),
+                                context=context,
+                                group_wide=True,
+                            )
+                            found = bool(statements.statement_ids)
+                    if found:
+                        record = replace(
+                            record,
+                            item=replace(
+                                record.item,
+                                older_context_signals=(
+                                    *record.item.older_context_signals,
+                                    "person_with_history",
+                                ),
+                            ),
+                        )
+                    annotated.append(record)
+        return annotated
 
     async def run(
         self,
@@ -804,7 +1047,192 @@ class ReplyStateRunner:
             )
         return await self.execute(prepared, run, report_dir=report_dir)
 
-    # -- preparation of one item (history reads only) ---------------------------------
+    # -- measurement only (no generation, no grading) ---------------------------------
+
+    async def measure(
+        self,
+        prepared: PreparedRun,
+        run: RunConfig,
+        *,
+        report_dir: Path | None = None,
+    ) -> RunOutcome:
+        """Count as-of recall availability per stratum; never calls a model."""
+        report_dir = Path(report_dir) if report_dir is not None else self._report_dir()
+        report_dir.mkdir(parents=True, exist_ok=True)
+        self._reset_run_state(limit=None, oracle=False, arms=_requested_arms(run))
+        rows: list[dict[str, Any]] = []
+        from yeoman_gateway.history.context import history_knowledge_scope
+
+        async with history_turn(self._history) as snapshot:
+            queries = HistoryQueries(snapshot)
+            with (
+                history_knowledge_scope(snapshot, self._knowledge)
+                if self._knowledge is not None
+                else nullcontext()
+            ):
+                for record in prepared.replies:
+                    rows.append(
+                        self._measure_record(
+                            queries,
+                            item=record.item,
+                            text=record.text,
+                            principal=record.sender_principal,
+                        )
+                    )
+                for record in prepared.writer:
+                    shaped = _history_row(
+                        queries,
+                        record.item.chat_id,
+                        record.target_native_id or record.target_history_id,
+                    )
+                    principal = (
+                        _sender_principal(
+                            queries,
+                            record.item.chat_id,
+                            str(shaped.get("sender_id") or ""),
+                            record.item.at_ms,
+                        )
+                        if shaped is not None
+                        else None
+                    )
+                    rows.append(
+                        self._measure_record(
+                            queries,
+                            item=record.item,
+                            text=record.text,
+                            principal=principal,
+                        )
+                    )
+        summary = self._measure_summary(rows, prepared)
+        descriptor = os.open(
+            report_dir / MEASURE_FILE,
+            os.O_WRONLY | os.O_CREAT | os.O_TRUNC,
+            0o600,
+        )
+        with os.fdopen(descriptor, "w", encoding="utf-8") as handle:
+            handle.write(json.dumps(summary, ensure_ascii=False, indent=2, sort_keys=True) + "\n")
+        return RunOutcome(
+            planned=prepared.planned,
+            summary=summary,
+            report_dir=report_dir,
+            partial=False,
+        )
+
+    def _measure_record(
+        self,
+        queries: HistoryQueries,
+        *,
+        item: ReplyStateItem,
+        text: str,
+        principal: str | None,
+    ) -> dict[str, Any]:
+        from yeoman_gateway.adapters.responder_llm import build_group_read_context
+        from yeoman_gateway.knowledge.models import RecallQuery
+
+        recall_hit = False
+        turn_person_hit = False
+        statements = 0
+        if self._knowledge is not None and principal:
+            context = build_group_read_context(
+                queries=queries,
+                channel="whatsapp",
+                chat_id=item.chat_id,
+                principal=principal,
+                is_owner=False,
+                at_ms=item.at_ms,
+                policy_revision=int(self._knowledge.policy_revision),
+                purpose="reply",
+            )
+            if context is not None:
+                recall = self._knowledge.recall(
+                    RecallQuery(text=text, limit=5, as_of_ms=item.at_ms),
+                    context=context,
+                    group_wide=True,
+                    require_match=True,
+                )
+                recall_hit = bool(recall.statement_ids)
+                person_id = self._knowledge.person_for_principal(principal)
+                if person_id:
+                    result = self._knowledge.recall(
+                        RecallQuery(
+                            person_ids=(person_id,),
+                            limit=50,
+                            as_of_ms=item.at_ms,
+                        ),
+                        context=context,
+                        group_wide=True,
+                    )
+                    statements = len(result.statement_ids)
+                    turn_person_hit = bool(statements)
+        return {
+            "item_id": item.item_id,
+            "kind": item.kind,
+            "stratum": item.stratum,
+            "older_context": item.older_context,
+            "signals": list(item.older_context_signals),
+            "as_of_recall_hit": recall_hit,
+            "turn_person_statement_hit": turn_person_hit,
+            "statements": statements,
+        }
+
+    def _measure_summary(
+        self, rows: Sequence[Mapping[str, Any]], prepared: PreparedRun
+    ) -> dict[str, Any]:
+        strata = sorted({str(row["stratum"]) for row in rows})
+        statements = [int(row["statements"]) for row in rows]
+        return {
+            "report_schema": 1,
+            "measure": True,
+            "read_only": True,
+            "no_generation": True,
+            "no_text": True,
+            "items": {
+                "selected": len(rows),
+                "reply": len(prepared.replies),
+                "writer": len(prepared.writer),
+                "requested": dict(prepared.selection.requested),
+                "available": dict(prepared.selection.available),
+                "shortfall": dict(prepared.selection.shortfall),
+                "older_context": sum(row["older_context"] for row in rows),
+            },
+            "overall": self._measure_stats(rows),
+            "strata": {
+                stratum: self._measure_stats([row for row in rows if row["stratum"] == stratum])
+                for stratum in strata
+            },
+            "statements_per_turn_person": _distribution(statements),
+        }
+
+    @staticmethod
+    def _measure_stats(rows: Sequence[Mapping[str, Any]]) -> dict[str, Any]:
+        total = len(rows)
+
+        def share(key: str) -> float | None:
+            if not total:
+                return None
+            return round(sum(bool(row[key]) for row in rows) / total, 3)
+
+        return {
+            "items": total,
+            "as_of_recall_hit": sum(bool(row["as_of_recall_hit"]) for row in rows),
+            "as_of_recall_hit_share": share("as_of_recall_hit"),
+            "turn_person_statement_hit": sum(
+                bool(row["turn_person_statement_hit"]) for row in rows
+            ),
+            "turn_person_statement_share": share("turn_person_statement_hit"),
+            "earlier_conversation_link": sum(
+                "earlier_conversation_link" in row["signals"] for row in rows
+            ),
+            "earlier_conversation_link_share": (
+                round(
+                    sum("earlier_conversation_link" in row["signals"] for row in rows) / total,
+                    3,
+                )
+                if total
+                else None
+            ),
+            "older_context": sum(bool(row["older_context"]) for row in rows),
+        }
 
     async def _state(self, queries: HistoryQueries, chat_id: str, at_ms: int) -> GroupState:
         return await build_state_as_of(
@@ -989,6 +1417,37 @@ class ReplyStateRunner:
             lines.append(f"[{sender}] {text[:MAX_TRANSCRIPT_CHARS]}")
         return "\n".join(lines)
 
+    def _recall_text(self, queries: HistoryQueries, record: ReplyRecord) -> str:
+        """The live reply recall block, built as of the item and nothing later."""
+        if self._knowledge is None or not record.sender_principal:
+            return ""
+        from yeoman_gateway.adapters.responder_llm import build_group_read_context
+        from yeoman_gateway.knowledge.models import RecallQuery
+
+        context = build_group_read_context(
+            queries=queries,
+            channel="whatsapp",
+            chat_id=record.item.chat_id,
+            principal=record.sender_principal,
+            is_owner=False,
+            at_ms=record.item.at_ms,
+            policy_revision=int(self._knowledge.policy_revision),
+            purpose="reply",
+        )
+        if context is None:
+            return ""
+        result = self._knowledge.recall(
+            RecallQuery(
+                text=record.text,
+                limit=5,
+                as_of_ms=record.item.at_ms,
+            ),
+            context=context,
+            group_wide=True,
+            require_match=True,
+        )
+        return str(result.text)
+
     async def _prepare_reply(self, record: ReplyRecord) -> _PreparedReply | None:
         target = ViewTarget(
             message_id=record.history_id,
@@ -997,6 +1456,13 @@ class ReplyStateRunner:
         try:
             async with history_turn(self._history) as snapshot:
                 queries = HistoryQueries(snapshot)
+                from yeoman_gateway.history.context import history_knowledge_scope
+
+                if self._knowledge is None:
+                    recall_text = ""
+                else:
+                    with history_knowledge_scope(snapshot, self._knowledge):
+                        recall_text = self._recall_text(queries, record)
                 base_state = await self._state(queries, record.item.chat_id, record.item.at_ms)
                 conversation = self._conversation(base_state, target, record.item.at_ms)
                 simulated, oracle, label_time = self._label_inputs(
@@ -1050,6 +1516,7 @@ class ReplyStateRunner:
             reply_text=reply_text,
             reply_participant=participant,
             base_messages=base_messages,
+            recall_text=recall_text,
             rendered_ms=[],
         )
 
@@ -1335,7 +1802,9 @@ class ReplyStateRunner:
         report_dir = Path(report_dir) if report_dir is not None else self._report_dir()
         report_dir.mkdir(parents=True, exist_ok=True)
         cache = LabelCache(report_dir / LABEL_CACHE_FILE)
-        self._reset_run_state(limit=run.limit_calls, oracle=bool(run.oracle))
+        self._reset_run_state(
+            limit=run.limit_calls, oracle=bool(run.oracle), arms=_requested_arms(run)
+        )
         self._items_total = len(prepared.replies) + len(prepared.writer)
         slots = asyncio.Semaphore(max(1, int(run.concurrency)))
         stopped = False
@@ -1383,11 +1852,18 @@ class ReplyStateRunner:
             partial=bool(summary["partial"]),
         )
 
-    def _reset_run_state(self, *, limit: int | None, oracle: bool) -> None:
+    def _reset_run_state(
+        self,
+        *,
+        limit: int | None,
+        oracle: bool,
+        arms: Sequence[str] | None = None,
+    ) -> None:
         """Start a clean run; the label cache is the only state that survives a rerun."""
         self._budget = _CallBudget(limit=limit)
         self._partial = False
         self._oracle = oracle
+        self._run_arms = tuple(arms or ("A", "A2", "S", "P"))
         self._label_calls = 0
         self._label_prompt_tokens = 0
         self._label_completion_tokens = 0
@@ -1425,56 +1901,71 @@ class ReplyStateRunner:
 
     async def _run_reply(self, prepared: _PreparedReply, cache: LabelCache, run: RunConfig) -> bool:
         record = prepared.record
-        simulated, _ = await self._label(prepared.simulated_input, cache, oracle=False)
-        if self._budget.exhausted:
-            self._partial = True
-            return False
-        oracle = None
-        if run.oracle:
-            oracle, _ = await self._label(prepared.oracle_input, cache, oracle=True)
+        requested = _requested_arms(run)
+        need_state = any(arm in {"S", "P", "Sx"} for arm in requested)
+        s_text = ""
+        s_items: tuple[str, ...] = ()
+        if need_state:
+            simulated, _ = await self._label(prepared.simulated_input, cache, oracle=False)
             if self._budget.exhausted:
                 self._partial = True
                 return False
-        s_section = self._label_section(
-            prepared.simulated_input,
-            simulated,
-            prepared.label_time_ms or record.item.at_ms,
-        )
-        s_state = self._with_labels(prepared.base_state, s_section)
-        s_text, s_items, s_ms = self._render(
-            s_state,
-            ViewTarget(record.history_id, record.reply_to_history_id),
-            chat_id=record.item.chat_id,
-            at_ms=record.item.at_ms,
-            writer=False,
-        )
-        oracle_text = ""
-        if run.oracle:
-            sx_section = self._label_section(prepared.oracle_input, oracle, record.item.at_ms)
-            sx_state = self._with_labels(prepared.base_state, sx_section)
-            oracle_text, _, sx_ms = self._render(
-                sx_state,
+            oracle = None
+            if run.oracle:
+                oracle, _ = await self._label(prepared.oracle_input, cache, oracle=True)
+                if self._budget.exhausted:
+                    self._partial = True
+                    return False
+            s_section = self._label_section(
+                prepared.simulated_input,
+                simulated,
+                prepared.label_time_ms or record.item.at_ms,
+            )
+            s_state = self._with_labels(prepared.base_state, s_section)
+            s_text, s_items, s_ms = self._render(
+                s_state,
                 ViewTarget(record.history_id, record.reply_to_history_id),
                 chat_id=record.item.chat_id,
                 at_ms=record.item.at_ms,
                 writer=False,
             )
-            prepared.rendered_ms.append(sx_ms)
-        prepared.rendered_ms.append(s_ms)
-        self._render_ms.extend(prepared.rendered_ms)
-        self._items_with_s_view += int(bool(s_text.strip()))
-        self._s_items_with_derived += int(bool(s_items))
+            oracle_text = ""
+            if run.oracle:
+                sx_section = self._label_section(prepared.oracle_input, oracle, record.item.at_ms)
+                sx_state = self._with_labels(prepared.base_state, sx_section)
+                oracle_text, _, sx_ms = self._render(
+                    sx_state,
+                    ViewTarget(record.history_id, record.reply_to_history_id),
+                    chat_id=record.item.chat_id,
+                    at_ms=record.item.at_ms,
+                    writer=False,
+                )
+                prepared.rendered_ms.append(sx_ms)
+            prepared.rendered_ms.append(s_ms)
+            self._render_ms.extend(prepared.rendered_ms)
+            self._items_with_s_view += int(bool(s_text.strip()))
+            self._s_items_with_derived += int(bool(s_items))
         placebo = build_placebo(s_text, seed=int(record.item.at_ms) + int(run.seed))
-        arms = {
-            "A": arm_messages(prepared.base_messages, ""),
-            "A2": arm_messages(prepared.base_messages, ""),
-            "S": arm_messages(prepared.base_messages, s_text),
-            "P": arm_messages(prepared.base_messages, placebo),
-        }
-        if run.oracle:
+        arms: dict[str, list[dict[str, str]]] = {}
+        if "A" in requested:
+            arms["A"] = arm_messages(prepared.base_messages, "")
+        if "A2" in requested:
+            arms["A2"] = arm_messages(prepared.base_messages, "")
+        if "S" in requested:
+            arms["S"] = arm_messages(prepared.base_messages, s_text)
+        if "P" in requested:
+            arms["P"] = arm_messages(prepared.base_messages, placebo)
+        if "Sx" in requested and run.oracle:
             arms["Sx"] = arm_messages(prepared.base_messages, oracle_text)
+        if "R" in requested:
+            arms["R"] = arm_messages(prepared.base_messages, prepared.recall_text)
+        if "P_R" in requested:
+            arms["P_R"] = arm_messages(
+                prepared.base_messages,
+                build_placebo(prepared.recall_text, seed=int(record.item.at_ms) + int(run.seed)),
+            )
         generated: dict[str, _CallResult] = {}
-        for arm in ARMS:
+        for arm in requested:
             if arm not in arms:
                 continue
             if self._budget.exhausted:
@@ -1503,45 +1994,51 @@ class ReplyStateRunner:
         self, prepared: _PreparedWriter, cache: LabelCache, run: RunConfig
     ) -> bool:
         record = prepared.record
-        simulated, _ = await self._label(prepared.simulated_input, cache, oracle=False)
-        if self._budget.exhausted:
-            self._partial = True
-            return False
-        oracle = None
-        if run.oracle:
-            oracle, _ = await self._label(prepared.oracle_input, cache, oracle=True)
+        # The writer already has group recall in production, so R/P_R are not generated.
+        requested = tuple(arm for arm in _requested_arms(run) if arm not in {"R", "P_R"})
+        need_state = any(arm in {"S", "P", "Sx"} for arm in requested)
+        s_text = ""
+        s_items: tuple[str, ...] = ()
+        if need_state:
+            simulated, _ = await self._label(prepared.simulated_input, cache, oracle=False)
             if self._budget.exhausted:
                 self._partial = True
                 return False
-        s_section = self._label_section(
-            prepared.simulated_input,
-            simulated,
-            prepared.label_time_ms or record.item.at_ms,
-        )
-        s_state = self._with_labels(prepared.base_state, s_section)
-        s_text, s_items, s_ms = self._render(
-            s_state,
-            prepared.target,
-            chat_id=record.item.chat_id,
-            at_ms=record.item.at_ms,
-            writer=True,
-        )
-        oracle_text = ""
-        if run.oracle:
-            sx_section = self._label_section(prepared.oracle_input, oracle, record.item.at_ms)
-            sx_state = self._with_labels(prepared.base_state, sx_section)
-            oracle_text, _, sx_ms = self._render(
-                sx_state,
+            oracle = None
+            if run.oracle:
+                oracle, _ = await self._label(prepared.oracle_input, cache, oracle=True)
+                if self._budget.exhausted:
+                    self._partial = True
+                    return False
+            s_section = self._label_section(
+                prepared.simulated_input,
+                simulated,
+                prepared.label_time_ms or record.item.at_ms,
+            )
+            s_state = self._with_labels(prepared.base_state, s_section)
+            s_text, s_items, s_ms = self._render(
+                s_state,
                 prepared.target,
                 chat_id=record.item.chat_id,
                 at_ms=record.item.at_ms,
                 writer=True,
             )
-            prepared.rendered_ms.append(sx_ms)
-        prepared.rendered_ms.append(s_ms)
-        self._render_ms.extend(prepared.rendered_ms)
-        self._items_with_s_view += int(bool(s_text.strip()))
-        self._s_items_with_derived += int(bool(s_items))
+            oracle_text = ""
+            if run.oracle:
+                sx_section = self._label_section(prepared.oracle_input, oracle, record.item.at_ms)
+                sx_state = self._with_labels(prepared.base_state, sx_section)
+                oracle_text, _, sx_ms = self._render(
+                    sx_state,
+                    prepared.target,
+                    chat_id=record.item.chat_id,
+                    at_ms=record.item.at_ms,
+                    writer=True,
+                )
+                prepared.rendered_ms.append(sx_ms)
+            prepared.rendered_ms.append(s_ms)
+            self._render_ms.extend(prepared.rendered_ms)
+            self._items_with_s_view += int(bool(s_text.strip()))
+            self._s_items_with_derived += int(bool(s_items))
         placebo = build_placebo(s_text, seed=int(record.item.at_ms) + int(run.seed))
 
         def prompt(block: str) -> str:
@@ -1550,16 +2047,19 @@ class ReplyStateRunner:
                 context["writer_state_text"] = block
             return _writer_prompt(context)
 
-        prompts = {
-            "A": prepared.base_prompt,
-            "A2": prepared.base_prompt,
-            "S": prompt(s_text),
-            "P": prompt(placebo),
-        }
-        if run.oracle:
+        prompts: dict[str, str] = {}
+        if "A" in requested:
+            prompts["A"] = prepared.base_prompt
+        if "A2" in requested:
+            prompts["A2"] = prepared.base_prompt
+        if "S" in requested:
+            prompts["S"] = prompt(s_text)
+        if "P" in requested:
+            prompts["P"] = prompt(placebo)
+        if "Sx" in requested and run.oracle:
             prompts["Sx"] = prompt(oracle_text)
         generated: dict[str, _CallResult] = {}
-        for arm in ARMS:
+        for arm in requested:
             if arm not in prompts:
                 continue
             if self._budget.exhausted:
@@ -1593,9 +2093,7 @@ class ReplyStateRunner:
         generated: Mapping[str, _CallResult],
         run: RunConfig,
     ) -> None:
-        pairs = list(PAIR_ORDER)
-        if run.oracle:
-            pairs.append(ORACLE_PAIR)
+        pairs = _pairs_for_arms(_requested_arms(run), oracle=run.oracle)
         for first_arm, second_arm, pair in pairs:
             if self._budget.exhausted:
                 self._partial = True
@@ -1641,9 +2139,7 @@ class ReplyStateRunner:
         for grade in self._grades:
             pair_records.setdefault(str(grade["pair"]), []).append(grade)
         pairs: dict[str, Any] = {}
-        pair_order = list(PAIR_ORDER)
-        if self._oracle:
-            pair_order.append(ORACLE_PAIR)
+        pair_order = _pairs_for_arms(self._run_arms, oracle=self._oracle)
         for first_arm, second_arm, pair in pair_order:
             records = pair_records.get(pair, [])
             pairs[pair] = {
@@ -1699,6 +2195,19 @@ class ReplyStateRunner:
             and isinstance(a_contradicts, (int, float))
             and s_contradicts <= a_contradicts
         )
+        r_a_ci = pairs.get("R_vs_A", {}).get("overall", {}).get("ci95")
+        r_a_low = r_a_ci[0] if isinstance(r_a_ci, (list, tuple)) and r_a_ci else None
+        r_gt_a = bool(
+            isinstance(r_a_low, (int, float)) and threshold is not None and r_a_low > threshold
+        )
+        r_p_r = pairs.get("R_vs_P_R", {}).get("overall", {}).get("win_rate")
+        r_gt_p_r = bool(isinstance(r_p_r, (int, float)) and r_p_r > 0.5)
+        r_contradicts = arms.get("R", {}).get("contradicts_rate")
+        no_more_contradictions_r = (
+            isinstance(r_contradicts, (int, float))
+            and isinstance(a_contradicts, (int, float))
+            and r_contradicts <= a_contradicts
+        )
         gate = {
             "s_gt_a": bool(
                 isinstance(s_a, (int, float)) and threshold is not None and s_a > threshold
@@ -1707,10 +2216,15 @@ class ReplyStateRunner:
                 isinstance(s_p, (int, float)) and threshold is not None and s_p > threshold
             ),
             "no_more_contradictions": bool(no_more_contradictions),
+            "r_gt_a": r_gt_a,
+            "r_gt_p_r": r_gt_p_r,
+            "no_more_contradictions_r": bool(no_more_contradictions_r),
             "owner_sample_pending": True,
             "s_vs_a_win_rate": s_a,
             "s_vs_p_win_rate": s_p,
             "a2_vs_a_win_rate": a2,
+            "r_vs_a_lower_ci": r_a_low,
+            "r_vs_p_r_win_rate": r_p_r,
             "noise_band": round(band, 3) if band is not None else None,
             "threshold": round(threshold, 3) if threshold is not None else None,
             "view_render_p95_ms": _percentile(self._render_ms, 0.95),
@@ -1741,6 +2255,14 @@ class ReplyStateRunner:
                     if prepared.replies
                     else None
                 ),
+                "older_context": sum(item.older_context for item in prepared.selection.items),
+                "older_context_signals": dict(
+                    Counter(
+                        signal
+                        for item in prepared.selection.items
+                        for signal in item.older_context_signals
+                    )
+                ),
                 "prepare_failures": dict(self._prepare_failures),
             },
             "planned": {
@@ -1756,6 +2278,14 @@ class ReplyStateRunner:
             "models": self._model_summary(),
             "pairs": pairs,
             "arms": arms,
+            "arm_notes": (
+                {
+                    "R": "not applicable to writer items: the live writer already renders "
+                    "group recall"
+                }
+                if any(arm in {"R", "P_R"} for arm in self._run_arms)
+                else {}
+            ),
             "labels": labels,
             "gate": gate,
             "generation_errors": dict(self._generation_errors),
@@ -2126,12 +2656,15 @@ def render_report(summary: Mapping[str, Any]) -> str:
 __all__ = [
     "ARMS",
     "CANDIDATES_FILE",
+    "DEFAULT_ARMS",
     "DEFAULT_LABELS_ROUTE",
     "GRADER_ROUTE",
     "ITEMS_FILE",
     "LABEL_CACHE_FILE",
+    "MEASURE_FILE",
     "ORACLE_PAIR",
     "PAIR_ORDER",
+    "RECALL_PAIR_ORDER",
     "REPLY_ROUTE",
     "REPORT_DIR",
     "WRITER_ROUTE",

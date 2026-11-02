@@ -246,6 +246,7 @@ def open_knowledge_store(
     policy_authority: PolicyAuthority,
     clock: Any | None = None,
     create: bool = True,
+    readonly: bool = False,
     retention_ms: int | None = None,
     legacy_sources: Iterable[Path] = (),
     people: PeopleResolver | None = None,
@@ -304,7 +305,7 @@ def open_knowledge_store(
                 " an explicit snapshot upgrade is required",
             )
     try:
-        store = KnowledgeStore(path, create=False)
+        store = KnowledgeStore(path, create=False, readonly=readonly)
     except sqlite3.Error as exc:  # pragma: no cover - defensive
         raise KnowledgeStartupError("storage_unavailable", str(exc)) from exc
     return KnowledgeService(
