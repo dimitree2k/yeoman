@@ -934,6 +934,9 @@ class RecallQuery:
     person_ids: tuple[str, ...] = ()
     roles: tuple[str, ...] = ()
     limit: int = 10
+    #: Evaluate the read as of this instant: anything created, corrected or sourced
+    #: after it is invisible.  ``None`` keeps the live read unchanged.
+    as_of_ms: int | None = None
 
     def __post_init__(self) -> None:
         if not isinstance(self.text, str):
@@ -950,6 +953,10 @@ class RecallQuery:
         if limit > MAX_RECALL_LIMIT:
             raise ValidationError(f"limit must be <= {MAX_RECALL_LIMIT}")
         object.__setattr__(self, "limit", limit)
+        if self.as_of_ms is not None:
+            object.__setattr__(
+                self, "as_of_ms", _require_int(self.as_of_ms, "as_of_ms", minimum=0)
+            )
 
 
 @dataclass(frozen=True, slots=True)

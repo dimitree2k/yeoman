@@ -704,6 +704,54 @@ def _render_participation_transcript(context: dict[str, object], *, limit: int =
     return rendered
 
 
+def build_group_read_context(
+    *,
+    queries: Any,
+    channel: str,
+    chat_id: str,
+    principal: str,
+    is_owner: bool,
+    at_ms: int,
+    policy_revision: int,
+    purpose: str,
+) -> TrustedReadContext | None:
+    """Build a group read context from *history-proven* membership.
+
+    Pure: the caller supplies the snapshot and the instant.  Membership is `None`
+    (a refused read) unless the archive proves a known roster at ``at_ms``, which is
+    exactly the proof the Knowledge read gate re-checks.  The principal is mapped to
+    the roster spelling before the context is built, so an LID message sender and a
+    phone-form membership name the same member.
+    """
+    if queries is None or not str(principal or "").strip():
+        return None
+    from yeoman_gateway.knowledge.models import TrustedReadContext
+
+    at = int(at_ms)
+    audience = queries.members(chat_id=str(chat_id), at_ms=at)
+    if audience.status != "known" or not audience.members:
+        return None
+    members = frozenset(audience.members)
+    resolved = str(principal)
+    if resolved not in members:
+        token = resolved.partition(":")[2] or resolved
+        mapped = queries.member_principal(token, members, at_ms=at)
+        if mapped is not None:
+            resolved = mapped
+    return TrustedReadContext(
+        principal_id=resolved,
+        channel=str(channel),
+        chat_id=str(chat_id),
+        recipient_principals=members,
+        membership_revision=f"{channel}:{chat_id}:{len(members)}",
+        policy_revision=int(policy_revision),
+        purpose=str(purpose),
+        now_ms=at,
+        is_direct=False,
+        owner=bool(is_owner),
+    )
+
+
 class LLMResponder(ResponderPort):
     """ResponderPort implementation using provider chat-completions + tool loop."""
 
@@ -727,6 +775,7 @@ class LLMResponder(ResponderPort):
         knowledge: object | None = None,
         people: PeopleResolver | None = None,
         knowledge_sources: object | None = None,
+        group_reply_recall: bool = False,
         telemetry: TelemetryPort | None = None,
         security: SecurityPort | None = None,
         owner_alert_resolver: "Callable[[str], list[str]] | None" = None,
@@ -771,6 +820,7 @@ class LLMResponder(ResponderPort):
         self._history_knowledge: Any = None
         self.knowledge = knowledge
         self.people = people
+        self._group_reply_recall = bool(group_reply_recall)
         #: Proof owner for archived turn sources.  Retained for the compositions that
         #: still inject it; registration itself goes through the public facade so the
         #: responder never needs the module's private authority types.
@@ -3462,6 +3512,25 @@ class LLMResponder(ResponderPort):
             members = (
                 frozenset({principal}) if owner_direct else frozenset({principal, str(chat_id)})
             )
+        if (
+            members is None
+            and getattr(self, "_group_reply_recall", False)
+            and snapshot is not None
+        ):
+            # Group recall is gated on a *proven* roster from the archive, the same
+            # source voice governance uses.  Unknown membership stays refused.
+            group_context = build_group_read_context(
+                queries=HistoryQueries(snapshot),
+                channel=channel,
+                chat_id=chat_id,
+                principal=str(principal),
+                is_owner=bool(is_owner),
+                at_ms=now_ms,
+                policy_revision=self._knowledge_policy_revision(),
+                purpose=purpose,
+            )
+            if group_context is not None:
+                return group_context
         return TrustedReadContext(
             principal_id=str(principal),
             channel=str(channel),
@@ -3565,6 +3634,7 @@ class LLMResponder(ResponderPort):
         result = cast(Any, self.knowledge).recall(
             RecallQuery(text=query, person_ids=person_ids, limit=20 if owner_scope else 5),
             context=context,
+            group_wide=not context.is_direct,
             require_match=True,
         )
         return str(result.text)

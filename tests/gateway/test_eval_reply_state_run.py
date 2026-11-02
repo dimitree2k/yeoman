@@ -5,6 +5,7 @@ from __future__ import annotations
 import asyncio
 import json
 import sqlite3
+from contextlib import contextmanager
 from pathlib import Path
 from types import SimpleNamespace
 from typing import Any
@@ -157,6 +158,7 @@ def _record(history: ProjectedHistory, *, at_ms: int) -> ReplyRecord:
         history_id="item",
         native_id="item",
         text="the item message",
+        sender_principal="whatsapp:10000",
     )
 
 
@@ -167,6 +169,7 @@ def _runner(
     labels: RecordingClient | None = None,
     grader: RecordingClient | None = None,
     reply: RecordingClient | None = None,
+    knowledge: Any | None = None,
 ) -> ReplyStateRunner:
     from yeoman_shared.config.schema import Config
 
@@ -187,7 +190,32 @@ def _runner(
         persona_for=lambda channel, chat_id: "You are Arvid.",
         reply_records=[_record(history, at_ms=T0 + 35_000)],
         writer_records=[],
+        knowledge=knowledge,
     )
+
+
+class FakeRecallKnowledge:
+    """A gate-shaped recall stub: only the as-of item instant yields a hit."""
+
+    policy_revision = 1
+    history_source_ledger = None
+    _legacy_authority = None
+
+    def __init__(self) -> None:
+        self.queries: list[tuple[Any, Any, dict[str, Any]]] = []
+
+    @contextmanager
+    def history_scope(self, queries: Any, sources: Any):
+        yield
+
+    def recall(self, query: Any, *, context: Any, **kwargs: Any) -> Any:
+        self.queries.append((query, context, dict(kwargs)))
+        if "item" in query.text and query.as_of_ms == T0 + 35_000:
+            return SimpleNamespace(text="before-item plan", statement_ids=("s1",))
+        return SimpleNamespace(text="", statement_ids=())
+
+    def person_for_principal(self, principal: str) -> str | None:
+        return None
 
 
 @pytest.mark.asyncio
@@ -671,3 +699,59 @@ async def test_concurrent_run_matches_serial_summary(tmp_path: Path) -> None:
         assert outcome.summary is not None
         summaries.append({key: outcome.summary[key] for key in ("pairs", "calls")})
     assert summaries[0] == summaries[1]
+
+
+@pytest.mark.asyncio
+async def test_r_arm_recall_built_as_of_item_time(tmp_path: Path) -> None:
+    history = _history(tmp_path, count=35)
+    knowledge = FakeRecallKnowledge()
+    reply = RecordingClient(text="reply candidate", route_key=REPLY_ROUTE)
+    runner = _runner(tmp_path, history, reply=reply, knowledge=knowledge)
+    try:
+        outcome = await runner.run(
+            RunConfig(replies=1, writer=0, seed=7, yes=True, arms=("A", "R")),
+            report_dir=tmp_path / "run",
+        )
+    finally:
+        history.close()
+
+    assert outcome.summary is not None
+    assert len(reply.calls) == 2  # A, R
+    base, recall = reply.calls
+    assert recall[:-1] == base[:-1]
+    assert "before-item plan" in recall[-1]["content"]
+    assert len(knowledge.queries) == 1
+    query, _context, kwargs = knowledge.queries[0]
+    assert query.as_of_ms == T0 + 35_000
+    assert query.limit == 5
+    assert kwargs["group_wide"] is True and kwargs["require_match"] is True
+
+
+@pytest.mark.asyncio
+async def test_measure_only_makes_no_generation_calls(tmp_path: Path) -> None:
+    history = _history(tmp_path, count=35)
+    knowledge = FakeRecallKnowledge()
+    reply = RecordingClient(text="reply candidate", route_key=REPLY_ROUTE)
+    grader = RecordingClient(text=GRADE, route_key=GRADER_ROUTE)
+    runner = _runner(
+        tmp_path,
+        history,
+        reply=reply,
+        grader=grader,
+        knowledge=knowledge,
+    )
+    report_dir = tmp_path / "measure"
+    try:
+        run = RunConfig(replies=1, writer=0, seed=7, yes=False, arms=("A", "A2", "R", "P_R"))
+        prepared = await runner.prepare(run)
+        outcome = await runner.measure(prepared, run, report_dir=report_dir)
+    finally:
+        history.close()
+
+    assert outcome.report_dir == report_dir
+    assert reply.calls == [] and grader.calls == []
+    payload = json.loads((report_dir / "measure.json").read_text())
+    assert payload["measure"] is True and payload["no_generation"] is True
+    assert payload["overall"]["items"] == 1
+    assert payload["overall"]["as_of_recall_hit"] == 1
+    assert "before-item plan" not in (report_dir / "measure.json").read_text()

@@ -4,8 +4,13 @@ from __future__ import annotations
 
 import pytest
 from pydantic import ValidationError
-from yeoman_shared.config.loader import camel_to_snake, convert_keys, snake_to_camel
-from yeoman_shared.config.schema import Config, GroupStateConfig
+from yeoman_shared.config.loader import (
+    camel_to_snake,
+    convert_keys,
+    convert_to_camel,
+    snake_to_camel,
+)
+from yeoman_shared.config.schema import Config, GroupStateConfig, KnowledgeConfig
 
 
 def test_config_default_off() -> None:
@@ -116,3 +121,14 @@ def test_labels_default_route_survives_config_key_round_trip() -> None:
     route = GroupStateConfig().labels.route
     assert camel_to_snake(snake_to_camel(route)) == route
     assert snake_to_camel(camel_to_snake(route)) == route
+
+
+def test_knowledge_group_reply_recall_defaults_off_and_round_trips() -> None:
+    assert Config().knowledge.group_reply_recall == "off"
+
+    configured = KnowledgeConfig.model_validate(convert_keys({"groupReplyRecall": "on"}))
+    assert configured.group_reply_recall == "on"
+
+    payload = convert_to_camel(Config().model_dump())
+    assert payload["knowledge"]["groupReplyRecall"] == "off"
+    assert convert_keys(payload)["knowledge"]["group_reply_recall"] == "off"

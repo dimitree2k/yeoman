@@ -459,6 +459,9 @@ class KnowledgeConfig(BaseModel):
     capture_batch_max: int = 8
     capture_max_waiting: int = 64
     capture_poll_seconds: float = 5.0
+    #: Restore Knowledge recall in group replies through a history-proven membership
+    #: read.  Off keeps today's prompt byte-identical; on is the R eval arm's live shape.
+    group_reply_recall: Literal["off", "on"] = str(DEFAULT_KNOWLEDGE["group_reply_recall"])
 
     @property
     def resolved_db_path(self) -> Path:

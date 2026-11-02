@@ -86,10 +86,10 @@ def test_sample_is_seeded_and_stratified_with_hard_case_floor() -> None:
     assert {item.stratum for item in replies} == set(REPLY_STRATA)
     assert {item.stratum for item in writer} == set(WRITER_STRATA)
     assert first.hard_cases == 6
-    assert first.shortfall == {"replies": 0, "writer": 0}
+    assert first.shortfall == {"replies": 0, "writer": 0, "older_context": 12}
 
     short = sample_items(items[:8], replies=20, writer=10, seed=7)
-    assert short.shortfall == {"replies": 12, "writer": 10}
+    assert short.shortfall == {"replies": 12, "writer": 10, "older_context": 12}
     assert len(short.items) == 8
 
 
@@ -186,3 +186,76 @@ def test_simulated_label_cut_policy() -> None:
     assert simulated_label_cut(times, t=59, refresh_after=30) == 29
     assert simulated_label_cut(times, t=60, refresh_after=30) == 59
     assert simulated_label_cut([], t=1_000, refresh_after=30) is None
+
+
+def test_older_context_signals_structural() -> None:
+    base = dict(kind="reply", chat_id="synthetic@g.us", at_ms=1_000, stratum=REPLY_STRATA[0])
+    outside = ReplyStateItem(
+        item_id="outside",
+        hard_case=True,
+        older_context_signals=("reply_outside_window",),
+        **base,
+    )
+    earlier = ReplyStateItem(
+        item_id="earlier",
+        older_context_signals=("earlier_conversation_link",),
+        **base,
+    )
+    person = ReplyStateItem(
+        item_id="person",
+        older_context_signals=("person_with_history",),
+        **base,
+    )
+    none = ReplyStateItem(item_id="none", **base)
+
+    assert outside.older_context and outside.hard_case
+    assert earlier.older_context and person.older_context
+    assert none.older_context is False and none.older_context_signals == ()
+    assert outside.older_context_signals == ("reply_outside_window",)
+    with pytest.raises(ValueError):
+        ReplyStateItem(item_id="bad", older_context_signals=("made_up",), **base)
+
+
+def _older_items() -> list[ReplyStateItem]:
+    items = [
+        ReplyStateItem(
+            item_id=f"o{index:02d}",
+            kind="reply",
+            chat_id="synthetic@g.us",
+            at_ms=index * 1_000,
+            stratum=REPLY_STRATA[index % len(REPLY_STRATA)],
+            older_context_signals=("reply_outside_window",),
+        )
+        for index in range(30)
+    ]
+    items.extend(
+        ReplyStateItem(
+            item_id=f"n{index:02d}",
+            kind="reply",
+            chat_id="synthetic@g.us",
+            at_ms=(index + 40) * 1_000,
+            stratum=REPLY_STRATA[index % len(REPLY_STRATA)],
+        )
+        for index in range(30)
+    )
+    return items
+
+
+def test_sample_oversamples_older_context_and_reports_shortfall() -> None:
+    selected = sample_items(_older_items(), replies=20, writer=0, seed=7)
+
+    older = [item for item in selected.items if item.older_context]
+    assert len(older) >= 12  # ceil(0.6 * 20)
+    assert selected.shortfall["older_context"] == 0
+
+    short = sample_items(_older_items()[:5], replies=20, writer=0, seed=7)
+    assert short.shortfall["older_context"] == 7
+    assert len([item for item in short.items if item.older_context]) == 5
+
+
+def test_hard_case_sampling_unchanged() -> None:
+    items = _items()
+    selected = sample_items(items, replies=20, writer=0, seed=7)
+    replies = [item for item in selected.items if item.kind == "reply"]
+    assert sum(item.hard_case for item in replies) == 6
+    assert selected.shortfall["older_context"] == 12
