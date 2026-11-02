@@ -4546,7 +4546,12 @@ def build_gateway_runtime(
     )
     if signal_invalidator is not None:
         signal_invalidator.set_group_state(group_state_service)
-    group_state_views = _build_group_state_view_reader(config, group_state_service)
+    group_state_views = _build_group_state_view_reader(
+        config,
+        group_state_service,
+        knowledge=knowledge_service,
+        history=history_projector,
+    )
     if group_state_views is not None:
         responder.set_group_state_views(group_state_views)
 
@@ -5012,7 +5017,13 @@ def _build_group_state_service(
     return service
 
 
-def _build_group_state_view_reader(config: "Config", service: Any | None) -> Any | None:
+def _build_group_state_view_reader(
+    config: "Config",
+    service: Any | None,
+    *,
+    knowledge: Any | None = None,
+    history: Any | None = None,
+) -> Any | None:
     """The hot-path reader, or ``None`` when both views are off or no state exists."""
     if service is None:
         return None
@@ -5027,11 +5038,20 @@ def _build_group_state_view_reader(config: "Config", service: Any | None) -> Any
         return None
     from yeoman_gateway.group_state.view_reader import GroupStateViewReader
 
+    def _current_queries() -> Any | None:
+        from yeoman_gateway.history.context import current_history_snapshot
+        from yeoman_gateway.history.queries import HistoryQueries
+
+        snapshot = current_history_snapshot()
+        return HistoryQueries(snapshot) if snapshot is not None else None
+
     lull_minutes = int(getattr(config.consciousness, "lull_silence_minutes", 25) or 25)
     return GroupStateViewReader(
         store=service.store,
         settings=settings,
         lull_ms=max(1, lull_minutes) * 60_000,
+        knowledge=knowledge,
+        history_queries=_current_queries if history is not None else None,
     )
 
 

@@ -209,7 +209,10 @@ def test_older_context_signals_structural() -> None:
     none = ReplyStateItem(item_id="none", **base)
 
     assert outside.older_context and outside.hard_case
-    assert earlier.older_context and person.older_context
+    assert earlier.older_context
+    # Kept as a reported signal, but it is not a structural older-context reason.
+    assert person.older_context is False
+    assert person.older_context_signals == ("person_with_history",)
     assert none.older_context is False and none.older_context_signals == ()
     assert outside.older_context_signals == ("reply_outside_window",)
     with pytest.raises(ValueError):

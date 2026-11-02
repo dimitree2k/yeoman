@@ -433,7 +433,9 @@ def eval_reply_state(
     arms: str = typer.Option(
         "A,A2,R,P_R",
         "--arms",
-        help="Comma list of arms: A, A2, R, P_R and the older S, P, Sx",
+        help=(
+            "Comma list of arms: A, A2, R, P_R, N, P_N, H, P_H and the older S, P, Sx"
+        ),
     ),
     measure: bool = typer.Option(
         False,
@@ -575,6 +577,10 @@ def eval_reply_state(
             typer.echo("no model calls; rerun with --yes")
             return
 
+        from yeoman_gateway.evaluation.long_term_context import (
+            PEOPLE_ROUTE,
+            SUMMARIES_ROUTE,
+        )
         from yeoman_gateway.processing.model_route import RouteClient, RouteUnavailableError
 
         try:
@@ -586,6 +592,12 @@ def eval_reply_state(
                 ),
                 GRADER_ROUTE: RouteClient(config=config, route_key=GRADER_ROUTE),
             }
+            if any(arm in {"N", "P_N"} for arm in requested_arms):
+                clients[PEOPLE_ROUTE] = RouteClient(config=config, route_key=PEOPLE_ROUTE)
+            if any(arm in {"H", "P_H"} for arm in requested_arms):
+                clients[SUMMARIES_ROUTE] = RouteClient(
+                    config=config, route_key=SUMMARIES_ROUTE
+                )
         except RouteUnavailableError as exc:
             typer.echo(f"error: model route unavailable: {exc}")
             raise typer.Exit(2) from exc
@@ -609,6 +621,14 @@ def eval_reply_state_review(
     report_dir: Path = typer.Argument(..., help="A reply-state evaluation report directory"),
     sample: int = typer.Option(20, "--sample", min=1, max=200),
     seed: int = typer.Option(7, "--seed"),
+    pair: str = typer.Option(
+        "S_vs_A", "--pair", help="Pair to review, e.g. N_vs_A, H_vs_A, A2_vs_A"
+    ),
+    stratum: str | None = typer.Option(
+        None,
+        "--stratum",
+        help="Only this stratum; 'older_context' selects structural older-context items",
+    ),
     out: Path = typer.Option(..., "--out", help="Owner review markdown (mode 0600)"),
 ) -> None:
     """Write the blind owner review and its separate X/Y key."""
@@ -629,7 +649,14 @@ def eval_reply_state_review(
     history = FrozenHistory(history_db_path())
     try:
         review, key = asyncio.run(
-            build_review(directory, history, sample=sample, seed=seed)
+            build_review(
+                directory,
+                history,
+                sample=sample,
+                seed=seed,
+                pair=pair,
+                stratum=stratum,
+            )
         )
     finally:
         history.close()

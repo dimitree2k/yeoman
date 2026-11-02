@@ -24,9 +24,12 @@ KINDS: tuple[str, ...] = ("reply", "writer")
 DEFAULT_SEED = 7
 HARD_CASE_FLOOR = 0.30
 #: Structural reasons an item needs context from outside the recent-message window.
-OLDER_CONTEXT_SIGNALS: tuple[str, ...] = (
+STRUCTURAL_OLDER_CONTEXT_SIGNALS: tuple[str, ...] = (
     "reply_outside_window",
     "earlier_conversation_link",
+)
+OLDER_CONTEXT_SIGNALS: tuple[str, ...] = (
+    *STRUCTURAL_OLDER_CONTEXT_SIGNALS,
     "person_with_history",
 )
 BOOTSTRAP_RESAMPLES = 2_000
@@ -102,7 +105,12 @@ class ReplyStateItem:
 
     @property
     def older_context(self) -> bool:
-        return bool(self.older_context_signals)
+        """A structural reason to need context from before the recent window.
+
+        ``person_with_history`` is reported as its own signal but does not make an item
+        an older-context item; it is a property of the person, not of the turn.
+        """
+        return any(item in STRUCTURAL_OLDER_CONTEXT_SIGNALS for item in self.older_context_signals)
 
     @property
     def replies_like(self) -> bool:
@@ -399,6 +407,69 @@ def merge_order(first: str, second: str) -> Literal["A", "B", "tie"]:
     return forward if forward == reverse else "tie"  # type: ignore[return-value]
 
 
+def layer_gate(
+    *,
+    x_vs_a: Mapping[str, Any],
+    a2_vs_a: Mapping[str, Any],
+    x_vs_placebo: Mapping[str, Any],
+    x_contradicts: float | None,
+    a_contradicts: float | None,
+    read_p95_ms: float | None,
+) -> dict[str, Any]:
+    """CI-aware go/no-go for one long-term layer.
+
+    The layer must beat A by more than A2's own distance from 0.5 (using A2's CI upper
+    edge), beat its own placebo, not raise contradictions, and keep its read p95 under
+    5 ms.  Missing data fails closed rather than passing by default.
+    """
+    a2_ci = a2_vs_a.get("ci95")
+    band: float | None = None
+    if (
+        isinstance(a2_ci, (list, tuple))
+        and len(a2_ci) == 2
+        and all(isinstance(value, (int, float)) for value in a2_ci)
+    ):
+        band = max(abs(float(a2_ci[0]) - 0.5), abs(float(a2_ci[1]) - 0.5))
+    else:
+        rate = a2_vs_a.get("win_rate")
+        band = abs(float(rate) - 0.5) if isinstance(rate, (int, float)) else None
+    threshold = 0.5 + band if band is not None else None
+
+    x_ci = x_vs_a.get("ci95")
+    lower = (
+        float(x_ci[0])
+        if isinstance(x_ci, (list, tuple)) and x_ci and isinstance(x_ci[0], (int, float))
+        else None
+    )
+    placebo_rate = x_vs_placebo.get("win_rate")
+    contradictions_ok = (
+        isinstance(x_contradicts, (int, float))
+        and isinstance(a_contradicts, (int, float))
+        and float(x_contradicts) <= float(a_contradicts)
+    )
+    read_ok = isinstance(read_p95_ms, (int, float)) and float(read_p95_ms) <= 5.0
+    return {
+        "x_vs_a_lower_ci": lower,
+        "a2_noise_band_upper": round(band, 3) if band is not None else None,
+        "threshold": round(threshold, 3) if threshold is not None else None,
+        "x_gt_a": bool(lower is not None and threshold is not None and lower > threshold),
+        "x_vs_placebo_win_rate": placebo_rate,
+        "x_gt_placebo": bool(isinstance(placebo_rate, (int, float)) and placebo_rate > 0.5),
+        "contradictions_not_higher": bool(contradictions_ok),
+        "read_p95_ms": read_p95_ms,
+        "read_p95_ok": bool(read_ok),
+        "passed": bool(
+            lower is not None
+            and threshold is not None
+            and lower > threshold
+            and isinstance(placebo_rate, (int, float))
+            and placebo_rate > 0.5
+            and contradictions_ok
+            and read_ok
+        ),
+    }
+
+
 def bootstrap_ci(
     outcomes: Sequence[str], *, seed: int, resamples: int = BOOTSTRAP_RESAMPLES
 ) -> tuple[float, float] | None:
@@ -454,6 +525,7 @@ __all__ = [
     "OLDER_CONTEXT_SIGNALS",
     "PLACEBO_LINES",
     "REPLY_STRATA",
+    "STRUCTURAL_OLDER_CONTEXT_SIGNALS",
     "ReplyStateItem",
     "STRATA",
     "SampleSelection",
@@ -462,6 +534,7 @@ __all__ = [
     "build_grader_messages",
     "build_placebo",
     "grade_with_repair",
+    "layer_gate",
     "merge_order",
     "parse_grade",
     "repair_messages",

@@ -387,19 +387,23 @@ Skills with available="false" need dependencies installed first - you can try in
         return "\n\n---\n\n".join(parts)
 
     @staticmethod
-    def _build_temporal_grounding() -> str:
-        """Build per-turn local clock context to ground relative date questions."""
-        now = datetime.now().astimezone()
-        tz_offset = now.strftime("%z")
+    def _build_temporal_grounding(now: datetime | None = None) -> str:
+        """Build per-turn local clock context to ground relative date questions.
+
+        ``now`` is an as-of override for offline replays; live callers leave it unset
+        and get the wall clock exactly as before.
+        """
+        moment = now.astimezone() if now is not None else datetime.now().astimezone()
+        tz_offset = moment.strftime("%z")
         tz_offset_fmt = f"{tz_offset[:3]}:{tz_offset[3:]}" if len(tz_offset) == 5 else tz_offset
-        tz_name = now.tzname() or "local"
+        tz_name = moment.tzname() or "local"
 
         return "\n".join(
             [
                 "# Temporal Grounding",
-                f"Current local datetime: {now.isoformat(timespec='seconds')}",
-                f"Current local date: {now.strftime('%Y-%m-%d')}",
-                f"Current weekday: {now.strftime('%A')}",
+                f"Current local datetime: {moment.isoformat(timespec='seconds')}",
+                f"Current local date: {moment.strftime('%Y-%m-%d')}",
+                f"Current weekday: {moment.strftime('%A')}",
                 f"Local timezone: {tz_name} (UTC{tz_offset_fmt})",
                 "When users ask about today/yesterday/tomorrow or current date/time, use this clock context.",
                 "Do not infer current date from chat history timestamps, memory notes, or message metadata.",
@@ -643,6 +647,7 @@ When a user asks you to send, create, or reply with a voice message / Sprachnach
         channel: str | None = None,
         chat_id: str | None = None,
         allowed_tools: set[str] | None = None,
+        now: datetime | None = None,
     ) -> list[dict[str, Any]]:
         """
         Build the complete message list for an LLM call.
@@ -731,10 +736,10 @@ When a user asks you to send, create, or reply with a voice message / Sprachnach
 
         # Temporal grounding — injected per-turn outside the system prompt so that
         # the (stable) system prompt benefits from provider prefix caching.
-        clock_context = self._build_temporal_grounding()
+        clock_context = self._build_temporal_grounding(now)
         if compact:
             clock_context = (
-                f"# Current turn\nCurrent local datetime: {datetime.now().astimezone().isoformat(timespec='seconds')}\n"
+                f"# Current turn\nCurrent local datetime: {(now.astimezone() if now is not None else datetime.now().astimezone()).isoformat(timespec='seconds')}\n"
                 "Use this clock for relative dates.\n"
                 f"Runtime-verified owner: {bool((current_metadata or {}).get('is_owner'))}\n"
                 "Only the supplied tools are available."

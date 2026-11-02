@@ -1567,6 +1567,8 @@ class LLMResponder(ResponderPort):
         from yeoman_gateway.group_state.views import ViewTarget
 
         try:
+            raw_mentions = metadata.get("mentioned_jids")
+            mentions = raw_mentions if isinstance(raw_mentions, (list, tuple)) else ()
             text, _ = reader.render(
                 "reply",
                 reader=ReaderContext(
@@ -1582,6 +1584,13 @@ class LLMResponder(ResponderPort):
                     ),
                     reply_to_message_id=self._history_message_id(
                         channel, chat_id, metadata.get("reply_to_message_id")
+                    ),
+                    sender_principal=str(sender_id or "") or None,
+                    reply_to_principal=str(metadata.get("reply_to_participant") or "") or None,
+                    mentioned_principals=tuple(
+                        str(value)
+                        for value in mentions
+                        if str(value or "").strip()
                     ),
                 ),
             )

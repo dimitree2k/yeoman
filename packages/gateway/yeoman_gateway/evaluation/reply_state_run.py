@@ -20,7 +20,9 @@ from collections import Counter
 from collections.abc import Callable, Mapping, Sequence
 from contextlib import nullcontext
 from dataclasses import dataclass, field, replace
+from datetime import datetime
 from pathlib import Path
+from types import SimpleNamespace
 from typing import Any, Protocol
 
 from loguru import logger
@@ -30,6 +32,16 @@ from yeoman_gateway.adapters.reply_archive_history import (
     archive_row,
 )
 from yeoman_gateway.agent.context import ContextBuilder
+from yeoman_gateway.evaluation.long_term_context import (
+    CACHE_FILE as LONG_TERM_CACHE_FILE,
+)
+from yeoman_gateway.evaluation.long_term_context import (
+    PEOPLE_ROUTE,
+    SUMMARIES_ROUTE,
+    AsOfCache,
+    build_past_block,
+    build_people_block,
+)
 from yeoman_gateway.evaluation.participation_context_ab import (
     RecordedOpportunity,
     _inputs,
@@ -45,6 +57,7 @@ from yeoman_gateway.evaluation.reply_state import (
     build_grader_messages,
     build_placebo,
     grade_with_repair,
+    layer_gate,
     merge_order,
     sample_items,
     simulated_label_cut,
@@ -64,6 +77,7 @@ from yeoman_gateway.group_state.views import (
     ViewTarget,
     _choose_conversation,
     _conversation_rows,
+    _linked_conversation_ids,
     render_reply_view,
     render_writer_view,
 )
@@ -103,12 +117,19 @@ RECALL_PAIR_ORDER: tuple[tuple[str, str, str], ...] = (
     ("P_R", "A", "P_R_vs_A"),
     ("R", "P_R", "R_vs_P_R"),
 )
+LONG_TERM_PAIR_ORDER: tuple[tuple[str, str, str], ...] = (
+    ("N", "A", "N_vs_A"),
+    ("N", "P_N", "N_vs_P_N"),
+    ("H", "A", "H_vs_A"),
+    ("H", "P_H", "H_vs_P_H"),
+)
 ORACLE_PAIR = ("Sx", "A", "Sx_vs_A")
 #: Every arm this offline runner can generate.  ``R`` and ``P_R`` are the recall
-#: layer; the older state arms stay available unchanged.
-ARMS: tuple[str, ...] = ("A", "A2", "S", "P", "Sx", "R", "P_R")
+#: layer, ``N``/``H`` the person-notes and past-summary layers, each with its placebo.
+ARMS: tuple[str, ...] = ("A", "A2", "S", "P", "Sx", "R", "P_R", "N", "H", "P_N", "P_H")
 DEFAULT_ARMS: tuple[str, ...] = ("A", "A2", "R", "P_R")
 MEASURE_FILE = "measure.json"
+GRADES_FILE = "grades.jsonl"
 DELIVERED_EFFECT_STATES = frozenset({"sent", "delivered", "transport_accepted"})
 DELIVERED_DISPOSITIONS = frozenset(
     {"comment_sent", "comment_delivered", "comment_transport_accepted"}
@@ -139,6 +160,9 @@ class ReplyRecord:
     reply_to_native_id: str | None = None
     #: The sender's roster principal as of the item, when membership proves it.
     sender_principal: str | None = None
+    #: The replied-to author's roster principal as of the item, when it proves one.
+    reply_to_principal: str | None = None
+    mentioned_principals: tuple[str, ...] = ()
 
 
 @dataclass(frozen=True, slots=True)
@@ -218,6 +242,9 @@ class _PreparedReply:
     base_messages: list[dict[str, str]]
     recall_text: str
     rendered_ms: list[float]
+    #: As-of long-term blocks for the N and H arms; empty when the arm did not run.
+    people_block: str = ""
+    past_block: str = ""
     #: The inputs of ``base_messages``, so R/P_R can rebuild it with recall in place.
     reply_inputs: dict[str, Any] = field(default_factory=dict)
 
@@ -235,6 +262,8 @@ class _PreparedWriter:
     target: ViewTarget
     base_prompt: str
     rendered_ms: list[float]
+    people_block: str = ""
+    past_block: str = ""
 
 
 @dataclass(slots=True)
@@ -340,6 +369,7 @@ def build_reply_base_messages(
     ambient: Sequence[str],
     reply_to: Mapping[str, object] | None,
     retrieved_memory_text: str | None = None,
+    now: Any | None = None,
 ) -> list[dict[str, Any]]:
     """The live reply prompt as of the item, with an empty session history.
 
@@ -358,6 +388,7 @@ def build_reply_base_messages(
         chat_id=str(chat_id),
         allowed_tools=set(),
         retrieved_memory_text=retrieved_memory_text or None,
+        now=now,
     )
 
 
@@ -637,6 +668,18 @@ async def load_reply_records(
                     sender_principal=_sender_principal(
                         queries, chat_id, str(shaped.get("sender_id") or ""), at_ms
                     ),
+                    reply_to_principal=(
+                        _sender_principal(
+                            queries, chat_id, str(target.get("sender_id") or ""), at_ms
+                        )
+                        if target is not None
+                        else None
+                    ),
+                    mentioned_principals=tuple(
+                        str(value)
+                        for value in shaped.get("mentioned_jids") or ()
+                        if str(value or "").strip()
+                    ),
                 )
             )
     return result
@@ -762,12 +805,22 @@ def _pairs_for_arms(arms: Sequence[str], *, oracle: bool) -> list[tuple[str, str
     available = set(arms)
     pairs = [
         pair
-        for pair in (*PAIR_ORDER, *RECALL_PAIR_ORDER)
+        for pair in (*PAIR_ORDER, *RECALL_PAIR_ORDER, *LONG_TERM_PAIR_ORDER)
         if pair[0] in available and pair[1] in available
     ]
     if oracle and {"Sx", "A"} <= available:
         pairs.append(ORACLE_PAIR)
     return pairs
+
+
+def _layer_for_pair(first_arm: str, second_arm: str) -> str | None:
+    """Which long-term layer a pair tests, if any."""
+    for arm in (first_arm, second_arm):
+        if arm in {"N", "P_N"}:
+            return "N"
+        if arm in {"H", "P_H"}:
+            return "H"
+    return None
 
 
 def _plan_calls(
@@ -791,10 +844,16 @@ def _plan_calls(
         labels_route: total * (1 if needs_labels else 0) + total * (1 if oracle else 0),
         GRADER_ROUTE: 2 * (replies * len(reply_pairs) + writer * len(writer_pairs)),
     }
+    if any(arm in {"N", "P_N"} for arm in reply_arms):
+        routes[PEOPLE_ROUTE] = total * 4
+    if any(arm in {"H", "P_H"} for arm in reply_arms):
+        routes[SUMMARIES_ROUTE] = total * 6
     prompt_tokens = (
         total * len(reply_arms) * 900
         + routes[labels_route] * LABEL_MAX_TOKENS
         + routes[GRADER_ROUTE] * 1_100
+        + routes.get(PEOPLE_ROUTE, 0) * 1_200
+        + routes.get(SUMMARIES_ROUTE, 0) * 1_500
     )
     completion_tokens = (
         total * len(reply_arms) * 90 + routes[labels_route] * 160 + routes[GRADER_ROUTE] * 140
@@ -893,8 +952,11 @@ class ReplyStateRunner:
         self._generation_errors: Counter[str] = Counter()
         self._candidates: list[dict[str, Any]] = []
         self._grades: list[dict[str, Any]] = []
+        self._grade_rows: list[dict[str, Any]] = []
         self._items: list[dict[str, Any]] = []
         self._render_ms: list[float] = []
+        self._layer_read_ms: list[float] = []
+        self._context_cache: AsOfCache | None = None
         self._s_items_with_derived = 0
         self._items_with_s_view = 0
         self._items_total = 0
@@ -906,6 +968,31 @@ class ReplyStateRunner:
     def set_clients(self, clients: Mapping[str, ChatRoute]) -> None:
         """Attach the route clients after the cost guard has accepted the plan."""
         self._clients = dict(clients)
+
+    def _route_client(self, route: str) -> Any:
+        """A budgeted view of one route client, so as-of calls obey --limit-calls."""
+        runner = self
+
+        class _BudgetedClient:
+            async def chat_with_usage(
+                self,
+                messages: list[dict[str, str]],
+                *,
+                max_tokens: int,
+                response_format: dict[str, Any] | None = None,
+                timeout_ms: int | None = None,
+            ) -> Any:
+                if not runner._budget.take(route):
+                    return SimpleNamespace(content="", usage={})
+                result = await runner._call(
+                    route,
+                    messages,
+                    max_tokens=int(max_tokens),
+                    response_format=response_format,
+                )
+                return SimpleNamespace(content=result.text, usage=dict(result.usage))
+
+        return _BudgetedClient()
 
     async def prepare(
         self, run: RunConfig, *, chat_ids: Sequence[str] | None = None
@@ -1456,10 +1543,13 @@ class ReplyStateRunner:
         )
         return str(result.text)
 
-    async def _prepare_reply(self, record: ReplyRecord) -> _PreparedReply | None:
+    async def _prepare_reply(self, record: ReplyRecord, run: RunConfig) -> _PreparedReply | None:
         target = ViewTarget(
             message_id=record.history_id,
             reply_to_message_id=record.reply_to_history_id,
+            sender_principal=record.sender_principal,
+            reply_to_principal=record.reply_to_principal,
+            mentioned_principals=record.mentioned_principals,
         )
         try:
             async with history_turn(self._history) as snapshot:
@@ -1473,6 +1563,52 @@ class ReplyStateRunner:
                         recall_text = self._recall_text(queries, record)
                 base_state = await self._state(queries, record.item.chat_id, record.item.at_ms)
                 conversation = self._conversation(base_state, target, record.item.at_ms)
+                requested = _requested_arms(run)
+                people_block = ""
+                past_block = ""
+                if self._context_cache is not None:
+                    if self._knowledge is not None and any(
+                        arm in {"N", "P_N"} for arm in requested
+                    ):
+                        with history_knowledge_scope(snapshot, self._knowledge):
+                            people_block = await build_people_block(
+                                knowledge=self._knowledge,
+                                queries=queries,
+                                channel="whatsapp",
+                                chat_id=record.item.chat_id,
+                                at_ms=record.item.at_ms,
+                                target=target,
+                                conversation_speakers=tuple(
+                                    str(value)
+                                    for value in (conversation or {}).get("participants") or ()
+                                ),
+                                client=self._route_client(PEOPLE_ROUTE),
+                                cache=self._context_cache,
+                                policy_revision=int(self._knowledge.policy_revision),
+                                timings=self._layer_read_ms,
+                            )
+                    if any(arm in {"H", "P_H"} for arm in requested):
+                        past_block = await build_past_block(
+                            queries=queries,
+                            chat_id=record.item.chat_id,
+                            at_ms=record.item.at_ms,
+                            settings=self._group_state,
+                            client=self._route_client(SUMMARIES_ROUTE),
+                            cache=self._context_cache,
+                            consciousness=self._consciousness,
+                            linked_conversation_ids=_linked_conversation_ids(base_state, target),
+                            current_conversation_id=(
+                                str(conversation.get("conversation_id") or "")
+                                if conversation is not None
+                                else None
+                            ),
+                            current_start_ms=(
+                                int(conversation.get("start_ms") or 0)
+                                if conversation is not None
+                                else None
+                            ),
+                            timings=self._layer_read_ms,
+                        )
                 simulated, oracle, label_time = self._label_inputs(
                     queries, base_state, target, record.item.at_ms
                 )
@@ -1499,6 +1635,7 @@ class ReplyStateRunner:
                     "chat_id": record.item.chat_id,
                     "ambient": ambient,
                     "reply_to": reply_to,
+                    "now": datetime.fromtimestamp(record.item.at_ms / 1000).astimezone(),
                 }
                 base_messages = build_reply_base_messages(self._context_builder, **reply_inputs)
                 transcript = self._transcript(
@@ -1526,10 +1663,12 @@ class ReplyStateRunner:
             base_messages=base_messages,
             recall_text=recall_text,
             rendered_ms=[],
+            people_block=people_block,
+            past_block=past_block,
             reply_inputs=reply_inputs,
         )
 
-    async def _prepare_writer(self, record: WriterRecord) -> _PreparedWriter | None:
+    async def _prepare_writer(self, record: WriterRecord, run: RunConfig) -> _PreparedWriter | None:
         target = ViewTarget(message_id=record.target_history_id, reply_to_message_id=None)
         try:
             async with history_turn(self._history) as snapshot:
@@ -1550,6 +1689,69 @@ class ReplyStateRunner:
                     ),
                     now_ms=int(record.item.at_ms),
                 )
+                messages = context.get("messages")
+                newest = messages[-1] if isinstance(messages, list) and messages else {}
+                raw_mentions = newest.get("mentioned_jids") if isinstance(newest, dict) else ()
+                mentions = raw_mentions if isinstance(raw_mentions, (list, tuple)) else ()
+                target = ViewTarget(
+                    message_id=record.target_history_id,
+                    reply_to_message_id=None,
+                    sender_principal=(
+                        str(newest.get("sender_id") or "") if isinstance(newest, dict) else ""
+                    )
+                    or None,
+                    mentioned_principals=tuple(
+                        str(value) for value in mentions if str(value or "").strip()
+                    ),
+                )
+                requested = _requested_arms(run)
+                people_block = ""
+                past_block = ""
+                if self._context_cache is not None:
+                    if self._knowledge is not None and any(
+                        arm in {"N", "P_N"} for arm in requested
+                    ):
+                        from yeoman_gateway.history.context import history_knowledge_scope
+
+                        with history_knowledge_scope(snapshot, self._knowledge):
+                            people_block = await build_people_block(
+                                knowledge=self._knowledge,
+                                queries=queries,
+                                channel="whatsapp",
+                                chat_id=record.item.chat_id,
+                                at_ms=record.item.at_ms,
+                                target=target,
+                                conversation_speakers=tuple(
+                                    str(value)
+                                    for value in (conversation or {}).get("participants") or ()
+                                ),
+                                client=self._route_client(PEOPLE_ROUTE),
+                                cache=self._context_cache,
+                                policy_revision=int(self._knowledge.policy_revision),
+                                timings=self._layer_read_ms,
+                            )
+                    if any(arm in {"H", "P_H"} for arm in requested):
+                        past_block = await build_past_block(
+                            queries=queries,
+                            chat_id=record.item.chat_id,
+                            at_ms=record.item.at_ms,
+                            settings=self._group_state,
+                            client=self._route_client(SUMMARIES_ROUTE),
+                            cache=self._context_cache,
+                            consciousness=self._consciousness,
+                            linked_conversation_ids=(),
+                            current_conversation_id=(
+                                str(conversation.get("conversation_id") or "")
+                                if conversation is not None
+                                else None
+                            ),
+                            current_start_ms=(
+                                int(conversation.get("start_ms") or 0)
+                                if conversation is not None
+                                else None
+                            ),
+                            timings=self._layer_read_ms,
+                        )
                 transcript = self._transcript(
                     queries, record.item.chat_id, record.target_history_id, record.item.at_ms
                 )
@@ -1579,6 +1781,8 @@ class ReplyStateRunner:
             target=target,
             base_prompt=base_prompt,
             rendered_ms=[],
+            people_block=people_block,
+            past_block=past_block,
         )
 
     # -- model calls ------------------------------------------------------------------
@@ -1744,6 +1948,8 @@ class ReplyStateRunner:
         transcript: str,
         candidates: Mapping[str, _CallResult],
         background: str = "",
+        older_context: bool = False,
+        block_present: Mapping[str, bool] | None = None,
     ) -> dict[str, Any] | None:
         first = candidates.get(first_arm)
         second = candidates.get(second_arm)
@@ -1778,6 +1984,8 @@ class ReplyStateRunner:
                         "item_id": item_id,
                         "stratum": stratum,
                         "hard_case": bool(hard_case),
+                        "older_context": bool(older_context),
+                        "block_present": dict(block_present or {}),
                         "outcome": "grade_failed",
                         "error": "invalid_grade",
                     }
@@ -1786,9 +1994,21 @@ class ReplyStateRunner:
             preferences.append(parsed.preference)
             labels = ("1", "2")
             arms = (first_arm, second_arm) if order == 1 else (second_arm, first_arm)
+            order_sides: list[dict[str, Any]] = []
             for label, arm in zip(labels, arms, strict=True):
                 side = parsed.sides[label]
-                sides.append({"arm": arm, **side.as_mapping()})
+                order_sides.append({"arm": arm, **side.as_mapping()})
+            sides.extend(order_sides)
+            self._grade_rows.append(
+                {
+                    "item_id": item_id,
+                    "pair": pair,
+                    "order": order,
+                    "preference": parsed.preference,
+                    "sides": order_sides,
+                    "stratum": stratum,
+                }
+            )
             if self._budget.exhausted:
                 self._partial = True
                 break
@@ -1801,6 +2021,8 @@ class ReplyStateRunner:
             "item_id": item_id,
             "stratum": stratum,
             "hard_case": bool(hard_case),
+            "older_context": bool(older_context),
+            "block_present": dict(block_present or {}),
             "outcome": outcome,
             "sides": sides,
         }
@@ -1818,6 +2040,7 @@ class ReplyStateRunner:
         self._reset_run_state(
             limit=run.limit_calls, oracle=bool(run.oracle), arms=_requested_arms(run)
         )
+        self._context_cache = AsOfCache(report_dir / LONG_TERM_CACHE_FILE)
         self._items_total = len(prepared.replies) + len(prepared.writer)
         slots = asyncio.Semaphore(max(1, int(run.concurrency)))
         stopped = False
@@ -1828,7 +2051,7 @@ class ReplyStateRunner:
                 if stopped or self._budget.exhausted:
                     self._partial = self._partial or self._budget.exhausted
                     return
-                prepared_reply = await self._prepare_reply(record)
+                prepared_reply = await self._prepare_reply(record, run)
                 if prepared_reply is not None and not await self._run_reply(
                     prepared_reply, cache, run
                 ):
@@ -1840,7 +2063,7 @@ class ReplyStateRunner:
                 if stopped or self._budget.exhausted:
                     self._partial = self._partial or self._budget.exhausted
                     return
-                prepared_writer = await self._prepare_writer(record)
+                prepared_writer = await self._prepare_writer(record, run)
                 if prepared_writer is not None and not await self._run_writer(
                     prepared_writer, cache, run
                 ):
@@ -1889,8 +2112,10 @@ class ReplyStateRunner:
         self._generation_errors = Counter()
         self._candidates = []
         self._grades = []
+        self._grade_rows = []
         self._items = []
         self._render_ms = []
+        self._layer_read_ms = []
         self._s_items_with_derived = 0
         self._items_with_s_view = 0
         self._items_total = 0
@@ -1977,6 +2202,21 @@ class ReplyStateRunner:
                 prepared,
                 build_placebo(prepared.recall_text, seed=int(record.item.at_ms) + int(run.seed)),
             )
+        layer_placebo_seed = int(record.item.at_ms) + int(run.seed)
+        if "N" in requested:
+            arms["N"] = arm_messages(prepared.base_messages, prepared.people_block)
+        if "P_N" in requested:
+            arms["P_N"] = arm_messages(
+                prepared.base_messages,
+                build_placebo(prepared.people_block, seed=layer_placebo_seed),
+            )
+        if "H" in requested:
+            arms["H"] = arm_messages(prepared.base_messages, prepared.past_block)
+        if "P_H" in requested:
+            arms["P_H"] = arm_messages(
+                prepared.base_messages,
+                build_placebo(prepared.past_block, seed=layer_placebo_seed),
+            )
         generated: dict[str, _CallResult] = {}
         for arm in requested:
             if arm not in arms:
@@ -1991,6 +2231,10 @@ class ReplyStateRunner:
             record.native_id,
             record.reply_to_history_id,
             record.reply_to_native_id,
+            block_present={
+                "N": bool(prepared.people_block.strip()),
+                "H": bool(prepared.past_block.strip()),
+            },
         )
         if self._budget.exhausted:
             self._partial = True
@@ -2000,7 +2244,16 @@ class ReplyStateRunner:
             transcript=prepared.transcript,
             generated=generated,
             run=run,
-            background=prepared.recall_text if "R" in _requested_arms(run) else "",
+            background=self._item_background(
+                run=run,
+                recall=prepared.recall_text,
+                people=prepared.people_block,
+                past=prepared.past_block,
+            ),
+            block_present={
+                "N": bool(prepared.people_block.strip()),
+                "H": bool(prepared.past_block.strip()),
+            },
         )
         return not self._budget.exhausted
 
@@ -2072,6 +2325,15 @@ class ReplyStateRunner:
             prompts["P"] = prompt(placebo)
         if "Sx" in requested and run.oracle:
             prompts["Sx"] = prompt(oracle_text)
+        layer_placebo_seed = int(record.item.at_ms) + int(run.seed)
+        if "N" in requested:
+            prompts["N"] = prompt(prepared.people_block)
+        if "P_N" in requested:
+            prompts["P_N"] = prompt(build_placebo(prepared.people_block, seed=layer_placebo_seed))
+        if "H" in requested:
+            prompts["H"] = prompt(prepared.past_block)
+        if "P_H" in requested:
+            prompts["P_H"] = prompt(build_placebo(prepared.past_block, seed=layer_placebo_seed))
         generated: dict[str, _CallResult] = {}
         for arm in requested:
             if arm not in prompts:
@@ -2086,7 +2348,15 @@ class ReplyStateRunner:
                 [{"role": "user", "content": prompts[arm]}],
             )
         self._record_item(
-            record.item, record.target_history_id, record.target_native_id, None, None
+            record.item,
+            record.target_history_id,
+            record.target_native_id,
+            None,
+            None,
+            block_present={
+                "N": bool(prepared.people_block.strip()),
+                "H": bool(prepared.past_block.strip()),
+            },
         )
         if self._budget.exhausted:
             self._partial = True
@@ -2096,6 +2366,13 @@ class ReplyStateRunner:
             transcript=prepared.transcript,
             generated=generated,
             run=run,
+            background=self._item_background(
+                run=run, recall="", people=prepared.people_block, past=prepared.past_block
+            ),
+            block_present={
+                "N": bool(prepared.people_block.strip()),
+                "H": bool(prepared.past_block.strip()),
+            },
         )
         return not self._budget.exhausted
 
@@ -2107,6 +2384,18 @@ class ReplyStateRunner:
             self._context_builder, **prepared.reply_inputs, retrieved_memory_text=block
         )
 
+    def _item_background(self, *, run: RunConfig, recall: str, people: str, past: str) -> str:
+        """The union of the long-term blocks this item's requested arms could use."""
+        requested = _requested_arms(run)
+        blocks: list[str] = []
+        if "R" in requested and str(recall or "").strip():
+            blocks.append(str(recall))
+        if "N" in requested and str(people or "").strip():
+            blocks.append(str(people))
+        if "H" in requested and str(past or "").strip():
+            blocks.append(str(past))
+        return "\n\n".join(blocks)
+
     async def _grade_item(
         self,
         *,
@@ -2115,6 +2404,7 @@ class ReplyStateRunner:
         generated: Mapping[str, _CallResult],
         run: RunConfig,
         background: str = "",
+        block_present: Mapping[str, bool] | None = None,
     ) -> None:
         pairs = _pairs_for_arms(_requested_arms(run), oracle=run.oracle)
         for first_arm, second_arm, pair in pairs:
@@ -2131,6 +2421,11 @@ class ReplyStateRunner:
                 transcript=transcript,
                 candidates=generated,
                 background=background,
+                older_context=item.older_context,
+                block_present={
+                    "N": bool(block_present.get("N")) if block_present else False,
+                    "H": bool(block_present.get("H")) if block_present else False,
+                },
             )
 
     def _record_item(
@@ -2140,6 +2435,8 @@ class ReplyStateRunner:
         native_id: str,
         reply_to_history_id: str | None,
         reply_to_native_id: str | None,
+        *,
+        block_present: Mapping[str, bool] | None = None,
     ) -> None:
         self._items.append(
             {
@@ -2149,6 +2446,9 @@ class ReplyStateRunner:
                 "at_ms": int(item.at_ms),
                 "stratum": item.stratum,
                 "hard_case": bool(item.hard_case),
+                "older_context": bool(item.older_context),
+                "older_context_signals": list(item.older_context_signals),
+                "block_present": dict(block_present or {}),
                 "history_id": history_id,
                 "native_id": native_id,
                 "reply_to_history_id": reply_to_history_id,
@@ -2166,18 +2466,54 @@ class ReplyStateRunner:
         pair_order = _pairs_for_arms(self._run_arms, oracle=self._oracle)
         for first_arm, second_arm, pair in pair_order:
             records = pair_records.get(pair, [])
+            decisive = [
+                record["outcome"] for record in records if record["outcome"] != "grade_failed"
+            ]
+            strata = self._pair_strata(records)
+            strata["older_context"] = self._pair_stats(
+                [
+                    record["outcome"]
+                    for record in records
+                    if record.get("older_context") and record["outcome"] != "grade_failed"
+                ],
+                seed=sum(ord(char) for char in "older_context") + len(records),
+            )
+            layer = _layer_for_pair(first_arm, second_arm)
+            block_subset = [
+                record["outcome"]
+                for record in records
+                if layer
+                and (record.get("block_present") or {}).get(layer)
+                and record["outcome"] != "grade_failed"
+            ]
             pairs[pair] = {
                 "first": first_arm,
                 "second": second_arm,
                 "overall": self._pair_stats(
+                    decisive,
+                    seed=int(prepared.selection.requested.get("replies", 0)) + len(records),
+                ),
+                "strata": strata,
+                "older_context": self._pair_stats(
                     [
                         record["outcome"]
                         for record in records
-                        if record["outcome"] != "grade_failed"
+                        if record.get("older_context") and record["outcome"] != "grade_failed"
                     ],
-                    seed=int(prepared.selection.requested.get("replies", 0)) + len(records),
+                    seed=len(records) + 2,
                 ),
-                "strata": self._pair_strata(records),
+                "block_present": self._pair_stats(
+                    block_subset,
+                    seed=len(records) + 3,
+                ),
+                "block_present_items": len(
+                    [
+                        record
+                        for record in records
+                        if layer and (record.get("block_present") or {}).get(layer)
+                    ]
+                ),
+                "layer": layer,
                 "hard_cases": self._pair_stats(
                     [
                         record["outcome"]
@@ -2254,6 +2590,20 @@ class ReplyStateRunner:
             "view_render_p95_ms": _percentile(self._render_ms, 0.95),
             "view_render_p95_source": "this run",
         }
+        read_p95_ms = _percentile(self._layer_read_ms, 0.95)
+        layers: dict[str, Any] = {}
+        for arm in ("N", "H"):
+            if arm not in self._run_arms:
+                continue
+            layers[arm] = layer_gate(
+                x_vs_a=pairs.get(f"{arm}_vs_A", {}).get("overall", {}),
+                a2_vs_a=pairs.get("A2_vs_A", {}).get("overall", {}),
+                x_vs_placebo=pairs.get(f"{arm}_vs_P_{arm}", {}).get("overall", {}),
+                x_contradicts=arms.get(arm, {}).get("contradicts_rate"),
+                a_contradicts=a_contradicts,
+                read_p95_ms=read_p95_ms,
+            )
+        gate["layers"] = layers
         return {
             "report_schema": 1,
             "partial": bool(self._partial),
@@ -2421,6 +2771,14 @@ class ReplyStateRunner:
         with os.fdopen(descriptor, "w", encoding="utf-8") as handle:
             for candidate in self._candidates:
                 handle.write(json.dumps(candidate, ensure_ascii=False, sort_keys=True) + "\n")
+        descriptor = os.open(
+            report_dir / GRADES_FILE,
+            os.O_WRONLY | os.O_CREAT | os.O_TRUNC,
+            0o600,
+        )
+        with os.fdopen(descriptor, "w", encoding="utf-8") as handle:
+            for grade in self._grade_rows:
+                handle.write(json.dumps(grade, ensure_ascii=False, sort_keys=True) + "\n")
         (report_dir / "summary.json").write_text(
             json.dumps(summary, ensure_ascii=False, indent=2, sort_keys=True),
             encoding="utf-8",
@@ -2450,6 +2808,26 @@ def read_run_candidates(report_dir: Path) -> dict[tuple[str, str], str]:
         if not arm.startswith("grade:"):
             result[(str(entry.get("item_id")), arm)] = str(entry.get("text") or "")
     return result
+
+
+def read_run_grades(report_dir: Path) -> list[dict[str, Any]]:
+    path = Path(report_dir) / GRADES_FILE
+    if not path.is_file():
+        return []
+    return [
+        json.loads(line) for line in path.read_text(encoding="utf-8").splitlines() if line.strip()
+    ]
+
+
+def _review_arms(pair: str, summary: Mapping[str, Any] | None) -> tuple[str, str]:
+    entry = ((summary or {}).get("pairs") or {}).get(pair) or {}
+    first = str(entry.get("first") or "")
+    second = str(entry.get("second") or "")
+    if not first or not second:
+        parts = str(pair).split("_vs_")
+        if len(parts) == 2:
+            return parts[0], parts[1]
+    return first or "S", second or "A"
 
 
 def _review_pick(
@@ -2487,24 +2865,46 @@ def _review_line(queries: HistoryQueries, row: Mapping[str, Any]) -> str:
 
 
 async def build_review(
-    report_dir: Path, history: Any, *, sample: int = 20, seed: int = 7
+    report_dir: Path,
+    history: Any,
+    *,
+    sample: int = 20,
+    seed: int = 7,
+    pair: str = "S_vs_A",
+    stratum: str | None = None,
 ) -> tuple[str, dict[str, Any]]:
     """The owner review markdown and its separate blind X/Y key."""
     from datetime import datetime
 
+    summary_path = Path(report_dir) / "summary.json"
+    summary: Mapping[str, Any] | None = None
+    if summary_path.is_file():
+        try:
+            loaded = json.loads(summary_path.read_text(encoding="utf-8"))
+        except ValueError:
+            loaded = None
+        if isinstance(loaded, Mapping):
+            summary = loaded
+    first_arm, second_arm = _review_arms(pair, summary)
     items = read_run_items(report_dir)
     candidates = read_run_candidates(report_dir)
     eligible = [
         item
         for item in items
-        if (str(item.get("item_id")), "A") in candidates
-        and (str(item.get("item_id")), "S") in candidates
+        if (str(item.get("item_id")), first_arm) in candidates
+        and (str(item.get("item_id")), second_arm) in candidates
+        and (
+            (str(item.get("stratum") or "") == stratum)
+            if stratum not in (None, "older_context")
+            else (bool(item.get("older_context")) if stratum == "older_context" else True)
+        )
     ]
     picked = _review_pick(eligible, sample=sample, seed=seed)
     assign_rng = random.Random(int(seed) ^ 0x5A5A)
     lines = [
         "# Reply-state owner review",
         "",
+        # The pair and stratum stay in the key only: naming them here unblinds the review.
         "Two candidates per item, blind. Mark your preference on the last line of each item.",
         "The X/Y key is in a separate file.",
         "",
@@ -2519,8 +2919,8 @@ async def build_review(
         }
         for index, item in enumerate(picked, start=1):
             item_id = str(item.get("item_id"))
-            first = candidates.get((item_id, "S"))
-            second = candidates.get((item_id, "A"))
+            first = candidates.get((item_id, first_arm))
+            second = candidates.get((item_id, second_arm))
             if first is None or second is None:
                 continue
             chat_id = str(item.get("chat_id") or "")
@@ -2536,7 +2936,7 @@ async def build_review(
             else:
                 rows = queries.recent(chat_id=chat_id, limit=8, until_ms=at_ms - 1)
             coin = assign_rng.random() < 0.5
-            x_arm, y_arm = ("S", "A") if coin else ("A", "S")
+            x_arm, y_arm = (first_arm, second_arm) if coin else (second_arm, first_arm)
             x_text = candidates[(item_id, x_arm)]
             y_text = candidates[(item_id, y_arm)]
             moment = datetime.fromtimestamp(at_ms / 1000).astimezone()
@@ -2573,7 +2973,13 @@ async def build_review(
                     "y": y_arm,
                 }
             )
-    return "\n".join(lines), {"seed": int(seed), "sample": len(key_items), "items": key_items}
+    return "\n".join(lines), {
+        "seed": int(seed),
+        "pair": pair,
+        "stratum": stratum,
+        "sample": len(key_items),
+        "items": key_items,
+    }
 
 
 def write_review(out: Path, review: str, key: Mapping[str, Any]) -> Path:
@@ -2683,8 +3089,10 @@ __all__ = [
     "DEFAULT_ARMS",
     "DEFAULT_LABELS_ROUTE",
     "GRADER_ROUTE",
+    "GRADES_FILE",
     "ITEMS_FILE",
     "LABEL_CACHE_FILE",
+    "LONG_TERM_PAIR_ORDER",
     "MEASURE_FILE",
     "ORACLE_PAIR",
     "PAIR_ORDER",
@@ -2707,6 +3115,7 @@ __all__ = [
     "load_reply_records",
     "load_writer_records",
     "read_run_candidates",
+    "read_run_grades",
     "read_run_items",
     "render_report",
     "write_review",
