@@ -413,6 +413,168 @@ def eval_participation_context(
     )
 
 
+@eval_app.command("reply-state")
+def eval_reply_state(
+    days: int = typer.Option(30, "--days", min=1, max=90),
+    replies: int = typer.Option(200, "--replies", min=0),
+    writer: int = typer.Option(80, "--writer", min=0),
+    seed: int = typer.Option(7, "--seed"),
+    oracle: bool = typer.Option(False, "--oracle", help="Also run the oracle-label arm Sx"),
+    yes: bool = typer.Option(False, "--yes", help="Actually spend model calls"),
+    limit_calls: int | None = typer.Option(
+        None, "--limit-calls", min=1, help="Abort cleanly after N calls; write a partial report"
+    ),
+    chats: list[str] | None = typer.Option(
+        None, "--chat", help="Only this chat (id or exact group subject); repeatable"
+    ),
+) -> None:
+    """Offline reply-state evaluation: as-of prompts, four arms and a blind grader."""
+    from yeoman_shared.config.loader import load_config
+    from yeoman_shared.utils.helpers import get_operational_store_path
+
+    from yeoman_gateway.evaluation.participation_context_ab import (
+        FrozenHistory,
+        chat_subjects,
+        looks_like_chat_id,
+        resolve_chat,
+    )
+    from yeoman_gateway.evaluation.reply_state_run import (
+        GRADER_ROUTE,
+        REPLY_ROUTE,
+        WRITER_ROUTE,
+        ReplyStateRunner,
+        RunConfig,
+    )
+    from yeoman_gateway.history.live import history_db_path
+
+    config = load_config()
+    if not history_db_path().is_file():
+        typer.echo("error: history.db not found")
+        raise typer.Exit(2)
+    history = FrozenHistory(history_db_path())
+    try:
+        chat_ids: list[str] | None = None
+        if chats:
+            subjects = (
+                {} if all(looks_like_chat_id(value) for value in chats)
+                else asyncio.run(chat_subjects(history))
+            )
+            try:
+                chat_ids = [resolve_chat(value, subjects) for value in chats]
+            except ValueError as exc:
+                typer.echo(f"error: --chat: {exc}")
+                raise typer.Exit(2) from exc
+        setup = _participation_replay_setup(config)
+        from yeoman_gateway.agent.context import ContextBuilder
+        from yeoman_gateway.app.bootstrap import _processing_store_path
+
+        mode = str(config.processing.participation.context_mode)
+        bounds = setup.replay_args[
+            "conversation_bounds" if mode == "conversation" else "window_bounds"
+        ]
+        from .core import make_policy_engine
+
+        engine, _policy_path = make_policy_engine(config)
+
+        def persona_for(channel: str, chat_id: str) -> str | None:
+            try:
+                policy = engine.resolve_policy(channel, chat_id)
+                return engine.persona_text(policy.persona_file)
+            except Exception:  # noqa: BLE001 - a missing persona is simply no persona
+                return None
+
+        run = RunConfig(
+            days=days, replies=replies, writer=writer, seed=seed, oracle=oracle,
+            limit_calls=limit_calls, yes=yes,
+        )
+        runner = ReplyStateRunner(
+            config=config, history=history,
+            context_builder=ContextBuilder(config.workspace_path),
+            participation_builder=setup.replay_args["builder"],
+            bounds=bounds,
+            guidance_for=setup.replay_args["guidance_for"],
+            persona_for=persona_for,
+            processing_db=_processing_store_path(config),
+            speakups_db=get_operational_store_path("speakups", create=False),
+            decisions_db=get_operational_store_path("group_decisions", create=False),
+        )
+        prepared = asyncio.run(runner.prepare(run, chat_ids=chat_ids))
+        planned = prepared.planned
+        typer.echo(
+            f"items: {planned.items} (reply {len(prepared.replies)}, "
+            f"writer {len(prepared.writer)}); shortfall "
+            f"{dict(prepared.selection.shortfall)}"
+        )
+        for route, count in planned.routes.items():
+            typer.echo(f"calls {route}: {count}")
+        typer.echo(
+            f"token estimate: prompt={planned.prompt_tokens} "
+            f"completion={planned.completion_tokens}"
+        )
+        if not yes:
+            typer.echo("no model calls; rerun with --yes")
+            return
+
+        from yeoman_gateway.processing.model_route import RouteClient, RouteUnavailableError
+
+        try:
+            clients = {
+                REPLY_ROUTE: RouteClient(config=config, route_key=REPLY_ROUTE),
+                WRITER_ROUTE: RouteClient(config=config, route_key=WRITER_ROUTE),
+                str(config.processing.group_state.labels.route): RouteClient(
+                    config=config, route_key=str(config.processing.group_state.labels.route)
+                ),
+                GRADER_ROUTE: RouteClient(config=config, route_key=GRADER_ROUTE),
+            }
+        except RouteUnavailableError as exc:
+            typer.echo(f"error: model route unavailable: {exc}")
+            raise typer.Exit(2) from exc
+        runner.set_clients(clients)
+        outcome = asyncio.run(runner.execute(prepared, run))
+    finally:
+        history.close()
+    summary = outcome.summary or {}
+    gate = summary.get("gate") or {}
+    typer.echo(
+        f"partial={summary.get('partial')} s_gt_a={gate.get('s_gt_a')} "
+        f"s_gt_p={gate.get('s_gt_p')} report: {outcome.report_dir}"
+    )
+
+
+@eval_app.command("reply-state-review")
+def eval_reply_state_review(
+    report_dir: Path = typer.Argument(..., help="A reply-state evaluation report directory"),
+    sample: int = typer.Option(20, "--sample", min=1, max=200),
+    seed: int = typer.Option(7, "--seed"),
+    out: Path = typer.Option(..., "--out", help="Owner review markdown (mode 0600)"),
+) -> None:
+    """Write the blind owner review and its separate X/Y key."""
+    from yeoman_gateway.evaluation.participation_context_ab import FrozenHistory
+    from yeoman_gateway.evaluation.reply_state_run import build_review, write_review
+    from yeoman_gateway.history.live import history_db_path
+
+    directory = report_dir.expanduser()
+    if not (directory / "items.jsonl").is_file():
+        typer.echo("error: not a reply-state report (items.jsonl missing)")
+        raise typer.Exit(2)
+    if not (directory / "candidates.jsonl").is_file():
+        typer.echo("error: not a reply-state report (candidates.jsonl missing)")
+        raise typer.Exit(2)
+    if not history_db_path().is_file():
+        typer.echo("error: history.db not found")
+        raise typer.Exit(2)
+    history = FrozenHistory(history_db_path())
+    try:
+        review, key = asyncio.run(
+            build_review(directory, history, sample=sample, seed=seed)
+        )
+    finally:
+        history.close()
+    key_path = write_review(out, review, key)
+    typer.echo(f"review: {Path(out).expanduser()} ({len(key['items'])} items)")
+    typer.echo(f"key: {key_path}")
+
+
 def _decision_line(variant: dict) -> str:
     if variant.get("status") != "decided":
         return f"{variant.get('status')} {variant.get('error') or ''}".strip()

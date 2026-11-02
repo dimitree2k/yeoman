@@ -179,13 +179,15 @@ class RouteClient:
         response_format: dict[str, Any] | None,
         max_retries: int | None,
         timeout_ms: int | None = None,
+        temperature: float | None = None,
     ) -> Any:
         call = target.provider.chat(
             messages=messages,
             tools=None,
             model=target.model,
             max_tokens=max_tokens,
-            temperature=0.0,
+            # Routes are classifiers by default; a generating caller passes its own.
+            temperature=0.0 if temperature is None else float(temperature),
             reasoning=target.reasoning,
             response_format=response_format,
             max_retries=max_retries,
@@ -203,6 +205,7 @@ class RouteClient:
         response_format: dict[str, Any] | None = None,
         max_retries: int | None = None,
         timeout_ms: int | None = None,
+        temperature: float | None = None,
     ) -> RouteReply:
         """Completion plus provider usage/status; None preserves the global retry default.
 
@@ -225,6 +228,7 @@ class RouteClient:
                     response_format=response_format,
                     max_retries=max_retries,
                     timeout_ms=timeout_ms,
+                    temperature=temperature,
                 )
             except asyncio.CancelledError:
                 raise

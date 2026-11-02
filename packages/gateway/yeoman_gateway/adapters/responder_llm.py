@@ -601,6 +601,16 @@ _PARTICIPATION_DRAFT_NOTE = (
 )
 
 
+def build_participation_draft_prompt(context: dict[str, object], purpose: str) -> str:
+    """The exact writer prompt live generation and the offline evaluation both send."""
+    transcript = _render_participation_transcript(context)
+    return (
+        f"{_PARTICIPATION_DRAFT_RULES}\n\n"
+        f"{transcript}\n\n"
+        f"{_PARTICIPATION_DRAFT_NOTE.format(purpose=purpose)}"
+    )
+
+
 def _render_participation_transcript(context: dict[str, object], *, limit: int = 4000) -> str:
     """Allocate the Writer's data budget by complete evidence entry."""
     from yeoman_gateway.processing.participation_context import (
@@ -3741,12 +3751,7 @@ class LLMResponder(ResponderPort):
         it is an internal note rather than a request from the chat.
         """
         route_channel, route_chat_id = self._route_for_event(event)
-        transcript = _render_participation_transcript(context)
-        prompt = (
-            f"{_PARTICIPATION_DRAFT_RULES}\n\n"
-            f"{transcript}\n\n"
-            f"{_PARTICIPATION_DRAFT_NOTE.format(purpose=purpose)}"
-        )
+        prompt = build_participation_draft_prompt(context, purpose)
         metadata = self._metadata_for_event(event)
         metadata["participation_draft"] = True
         budget = derive_reply_budget(
