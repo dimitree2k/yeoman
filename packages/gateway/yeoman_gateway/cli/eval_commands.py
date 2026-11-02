@@ -3,6 +3,9 @@
 from __future__ import annotations
 
 import asyncio
+import sqlite3
+import tempfile
+from contextlib import closing
 from dataclasses import asdict
 from pathlib import Path
 
@@ -413,6 +416,29 @@ def eval_participation_context(
     )
 
 
+def _snapshot_parent() -> Path:
+    """Snapshots go next to the eval reports on disk, never into the RAM-backed /tmp."""
+    from yeoman_shared.utils.helpers import get_var_path
+
+    parent = get_var_path() / "eval"
+    parent.mkdir(parents=True, exist_ok=True)
+    return parent
+
+
+def snapshot_knowledge_db(source: Path, directory: Path) -> Path:
+    """A consistent copy of the live Knowledge DB for one offline run.
+
+    The read-only store opens its file ``immutable``, which skips locking and the WAL;
+    on the live file a concurrent capture write then reads as a corrupt page. The
+    SQLite backup API copies one consistent state that nothing else writes.
+    """
+    target = Path(directory) / "knowledge.db"
+    uri = f"{Path(source).expanduser().resolve().as_uri()}?mode=ro"
+    with closing(sqlite3.connect(uri, uri=True)) as live, closing(sqlite3.connect(target)) as copy:
+        live.backup(copy)
+    return target
+
+
 @eval_app.command("reply-state")
 def eval_reply_state(
     days: int = typer.Option(30, "--days", min=1, max=90),
@@ -480,6 +506,7 @@ def eval_reply_state(
     if not history_db_path().is_file():
         typer.echo("error: history.db not found")
         raise typer.Exit(2)
+    snapshot_dir: tempfile.TemporaryDirectory[str] | None = None
     history = FrozenHistory(history_db_path())
     try:
         chat_ids: list[str] | None = None
@@ -517,8 +544,13 @@ def eval_reply_state(
         knowledge = None
         if bool(config.knowledge.enabled) and config.knowledge.resolved_db_path.is_file():
             try:
+                snapshot_dir = tempfile.TemporaryDirectory(
+                    prefix="knowledge-snapshot-", dir=_snapshot_parent()
+                )
                 knowledge = open_knowledge_store(
-                    config.knowledge.resolved_db_path,
+                    snapshot_knowledge_db(
+                        config.knowledge.resolved_db_path, Path(snapshot_dir.name)
+                    ),
                     workspace_id=workspace_id_for(config.workspace_path),
                     source_authority=RuntimeKnowledgeSources(),
                     policy_authority=RuntimeKnowledgePolicy(engine=engine, policy_revision=1),
@@ -607,6 +639,8 @@ def eval_reply_state(
         history.close()
         if knowledge is not None:
             knowledge.close()
+        if snapshot_dir is not None:
+            snapshot_dir.cleanup()
     summary = outcome.summary or {}
     gate = summary.get("gate") or {}
     typer.echo(

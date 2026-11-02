@@ -219,3 +219,30 @@ def test_cli_dry_estimate_prints_calls_per_route(
     assert f"calls {REPLY_ROUTE}: 4" in result.output
     assert f"calls {GRADER_ROUTE}: 8" in result.output
     assert "no model calls; rerun with --yes" in result.output
+
+
+def test_knowledge_snapshot_is_consistent_and_includes_the_wal(tmp_path: Path) -> None:
+    import sqlite3
+
+    from yeoman_gateway.cli.eval_commands import snapshot_knowledge_db
+
+    live_path = tmp_path / "live.db"
+    live = sqlite3.connect(live_path)
+    live.execute("PRAGMA journal_mode=WAL")
+    live.execute("PRAGMA wal_autocheckpoint=0")
+    live.execute("CREATE TABLE t (v INTEGER)")
+    live.executemany("INSERT INTO t VALUES (?)", [(i,) for i in range(100)])
+    live.commit()  # still only in the WAL: nothing is checkpointed
+    (tmp_path / "snap").mkdir()
+
+    copy_path = snapshot_knowledge_db(live_path, tmp_path / "snap")
+    live.execute("INSERT INTO t VALUES (100)")  # a write after the snapshot
+    live.commit()
+
+    copy = sqlite3.connect(f"{copy_path.as_uri()}?mode=ro&immutable=1", uri=True)
+    try:
+        assert copy.execute("SELECT COUNT(*) FROM t").fetchone()[0] == 100
+        assert copy.execute("PRAGMA integrity_check").fetchone()[0] == "ok"
+    finally:
+        copy.close()
+        live.close()
