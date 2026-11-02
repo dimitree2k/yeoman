@@ -71,3 +71,25 @@ async def test_ambiguous_cards_are_filtered_and_truncated(directory_case):
     result = await execute(c, tool, query="holdings", person="Same Person")
     assert "Several people match" in result and result.count("Same Person (groups:") == 8
     assert "truncated" in result and "Private Group" not in result
+
+
+async def test_person_without_query_or_period_lists_their_messages(directory_case):
+    # "What did Alex say?" names only a person; the tool must not demand a query.
+    c = directory_case
+    p = c.add_person("Alex Example", ids=(("phone", "4915000000031"),))
+    c.set_roster("g@g.us", [c.owner, p], label="Shared")
+    c.add_message("authored", sender_person=p, identifier=c.endpoint(p), at_ms=100, text="hello")
+    tool = RecallConversationTool(None, people=c.directory)
+    result = await execute(c, tool, person="Alex Example", max_messages=50)
+    assert not result.startswith("Error")
+    assert "hello" in result and "sender=Alex Example" in result
+    assert "period ''" not in result
+
+
+async def test_person_without_query_or_period_reports_no_messages(directory_case):
+    c = directory_case
+    p = c.add_person("Quiet Example", ids=(("phone", "4915000000032"),))
+    c.set_roster("g@g.us", [c.owner, p], label="Shared")
+    tool = RecallConversationTool(None, people=c.directory)
+    result = await execute(c, tool, person="Quiet Example")
+    assert result == "No messages found."
