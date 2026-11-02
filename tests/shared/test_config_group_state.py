@@ -4,7 +4,7 @@ from __future__ import annotations
 
 import pytest
 from pydantic import ValidationError
-from yeoman_shared.config.loader import convert_keys
+from yeoman_shared.config.loader import camel_to_snake, convert_keys, snake_to_camel
 from yeoman_shared.config.schema import Config, GroupStateConfig
 
 
@@ -60,7 +60,7 @@ def test_labels_config_defaults_off() -> None:
     labels = Config().processing.group_state.labels
     assert labels.mode == "off"
     assert labels.chats == []
-    assert labels.route == "groupState.labels"
+    assert labels.route == "conversation.labels"
     assert labels.max_per_chat_day == 40
     assert labels.max_global_day == 80
     assert labels.max_tokens_day == 400_000
@@ -109,3 +109,10 @@ def test_labels_config_forbids_unknown_keys() -> None:
         GroupStateConfig.model_validate({"labels": {"enabled": True}})
     with pytest.raises(ValidationError):
         GroupStateConfig.model_validate({"labels": {"mode": "maybe"}})
+
+
+def test_labels_default_route_survives_config_key_round_trip() -> None:
+    # models.routes keys are written camelCase and read snake_case; the default must survive.
+    route = GroupStateConfig().labels.route
+    assert camel_to_snake(snake_to_camel(route)) == route
+    assert snake_to_camel(camel_to_snake(route)) == route
