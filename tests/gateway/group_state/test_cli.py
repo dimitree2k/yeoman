@@ -164,3 +164,111 @@ def test_show_resolves_exact_subject(tmp_path, subject: str) -> None:
     )
     assert result.exit_code == 0, result.output
     assert "revision: 3" in result.output
+
+
+def _history_db(tmp_path: Path) -> Path:
+    import sqlite3
+    import time
+
+    from yeoman_gateway.history.schema import create
+
+    path = tmp_path / "history.db"
+    now_ms = int(time.time() * 1000)
+    conn = sqlite3.connect(path)
+    try:
+        create(conn)
+        for index in range(1, 5):
+            conn.execute(
+                "INSERT INTO messages(message_id, channel, chat_id, native_message_id,"
+                " sender_contact_id, sender_identifier, sender_basis, direction, sent_ms,"
+                " time_certainty, text, media_json, reply_to_native_id, mentions_json,"
+                " provenance, source_refs)"
+                " VALUES (?, 'whatsapp', ?, ?, 'contact-a', 'contact-a',"
+                " 'native_identifier', 'in', ?, 'native', ?, NULL, NULL, NULL,"
+                " 'native', '[]')",
+                (
+                    f"h{index}",
+                    CHAT,
+                    f"native-h{index}",
+                    now_ms - 10_000 + index * 1_000,
+                    f"Nachricht {index}",
+                ),
+            )
+        conn.execute(
+            "INSERT INTO projector_state"
+            "(file, lines, end_offset, sha256, projector_version, state_json)"
+            " VALUES ('@runtime', 0, 0, 'sha', 1, ?)",
+            (json.dumps({"generation": 1}),),
+        )
+        conn.commit()
+    finally:
+        conn.close()
+    return path
+
+
+class _FakeReply:
+    def __init__(self, content: str) -> None:
+        self.content = content
+        self.usage = {"prompt_tokens": 11, "completion_tokens": 7}
+        self.model = "fake-model"
+        self.finish_reason = ""
+
+
+class _FakeRouteClient:
+    model = "fake-model"
+
+    def __init__(self, *, config, route_key: str) -> None:
+        self.config = config
+        self.route_key = route_key
+
+    async def chat_with_usage(
+        self,
+        messages,
+        *,
+        max_tokens: int,
+        response_format=None,
+        timeout_ms=None,
+    ):
+        return _FakeReply(
+            json.dumps(
+                {
+                    "topic": "Samstagsplan",
+                    "mood": "relaxed",
+                    "open_questions": [{"text": "Kommst du?", "asked_by": "p1", "source": "m1"}],
+                    "plans": [
+                        {
+                            "text": "Treffen",
+                            "who": ["p1"],
+                            "when": "18:00",
+                            "source": "m2",
+                        }
+                    ],
+                },
+                ensure_ascii=False,
+            )
+        )
+
+
+def test_cli_dry_run_writes_nothing(tmp_path, monkeypatch) -> None:
+    import yeoman_gateway.processing.model_route as model_route
+
+    history = _history_db(tmp_path)
+    db_path = tmp_path / "group-state.db"
+    monkeypatch.setattr(model_route, "RouteClient", _FakeRouteClient)
+    result = _invoke(
+        "label",
+        CHAT,
+        "--dry-run",
+        "--db-path",
+        str(db_path),
+        "--history-db",
+        str(history),
+    )
+    assert result.exit_code == 0, result.output
+    payload = json.loads(result.output)
+    assert payload["outcome"] == "written"
+    assert payload["labels"]["topic"] == "Samstagsplan"
+    assert payload["labels"]["open_questions"][0]["asked_by"] == "contact-a"
+    assert payload["prompt_tokens"] == 11
+    assert payload["completion_tokens"] == 7
+    assert not db_path.exists()

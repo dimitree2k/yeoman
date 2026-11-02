@@ -4880,6 +4880,20 @@ def _build_group_state_service(
     store = GroupStateStore(
         _group_state_store_path(settings), snapshots_kept=int(settings.snapshots_kept)
     )
+    labels_settings = settings.labels
+    labeler: Any | None = None
+    if getattr(labels_settings, "mode", "off") == "on":
+        from yeoman_gateway.group_state.labels.runner import ConversationLabeler
+        from yeoman_gateway.processing.model_route import RouteClient
+
+        labeler = ConversationLabeler(
+            store=store,
+            history_projector=history_projector,
+            settings=labels_settings,
+            client_factory=lambda: RouteClient(
+                config=config, route_key=labels_settings.route
+            ),
+        )
     service = GroupStateService(
         store=store,
         registry=registry,
@@ -4893,6 +4907,7 @@ def _build_group_state_service(
             cron=cron,
         ),
         consciousness=config.consciousness,
+        labeler=labeler,
     )
 
     async def _mark_from_observed(event: Any) -> None:

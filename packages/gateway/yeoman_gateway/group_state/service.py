@@ -9,8 +9,10 @@ the CAS store write, so no history transaction is held across a store write.
 from __future__ import annotations
 
 import asyncio
+import inspect
 import time
-from collections.abc import Callable
+from collections.abc import Callable, Mapping
+from datetime import datetime
 from typing import Any
 
 from loguru import logger
@@ -26,6 +28,8 @@ from .store import GroupStateStore
 
 #: Message sources checked for a purge per invalidation pass.
 PURGE_CHECK_LIMIT = 200
+#: Label run rows older than this are pruned once per local day.
+LABEL_RUN_RETENTION_MS = 30 * 24 * 60 * 60 * 1000
 
 
 class GroupStateService:
@@ -41,6 +45,7 @@ class GroupStateService:
         sources: SourceReaders,
         clock_ms: Callable[[], int] = lambda: int(time.time() * 1000),
         consciousness: Any | None = None,
+        labeler: Any | None = None,
     ) -> None:
         self._store = store
         self._registry = registry
@@ -49,6 +54,7 @@ class GroupStateService:
         self._sources = sources
         self._clock = clock_ms
         self._consciousness = consciousness
+        self._labels = labeler
         self._managed = {
             (channel, chat_id)
             for channel, _, chat_id in (
@@ -62,6 +68,14 @@ class GroupStateService:
         self._last_purge_check: dict[tuple[str, str], int] = {}
         self._last_full = int(clock_ms())
         self._task: asyncio.Task[None] | None = None
+        self._label_tasks: dict[tuple[str, str], asyncio.Task[None]] = {}
+        #: Per chat: the conversation snapshot the last write/cache hit covered.
+        self._label_written: dict[tuple[str, str], dict[str, Any]] = {}
+        #: A scrub removed an item, so a quiet chat must be relabelled.
+        self._label_dirty: set[tuple[str, str]] = set()
+        #: Do not hammer a chat whose last label attempt did not write.
+        self._label_retry_after: dict[tuple[str, str], int] = {}
+        self._last_prune_day: str | None = None
 
     @property
     def store(self) -> GroupStateStore:
@@ -202,27 +216,20 @@ class GroupStateService:
             await self.rebuild(channel, chat_id)
         if full:
             self._last_full = now_ms
+        self._maybe_prune(now_ms)
+        self._schedule_labels(now_ms)
 
     async def _invalidate_chat(self, channel: str, chat_id: str, now_ms: int) -> None:
         """Drop derived items whose source message was deleted, edited or purged."""
         key = (str(channel), str(chat_id))
         cursor_ms, cursor_event = self._store.invalidation_cursor(*key)
-        state = self._store.get(*key)
         purge_interval_ms = max(1, int(self._settings.rebuild_every_seconds)) * 1000
         last_check = self._last_purge_check.get(key)
         check_purge = last_check is None or now_ms - last_check >= purge_interval_ms
         sources: tuple[str, ...] = ()
-        if check_purge and state is not None:
-            sources = tuple(
-                sorted(
-                    {
-                        str(source)
-                        for section in state.sections.values()
-                        for item in section.items
-                        for source in item.sources
-                    }
-                )[:PURGE_CHECK_LIMIT]
-            )
+        if check_purge:
+            # Snapshots too: an item that left the document can still sit in a snapshot.
+            sources = tuple(sorted(self._store.item_sources(*key))[:PURGE_CHECK_LIMIT])
         try:
             async with history_turn(self._history_projector) as snapshot:
                 queries = HistoryQueries(snapshot)
@@ -238,7 +245,8 @@ class GroupStateService:
                     source for source in sources if queries.content_fingerprint(source) is None
                 )
         except HistoryPaused as exc:
-            logger.warning(
+            # Expected while history starts; the next tick retries from the same cursor.
+            logger.debug(
                 "group_state_invalidation_skipped_paused chat={}:{} reason={}",
                 key[0],
                 key[1],
@@ -256,6 +264,10 @@ class GroupStateService:
         if check_purge:
             self._last_purge_check[key] = now_ms
         removed = self._store.scrub_items(key[0], key[1], targets) if targets else 0
+        if removed:
+            # The scrub already ran, so the cache hash may still match the old write.
+            self._label_dirty.add(key)
+            self._label_written.pop(key, None)
         if events:
             last = events[-1]
             self._store.set_invalidation_cursor(
@@ -270,11 +282,133 @@ class GroupStateService:
                 removed,
             )
 
+    def _maybe_prune(self, now_ms: int) -> None:
+        labels = getattr(self._settings, "labels", None)
+        if labels is None or getattr(labels, "mode", "off") != "on":
+            return
+        day = self._local_day(now_ms)
+        if day == self._last_prune_day:
+            return
+        removed = self._store.prune_runs(int(now_ms) - LABEL_RUN_RETENTION_MS)
+        self._last_prune_day = day
+        if removed:
+            logger.info("group_state_runs_pruned removed={} day={}", removed, day)
+
+    def _local_day(self, now_ms: int) -> str:
+        tz = getattr(self._labels, "tz", None)
+        moment = datetime.fromtimestamp(int(now_ms) / 1000, tz)
+        if tz is None:
+            moment = moment.astimezone()
+        return moment.date().isoformat()
+
+    def _schedule_labels(self, now_ms: int) -> None:
+        """Start one tracked label task per eligible chat; the model call is not locked."""
+        labels = getattr(self._settings, "labels", None)
+        if labels is None or getattr(labels, "mode", "off") != "on" or self._labels is None:
+            return
+        lull_ms = max(1, int(getattr(self._consciousness, "lull_silence_minutes", 25))) * 60_000
+        for channel, chat_id in self._label_chats(labels):
+            if not self.manages(channel, chat_id):
+                continue
+            key = (channel, chat_id)
+            if key in self._label_tasks:
+                continue
+            retry_after = self._label_retry_after.get(key)
+            if retry_after is not None and now_ms < retry_after:
+                continue
+            state = self._store.get(channel, chat_id)
+            if state is None:
+                continue
+            section = state.sections.get("conversations")
+            if section is None:
+                continue
+            raw = section.data.get("conversations")
+            conversations = [item for item in raw or () if isinstance(item, Mapping)]
+            if not conversations:
+                continue
+            conversation = max(conversations, key=lambda item: int(item.get("last_ms") or 0))
+            written = self._label_written.get(key)
+            quiet = now_ms - int(conversation.get("last_ms") or 0) >= lull_ms
+            last_id = str(conversation.get("last_message_id") or "")
+            changed = (
+                written is None
+                or str(written.get("last_message_id") or "") != last_id
+                or key in self._label_dirty
+            )
+            grew = written is not None and (
+                int(conversation.get("messages") or 0) - int(written.get("messages") or 0)
+                >= int(getattr(labels, "refresh_after_messages", 30))
+            )
+            if not ((quiet and changed) or grew):
+                continue
+            lock = self._locks.setdefault(key, asyncio.Lock())
+            task = asyncio.create_task(
+                self._run_label(key, conversation, lock),
+                name=f"group-state-labels:{channel}:{chat_id}",
+            )
+            self._label_tasks[key] = task
+            task.add_done_callback(_forget_task(self._label_tasks, key))
+
+    async def _run_label(
+        self,
+        key: tuple[str, str],
+        conversation: Mapping[str, Any],
+        lock: asyncio.Lock,
+    ) -> None:
+        label = self._labels.label
+        try:
+            if _accepts_lock(label):
+                outcome = await label(key[0], key[1], conversation, lock=lock)
+            else:
+                outcome = await label(key[0], key[1], conversation)
+        except asyncio.CancelledError:
+            raise
+        except Exception as exc:  # noqa: BLE001 - a label failure must not stop the ticker
+            logger.warning(
+                "group_state_labels_failed chat={}:{} error_type={}",
+                key[0],
+                key[1],
+                type(exc).__name__,
+            )
+            return
+        if outcome.outcome == "skipped_budget":
+            # The day's budget is spent; look again after a full rebuild interval.
+            interval_ms = max(1, int(getattr(self._settings, "rebuild_every_seconds", 600))) * 1000
+            self._label_retry_after[key] = int(self._clock()) + interval_ms
+            return
+        # ``no_input`` covers this snapshot too: a short conversation is not re-read each tick.
+        if outcome.outcome in {"written", "cached", "no_input"}:
+            self._label_written[key] = {
+                "conversation_id": str(conversation.get("conversation_id") or ""),
+                "last_message_id": str(conversation.get("last_message_id") or ""),
+                "messages": int(conversation.get("messages") or 0),
+            }
+            self._label_dirty.discard(key)
+            self._label_retry_after.pop(key, None)
+        else:
+            interval_ms = max(1, int(getattr(self._settings, "min_interval_seconds", 30))) * 1000
+            self._label_retry_after[key] = int(self._clock()) + interval_ms
+
+    @staticmethod
+    def _label_chats(labels: Any) -> tuple[tuple[str, str], ...]:
+        chats: list[tuple[str, str]] = []
+        for entry in getattr(labels, "chats", ()) or ():
+            channel, _, chat_id = str(entry).strip().partition(":")
+            if channel and chat_id:
+                chats.append((channel, chat_id))
+        return tuple(dict.fromkeys(chats))
+
     async def start(self) -> None:
         if self._task is None or self._task.done():
             self._task = asyncio.create_task(self._run(), name="group-state")
 
     async def stop(self) -> None:
+        label_tasks = list(self._label_tasks.values())
+        for task in label_tasks:
+            task.cancel()
+        if label_tasks:
+            await asyncio.gather(*label_tasks, return_exceptions=True)
+        self._label_tasks.clear()
         task = self._task
         self._task = None
         if task is None:
@@ -297,3 +431,22 @@ class GroupStateService:
                 raise
             except Exception as exc:  # noqa: BLE001 - a tick failure must not stop the loop
                 logger.warning("group_state_tick_failed error_type={}", type(exc).__name__)
+
+
+def _accepts_lock(label: Any) -> bool:
+    try:
+        return "lock" in inspect.signature(label).parameters
+    except TypeError, ValueError:
+        return False
+
+
+def _forget_task(
+    tasks: dict[tuple[str, str], asyncio.Task[None]], key: tuple[str, str]
+) -> Callable[[asyncio.Task[None]], None]:
+    def _done(task: asyncio.Task[None]) -> None:
+        if tasks.get(key) is task:
+            tasks.pop(key, None)
+        if not task.cancelled():
+            task.exception()
+
+    return _done

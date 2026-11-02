@@ -184,7 +184,7 @@ async def test_as_of_decisions_open_at_time_only() -> None:
 def test_as_of_decisions_reader_without_as_of_is_unavailable() -> None:
     readers = AsOfSources(SourceReaders(decisions=CurrentDecisions()), AT).readers()
     assert readers.decisions is None
-    assert UNAVAILABLE_IN_REPLAY == frozenset({"commitments"})
+    assert UNAVAILABLE_IN_REPLAY == frozenset({"commitments", "conversation_labels"})
 
 
 @pytest.mark.asyncio

@@ -20,7 +20,7 @@ from .contract import BuildContext, ContributorRegistry, SourceReaders
 from .models import SCHEMA_VERSION, GroupState, Section
 
 #: Sections the replay cannot rebuild honestly and the renderer leaves out.
-UNAVAILABLE_IN_REPLAY: frozenset[str] = frozenset({"commitments"})
+UNAVAILABLE_IN_REPLAY: frozenset[str] = frozenset({"commitments", "conversation_labels"})
 
 
 def _value(item: Any, field: str) -> Any:
