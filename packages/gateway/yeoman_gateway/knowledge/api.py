@@ -1448,17 +1448,19 @@ class KnowledgeService:
         return self._person_notes.store_note(seed)
 
     def has_person_note_hash(
-        self, *, channel: str, chat_id: str, person_id: str, input_hash: str
+        self, *, channel: str, chat_id: str, person_id: str, input_hash: str,
+        family: str = "profile",
     ) -> bool:
         return self._person_notes.has_hash(
-            channel=channel, chat_id=chat_id, person_id=person_id, input_hash=input_hash
+            channel=channel, chat_id=chat_id, person_id=person_id, input_hash=input_hash,
+            family=family,
         )
 
     def latest_person_note(
-        self, *, channel: str, chat_id: str, person_id: str
+        self, *, channel: str, chat_id: str, person_id: str, family: str = "profile"
     ) -> PersonNoteView | None:
         return self._person_notes.latest(
-            channel=channel, chat_id=chat_id, person_id=person_id
+            channel=channel, chat_id=chat_id, person_id=person_id, family=family
         )
 
     def person_notes(
@@ -1471,6 +1473,7 @@ class KnowledgeService:
         source_present: Callable[[str], bool] | None = None,
         include_superseded: bool = False,
         limit: int = 100,
+        family: str = "profile",
     ) -> tuple[PersonNoteView, ...]:
         """Active notes for a reader; every read re-checks staleness before rendering.
 
@@ -1492,6 +1495,7 @@ class KnowledgeService:
             source_present=source_present,
             include_superseded=include_superseded,
             limit=limit,
+            family=family,
         )
 
     def mark_person_notes_stale(
@@ -1516,21 +1520,51 @@ class KnowledgeService:
         chat_id: str | None = None,
         person_id: str | None = None,
         context: TrustedReadContext | None = None,
+        family: str | None = None,
     ) -> int:
-        """Owner-only deletion of stored notes (the CLI passes ``None`` after --yes)."""
+        """Owner-only deletion of stored notes (the CLI passes ``None`` after --yes).
+
+        ``family=None`` purges both families; the explicit argument exists for tests and
+        for a future family-specific owner command.
+        """
         if context is not None:
             self._require_admin_read(context)
         if not chat_id and not person_id:
             raise ValidationError("purge requires a chat or a person")
         return self._person_notes.purge(
-            channel=channel, chat_id=chat_id, person_id=person_id
+            channel=channel, chat_id=chat_id, person_id=person_id, family=family
         )
 
     def person_note_counts(
-        self, *, channel: str = "whatsapp", chat_id: str | None = None
+        self, *, channel: str = "whatsapp", chat_id: str | None = None,
+        family: str = "profile",
     ) -> tuple[dict[str, Any], ...]:
         """Counts and line kinds only; never line text."""
-        return self._person_notes.counts(channel=channel, chat_id=chat_id)
+        return self._person_notes.counts(channel=channel, chat_id=chat_id, family=family)
+
+    def stance_notes(
+        self,
+        *,
+        channel: str,
+        chat_id: str,
+        person_ids: Iterable[str] = (),
+        source_present: Callable[[str], bool] | None = None,
+        limit: int = 100,
+    ) -> tuple[PersonNoteView, ...]:
+        """Internal stance-family read for tuned prompts and the owner CLI.
+
+        Stance notes contain only deterministic pattern lines and no raw chat text, and
+        they are read by the reception path after the per-chat policy gate.  They are
+        deliberately not part of the group reader's ``person_notes`` surface.
+        """
+        return self._person_notes.notes(
+            channel=channel,
+            chat_id=chat_id,
+            person_ids=person_ids,
+            source_present=source_present,
+            limit=limit,
+            family="stance",
+        )
 
     def person_note_tokens(self, *, day: str) -> int:
         return self._person_notes.tokens_used(day=day)

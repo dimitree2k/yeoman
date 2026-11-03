@@ -18,7 +18,7 @@ def test_schema_is_versioned_private_and_wal(tmp_path: Path) -> None:
     db = store._db()
     assert db.execute("PRAGMA journal_mode").fetchone()[0].lower() == "wal"
     version = db.execute("SELECT value FROM meta WHERE key='schema_version'").fetchone()[0]
-    assert version == "1"
+    assert version == "2"
     assert (store.path.stat().st_mode & 0o777) == 0o600
     store.close()
 

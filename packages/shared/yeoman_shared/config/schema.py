@@ -1064,6 +1064,34 @@ class ProcessingReceptionConfig(BaseModel):
     alert_window_hours: int = Field(default=24, alias="alertWindowHours", ge=1, le=168)
     #: Sticker vision is deliberately not implemented; the switch stays off.
     sticker_vision: bool = Field(default=False, alias="stickerVision")
+    #: Reception self-tuning (per-chat ``receptionTuning``): stance-note thresholds.
+    stance_window_days: int = Field(default=30, alias="stanceWindowDays", ge=1, le=365)
+    stance_min_replies: int = Field(default=3, alias="stanceMinReplies", ge=1, le=100)
+    stance_min_days: int = Field(default=2, alias="stanceMinDays", ge=1, le=30)
+    stance_hostile_min: int = Field(default=3, alias="stanceHostileMin", ge=1, le=100)
+    stance_annoyed_min: int = Field(default=3, alias="stanceAnnoyedMin", ge=1, le=100)
+    stance_playful_min: int = Field(default=3, alias="stancePlayfulMin", ge=1, le=100)
+    stance_positive_min: int = Field(default=3, alias="stancePositiveMin", ge=1, le=100)
+    stance_signal_min: int = Field(default=3, alias="stanceSignalMin", ge=1, le=100)
+    stance_ratio_threshold: float = Field(
+        default=0.5, alias="stanceRatioThreshold", gt=0, le=1
+    )
+    #: Maximum stance-note people in one prompt block and characters for that block.
+    stance_max_people: int = Field(default=6, alias="stanceMaxPeople", ge=1, le=20)
+    stance_block_max_chars: int = Field(
+        default=1_500, alias="stanceBlockMaxChars", ge=200, le=8_000
+    )
+    #: Lessons proposer and trial week.
+    lessons_route: str = Field(default="reception.lessons", alias="lessonsRoute")
+    lessons_approval: Literal["owner"] = Field(default="owner", alias="lessonsApproval")
+    lessons_trial_days: int = Field(default=7, alias="lessonsTrialDays", ge=1, le=28)
+    #: Rollback margin in annoyed+hostile labels per 100 outputs, and output growth.
+    lessons_negative_margin: float = Field(
+        default=5.0, alias="lessonsNegativeMargin", ge=0, le=100
+    )
+    lessons_output_increase_pct: int = Field(
+        default=20, alias="lessonsOutputIncreasePct", ge=0, le=500
+    )
 
 
 class GroupStateLabelsConfig(BaseModel):

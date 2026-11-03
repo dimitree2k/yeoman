@@ -175,6 +175,7 @@ def weekly_digest(
     chat_ids: Iterable[str],
     now_ms: int,
     quotes: Mapping[str, Sequence[str]] | None = None,
+    lesson_lines: Mapping[str, str] | None = None,
 ) -> tuple[str, tuple[str, ...]]:
     """One compact owner message; quotes are passed in from live history only."""
     lines: list[str] = []
@@ -199,6 +200,9 @@ def weekly_digest(
             f"stance {_stance_distribution(store.labels(chat_id=chat_id, iso_week=row.iso_week))} "
             f"· {trend_arrow(row, previous)}"
         )
+        lesson_line = str((lesson_lines or {}).get(chat_id) or "").strip()
+        if lesson_line:
+            lines.append(f"  {lesson_line}")
         for quote in (spoken.get(chat_id) or ())[:3]:
             clean = " ".join(str(quote).split())[:120]
             if clean:

@@ -113,7 +113,7 @@ def test_reception_jobs_follow_a_reloaded_policy_engine(tmp_path: Path) -> None:
     current = {"engine": Engine(())}
     store = SentimentStore(tmp_path / "ops" / "sentiment.db")
     try:
-        _, weekly, _, _, _ = build_reception_jobs(
+        _, weekly, _, _, _, _, _ = build_reception_jobs(
             Config(), policy_engine=lambda: current["engine"], history=object(),
             send_owner=lambda content: None, workspace=tmp_path, store=store,
         )

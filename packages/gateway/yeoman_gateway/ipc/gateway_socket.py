@@ -43,6 +43,18 @@ class GatewaySocket:
     history_control_handler: Callable[[str, Mapping[str, Any]], Awaitable[dict[str, Any]]] | None = None
     send_poll_handler: Callable[[dict[str, Any]], Awaitable[dict[str, Any]]] | None = None
     sentiment_run_handler: Callable[[dict[str, Any]], Awaitable[dict[str, Any]]] | None = None
+    sentiment_lessons_propose_handler: (
+        Callable[[dict[str, Any]], Awaitable[dict[str, Any]]] | None
+    ) = None
+    sentiment_lessons_accept_handler: (
+        Callable[[dict[str, Any]], Awaitable[dict[str, Any]]] | None
+    ) = None
+    sentiment_lessons_reject_handler: (
+        Callable[[dict[str, Any]], Awaitable[dict[str, Any]]] | None
+    ) = None
+    sentiment_lessons_rollback_handler: (
+        Callable[[dict[str, Any]], Awaitable[dict[str, Any]]] | None
+    ) = None
     rate_limit: int = 10  # commands per second
     _server: asyncio.Server | None = field(default=None, init=False)
     _request_timestamps: list[float] = field(default_factory=list, init=False)
@@ -101,7 +113,7 @@ class GatewaySocket:
                     if (not isinstance(request, dict) or not isinstance(request.get('cmd'), str) or
                             not isinstance(request.get('args', {}), dict)):
                         raise ValueError('invalid frame')
-                    if request['cmd'] in {'history_control', 'history_read', 'knowledge_read', 'history_chats', 'knowledge_accounting', 'knowledge_statements', 'send_poll', 'sentiment_run'} and not self._peer_is_owner(writer):
+                    if request['cmd'] in {'history_control', 'history_read', 'knowledge_read', 'history_chats', 'knowledge_accounting', 'knowledge_statements', 'send_poll', 'sentiment_run', 'sentiment_lessons_propose', 'sentiment_lessons_accept', 'sentiment_lessons_reject', 'sentiment_lessons_rollback'} and not self._peer_is_owner(writer):
                         response = {'status': 'error', 'code': 'OWNER_REQUIRED'}
                     elif not self._check_rate_limit():
                         response = {"status": "error", "message": "Rate limit exceeded"}
@@ -213,6 +225,63 @@ class GatewaySocket:
                 return await self.sentiment_run_handler(args)
             except Exception:
                 return {'status': 'error', 'code': 'SENTIMENT_RUN_FAILED'}
+
+        if cmd == 'sentiment_lessons_propose':
+            if (
+                set(request) != {'cmd', 'args'}
+                or set(args) != {'chat'}
+                or not isinstance(args['chat'], str)
+                or (args['chat'] and '@' not in args['chat'])
+            ):
+                return {'status': 'error', 'code': 'INVALID_LESSONS'}
+            if self.sentiment_lessons_propose_handler is None:
+                return {'status': 'disabled'}
+            try:
+                return await self.sentiment_lessons_propose_handler(args)
+            except Exception:
+                return {'status': 'error', 'code': 'LESSONS_PROPOSE_FAILED'}
+
+        if cmd in {'sentiment_lessons_accept', 'sentiment_lessons_reject'}:
+            field = 'proposal_id'
+            if (
+                set(request) != {'cmd', 'args'}
+                or set(args) != {field}
+                or not isinstance(args[field], str)
+                or not args[field].startswith('lp-')
+                or len(args[field]) > 80
+            ):
+                return {'status': 'error', 'code': 'INVALID_LESSONS'}
+            handler = (
+                self.sentiment_lessons_accept_handler
+                if cmd.endswith('accept')
+                else self.sentiment_lessons_reject_handler
+            )
+            if handler is None:
+                return {'status': 'disabled'}
+            try:
+                return await handler(args)
+            except Exception:
+                return {'status': 'error', 'code': 'LESSONS_ACTION_FAILED'}
+
+        if cmd == 'sentiment_lessons_rollback':
+            if (
+                set(request) != {'cmd', 'args'}
+                or set(args) != {'chat', 'version'}
+                or not isinstance(args['chat'], str)
+                or not args['chat']
+                or '@' not in args['chat']
+                or not (
+                    args['version'] is None
+                    or (type(args['version']) is int and args['version'] >= 1)
+                )
+            ):
+                return {'status': 'error', 'code': 'INVALID_LESSONS'}
+            if self.sentiment_lessons_rollback_handler is None:
+                return {'status': 'disabled'}
+            try:
+                return await self.sentiment_lessons_rollback_handler(args)
+            except Exception:
+                return {'status': 'error', 'code': 'LESSONS_ROLLBACK_FAILED'}
 
         if cmd == 'send_poll':
             fields = {'chat_id', 'question', 'options', 'multi_select', 'request_id'}

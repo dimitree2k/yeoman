@@ -49,6 +49,7 @@ __all__ = [
     "MAX_NAME_LENGTH",
     "MAX_PEOPLE_PER_STATEMENT",
     "MAX_SOURCES_PER_STATEMENT",
+    "PERSON_NOTE_FAMILIES",
     "PERSON_NOTE_JOB_KIND",
     "PERSON_NOTE_LINE_KINDS",
     "PERSON_NOTE_SOURCE_KINDS",
@@ -192,8 +193,12 @@ GROUP_DIGEST_JOB_KIND: Final[str] = "group_digest"
 #: every line carries the statements or messages it rests on.
 PERSON_NOTE_STATUSES: Final[tuple[str, ...]] = ("active", "superseded", "stale")
 PERSON_NOTE_SOURCE_KINDS: Final[tuple[str, ...]] = ("statement", "message")
-PERSON_NOTE_LINE_KINDS: Final[tuple[str, ...]] = ("stated", "observed")
+#: ``stance`` lines are built deterministically from reception labels; they never mix
+#: with the model-built ``profile`` family of the same store.
+PERSON_NOTE_LINE_KINDS: Final[tuple[str, ...]] = ("stated", "observed", "stance")
 PERSON_NOTE_JOB_KIND: Final[str] = "person_note"
+#: Note families kept apart inside one table.  The default keeps N1 unchanged.
+PERSON_NOTE_FAMILIES: Final[tuple[str, ...]] = ("profile", "stance")
 
 ERROR_CODES: Final[tuple[str, ...]] = (
     "history_identity_read_only",
@@ -1185,8 +1190,11 @@ class PersonNoteSeed:
     input_cut_ms: int
     lines: tuple[PersonNoteLine, ...]
     #: ``(kind, ref, revision)`` rows; ``revision`` is the statement ``updated_ms`` or
-    #: ``0`` for a message.
+    #: ``0`` for a message.  Stance notes put the message's ``sent_ms`` in ``revision``
+    #: so the reader can apply the evidence-age TTL without another table.
     sources: tuple[tuple[str, str, int], ...] = ()
+    #: ``profile`` for N1 model-built notes, ``stance`` for reception notes.
+    family: str = "profile"
 
 
 @dataclass(frozen=True, slots=True)
@@ -1206,6 +1214,7 @@ class PersonNoteView:
     stale_reason: str = ""
     sources: tuple[tuple[str, str, int], ...] = ()
     reason: str = "ok"
+    family: str = "profile"
 
     @property
     def stale(self) -> bool:

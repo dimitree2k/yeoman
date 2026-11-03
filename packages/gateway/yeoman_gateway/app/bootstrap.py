@@ -1190,6 +1190,21 @@ def _build_participation_runtime(
         )
 
     group_notes, group_notes_shadow = build_group_notes_read_path(config, knowledge=knowledge)
+
+    def _reception_tuning(channel: str, chat_id: str) -> bool:
+        engine = policy_adapter.policy_engine() if policy_adapter is not None else policy_engine
+        checker = getattr(engine, "reception_tuning_enabled", None)
+        return bool(checker(channel, chat_id)) if callable(checker) else False
+
+    reception_stance = None
+    if knowledge is not None:
+        from yeoman_gateway.reception.stance import StanceBounds, StanceNotesReader
+
+        reception_stance = StanceNotesReader(
+            knowledge=knowledge,
+            tuning=_reception_tuning,
+            bounds=lambda: StanceBounds.from_config(config),
+        )
     knowledge_selector, knowledge_context_supplier, revalidate_knowledge = (
         build_participation_knowledge(participation, knowledge=knowledge)
     )
@@ -1199,6 +1214,7 @@ def _build_participation_runtime(
         source_authorizer=_source_authorized,
         thread_lookup=getattr(processing_store, "thread_for_message", None),
         group_notes=group_notes,
+        reception_stance=reception_stance,
         group_state_views=group_state_views,
         knowledge_selector=knowledge_selector,
         knowledge_context_supplier=knowledge_context_supplier,
@@ -2129,17 +2145,24 @@ def build_reception_jobs(
     send_owner: Callable[[str], Any],
     workspace: Path,
     store: object | None = None,
+    knowledge: object | None = None,
 ):
-    """Build the P1/P2/P3 ticks and the best-effort outbound recorder.
+    """Build the P1/P2/P3 ticks, the tuning ticks and the outbound recorder.
 
     Deterministic weekly rows are always built when participation maintenance runs.
     The labeler and the owner digest are skipped when ``processing.reception.enabled``
-    is false, but the recorder stays a no-op because no chat opted in anyway.
+    is false, but the recorder stays a no-op because no chat opted in anyway.  The
+    stance and lessons ticks are additionally gated per chat by ``receptionTuning``.
     """
     from yeoman_gateway.reception.labeler import (
         LABEL_ROUTE,
         ReceptionLabelJob,
         ReceptionLabelRunner,
+    )
+    from yeoman_gateway.reception.lessons import (
+        LESSONS_ROUTE,
+        LessonProposer,
+        LessonsJob,
     )
     from yeoman_gateway.reception.metrics import (
         ReceptionBounds,
@@ -2148,6 +2171,11 @@ def build_reception_jobs(
     )
     from yeoman_gateway.reception.outbound import ReceptionOutboundRecorder
     from yeoman_gateway.reception.owner import OwnerDigestJob, alert_sender
+    from yeoman_gateway.reception.stance import (
+        ReceptionStanceBuilder,
+        ReceptionStanceJob,
+        StanceBounds,
+    )
     from yeoman_gateway.reception.store import SentimentStore
 
     reception_config = config.processing.reception
@@ -2160,6 +2188,11 @@ def build_reception_jobs(
 
     def chats() -> tuple[str, ...]:
         return tuple(engine().reception_chats("whatsapp"))
+
+    def tuned_chats() -> tuple[str, ...]:
+        current = engine()
+        getter = getattr(current, "reception_tuning_chats", None)
+        return tuple(getter("whatsapp")) if callable(getter) else ()
 
     def labels() -> dict[str, str]:
         return policy_chat_labels(engine())
@@ -2186,7 +2219,7 @@ def build_reception_jobs(
         persona_sha=sha_for,
     )
     if not bool(reception_config.enabled):
-        return sentiment_store, weekly, None, None, recorder
+        return sentiment_store, weekly, None, None, recorder, None, None
 
     from yeoman_gateway.processing.model_route import RouteClient
 
@@ -2224,12 +2257,65 @@ def build_reception_jobs(
         alert_threshold=int(reception_config.alert_threshold),
         alert_window_hours=int(reception_config.alert_window_hours),
     )
+    stance_builder = ReceptionStanceBuilder(
+        store=sentiment_store,
+        history=history,
+        knowledge=knowledge,
+        bounds=lambda: StanceBounds.from_config(config),
+    )
+    stance_job = ReceptionStanceJob(
+        builder=stance_builder,
+        chats=tuned_chats,
+        run_hour=int(reception_config.label_hour),
+    )
+
+    lessons_clients: dict[str, object] = {}
+
+    def lessons_client() -> object:
+        if "client" not in lessons_clients:
+            lessons_clients["client"] = RouteClient(
+                config=config,
+                route_key=str(reception_config.lessons_route or LESSONS_ROUTE),
+            )
+        return lessons_clients["client"]
+
+    runtime_home = Path(workspace).expanduser().parent
+    proposer = LessonProposer(
+        store=sentiment_store,
+        history=history,
+        workspace=Path(workspace),
+        runtime_home=runtime_home,
+        client_factory=lessons_client,
+        send_owner=send_owner,
+        max_attempts=int(reception_config.max_attempts),
+        timeout_seconds=float(reception_config.timeout_seconds),
+        trial_days=int(reception_config.lessons_trial_days),
+        negative_margin=float(reception_config.lessons_negative_margin),
+        output_increase_pct=int(reception_config.lessons_output_increase_pct),
+    )
+    lessons_job = LessonsJob(
+        proposer=proposer,
+        chats=tuned_chats,
+        run_hour=max(6, int(reception_config.digest_hour) + 1),
+        digest_hour=int(reception_config.digest_hour),
+    )
     owner_job = OwnerDigestJob(
         store=sentiment_store, chats=chats, chat_labels=labels, send=send_owner,
         quotes=_reception_quotes(config, history=history, store=sentiment_store),
+        lessons=lambda: {
+            chat_id: lessons_job.digest_line(chat_id) for chat_id in tuned_chats()
+        },
         run_hour=int(reception_config.digest_hour),
     )
-    return sentiment_store, weekly, label_job, owner_job, recorder
+    return (
+        sentiment_store,
+        weekly,
+        label_job,
+        owner_job,
+        recorder,
+        stance_job,
+        lessons_job,
+    )
 
 
 def policy_chat_labels(policy_engine: object) -> dict[str, str]:
@@ -3409,6 +3495,25 @@ def build_gateway_runtime(
         whatsapp_session_history_limit=config.channels.whatsapp.session_history_limit,
         whatsapp_session_history_limit_group=config.channels.whatsapp.session_history_limit_group,
     )
+    from yeoman_gateway.reception.stance import StanceBounds, StanceNotesReader
+
+    def _live_reception_tuning(channel: str, chat_id: str) -> bool:
+        current = policy_adapter.policy_engine()
+        checker = getattr(current, "reception_tuning_enabled", None)
+        return bool(checker(channel, chat_id)) if callable(checker) else False
+
+    responder.set_reception_tuning(
+        tuning=_live_reception_tuning,
+        stance_reader=(
+            StanceNotesReader(
+                knowledge=knowledge_service,
+                tuning=_live_reception_tuning,
+                bounds=lambda: StanceBounds.from_config(config),
+            )
+            if knowledge_service is not None
+            else None
+        ),
+    )
     if policy_engine is not None:
         policy_engine.validate(policy_validation_tools(set(responder.tool_names)))
 
@@ -4474,6 +4579,7 @@ def build_gateway_runtime(
             weeks = 0
             labels = 0
             failed_days = 0
+            stance_built = 0
             for chat_id in chats:
                 outcomes = await service.backfill(
                     chat_id=chat_id, since_ms=since_ms, until_ms=now
@@ -4485,9 +4591,24 @@ def build_gateway_runtime(
                     labels += outcome.labels
                     failed_days += int(outcome.state != "done")
                     day = day_window(day.end_ms)
+                if live_engine.reception_tuning_enabled("whatsapp", chat_id):
+                    from yeoman_gateway.reception.stance import (
+                        ReceptionStanceBuilder,
+                        StanceBounds,
+                    )
+
+                    stance_builder = ReceptionStanceBuilder(
+                        store=store,
+                        history=history_projector,
+                        knowledge=knowledge_service,
+                        bounds=lambda: StanceBounds.from_config(config),
+                    )
+                    stance_built += (
+                        await stance_builder.build(chat_id, now_ms=now)
+                    ).built
             return {
                 "status": "ok", "weeks": weeks, "labels": labels, "chats": len(chats),
-                "failed_days": failed_days,
+                "failed_days": failed_days, "stance_notes": stance_built,
             }
         except Exception as exc:
             # The socket answers only a code; the cause belongs in the gateway log.
@@ -4495,6 +4616,145 @@ def build_gateway_runtime(
             raise
         finally:
             store.close()
+
+    async def ipc_sentiment_lessons_propose(args: dict[str, Any]) -> dict[str, Any]:
+        """Owner trigger for the weekly lessons proposer (one chat or all tuned)."""
+        from yeoman_gateway.processing.model_route import RouteClient
+        from yeoman_gateway.reception.lessons import (
+            LESSONS_ROUTE,
+            LessonProposer,
+        )
+        from yeoman_gateway.reception.store import SentimentStore
+
+        live_engine = policy_adapter.policy_engine()
+        if live_engine is None:
+            return {"status": "error", "code": "POLICY_UNAVAILABLE"}
+        tuned = tuple(live_engine.reception_tuning_chats("whatsapp"))
+        chat_id = str(args.get("chat") or "").strip()
+        if chat_id and chat_id not in tuned:
+            return {"status": "error", "code": "CHAT_NOT_TUNED"}
+        chats = [chat_id] if chat_id else list(tuned)
+        if not chats:
+            return {"status": "ok", "proposed": 0, "chats": 0}
+        reception_config = config.processing.reception
+        store = SentimentStore()
+        try:
+            clients: dict[str, object] = {}
+
+            def client() -> object:
+                if "client" not in clients:
+                    clients["client"] = RouteClient(
+                        config=config,
+                        route_key=str(
+                            reception_config.lessons_route or LESSONS_ROUTE
+                        ),
+                    )
+                return clients["client"]
+
+            proposer = LessonProposer(
+                store=store,
+                history=history_projector,
+                workspace=Path(workspace),
+                runtime_home=Path(workspace).expanduser().parent,
+                client_factory=client,
+                send_owner=_send_reception_owner,
+                max_attempts=int(reception_config.max_attempts),
+                timeout_seconds=float(reception_config.timeout_seconds),
+                trial_days=int(reception_config.lessons_trial_days),
+                negative_margin=float(reception_config.lessons_negative_margin),
+                output_increase_pct=int(
+                    reception_config.lessons_output_increase_pct
+                ),
+            )
+            proposed = 0
+            results: list[dict[str, Any]] = []
+            moment = int(time.time() * 1000)
+            for chat in chats:
+                result = await proposer.propose(chat, now_ms=moment)
+                proposed += 1 if result.state == "done" else 0
+                rollback = await proposer.propose_trial_rollback(chat, now_ms=moment)
+                results.append(
+                    {
+                        "chat_id": chat,
+                        "state": result.state,
+                        "reason": result.reason,
+                        "proposal_id": result.proposal_id,
+                        "rollback_state": rollback.state,
+                        "rollback_proposal_id": rollback.proposal_id,
+                    }
+                )
+            return {
+                "status": "ok", "proposed": proposed, "chats": len(chats),
+                "results": results,
+            }
+        except Exception as exc:
+            logger.exception(
+                "sentiment_lessons_propose_failed error_type={}", type(exc).__name__
+            )
+            raise
+        finally:
+            store.close()
+
+    async def ipc_sentiment_lessons_accept(args: dict[str, Any]) -> dict[str, Any]:
+        from yeoman_gateway.reception.lessons import LessonService
+        from yeoman_gateway.reception.store import SentimentStore
+
+        def run() -> dict[str, Any]:
+            # The file write and git step block; keep them and their store in one thread.
+            store = SentimentStore()
+            try:
+                service = LessonService(
+                    store=store,
+                    workspace=Path(workspace),
+                    runtime_home=Path(workspace).expanduser().parent,
+                )
+                return service.accept(str(args["proposal_id"]))
+            finally:
+                store.close()
+
+        return await asyncio.to_thread(run)
+
+    async def ipc_sentiment_lessons_reject(args: dict[str, Any]) -> dict[str, Any]:
+        from yeoman_gateway.reception.lessons import LessonService
+        from yeoman_gateway.reception.store import SentimentStore
+
+        def run() -> dict[str, Any]:
+            # The file write and git step block; keep them and their store in one thread.
+            store = SentimentStore()
+            try:
+                service = LessonService(
+                    store=store,
+                    workspace=Path(workspace),
+                    runtime_home=Path(workspace).expanduser().parent,
+                )
+                return service.reject(str(args["proposal_id"]))
+            finally:
+                store.close()
+
+        return await asyncio.to_thread(run)
+
+    async def ipc_sentiment_lessons_rollback(args: dict[str, Any]) -> dict[str, Any]:
+        from yeoman_gateway.reception.lessons import LessonService
+        from yeoman_gateway.reception.store import SentimentStore
+
+        version = args.get("version")
+
+        def run() -> dict[str, Any]:
+            store = SentimentStore()
+            try:
+                service = LessonService(
+                    store=store,
+                    workspace=Path(workspace),
+                    runtime_home=Path(workspace).expanduser().parent,
+                )
+                return service.rollback(
+                    str(args["chat"]),
+                    version=None if version is None else int(version),
+                )
+            finally:
+                store.close()
+
+        return await asyncio.to_thread(run)
 
     gateway_socket = GatewaySocket(
         path=socket_path,
@@ -4513,6 +4773,10 @@ def build_gateway_runtime(
         history_control_handler=history_projector.control,
         send_poll_handler=ipc_send_poll,
         sentiment_run_handler=ipc_sentiment_run,
+        sentiment_lessons_propose_handler=ipc_sentiment_lessons_propose,
+        sentiment_lessons_accept_handler=ipc_sentiment_lessons_accept,
+        sentiment_lessons_reject_handler=ipc_sentiment_lessons_reject,
+        sentiment_lessons_rollback_handler=ipc_sentiment_lessons_rollback,
         rate_limit=ipc_config.command_rate_limit,
     )
 
@@ -4796,12 +5060,15 @@ def build_gateway_runtime(
             reception_label,
             reception_owner,
             reception_recorder,
+            reception_stance,
+            reception_lessons,
         ) = build_reception_jobs(
             config,
             policy_engine=policy_adapter.policy_engine,
             history=history_projector,
             send_owner=_send_reception_owner,
             workspace=Path(workspace),
+            knowledge=knowledge_service,
         )
         if effect_router is not None:
             effect_router.set_reception_recorder(reception_recorder)
@@ -4821,7 +5088,9 @@ def build_gateway_runtime(
             )
             participation_maintenance._reception_weekly = reception_weekly
             participation_maintenance._reception_label = reception_label
+            participation_maintenance._reception_stance = reception_stance
             participation_maintenance._reception_owner = reception_owner
+            participation_maintenance._reception_lessons = reception_lessons
         burst_observer = BurstObserver(
             config=config,
             state_path=get_operational_store_path("burst_state"),
