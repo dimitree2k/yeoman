@@ -208,6 +208,23 @@ async def test_projector_does_not_save_uncommitted_or_staged_state(tmp_path):
         await p.stop()
 
 
+async def test_snapshot_write_failure_logs_error_type(tmp_path):
+    from loguru import logger
+
+    root, db, archive = fixture(tmp_path)
+    p = HistoryProjector(root, db, archive)
+    await start_ready(p)
+    messages: list[str] = []
+    sink = logger.add(lambda m: messages.append(str(m)), level='WARNING')
+    try:
+        with patch('yeoman_gateway.history.live.save_snapshot', side_effect=OSError(28, 'full')):
+            await p._submit(p._save_snapshot)
+    finally:
+        logger.remove(sink)
+        await p.stop()
+    assert any('reason=write_failed error_type=OSError' in m for m in messages), messages
+
+
 async def test_rebuild_invalidates_before_mutation_and_writes_replacement(tmp_path):
     root, db, archive = fixture(tmp_path)
     p = HistoryProjector(root, db, archive)

@@ -562,8 +562,9 @@ class HistoryProjector:
                     or any(row[4] != PROJECTOR_VERSION for row in states)):
                 return
             save_snapshot(snapshot_path(self.db_path), index, self._generation)
-        except Exception:
-            logger.warning('Projection index snapshot skipped reason=write_failed')
+        except Exception as exc:
+            logger.warning('Projection index snapshot skipped reason=write_failed error_type={}',
+                           type(exc).__name__)
 
     def _close_writer(self) -> None:
         if self._connection is not None:
