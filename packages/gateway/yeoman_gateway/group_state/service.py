@@ -407,8 +407,12 @@ class GroupStateService:
             or self._summaries is None
         ):
             return
+        wanted = {str(entry).strip() for entry in getattr(summaries, "chats", ()) or ()}
+        wanted.discard("")
         for channel, chat_id in self.managed_chats():
             key = (channel, chat_id)
+            if wanted and f"{channel}:{chat_id}" not in wanted:
+                continue
             if key in self._summary_tasks:
                 continue
             retry_after = self._summary_retry_after.get(key)

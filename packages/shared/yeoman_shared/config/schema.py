@@ -1103,6 +1103,8 @@ class GroupStateSummariesConfig(BaseModel):
     #: A models.routes key: lowercase and dotted, so the camelCase config round-trip
     #: never rewrites it (``history.summaries`` stays itself).
     route: str = "history.summaries"
+    #: ``"channel:chat_id"`` entries; empty summarizes every managed chat.
+    chats: list[str] = Field(default_factory=list)
     min_messages: int = Field(default=4, alias="minMessages", ge=1)
     daily_prompt_token_cap: int = Field(default=300_000, alias="dailyPromptTokenCap", ge=0)
     keep_weeks: int = Field(default=12, alias="keepWeeks", ge=1, le=104)
@@ -1126,6 +1128,9 @@ class GroupStateViewConfig(BaseModel):
     #: ``off`` reads no Knowledge and renders no past block.
     people: Literal["off", "on"] = "off"
     past: Literal["off", "on"] = "off"
+    #: ``off`` renders only the long-term blocks above (no ``[Group State]`` header,
+    #: presence, conversations or derived items): the evaluated people/past arms.
+    state: Literal["on", "off"] = "on"
 
 
 class GroupStateViewsConfig(BaseModel):

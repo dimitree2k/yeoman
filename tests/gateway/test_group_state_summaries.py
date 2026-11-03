@@ -851,3 +851,43 @@ async def test_summaries_on_schedules_a_task(tmp_path) -> None:
     finally:
         store.close()
         projector.close()
+
+
+@pytest.mark.asyncio
+async def test_summaries_chat_list_skips_unlisted_managed_chats(tmp_path) -> None:
+    now_ms = int(datetime(2026, 11, 4, 12, 0, tzinfo=timezone.utc).timestamp() * 1000)
+    clock = [now_ms]
+    projector = FakeProjector()
+    store = GroupStateStore(tmp_path / "group-state.db")
+    settings = _settings(
+        summaries={"mode": "build", "minMessages": 4, "chats": ["whatsapp:other@g.us"]}
+    )
+    summarizer = FakeSummarizer()
+    registry = ContributorRegistry()
+    registry.register(ConversationsSection())
+    try:
+        _add_conversation(projector, "unlisted", start_ms=now_ms - 3 * 3_600_000, count=4)
+        service = GroupStateService(
+            store=store,
+            registry=registry,
+            settings=settings,
+            history_projector=projector,
+            sources=SourceReaders(),
+            clock_ms=lambda: clock[0],
+            consciousness=SimpleNamespace(
+                lull_silence_minutes=25,
+                burst_threshold_messages=8,
+                burst_window_minutes=15,
+            ),
+            summarizer=summarizer,
+        )
+        clock[0] += 700_000
+        await service.tick_once()
+        tasks = list(service._summary_tasks.values())
+        if tasks:
+            await asyncio.gather(*tasks)
+        assert summarizer.calls == 0
+        assert service.managed_chats()  # the chat is still managed, only not summarized
+    finally:
+        store.close()
+        projector.close()

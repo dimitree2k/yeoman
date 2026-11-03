@@ -146,6 +146,7 @@ class GroupStateViewReader:
                 people=people,
                 people_names=people_names,
                 past=past,
+                with_state=getattr(config, "state", "on") != "off",
             )
         except Exception:  # noqa: BLE001 - a renderer bug means today's prompt
             self._log(
@@ -172,6 +173,8 @@ class GroupStateViewReader:
             items=len(rendered.items),
             state_read_ms=state_read_ms,
             render_ms=render_ms,
+            revision=rendered.revision,
+            long_term=rendered.long_term,
         )
         if config.mode == "shadow":
             return None, rendered
@@ -293,11 +296,13 @@ class GroupStateViewReader:
         items: int,
         state_read_ms: int,
         render_ms: int,
+        revision: int | None = None,
+        long_term: tuple[str, ...] = (),
     ) -> None:
         try:
             logger.info(
                 "group_state_view view={} chat={} mode={} fallback={} chars={} sections={} "
-                "items={} state_read_ms={} render_ms={}",
+                "items={} state_read_ms={} render_ms={} revision={} long_term={}",
                 view,
                 reader.chat_id,
                 mode,
@@ -307,6 +312,8 @@ class GroupStateViewReader:
                 items,
                 state_read_ms,
                 render_ms,
+                revision if revision is not None else "-",
+                ",".join(long_term) or "-",
             )
         except Exception:  # noqa: BLE001 - logging must not break the reply path
             pass
