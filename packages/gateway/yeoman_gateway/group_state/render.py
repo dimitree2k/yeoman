@@ -49,6 +49,8 @@ class RenderedState:
     fallback: str | None
     #: Non-expired, fingerprint-current item ids; step B renders their content.
     items: tuple[str, ...] = ()
+    #: Long-term blocks the text carries, from ``("people", "past")``.
+    long_term: tuple[str, ...] = ()
 
 
 def _int(value: Any) -> int | None:

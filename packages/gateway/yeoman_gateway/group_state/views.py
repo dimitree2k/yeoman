@@ -544,13 +544,16 @@ def _render_view(
     people: Sequence[PersonNoteView] = (),
     people_names: Mapping[str, str] | None = None,
     past: Sequence[Item] = (),
+    with_state: bool = True,
 ) -> RenderedState:
     fallback, age_ms = _guard_state(
         state,
         reader=reader,
         now_ms=now_ms,
         max_age_ms=max_age_ms,
-        quiet_stale_ok=False,
+        # Summaries outlive presence: a quiet chat's old state still names the right
+        # current conversation to exclude, but a chat talking again needs a rebuild.
+        quiet_stale_ok=not with_state,
     )
     if fallback is not None or state is None:
         return RenderedState(
@@ -563,6 +566,18 @@ def _render_view(
         )
     if age_ms is None:
         return RenderedState("", state.revision, None, (), (), "no_state")
+    if not with_state:
+        return _render_long_term_only(
+            state,
+            target=target,
+            now_ms=now_ms,
+            max_chars=max_chars,
+            age_ms=age_ms,
+            lull_ms=lull_ms,
+            people=people,
+            people_names=people_names,
+            past=past,
+        )
 
     names = _name_map(state)
     header = (
@@ -666,6 +681,63 @@ def _render_view(
         dropped=dropped,
         fallback=None,
         items=items,
+        long_term=tuple(
+            name for name, count in (("people", people_count), ("past", past_count)) if count
+        ),
+    )
+
+
+def _render_long_term_only(
+    state: GroupState,
+    *,
+    target: ViewTarget,
+    now_ms: int,
+    max_chars: int,
+    age_ms: int,
+    lull_ms: int,
+    people: Sequence[PersonNoteView],
+    people_names: Mapping[str, str] | None,
+    past: Sequence[Item],
+) -> RenderedState:
+    """Only the people and past blocks, exactly as the evaluation arms rendered them.
+
+    The state is read for one thing: which conversation is current, so its own
+    summary is excluded and older ones are chosen.  The people block goes first and
+    is dropped first when both do not fit ``max_chars``.
+    """
+    conversation = _choose_conversation(
+        _conversation_rows(state), target, now_ms=now_ms, lull_ms=lull_ms
+    )
+    people_text = render_people_block(people, names=people_names) if people else ""
+    past_text = ""
+    if past:
+        conversation_id = (
+            str(conversation.get("conversation_id") or "") if conversation is not None else ""
+        )
+        past_text = render_past_block(
+            past,
+            linked_conversation_ids=_linked_conversation_ids(state, target),
+            older_than_ms=_int(conversation.get("start_ms")) if conversation is not None else None,
+            exclude_conversation_ids=(conversation_id,) if conversation_id else (),
+            now_ms=now_ms,
+            max_chars=min(MAX_PAST_CHARS, max(0, int(max_chars))),
+        )
+        if past_text.count("\n") == 0:
+            past_text = ""  # the header alone carries nothing
+    blocks = [("people", people_text), ("past", past_text)]
+    kept = [(name, text) for name, text in blocks if text]
+    dropped: list[str] = []
+    while kept and len("\n\n".join(text for _, text in kept)) > max(0, int(max_chars)):
+        dropped.append(kept.pop(0)[0])
+    text = "\n\n".join(block for _, block in kept)
+    return RenderedState(
+        text=text,
+        revision=state.revision,
+        age_ms=age_ms,
+        sections=(),
+        dropped=tuple(dropped),
+        fallback=None if text else "empty",
+        long_term=tuple(name for name, _ in kept),
     )
 
 
@@ -681,6 +753,7 @@ def render_reply_view(
     people: Sequence[PersonNoteView] = (),
     people_names: Mapping[str, str] | None = None,
     past: Sequence[Item] = (),
+    with_state: bool = True,
 ) -> RenderedState:
     """The reply-path block: what is happening now and in the replied-to conversation."""
     return _render_view(
@@ -695,6 +768,7 @@ def render_reply_view(
         people=people,
         people_names=people_names,
         past=past,
+        with_state=with_state,
     )
 
 
@@ -710,6 +784,7 @@ def render_writer_view(
     people: Sequence[PersonNoteView] = (),
     people_names: Mapping[str, str] | None = None,
     past: Sequence[Item] = (),
+    with_state: bool = True,
 ) -> RenderedState:
     """The writer-path block: the reply view plus Arvid's recent actions here."""
     return _render_view(
@@ -724,6 +799,7 @@ def render_writer_view(
         people=people,
         people_names=people_names,
         past=past,
+        with_state=with_state,
     )
 
 
