@@ -117,7 +117,10 @@ class OpsTool(Tool):
                 "service": {
                     "type": "string",
                     "enum": ["gateway", "bridge", "all"],
-                    "description": "Target service (for log_scan and service_status).",
+                    "description": (
+                        "Target service (for log_scan and service_status). "
+                        "log_scan defaults to 'gateway'; 'all' scans both logs."
+                    ),
                 },
                 "level": {
                     "type": "string",
@@ -432,11 +435,15 @@ class OpsTool(Tool):
     # ── log_scan ──────────────────────────────────────────────────
 
     async def _log_scan(self, **kwargs: Any) -> str:
-        service = kwargs.get("service")
-        if not service or service not in ("gateway", "bridge"):
+        service = kwargs.get("service") or "gateway"
+        if service == "all":
+            names = ("gateway", "bridge")
+            parts = [await self._log_scan(**{**kwargs, "service": name}) for name in names]
+            return "\n\n".join(f"[{name}]\n{part}" for name, part in zip(names, parts))
+        if service not in ("gateway", "bridge"):
             return (
-                "Error: 'service' parameter is required for log_scan. "
-                "Use 'gateway' or 'bridge'."
+                f"Error: unknown service {service!r} for log_scan. "
+                "Use 'gateway', 'bridge' or 'all'."
             )
 
         log_path = _GATEWAY_LOG if service == "gateway" else _BRIDGE_LOG

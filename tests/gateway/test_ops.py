@@ -123,10 +123,45 @@ def test_parse_loguru_line_returns_none_for_non_loguru():
 
 
 @pytest.mark.asyncio
-async def test_log_scan_missing_service():
+async def test_log_scan_without_service_scans_gateway_log(tmp_path):
+    # The schema only requires `action`; a call without `service` must not
+    # fail (models retried the identical call in a loop).
+    log_file = tmp_path / "gateway.log"
+    log_file.write_text("2026-03-13 10:00:00.000 | INFO     | mod:fn:1 - weekly report sent\n")
     tool = OpsTool()
-    result = await tool.execute(action="log_scan")
-    assert "service" in result.lower() or "required" in result.lower()
+    with patch("yeoman_gateway.agent.tools.ops._GATEWAY_LOG", log_file):
+        result = await tool.execute(
+            action="log_scan", keyword="weekly", since="2026-03-13 00:00", limit=20
+        )
+    assert not result.startswith("Error")
+    assert "weekly report sent" in result
+
+
+@pytest.mark.asyncio
+async def test_log_scan_all_scans_gateway_and_bridge(tmp_path):
+    gateway_log = tmp_path / "gateway.log"
+    gateway_log.write_text("2026-03-13 10:00:00.000 | ERROR    | mod:fn:1 - gateway auth error\n")
+    bridge_log = tmp_path / "bridge.log"
+    bridge_log.write_text("connection error: auth failed\n")
+    tool = OpsTool()
+    with (
+        patch("yeoman_gateway.agent.tools.ops._GATEWAY_LOG", gateway_log),
+        patch("yeoman_gateway.agent.tools.ops._BRIDGE_LOG", bridge_log),
+    ):
+        result = await tool.execute(
+            action="log_scan", service="all", keyword="auth", since="2026-03-13 00:00"
+        )
+    assert not result.startswith("Error")
+    assert "gateway auth error" in result
+    assert "auth failed" in result
+
+
+@pytest.mark.asyncio
+async def test_log_scan_unknown_service_names_valid_values():
+    tool = OpsTool()
+    result = await tool.execute(action="log_scan", service="database")
+    assert result.startswith("Error")
+    assert "'gateway', 'bridge' or 'all'" in result
 
 
 @pytest.mark.asyncio
