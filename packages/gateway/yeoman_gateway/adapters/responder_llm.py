@@ -659,14 +659,20 @@ def _render_participation_transcript(context: dict[str, object], *, limit: int =
     notes_block = render_group_notes_block(
         context.get("group_notes_week"), context.get("group_notes_text")
     )
+    stance_block = str(context.get("reception_stance_text") or "").strip()
     fixed = [target_line, *([knowledge_block] if knowledge_block else [])]
-    # Budget order: required sources > Knowledge > group notes > optional entries. The
-    # group-notes block is dropped whole when it does not fit beside Knowledge.
+    # Budget order: required sources > Knowledge > group notes > stance notes > optional
+    # entries. Every optional block is dropped whole when it does not fit.
     with_notes = [*fixed, *([notes_block] if notes_block else [])]
     if notes_block and sum(map(len, with_notes)) + len(with_notes) - 1 <= limit:
         fixed = with_notes
     elif notes_block:
         context["group_notes_status"] = "budget_dropped"
+    with_stance = [*fixed, *([stance_block] if stance_block else [])]
+    if stance_block and sum(map(len, with_stance)) + len(with_stance) - 1 <= limit:
+        fixed = with_stance
+    elif stance_block:
+        context["reception_stance_status"] = "budget_dropped"
     if sum(map(len, fixed)) + len(fixed) - 1 > limit:
         raise ValueError("required participation context exceeds writer budget")
     state_text = str(context.get("writer_state_text") or "").strip()
@@ -702,6 +708,7 @@ def _render_participation_transcript(context: dict[str, object], *, limit: int =
     context["writer_dropped_entry_count"] = len(dropped)
     context["knowledge_rendered_to_writer"] = bool(knowledge_block)
     context["group_notes_rendered_to_writer"] = bool(notes_block) and notes_block in fixed
+    context["reception_stance_rendered_to_writer"] = bool(stance_block) and stance_block in fixed
     return rendered
 
 
@@ -807,6 +814,9 @@ class LLMResponder(ResponderPort):
         self._pending_hidden_assistant_messages: list[str] = []
         #: Optional reply-view reader; ``None`` keeps today's prompt byte-identical.
         self._group_state_views: Any | None = None
+        #: Reception self-tuning is off unless the live per-chat policy says otherwise.
+        self._reception_tuning: Callable[[str, str], bool] | None = None
+        self._reception_stance: Any | None = None
 
         self.effective_restrict_to_workspace = restrict_to_workspace or (
             self.exec_config.isolation.enabled
@@ -832,6 +842,39 @@ class LLMResponder(ResponderPort):
             quota_governance=quota_governance,
         )
         self._register_default_tools()
+
+    def set_reception_tuning(
+        self,
+        *,
+        tuning: Callable[[str, str], bool],
+        stance_reader: Any,
+    ) -> None:
+        """Attach the live policy gate and the stance reader from the composition root."""
+        self._reception_tuning = tuning
+        self._reception_stance = stance_reader
+
+    def _reception_enabled(self, channel: str, chat_id: str) -> bool:
+        # ``getattr``: tests and helpers build the responder without ``__init__``.
+        tuning = getattr(self, "_reception_tuning", None)
+        if tuning is None:
+            return False
+        try:
+            return bool(tuning(str(channel), str(chat_id)))
+        except Exception:  # noqa: BLE001 - a policy read never breaks a reply
+            return False
+
+    def _reception_persona(
+        self, persona_text: str | None, channel: str, chat_id: str
+    ) -> str | None:
+        """Persona plus the chat's capped lessons addendum, tuned chats only."""
+        if not self._reception_enabled(channel, chat_id):
+            return persona_text
+        from yeoman_gateway.reception.lessons import compose_persona_with_lessons
+
+        try:
+            return compose_persona_with_lessons(persona_text, self.workspace, chat_id)
+        except Exception:  # noqa: BLE001 - lessons are advisory
+            return persona_text
 
     @property
     def tool_names(self) -> frozenset[str]:
@@ -3729,6 +3772,29 @@ class LLMResponder(ResponderPort):
             metadata["private_handoff_remaining_replies"] = (
                 decision.private_handoff_remaining_replies
             )
+        persona_text = self._reception_persona(
+            decision.persona_text, route_channel, route_chat_id
+        )
+        if (
+            getattr(self, "_reception_stance", None) is not None
+            and self._reception_enabled(route_channel, route_chat_id)
+            and str(route_channel) == "whatsapp"
+            and str(route_chat_id).endswith("@g.us")
+        ):
+            from yeoman_gateway.reception.stance import metadata_principals
+
+            try:
+                block = self._reception_stance.block_for_principals(
+                    route_channel,
+                    route_chat_id,
+                    metadata_principals(metadata),
+                    now_ms=int(time.time() * 1000),
+                    snapshot=history_snapshot,
+                )
+            except Exception:  # noqa: BLE001 - stance notes are advisory
+                block = ""
+            if block:
+                metadata["_reception_stance_text"] = block
         # Inject contacts roster for group chats with disclosure enabled
         if decision.contacts_disclosure and event.is_group:
             roster_text = self._knowledge_roster_text(
@@ -3749,7 +3815,7 @@ class LLMResponder(ResponderPort):
             media=event.media,
             metadata=metadata,
             allowed_tools=set(decision.allowed_tools),
-            persona_text=decision.persona_text,
+            persona_text=persona_text,
             talkative_cooldown_enabled=decision.talkative_cooldown_enabled,
             talkative_cooldown_streak_threshold=decision.talkative_cooldown_streak_threshold,
             talkative_cooldown_topic_overlap_threshold=decision.talkative_cooldown_topic_overlap_threshold,
@@ -3787,6 +3853,9 @@ class LLMResponder(ResponderPort):
         route_channel, route_chat_id = self._route_for_event(event)
         prompt = build_participation_draft_prompt(context, purpose)
         metadata = self._metadata_for_event(event)
+        persona_text = self._reception_persona(
+            decision.persona_text, route_channel, route_chat_id
+        )
         metadata["participation_draft"] = True
         budget = derive_reply_budget(
             policy=getattr(decision, "reply_budget", None),
@@ -3804,7 +3873,7 @@ class LLMResponder(ResponderPort):
             media=(),
             metadata=metadata,
             allowed_tools=set(),
-            persona_text=decision.persona_text,
+            persona_text=persona_text,
             talkative_cooldown_enabled=False,
             talkative_cooldown_streak_threshold=7,
             talkative_cooldown_topic_overlap_threshold=0.34,
@@ -4111,6 +4180,7 @@ class LLMResponder(ResponderPort):
             async with history_turn(self._history_projector) as snapshot:
                 with history_knowledge_scope(snapshot, self._history_knowledge):
                     return await self.process_direct(content, **arguments)
+        persona_text = self._reception_persona(persona_text, channel, chat_id)
         return await self._generate(
             session_key=session_key,
             channel=channel,

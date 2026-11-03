@@ -141,6 +141,7 @@ class EffectivePolicy:
     group_reminders: bool = False
     decisions: bool = False
     reception_metrics: bool = False
+    reception_tuning: bool = False
     trends: TrendsPolicy = field(default_factory=TrendsPolicy)
 
 
@@ -312,6 +313,7 @@ class _CompiledPolicy:
     group_reminders: bool = False
     decisions: bool = False
     reception_metrics: bool = False
+    reception_tuning: bool = False
     trends: TrendsPolicy = field(default_factory=TrendsPolicy)
 
 
@@ -431,6 +433,7 @@ class PolicyEngine:
             group_reminders=bool(resolved.group_reminders),
             decisions=bool(resolved.decisions),
             reception_metrics=bool(resolved.reception_metrics),
+            reception_tuning=bool(resolved.reception_tuning),
             session_history_limit=resolved.session_history_limit,
             participation=ParticipationPolicy.model_validate(
                 resolved.participation.model_dump()
@@ -455,6 +458,25 @@ class PolicyEngine:
     def reception_enabled(self, channel: str, chat_id: str) -> bool:
         """Whether this chat opted into reception measurement."""
         return bool(self.resolve_compiled_policy(channel, chat_id).reception_metrics)
+
+    def reception_tuning_enabled(self, channel: str, chat_id: str) -> bool:
+        """Whether this chat opted into reception self-tuning *and* measurement.
+
+        The tuning flag alone never enables anything: it is a modifier of
+        ``receptionMetrics``, exactly like the owner's per-chat policy comment.
+        """
+        compiled = self.resolve_compiled_policy(channel, chat_id)
+        return bool(compiled.reception_metrics and compiled.reception_tuning)
+
+    def reception_tuning_chats(self, channel: str = "whatsapp") -> tuple[str, ...]:
+        """Every chat with both the measurement and the tuning flag, in policy order."""
+        return tuple(
+            chat_id
+            for (rule_channel, chat_id), rule in self._chat_rules.items()
+            if rule_channel == channel
+            and rule.reception_metrics
+            and rule.reception_tuning
+        )
 
     def reception_chats(self, channel: str = "whatsapp") -> tuple[str, ...]:
         """Every explicitly enabled chat id of one channel, in policy order.
@@ -636,6 +658,7 @@ class PolicyEngine:
             group_reminders=resolved.group_reminders,
             decisions=resolved.decisions,
             reception_metrics=resolved.reception_metrics,
+            reception_tuning=resolved.reception_tuning,
             session_history_limit=resolved.session_history_limit,
             participation=ParticipationPolicy.model_validate(
                 resolved.participation.model_dump()

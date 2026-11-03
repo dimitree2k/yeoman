@@ -86,7 +86,9 @@ class ParticipationMaintenance:
         #: Reception measurement ticks (deterministic weekly rows, nightly labels, owner DM).
         self._reception_weekly: Any = None
         self._reception_label: Any = None
+        self._reception_stance: Any = None
         self._reception_owner: Any = None
+        self._reception_lessons: Any = None
         self._ledger = ledger
         self._reconciler = reconciler
         self._archive = archive
@@ -155,10 +157,12 @@ class ParticipationMaintenance:
             return None
 
     async def run_reception(self, *, now_ms: int | None = None) -> None:
-        """Reception ticks: weekly rows, nightly labels, then the owner digest.
+        """Reception ticks: weekly rows, nightly labels, stance notes, then the digest.
 
         Each tick is isolated: an unconfigured label route or a failed provider call
-        must never stop maintenance or the deterministic weekly computation.
+        must never stop maintenance or the deterministic weekly computation.  Stance
+        notes run right after the labeler; the Monday lessons proposer runs after the
+        owner digest so its line can include the current version.
         """
         import asyncio
 
@@ -166,7 +170,9 @@ class ParticipationMaintenance:
         for name, job in (
             ("weekly", self._reception_weekly),
             ("label", self._reception_label),
+            ("stance", self._reception_stance),
             ("owner", self._reception_owner),
+            ("lessons", self._reception_lessons),
         ):
             if job is None:
                 continue

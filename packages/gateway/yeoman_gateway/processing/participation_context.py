@@ -133,6 +133,7 @@ class ParticipationContextBuilder:
         source_authorizer: Callable[[Mapping[str, Any]], bool] | None = None,
         thread_lookup: Callable[[str], object] | None = None,
         group_notes: Any | None = None,
+        reception_stance: Any | None = None,
         group_state_views: Any | None = None,
         knowledge_selector: Any | None = None,
         knowledge_context_supplier: Callable[[ParticipationOpportunity, Mapping[str, Any]], Any]
@@ -149,6 +150,9 @@ class ParticipationContextBuilder:
         self._thread_lookup = thread_lookup
         # Weekly group note reader (``GroupNotesReader``); same chat only, by mode.
         self._group_notes = group_notes
+        # Per-person stance-note reader; its own policy gate keeps every untuned chat
+        # byte-identical (no key is ever added).
+        self._reception_stance = reception_stance
         # Optional writer-view reader; ``None`` (and every ``off`` mode) leaves the
         # context exactly as it was.
         self._group_state_views = group_state_views
@@ -454,6 +458,7 @@ class ParticipationContextBuilder:
             (time.monotonic() - selection_started) * 1000
         )
         self._attach_group_note(context, opportunity, now_ms=moment)
+        self._attach_reception_stance(context, opportunity, now_ms=moment)
         self._attach_group_state_view(context, opportunity)
         return context
 
@@ -488,6 +493,55 @@ class ParticipationContextBuilder:
             context["group_notes_digest_id"] = note.digest_id
         else:
             context[SHADOW_NOTE_KEY] = note.as_mapping()
+
+    def _attach_reception_stance(
+        self,
+        context: dict[str, object],
+        opportunity: ParticipationOpportunity,
+        *,
+        now_ms: int,
+    ) -> None:
+        """Add stance lines for people present in this window, tuned chats only."""
+        if self._reception_stance is None:
+            return
+        messages = context.get("messages")
+        if not isinstance(messages, list):
+            return
+        current_ids = {
+            str(item) for item in (context.get("current_source_ids") or ()) if str(item)
+        }
+        principals: list[str] = []
+        target_sender = ""
+        for row in messages:
+            if not isinstance(row, Mapping):
+                continue
+            sender = str(row.get("sender_id") or row.get("participant") or "").strip()
+            if not sender:
+                continue
+            principals.append(sender)
+            message_id = str(row.get("event_id") or row.get("message_id") or "")
+            if message_id and (not current_ids or message_id in current_ids):
+                target_sender = sender
+        # The newest current source is the target even when the caller did not mark ids.
+        if not target_sender and messages:
+            newest = messages[-1]
+            if isinstance(newest, Mapping):
+                target_sender = str(
+                    newest.get("sender_id") or newest.get("participant") or ""
+                ).strip()
+        if target_sender:
+            principals.append(target_sender)
+        try:
+            block = self._reception_stance.block_for_principals(
+                opportunity.channel,
+                opportunity.chat_id,
+                principals,
+                now_ms=now_ms,
+            )
+        except Exception:  # noqa: BLE001 - stance notes are advisory
+            return
+        if block:
+            context["reception_stance_text"] = block
 
     def _attach_group_state_view(
         self, context: dict[str, object], opportunity: ParticipationOpportunity

@@ -750,6 +750,13 @@ When a user asks you to send, create, or reply with a voice message / Sprachnach
         if reply_budget_context:
             messages.append({"role": "system", "content": reply_budget_context})
 
+        # Reception stance notes (tuned chats only; the key is absent otherwise).
+        reception_stance = str(
+            (current_metadata or {}).get("_reception_stance_text") or ""
+        ).strip()
+        if reception_stance:
+            messages.append({"role": "system", "content": reception_stance})
+
         # Retrieved long-term memory (bounded, synthetic system context)
         if retrieved_memory_text:
             if compact:

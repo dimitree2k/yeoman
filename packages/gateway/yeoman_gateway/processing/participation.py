@@ -504,14 +504,23 @@ class ParticipationJudge:
         notes_block = render_group_notes_block(
             context.get("group_notes_week"), context.get("group_notes_text")
         )
+        stance_block = str(context.get("reception_stance_text") or "").strip()
         state_block = str(context.get("group_state_text") or "").strip()
-        # Budget order: required sources > Knowledge > group notes > optional entries > group
-        # state. Group state is dropped whole, and before notes and Knowledge, when the
-        # budget is short.
-        fixed_length = max_target + len(knowledge_block) + len(notes_block) + len(state_block)
+        # Budget order: required sources > Knowledge > group notes > stance notes >
+        # optional entries > group state. Every optional block is dropped whole.
+        fixed_length = (
+            max_target + len(knowledge_block) + len(notes_block)
+            + len(stance_block) + len(state_block)
+        )
         if fixed_length + 2 > 4000 and state_block:
             _drop_group_state(context)
             state_block = ""
+            fixed_length = (
+                max_target + len(knowledge_block) + len(notes_block) + len(stance_block)
+            )
+        if fixed_length + 2 > 4000 and stance_block:
+            _drop_reception_stance(context)
+            stance_block = ""
             fixed_length = max_target + len(knowledge_block) + len(notes_block)
         if fixed_length + 2 > 4000 and notes_block:
             _drop_group_notes(context)
@@ -560,6 +569,9 @@ class ParticipationJudge:
             if str(context.get("group_notes_text") or "").strip():
                 _drop_group_notes(context)
                 continue
+            if str(context.get("reception_stance_text") or "").strip():
+                _drop_reception_stance(context)
+                continue
             if knowledge:
                 context.pop("selected_knowledge_text", None)
                 selection = context.get("_knowledge_selection")
@@ -578,6 +590,9 @@ class ParticipationJudge:
         context["knowledge_rendered_to_judge"] = bool(context.get("selected_knowledge_text"))
         context["group_notes_rendered_to_judge"] = bool(
             str(context.get("group_notes_text") or "").strip()
+        )
+        context["reception_stance_rendered_to_judge"] = bool(
+            str(context.get("reception_stance_text") or "").strip()
         )
         context["group_state_rendered_to_judge"] = bool(
             str(context.get("group_state_text") or "").strip()
@@ -964,6 +979,7 @@ class _JudgeContext:
     rendered: str
     group_notes_text: str = ""
     group_notes_week: str = ""
+    reception_stance_text: str = ""
     group_state_text: str = ""
     meme_templates: frozenset[str] = frozenset()
     meme_photo_ids: frozenset[str] = frozenset()
@@ -1102,6 +1118,7 @@ class _JudgeContext:
             rendered="\n".join(lines) if lines else "(no retained context)",
             group_notes_text=str(context.get("group_notes_text") or ""),
             group_notes_week=str(context.get("group_notes_week") or ""),
+            reception_stance_text=str(context.get("reception_stance_text") or ""),
             group_state_text=str(context.get("group_state_text") or ""),
             **_meme_view(context),
         )
@@ -1120,6 +1137,8 @@ class _JudgeContext:
         notes = render_group_notes_block(self.group_notes_week, self.group_notes_text)
         if notes:
             blocks.append(notes)
+        if self.reception_stance_text.strip():
+            blocks.append(self.reception_stance_text.strip())
         state = self.group_state_text.strip()
         if state:
             blocks.append(state)
@@ -1171,6 +1190,12 @@ def _drop_group_notes(context: dict[str, Any]) -> None:
     """Remove the group-notes block whole; its identity stays for the record."""
     context.pop("group_notes_text", None)
     context["group_notes_status"] = "budget_dropped"
+
+
+def _drop_reception_stance(context: dict[str, Any]) -> None:
+    """Remove the stance block whole; its status stays for the record."""
+    context.pop("reception_stance_text", None)
+    context["reception_stance_status"] = "budget_dropped"
 
 
 def _drop_group_state(context: dict[str, Any]) -> None:

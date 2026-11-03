@@ -25,6 +25,7 @@ from collections.abc import Callable, Iterable, Mapping
 from typing import TYPE_CHECKING, Any
 
 from yeoman_gateway.knowledge.models import (
+    PERSON_NOTE_FAMILIES,
     PERSON_NOTE_JOB_KIND,
     PERSON_NOTE_LINE_KINDS,
     PERSON_NOTE_SOURCE_KINDS,
@@ -228,6 +229,9 @@ class PersonNoteStore:
     def store_note(self, seed: PersonNoteSeed, *, now_ms: int | None = None) -> PersonNoteView:
         """Insert a new version; the previous active note becomes ``superseded``."""
         lines = tuple(seed.lines)
+        family = str(seed.family or "profile")
+        if family not in PERSON_NOTE_FAMILIES:
+            raise ValidationError(f"unknown person note family: {family!r}")
         if any(line.kind not in PERSON_NOTE_LINE_KINDS for line in lines):
             raise ValidationError("unknown person note line kind")
         if any(not line.text.strip() for line in lines):
@@ -245,13 +249,17 @@ class PersonNoteStore:
             latest = self._store.query_one(
                 "SELECT note_id FROM knowledge_person_notes"
                 " WHERE workspace_id = ? AND channel = ? AND chat_id = ? AND person_id = ?"
-                " AND status = 'active' ORDER BY built_ms DESC, note_id DESC LIMIT 1",
-                (self.workspace_id, str(seed.channel), str(seed.chat_id), str(seed.person_id)),
+                " AND family = ? AND status = 'active'"
+                " ORDER BY built_ms DESC, note_id DESC LIMIT 1",
+                (
+                    self.workspace_id, str(seed.channel), str(seed.chat_id),
+                    str(seed.person_id), family,
+                ),
             )
             self._store.execute(
                 "INSERT INTO knowledge_person_notes (note_id, workspace_id, channel, chat_id,"
-                " person_id, status, input_hash, built_ms, input_cut_ms, lines_json,"
-                " superseded_by, stale_reason) VALUES (?, ?, ?, ?, ?, 'active', ?, ?, ?, ?,"
+                " person_id, family, status, input_hash, built_ms, input_cut_ms, lines_json,"
+                " superseded_by, stale_reason) VALUES (?, ?, ?, ?, ?, ?, 'active', ?, ?, ?, ?,"
                 " NULL, NULL)",
                 (
                     note_id,
@@ -259,6 +267,7 @@ class PersonNoteStore:
                     str(seed.channel),
                     str(seed.chat_id),
                     str(seed.person_id),
+                    family,
                     str(seed.input_hash),
                     built,
                     int(seed.input_cut_ms),
@@ -294,21 +303,30 @@ class PersonNoteStore:
         assert view is not None
         return view
 
-    def has_hash(self, *, channel: str, chat_id: str, person_id: str, input_hash: str) -> bool:
+    def has_hash(
+        self, *, channel: str, chat_id: str, person_id: str, input_hash: str,
+        family: str = "profile",
+    ) -> bool:
         return (
             self._store.query_one(
                 "SELECT 1 FROM knowledge_person_notes WHERE workspace_id = ? AND channel = ?"
-                " AND chat_id = ? AND person_id = ? AND input_hash = ? LIMIT 1",
-                (self.workspace_id, str(channel), str(chat_id), str(person_id), str(input_hash)),
+                " AND chat_id = ? AND person_id = ? AND family = ? AND input_hash = ? LIMIT 1",
+                (
+                    self.workspace_id, str(channel), str(chat_id), str(person_id),
+                    str(family), str(input_hash),
+                ),
             )
             is not None
         )
 
-    def latest(self, *, channel: str, chat_id: str, person_id: str) -> PersonNoteView | None:
+    def latest(
+        self, *, channel: str, chat_id: str, person_id: str, family: str = "profile"
+    ) -> PersonNoteView | None:
         row = self._store.query_one(
             "SELECT * FROM knowledge_person_notes WHERE workspace_id = ? AND channel = ?"
-            " AND chat_id = ? AND person_id = ? ORDER BY built_ms DESC, note_id DESC LIMIT 1",
-            (self.workspace_id, str(channel), str(chat_id), str(person_id)),
+            " AND chat_id = ? AND person_id = ? AND family = ?"
+            " ORDER BY built_ms DESC, note_id DESC LIMIT 1",
+            (self.workspace_id, str(channel), str(chat_id), str(person_id), str(family)),
         )
         return self._view(row)
 
@@ -321,16 +339,17 @@ class PersonNoteStore:
         source_present: Callable[[str], bool] | None = None,
         include_superseded: bool = False,
         limit: int = 100,
+        family: str = "profile",
     ) -> tuple[PersonNoteView, ...]:
         """Notes for one chat, newest first; an active one is re-checked before it renders."""
         wanted = tuple(dict.fromkeys(str(item) for item in person_ids if str(item)))
         rows = self._store.query(
             "SELECT * FROM knowledge_person_notes WHERE workspace_id = ? AND channel = ?"
-            " AND chat_id = ?"
+            " AND chat_id = ? AND family = ?"
             + (" AND person_id IN (" + ",".join("?" for _ in wanted) + ")" if wanted else "")
             + ("" if include_superseded else " AND status = 'active'")
             + " ORDER BY built_ms DESC, note_id DESC LIMIT ?",
-            (self.workspace_id, str(channel), str(chat_id), *wanted, int(limit)),
+            (self.workspace_id, str(channel), str(chat_id), str(family), *wanted, int(limit)),
         )
         views: list[PersonNoteView] = []
         for row in rows:
@@ -391,6 +410,7 @@ class PersonNoteStore:
             stale_reason=str(row["stale_reason"] or ""),
             sources=self._sources_of(str(row["note_id"])),
             reason=reason,
+            family=str(row["family"] or "profile"),
         )
 
     def _is_stale(self, note_id: str, source_present: Callable[[str], bool] | None) -> bool:
@@ -459,8 +479,12 @@ class PersonNoteStore:
         channel: str,
         chat_id: str | None = None,
         person_id: str | None = None,
+        family: str | None = None,
     ) -> int:
-        """Delete notes (and their source rows) for one chat and/or person."""
+        """Delete notes (and their source rows) for one chat and/or person.
+
+        ``family=None`` covers both families, which is what the owner purge wants.
+        """
         clauses = ["workspace_id = ?", "channel = ?"]
         params: list[Any] = [self.workspace_id, str(channel)]
         if chat_id is not None:
@@ -469,6 +493,9 @@ class PersonNoteStore:
         if person_id is not None:
             clauses.append("person_id = ?")
             params.append(str(person_id))
+        if family is not None:
+            clauses.append("family = ?")
+            params.append(str(family))
         rows = self._store.query(
             f"SELECT note_id FROM knowledge_person_notes WHERE {' AND '.join(clauses)}",
             tuple(params),
@@ -488,16 +515,19 @@ class PersonNoteStore:
             )
         return len(note_ids)
 
-    def counts(self, *, channel: str, chat_id: str | None = None) -> tuple[dict[str, Any], ...]:
+    def counts(
+        self, *, channel: str, chat_id: str | None = None, family: str = "profile"
+    ) -> tuple[dict[str, Any], ...]:
         """Aggregate counts and line kinds only; never line text."""
         rows = (
             self.notes(
                 channel=channel,
                 chat_id=str(chat_id) if chat_id is not None else "",
                 limit=10_000,
+                family=family,
             )
             if chat_id is not None
-            else self._all_active(channel)
+            else self._all_active(channel, family=family)
         )
         out: list[dict[str, Any]] = []
         for view in rows:
@@ -511,17 +541,21 @@ class PersonNoteStore:
                     "note_id": view.note_id,
                     "status": view.status,
                     "built_ms": view.built_ms,
+                    "family": view.family,
                     "kinds": kinds,
                     "line_count": len(view.lines),
                 }
             )
         return tuple(out)
 
-    def _all_active(self, channel: str) -> tuple[PersonNoteView, ...]:
+    def _all_active(
+        self, channel: str, family: str = "profile"
+    ) -> tuple[PersonNoteView, ...]:
         rows = self._store.query(
             "SELECT * FROM knowledge_person_notes WHERE workspace_id = ? AND channel = ?"
-            " AND status = 'active' ORDER BY chat_id, person_id, built_ms DESC",
-            (self.workspace_id, str(channel)),
+            " AND family = ? AND status = 'active'"
+            " ORDER BY chat_id, person_id, built_ms DESC",
+            (self.workspace_id, str(channel), str(family)),
         )
         views: list[PersonNoteView] = []
         for row in rows:

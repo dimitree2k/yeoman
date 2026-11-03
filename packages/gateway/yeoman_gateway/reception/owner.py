@@ -33,6 +33,7 @@ class OwnerDigestJob:
         chat_labels: Callable[[], Mapping[str, str]],
         send: Callable[[str], Awaitable[Any]],
         quotes: Callable[[str, str], Awaitable[list[str]]] | None = None,
+        lessons: Callable[[], Mapping[str, str]] | None = None,
         clock_ms: Callable[[], int] | None = None,
         run_hour: int = DIGEST_RUN_HOUR,
         tz: tzinfo | None = None,
@@ -42,6 +43,7 @@ class OwnerDigestJob:
         self._chat_labels = chat_labels
         self._send = send
         self._quotes = quotes
+        self._lessons = lessons
         self._clock_ms = clock_ms or (lambda: int(time.time() * 1000))
         self._run_hour = int(run_hour)
         self._tz = tz
@@ -67,9 +69,15 @@ class OwnerDigestJob:
                     quotes[chat_id] = list(await self._quotes(chat_id, target.label))
                 except Exception:  # noqa: BLE001 - quotes are optional
                     quotes[chat_id] = []
+        lesson_lines: dict[str, str] = {}
+        if self._lessons is not None:
+            try:
+                lesson_lines = dict(self._lessons())
+            except Exception:  # noqa: BLE001 - the digest line is advisory
+                lesson_lines = {}
         text, used = weekly_digest(
             self._store, chat_labels=dict(self._chat_labels()), chat_ids=chat_ids,
-            now_ms=moment, quotes=quotes,
+            now_ms=moment, quotes=quotes, lesson_lines=lesson_lines,
         )
         self._last_week = target.label
         if not text.strip():

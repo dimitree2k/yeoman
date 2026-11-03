@@ -444,6 +444,9 @@ class ChatPolicy(PolicyModel):
     decisions: bool = False
     #: Opt-in switch for reception measurement (sentiment.db); off unless a chat enables it.
     reception_metrics: bool = Field(default=False, alias="receptionMetrics")
+    #: Opt-in switch for reception self-tuning (stance notes and lessons). It only has an
+    #: effect where ``receptionMetrics`` is also on.
+    reception_tuning: bool = Field(default=False, alias="receptionTuning")
     session_history_limit: int | None = Field(default=None, alias="sessionHistoryLimit")
 
 
@@ -476,6 +479,8 @@ class ChatPolicyOverride(PolicyModel):
     decisions: bool | None = None
     #: Per-chat reception measurement opt-in; the owner sets it for selected groups.
     reception_metrics: bool | None = Field(default=None, alias="receptionMetrics")
+    #: Per-chat reception self-tuning opt-in; effective only beside ``receptionMetrics``.
+    reception_tuning: bool | None = Field(default=None, alias="receptionTuning")
     session_history_limit: int | None = Field(default=None, alias="sessionHistoryLimit", ge=1, le=100)
 
 

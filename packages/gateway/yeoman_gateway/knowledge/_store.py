@@ -778,6 +778,9 @@ PERSON_NOTE_SCHEMA: tuple[str, ...] = (
         channel TEXT NOT NULL,
         chat_id TEXT NOT NULL,
         person_id TEXT NOT NULL,
+        -- N1 profile notes and reception stance notes share the table but never the
+        -- supersession chain.  Existing rows migrate to the default without a rewrite.
+        family TEXT NOT NULL DEFAULT 'profile',
         status TEXT NOT NULL DEFAULT 'active'
             CHECK(status IN ('active','superseded','stale')),
         input_hash TEXT NOT NULL,
@@ -942,10 +945,38 @@ class KnowledgeStore:
                 self._conn.execute(statement)
 
     def ensure_person_note_schema(self) -> None:
-        """Create the person-note tables if missing; never touches an existing table."""
+        """Create the person-note tables if missing and add the additive family column.
+
+        ``CREATE TABLE IF NOT EXISTS`` cannot upgrade a table that predates the column,
+        so the upgrade is one explicit ``ALTER TABLE`` guarded by ``PRAGMA table_info``.
+        Existing rows keep the default ``profile`` family, which is exactly N1's old
+        behaviour.
+        """
         with self.transaction():
             for statement in PERSON_NOTE_SCHEMA:
                 self._conn.execute(statement)
+            columns = {
+                str(row["name"])
+                for row in self._conn.execute(
+                    "PRAGMA table_info(knowledge_person_notes)"
+                ).fetchall()
+            }
+            if "family" not in columns:
+                self._conn.execute(
+                    "ALTER TABLE knowledge_person_notes"
+                    " ADD COLUMN family TEXT NOT NULL DEFAULT 'profile'"
+                )
+            # Indexes that name the new column are created after the column exists.
+            self._conn.execute(
+                "CREATE INDEX IF NOT EXISTS knowledge_person_notes_by_family"
+                " ON knowledge_person_notes"
+                " (workspace_id, channel, chat_id, person_id, family, status, built_ms DESC)"
+            )
+            self._conn.execute(
+                "CREATE INDEX IF NOT EXISTS knowledge_person_notes_by_family_hash"
+                " ON knowledge_person_notes"
+                " (workspace_id, channel, chat_id, person_id, family, input_hash)"
+            )
 
     def table_names(self) -> tuple[str, ...]:
         with self._lock:

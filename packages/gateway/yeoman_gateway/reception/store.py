@@ -15,7 +15,7 @@ from dataclasses import dataclass
 from pathlib import Path
 from typing import Any
 
-SCHEMA_VERSION = 1
+SCHEMA_VERSION = 2
 #: One alert per chat per day is a hard rate limit, not a schedule.
 ALERT_WINDOW_MS = 24 * 60 * 60 * 1000
 
@@ -78,6 +78,24 @@ _DDL = (
         reported_ms INTEGER NOT NULL,
         PRIMARY KEY (chat_id, persona_sha)
     )""",
+    """CREATE TABLE IF NOT EXISTS lesson_proposals (
+        id TEXT PRIMARY KEY,
+        chat_id TEXT NOT NULL,
+        created_ms INTEGER NOT NULL,
+        status TEXT NOT NULL CHECK(status IN ('open','accepted','rejected','superseded')),
+        items_json TEXT NOT NULL DEFAULT '[]',
+        diff_text TEXT NOT NULL DEFAULT ''
+    )""",
+    "CREATE INDEX IF NOT EXISTS idx_lesson_proposals_chat "
+    "ON lesson_proposals(chat_id, created_ms DESC)",
+    """CREATE TABLE IF NOT EXISTS lesson_versions (
+        chat_id TEXT NOT NULL,
+        version INTEGER NOT NULL,
+        applied_ms INTEGER NOT NULL,
+        items_json TEXT NOT NULL DEFAULT '[]',
+        source_proposal TEXT NOT NULL DEFAULT '',
+        PRIMARY KEY (chat_id, version)
+    )""",
 )
 
 
@@ -91,6 +109,25 @@ class WeeklyRow:
     persona_sha: str
     policy_snapshot: dict[str, Any]
     metrics: dict[str, Any]
+
+
+@dataclass(frozen=True, slots=True)
+class LessonProposalRow:
+    id: str
+    chat_id: str
+    created_ms: int
+    status: str
+    items: tuple[dict[str, Any], ...]
+    diff_text: str
+
+
+@dataclass(frozen=True, slots=True)
+class LessonVersionRow:
+    chat_id: str
+    version: int
+    applied_ms: int
+    items: tuple[dict[str, Any], ...]
+    source_proposal: str
 
 
 @dataclass(frozen=True, slots=True)
@@ -126,6 +163,32 @@ def _weekly(row: sqlite3.Row) -> WeeklyRow:
         persona_sha=str(row["persona_sha"]),
         policy_snapshot=_decode(row["policy_snapshot_json"], {}),
         metrics=_decode(row["metrics_json"], {}),
+    )
+
+
+def _items(value: str | None) -> tuple[dict[str, Any], ...]:
+    payload = _decode(value, [])
+    return tuple(item for item in payload if isinstance(item, dict))
+
+
+def _proposal(row: sqlite3.Row) -> LessonProposalRow:
+    return LessonProposalRow(
+        id=str(row["id"]),
+        chat_id=str(row["chat_id"]),
+        created_ms=int(row["created_ms"]),
+        status=str(row["status"]),
+        items=_items(row["items_json"]),
+        diff_text=str(row["diff_text"] or ""),
+    )
+
+
+def _version(row: sqlite3.Row) -> LessonVersionRow:
+    return LessonVersionRow(
+        chat_id=str(row["chat_id"]),
+        version=int(row["version"]),
+        applied_ms=int(row["applied_ms"]),
+        items=_items(row["items_json"]),
+        source_proposal=str(row["source_proposal"] or ""),
     )
 
 
@@ -360,6 +423,146 @@ class SentimentStore:
         ).fetchall()
         return {str(row["message_id"]) for row in rows}
 
+    # -- lessons -------------------------------------------------------------------
+
+    def get_meta(self, key: str, default: str | None = None) -> str | None:
+        row = self._db().execute(
+            "SELECT value FROM meta WHERE key=?", (str(key),)
+        ).fetchone()
+        return default if row is None else str(row["value"])
+
+    def set_meta(self, key: str, value: str) -> None:
+        self._db().execute(
+            "INSERT INTO meta(key, value) VALUES (?, ?) "
+            "ON CONFLICT(key) DO UPDATE SET value=excluded.value",
+            (str(key), str(value)),
+        )
+
+    def create_lesson_proposal(
+        self,
+        *,
+        chat_id: str,
+        created_ms: int,
+        items: tuple[dict[str, Any], ...] | list[dict[str, Any]],
+        diff_text: str,
+    ) -> LessonProposalRow:
+        """Store one open proposal; an older open one for the chat becomes superseded."""
+        proposal_id = f"lp-{int(created_ms)}-{os.urandom(4).hex()}"
+        db = self._db()
+        db.execute("BEGIN IMMEDIATE")
+        try:
+            db.execute(
+                "UPDATE lesson_proposals SET status='superseded'"
+                " WHERE chat_id=? AND status='open'",
+                (str(chat_id),),
+            )
+            db.execute(
+                "INSERT INTO lesson_proposals(id, chat_id, created_ms, status, items_json,"
+                " diff_text) VALUES (?, ?, ?, 'open', ?, ?)",
+                (
+                    proposal_id,
+                    str(chat_id),
+                    int(created_ms),
+                    json.dumps(list(items), ensure_ascii=False, sort_keys=True),
+                    str(diff_text),
+                ),
+            )
+            db.execute("COMMIT")
+        except BaseException:
+            db.execute("ROLLBACK")
+            raise
+        row = db.execute(
+            "SELECT * FROM lesson_proposals WHERE id=?", (proposal_id,)
+        ).fetchone()
+        assert row is not None
+        return _proposal(row)
+
+    def lesson_proposal(self, proposal_id: str) -> LessonProposalRow | None:
+        row = self._db().execute(
+            "SELECT * FROM lesson_proposals WHERE id=?", (str(proposal_id),)
+        ).fetchone()
+        return None if row is None else _proposal(row)
+
+    def lesson_proposals(
+        self, chat_id: str | None = None, *, status: str | None = None, limit: int = 50
+    ) -> tuple[LessonProposalRow, ...]:
+        conditions: list[str] = []
+        parameters: list[Any] = []
+        if chat_id is not None:
+            conditions.append("chat_id=?")
+            parameters.append(str(chat_id))
+        if status is not None:
+            conditions.append("status=?")
+            parameters.append(str(status))
+        where = f" WHERE {' AND '.join(conditions)}" if conditions else ""
+        rows = self._db().execute(
+            f"SELECT * FROM lesson_proposals{where} ORDER BY created_ms DESC, id DESC LIMIT ?",
+            (*parameters, int(limit)),
+        ).fetchall()
+        return tuple(_proposal(row) for row in rows)
+
+    def set_lesson_proposal_status(self, proposal_id: str, status: str) -> bool:
+        if status not in ("open", "accepted", "rejected", "superseded"):
+            raise ValueError("unknown lesson proposal status")
+        cursor = self._db().execute(
+            "UPDATE lesson_proposals SET status=? WHERE id=? AND status='open'",
+            (str(status), str(proposal_id)),
+        )
+        return cursor.rowcount == 1
+
+    def record_lesson_version(
+        self,
+        *,
+        chat_id: str,
+        applied_ms: int,
+        items: tuple[dict[str, Any], ...] | list[dict[str, Any]],
+        source_proposal: str = "",
+    ) -> LessonVersionRow:
+        db = self._db()
+        db.execute("BEGIN IMMEDIATE")
+        try:
+            row = db.execute(
+                "SELECT COALESCE(MAX(version), 0) AS version FROM lesson_versions"
+                " WHERE chat_id=?",
+                (str(chat_id),),
+            ).fetchone()
+            version = int(row["version"] or 0) + 1
+            db.execute(
+                "INSERT INTO lesson_versions(chat_id, version, applied_ms, items_json,"
+                " source_proposal) VALUES (?, ?, ?, ?, ?)",
+                (
+                    str(chat_id),
+                    version,
+                    int(applied_ms),
+                    json.dumps(list(items), ensure_ascii=False, sort_keys=True),
+                    str(source_proposal),
+                ),
+            )
+            db.execute("COMMIT")
+        except BaseException:
+            db.execute("ROLLBACK")
+            raise
+        saved = db.execute(
+            "SELECT * FROM lesson_versions WHERE chat_id=? AND version=?",
+            (str(chat_id), version),
+        ).fetchone()
+        assert saved is not None
+        return _version(saved)
+
+    def lesson_versions(self, chat_id: str) -> tuple[LessonVersionRow, ...]:
+        rows = self._db().execute(
+            "SELECT * FROM lesson_versions WHERE chat_id=? ORDER BY version",
+            (str(chat_id),),
+        ).fetchall()
+        return tuple(_version(row) for row in rows)
+
+    def latest_lesson_version(self, chat_id: str) -> LessonVersionRow | None:
+        row = self._db().execute(
+            "SELECT * FROM lesson_versions WHERE chat_id=? ORDER BY version DESC LIMIT 1",
+            (str(chat_id),),
+        ).fetchone()
+        return None if row is None else _version(row)
+
     # -- alerts --------------------------------------------------------------------
 
     def claim_alert(
@@ -444,6 +647,7 @@ class SentimentStore:
 
 
 def _migrate(conn: sqlite3.Connection) -> None:
+    version = 0
     has_meta = conn.execute(
         "SELECT 1 FROM sqlite_master WHERE type='table' AND name='meta'"
     ).fetchone()
@@ -455,7 +659,10 @@ def _migrate(conn: sqlite3.Connection) -> None:
                 raise RuntimeError(
                     f"sentiment.db schema {version} is newer than {SCHEMA_VERSION}"
                 )
-            return
+    if version == SCHEMA_VERSION:
+        return
+    # Every step so far is additive (new tables and indexes), so re-running the full
+    # DDL on an old file is the migration, and the version row records the result.
     conn.execute("BEGIN IMMEDIATE")
     try:
         for statement in _DDL:
@@ -478,6 +685,8 @@ __all__ = [
     "ALERT_WINDOW_MS",
     "SCHEMA_VERSION",
     "LabelRow",
+    "LessonProposalRow",
+    "LessonVersionRow",
     "SentimentStore",
     "WeeklyRow",
     "now_ms",
