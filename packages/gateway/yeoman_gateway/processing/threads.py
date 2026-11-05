@@ -787,8 +787,15 @@ class ThreadRegistry:
             exclude_event_id=data.event_id,
             exclude_source_id=str(getattr(data, "source_message_id", "") or ""),
         )
+        # A quote-reply names what it answers. Quoting a message outside the candidate
+        # thread (the bot's quotes resolve through the reply rules first) is structural
+        # evidence against adjacency, so it never attaches by proximity alone.
+        quotes_elsewhere = bool(data.reply_to_message_id) and (
+            not data.reply_to_bot and self._reply_thread(data) != thread_id
+        )
         return continuity_signal(
             candidate_thread_id=thread_id,
+            quotes_elsewhere=quotes_elsewhere,
             principal=data.principal,
             previous=PreviousMessage(*previous) if previous is not None else None,
             now_ms=current_ms,

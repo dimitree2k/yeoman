@@ -138,6 +138,11 @@ JUDGE_SYSTEM_PROMPT = (
     "silence, not a reaction. react only when reading names a concrete reason why "
     "this exact emoji fits what the message says and its tone; if no emoji clearly "
     "fits, choose silence.\n"
+    "- A message marked as a quote-reply answers exactly the quoted message, however "
+    "old it is. When the quoted message is not Arvid's, the reply belongs to the "
+    "exchange between those people: its 'you' means the quoted person, never Arvid. "
+    "Speak into it only for a weighty reason grounded in the current conversation; "
+    "otherwise choose silence.\n"
     "- intent=continue requires a delivered Arvid message (anchor_message_id) that the "
     "current material still relates to.\n"
     "- intent=direct is only valid when the context says the material is addressed to "
@@ -153,6 +158,12 @@ JUDGE_SYSTEM_PROMPT = (
     "- closes_exchange=true only retires the social association; it never closes "
     "another person's task."
 )
+
+def _quoted_sender(item: Mapping[str, Any]) -> str:
+    if item.get("from_arvid"):
+        return "Arvid"
+    return str(item.get("sender") or "?").strip() or "?"
+
 
 #: Added only when an offered trend card is among the current sources.
 JUDGE_TREND_RULES = (
@@ -1008,6 +1019,20 @@ class _JudgeContext:
         if header:
             # One summary line of the current conversation: data, not a decision rule.
             lines.append(header)
+        raw_quoted = context.get("quoted_messages")
+        quoted = {
+            str(item.get("message_id") or "").strip(): item
+            for item in (raw_quoted if isinstance(raw_quoted, (list, tuple)) else ())
+            if isinstance(item, Mapping) and str(item.get("message_id") or "").strip()
+        }
+        for item in quoted.values():
+            if item.get("shown"):
+                continue
+            # A quote target outside the shown messages: data only, never a target id.
+            lines.append(
+                f"quoted earlier message from={_quoted_sender(item)}: "
+                f"{str(item.get('text') or '').strip() or '[no text]'}"
+            )
         raw_earlier = context.get("earlier_message_ids")
         earlier_ids = {
             str(item).strip()
@@ -1036,7 +1061,13 @@ class _JudgeContext:
             body = text if text else (f"[{media}]" if media else "[no text]")
             # The id is labelled explicitly: a bare bracketed prefix invites the model
             # to copy the brackets into evidence_ids, which then fails validation.
-            lines.append(f'id="{event_id or "?"}" from={sender}: {body}')
+            reply_id = str(item.get("reply_to_message_id") or "").strip()
+            target = quoted.get(reply_id) if reply_id else None
+            relation = ""
+            if target is not None:
+                where = f'id="{reply_id}"' if target.get("shown") else "a quoted earlier message"
+                relation = f" (quote-reply to {where} from={_quoted_sender(target)})"
+            lines.append(f'id="{event_id or "?"}" from={sender}{relation}: {body}')
         raw_current_ids = context.get("current_source_ids")
         if raw_current_ids is None:
             raw_current_ids = context.get("source_event_ids")
