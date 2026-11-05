@@ -19,6 +19,7 @@ from typing import TYPE_CHECKING, Any
 
 from loguru import logger
 from yeoman_shared.config.schema import WhatsAppConfig
+from yeoman_shared.disconnect_class import classify_disconnect
 from yeoman_shared.raw_archive.writer import (
     RawArchive,
     RawArchiveCapacityError,
@@ -423,6 +424,7 @@ class WhatsAppChannel(BaseChannel):
         self._ack_queue_maxsize = BRIDGE_ACK_QUEUE_MAXSIZE
         self._typing_tasks: dict[str, asyncio.Task[None]] = {}
         self._reconnect_attempts = 0
+        self.last_disconnect: dict[str, Any] | None = None
         self._repair_attempted = False
         self._next_dedupe_cleanup_at = 0.0
         self._max_dedupe_entries = max(1, int(self.config.max_dedupe_entries))
@@ -1092,7 +1094,13 @@ class WhatsAppChannel(BaseChannel):
 
         if msg_type == "status":
             status = payload.get("status")
-            logger.info(f"WhatsApp status: {status}")
+            code = payload.get("statusCode", payload.get("lastDisconnectStatus"))
+            if status in {"disconnected", "reconnecting", "reconnect_exhausted"} and isinstance(code, int):
+                reason, cls = classify_disconnect("whatsapp", code)
+                self.last_disconnect = {"code": code, "reason": reason, "class": cls}
+                logger.info(f"WhatsApp status: {status} code={code} reason={reason} class={cls}")
+            else:
+                logger.info(f"WhatsApp status: {status}")
             return
 
         if msg_type == "qr":

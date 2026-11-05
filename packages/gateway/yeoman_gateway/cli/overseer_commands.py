@@ -169,7 +169,7 @@ def status() -> None:
             pid = int(pid_path.read_text().strip())
             os.kill(pid, 0)
             typer.echo(f"Overseer: running (PID {pid})")
-        except (ProcessLookupError, ValueError):
+        except ProcessLookupError, ValueError:
             typer.echo("Overseer: not running (stale PID file)")
     else:
         typer.echo("Overseer: not running")
@@ -181,6 +181,51 @@ def status() -> None:
         typer.echo(
             f"Budget: actions/hr={budget.get('actions_hour', 0)}, llm/day={budget.get('llm_daily', 0)}"
         )
+
+
+_MANAGED_UNITS = ("yeoman-gateway", "yeoman-bridge", "yeoman-overseer")
+
+
+def _unit_state(unit: str) -> str:
+    import subprocess
+
+    try:
+        proc = subprocess.run(
+            ["systemctl", "--user", "is-active", f"{unit}.service"],
+            capture_output=True,
+            text=True,
+            timeout=5,
+            check=False,
+        )
+    except (OSError, subprocess.TimeoutExpired) as exc:
+        return f"unknown ({exc.__class__.__name__})"
+    return proc.stdout.strip() or "unknown"
+
+
+@overseer_app.command()
+def services() -> None:
+    """Show each managed unit's state and the WhatsApp link's last disconnect (read-only)."""
+    from yeoman_overseer.trigger.checks import _whatsapp_bridge_health
+    from yeoman_shared.disconnect_class import classify_disconnect
+
+    for unit in _MANAGED_UNITS:
+        typer.echo(f"{unit:18s} {_unit_state(unit)}")
+
+    try:
+        health = _whatsapp_bridge_health(target="default", timeout_s=3.0)
+    except Exception as exc:
+        typer.echo(f"whatsapp           bridge unreachable ({exc})")
+        return
+    wa = health.get("whatsapp") if isinstance(health.get("whatsapp"), dict) else {}
+    line = (
+        f"whatsapp           connected={bool(wa.get('connected'))} "
+        f"reconnectAttempts={wa.get('reconnectAttempts', 0)}"
+    )
+    code = wa.get("lastDisconnectStatus")
+    if isinstance(code, int):
+        reason, cls = classify_disconnect("whatsapp", code)
+        line += f" lastDisconnect={code} ({reason}, {cls})"
+    typer.echo(line)
 
 
 @overseer_app.command()
