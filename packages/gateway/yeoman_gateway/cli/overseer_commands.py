@@ -202,23 +202,113 @@ def _unit_state(unit: str) -> str:
     return proc.stdout.strip() or "unknown"
 
 
+def _describe_hold(record: object) -> str:
+    from datetime import datetime
+
+    until = getattr(record, "until", None)
+    when = "no expiry" if until is None else f"until {datetime.fromtimestamp(until):%Y-%m-%d %H:%M}"
+    reason = getattr(record, "reason", "") or "no reason"
+    return f"{when}; {reason}; set by {getattr(record, 'set_by', '') or '?'}"
+
+
+def _systemctl(verb: str, unit: str) -> None:
+    import subprocess
+
+    proc = subprocess.run(
+        ["systemctl", "--user", verb, unit], capture_output=True, text=True, timeout=60, check=False
+    )
+    if proc.returncode != 0:
+        typer.echo(f"systemctl {verb} {unit} failed: {proc.stderr.strip()}", err=True)
+        raise typer.Exit(1)
+
+
+def _hold(service: str, desired: str, *, for_: str | None, reason: str) -> None:
+    import time
+
+    from yeoman_shared.desired_state import (
+        DesiredStateStore,
+        canonical_service,
+        parse_duration,
+        systemd_unit,
+    )
+
+    key = canonical_service(service)
+    until = None
+    if for_:
+        try:
+            until = time.time() + parse_duration(for_)
+        except ValueError as exc:
+            typer.echo(str(exc), err=True)
+            raise typer.Exit(2) from None
+    record = DesiredStateStore().set(key, desired, until=until, reason=reason, set_by="cli")  # type: ignore[arg-type]
+    unit = systemd_unit(key)
+    if unit is not None:
+        _systemctl("stop", unit)
+    typer.echo(f"{key}: desired={desired} ({_describe_hold(record)})")
+
+
+@overseer_app.command()
+def pause(
+    service: str = typer.Argument(..., help="bridge, gateway, telegram or a unit name"),
+    for_: str | None = typer.Option(
+        None, "--for", help="Duration such as 30m, 12h, 2d; default no expiry"
+    ),
+    reason: str = typer.Option("paused by owner", "--reason"),
+) -> None:
+    """Pause a service: stop it and keep the Overseer from restarting it."""
+    _hold(service, "paused", for_=for_, reason=reason)
+
+
+@overseer_app.command("stop-service")
+def stop_service(
+    service: str = typer.Argument(..., help="bridge, gateway, telegram or a unit name"),
+    reason: str = typer.Option("stopped by owner", "--reason"),
+) -> None:
+    """Stop a service with no expiry; the Overseer never starts it."""
+    _hold(service, "stopped", for_=None, reason=reason)
+
+
+@overseer_app.command()
+def resume(
+    service: str = typer.Argument(..., help="bridge, gateway, telegram or a unit name"),
+) -> None:
+    """Hand a paused or stopped service back to the Overseer and start it."""
+    from yeoman_shared.desired_state import DesiredStateStore, canonical_service, systemd_unit
+
+    key = canonical_service(service)
+    DesiredStateStore().set(key, "running", set_by="cli")
+    unit = systemd_unit(key)
+    if unit is not None:
+        _systemctl("start", unit)
+    typer.echo(f"{key}: desired=running")
+
+
 @overseer_app.command()
 def services() -> None:
     """Show each managed unit's state and the WhatsApp link's last disconnect (read-only)."""
     from yeoman_overseer.trigger.checks import _whatsapp_bridge_health
+    from yeoman_shared.desired_state import DesiredStateStore
     from yeoman_shared.disconnect_class import classify_disconnect
 
-    for unit in _MANAGED_UNITS:
-        typer.echo(f"{unit:18s} {_unit_state(unit)}")
+    store = DesiredStateStore()
+    for unit in (*_MANAGED_UNITS, "yeoman-gateway/telegram"):
+        record = store.get(unit)
+        actual = _unit_state(unit) if "/" not in unit else "-"
+        line = f"{unit:24s} desired={record.desired:8s} actual={actual}"
+        if record.desired != "running":
+            line += f" ({_describe_hold(record)})"
+            if actual == "active":
+                line += " DRIFT: running although held"
+        typer.echo(line)
 
     try:
         health = _whatsapp_bridge_health(target="default", timeout_s=3.0)
     except Exception as exc:
-        typer.echo(f"whatsapp           bridge unreachable ({exc})")
+        typer.echo(f"whatsapp                 bridge unreachable ({exc})")
         return
     wa = health.get("whatsapp") if isinstance(health.get("whatsapp"), dict) else {}
     line = (
-        f"whatsapp           connected={bool(wa.get('connected'))} "
+        f"whatsapp                 connected={bool(wa.get('connected'))} "
         f"reconnectAttempts={wa.get('reconnectAttempts', 0)}"
     )
     code = wa.get("lastDisconnectStatus")

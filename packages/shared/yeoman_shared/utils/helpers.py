@@ -21,6 +21,7 @@ OPERATIONAL_STORE_PATHS = {
     "a2a": "ops/a2a.db",
     "seen_chats": "ops/seen-chats.json",
     "overseer": "ops/overseer",
+    "desired_state": "ops/desired-state.json",
     "trends": "ops/trends.db",
     "meme_quota": "ops/meme-quota.json",
     "poll_guard": "ops/poll-guard.json",

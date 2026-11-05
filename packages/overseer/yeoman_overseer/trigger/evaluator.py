@@ -8,7 +8,9 @@ from dataclasses import dataclass, field
 from typing import Any
 
 from croniter import croniter
+from yeoman_shared.desired_state import DesiredStateStore
 
+from yeoman_overseer.executor.deterministic import parse_deterministic_actions
 from yeoman_overseer.maintenance import MaintenanceManager
 from yeoman_overseer.runbook.parser import Runbook
 from yeoman_overseer.runbook.schema import TriggerCondition
@@ -33,6 +35,7 @@ class TriggerEvaluator:
     maintenance: MaintenanceManager
     state: OverseerState
     persist_state: Callable[[], None] | None = None
+    desired: DesiredStateStore = field(default_factory=DesiredStateStore)
 
     _last_poll: dict[str, float] = field(default_factory=dict)
     _cron_initialized: set[str] = field(default_factory=set)
@@ -94,6 +97,10 @@ class TriggerEvaluator:
 
             if trigger.condition and self.maintenance.is_active(trigger.condition.target):
                 continue
+            held = self._held_target(rb)
+            if held is not None:
+                logger.debug("Runbook %s skipped: %s is not desired running", name, held)
+                continue
 
             if not self.lock_manager.acquire(name, name, exclusive=True):
                 if rb.meta.safety.on_lock_conflict == "skip":
@@ -113,6 +120,13 @@ class TriggerEvaluator:
             finally:
                 self.lock_manager.release(name, name)
                 self._cooldown_until[name] = now + rb.meta.safety.cooldown_s
+
+    def _held_target(self, rb: Runbook) -> str | None:
+        """The first service this runbook acts on that the owner paused or stopped."""
+        for action in parse_deterministic_actions(rb.body):
+            if action.action == "restart_service" and self.desired.is_held(action.target):
+                return action.target
+        return None
 
     def _evaluate_condition(self, condition: TriggerCondition | None) -> CheckResult:
         if condition is None:
