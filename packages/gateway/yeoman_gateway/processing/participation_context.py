@@ -327,6 +327,19 @@ class ParticipationContextBuilder:
         truncated = len(ordered) - len(selected)
 
         messages = [_render_message(row) for row in selected if _row_id(row)]
+        quoted = self._quoted_messages(
+            archive,
+            opportunity,
+            [row for row in required if _row_id(row) not in trend_ids],
+            selected,
+            snapshot=inputs.snapshot,
+            until_ms=moment,
+        )
+        for message in messages:
+            target = quoted.get(str(message.get("reply_to_message_id") or ""))
+            if target is not None:
+                message["reply_to_sender"] = target["sender"]
+                message["reply_to_from_arvid"] = target["from_arvid"]
         trend_posts = {
             source_id: str(required_rows[source_id].get("trend_post") or "")
             for source_id in sorted(trend_ids)
@@ -403,6 +416,9 @@ class ParticipationContextBuilder:
             "allows_continuation": "continue" in inputs.allowed_intents,
             # Fixed text of each offered trend card; a card is posted verbatim.
             "trend_posts": trend_posts,
+            # Messages a current source quotes, resolved by exact id regardless of the
+            # window: a quote-reply is structural evidence of what it answers.
+            "quoted_messages": [quoted[key] for key in sorted(quoted)],
         }
         selection_started = time.monotonic()
         context["knowledge_selection_status"] = "disabled"
@@ -461,6 +477,57 @@ class ParticipationContextBuilder:
         self._attach_reception_stance(context, opportunity, now_ms=moment)
         self._attach_group_state_view(context, opportunity)
         return context
+
+    def _quoted_messages(
+        self,
+        archive: Any,
+        opportunity: ParticipationOpportunity,
+        required: list[dict[str, object]],
+        selected: list[dict[str, object]],
+        *,
+        snapshot: Any,
+        until_ms: int,
+    ) -> dict[str, dict[str, object]]:
+        """What each quote-reply answers, keyed by the quoted message id.
+
+        A current source's quote target is read by its exact id with no age limit:
+        the window bounds optional context, never what a reply explicitly points at.
+        A quoted Arvid message is Arvid's own delivered text; any other quoted message
+        passes the same per-source authorization as every context row (only the window
+        check is waived). Targets of shown messages that are themselves shown are
+        annotated too, without another read.
+        """
+        shown = {_row_id(row): row for row in selected if _row_id(row)}
+        quoted: dict[str, dict[str, object]] = {}
+        for row in selected:
+            reply_id = str(row.get("reply_to_message_id") or "").strip()
+            if reply_id and reply_id in shown:
+                quoted[reply_id] = _quoted_entry(shown[reply_id], shown=True)
+        for row in required:
+            reply_id = str(row.get("reply_to_message_id") or "").strip()
+            if not reply_id or reply_id in quoted:
+                continue
+            try:
+                target = archive.lookup_message(
+                    opportunity.channel, opportunity.chat_id, reply_id
+                )
+            except HistoryPaused:
+                raise
+            except Exception:  # noqa: BLE001 - a quote is context, never a hard input
+                continue
+            if not isinstance(target, Mapping):
+                continue
+            if not _is_arvid_row(target) and self._source_rejection(
+                target,
+                source_id=reply_id,
+                opportunity=opportunity,
+                since_ms=0,
+                until_ms=until_ms,
+                snapshot=snapshot,
+            ):
+                continue
+            quoted[reply_id] = _quoted_entry(target, shown=False)
+        return quoted
 
     def _attach_group_note(
         self,
@@ -925,6 +992,26 @@ def _render_message(row: Mapping[str, Any]) -> dict[str, object]:
         "channel": str(row.get("channel") or ""),
         "chat_id": str(row.get("chat_id") or ""),
         "reply_to_message_id": str(row.get("reply_to_message_id") or ""),
+    }
+
+
+def _is_arvid_row(row: Mapping[str, Any]) -> bool:
+    """Whether an archive row is Arvid's own outbound message."""
+    return str(row.get("direction") or "") == "out"
+
+
+def _quoted_entry(row: Mapping[str, Any], *, shown: bool) -> dict[str, object]:
+    """One quoted message for the judge and the writer."""
+    from_arvid = _is_arvid_row(row)
+    rendered = _render_message(row)
+    text = str(rendered["text"] or "") or str(rendered["media_summary"] or "")
+    return {
+        "message_id": _row_id(row),
+        "sender": "Arvid" if from_arvid else str(rendered["sender"]),
+        "from_arvid": from_arvid,
+        "text": text,
+        "timestamp": rendered["timestamp"],
+        "shown": shown,
     }
 
 

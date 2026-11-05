@@ -685,3 +685,56 @@ async def test_history_media_summary_keeps_authored_caption(tmp_path: Path) -> N
     row = context["messages"][0]
     assert row["text"] == "My formation"
     assert row["media_summary"] == "[Derived description]: A whiteboard"
+
+
+@pytest.mark.asyncio
+async def test_quoted_message_is_resolved_beyond_the_window(tmp_path: Path) -> None:
+    """Incident 2026-11-05: a quote-reply to a 3.5 h old question lost its target."""
+    from yeoman_gateway.adapters.responder_llm import build_participation_draft_prompt
+    from yeoman_gateway.processing.participation import _JudgeContext
+
+    builder = await _builder(tmp_path)
+    archive = builder._history_projector
+    _record(archive, message_id="lever", text="does leverage lose more on swings?",
+            minutes_ago=210, sender="ben")
+    _record(archive, message_id="arvid-ish", text="voice clones need clean audio",
+            minutes_ago=2, sender="cara")
+    _record(archive, message_id="reply", text="not sure what you mean",
+            minutes_ago=1, sender="anna", reply_to_message_id="lever")
+
+    context = await _build_context(builder, _opportunity("reply"))
+
+    ids = [row["event_id"] for row in context["messages"]]  # type: ignore[index]
+    assert "lever" not in ids, "the quote is shown as a quote, not as a target"
+    [quoted] = context["quoted_messages"]  # type: ignore[misc]
+    assert quoted["message_id"] == "lever"
+    assert quoted["sender"] == "ben" and quoted["shown"] is False
+    assert quoted["text"] == "does leverage lose more on swings?"
+    current = next(row for row in context["messages"] if row["event_id"] == "reply")  # type: ignore[union-attr]
+    assert current["reply_to_sender"] == "ben"
+
+    judge_view = _JudgeContext.from_mapping(context).render()
+    assert "quoted earlier message from=ben: does leverage lose more on swings?" in judge_view
+    assert 'id="reply" from=anna (quote-reply to a quoted earlier message from=ben)' in judge_view
+
+    prompt = build_participation_draft_prompt({**context, "target_message_id": "reply"}, "x")
+    assert "[CURRENT] anna (quote-reply to ben): not sure what you mean" in prompt
+    assert "[QUOTED by CURRENT] ben: does leverage lose more on swings?" in prompt
+
+
+@pytest.mark.asyncio
+async def test_quoted_message_inside_the_view_is_referenced_by_id(tmp_path: Path) -> None:
+    from yeoman_gateway.processing.participation import _JudgeContext
+
+    builder = await _builder(tmp_path)
+    archive = builder._history_projector
+    _record(archive, message_id="q", text="who plays?", minutes_ago=3, sender="ben")
+    _record(archive, message_id="r", text="me", minutes_ago=1, sender="anna",
+            reply_to_message_id="q")
+
+    context = await _build_context(builder, _opportunity("r"))
+
+    assert context["quoted_messages"][0]["shown"] is True  # type: ignore[index]
+    view = _JudgeContext.from_mapping(context).render()
+    assert 'id="r" from=anna (quote-reply to id="q" from=ben): me' in view
+    assert "quoted earlier message" not in view

@@ -163,3 +163,27 @@ def test_a_quote_after_new_starts_a_new_thread_that_keeps_the_quote(tmp_path: Pa
     assert quote.thread_id != started.thread_id
     assert quote.quote_ref == "bot-1"
     store.close()
+
+
+def test_quote_reply_to_another_message_never_joins_by_adjacency(tmp_path: Path) -> None:
+    """Incident 2026-11-05: a quote of an older human message right after the bot spoke
+    was hung on the bot's thread by proximity, and the bot answered it as its own."""
+    store, registry = _setup(tmp_path)
+    _say(store, registry, _event("alex-q", sender=ALEX, at_ms=T0 - 3 * 3_600_000))
+    started = _say(store, registry, _event("q", mentioned=True, at_ms=T0))
+    _bot(store, started, at_ms=T0 + 5_000, message_id="bot-1")
+
+    quote = _say(store, registry, _event("a", at_ms=T0 + 30_000, reply_to="alex-q"))
+
+    assert quote.thread_id != started.thread_id
+    assert quote.rule is not JoinRule.FOLLOWUP_SINGLE_ACTIVE
+    store.close()
+
+
+def test_quote_outside_thread_signal_outranks_adjacency() -> None:
+    bot = PreviousMessage("b", True, frozenset(), frozenset({"th"}), T0)
+    signal = continuity_signal(
+        candidate_thread_id="th", principal=OWNER, previous=bot, quotes_elsewhere=True
+    )
+    assert not signal.positive
+    assert signal.detail == "quote_outside_thread"

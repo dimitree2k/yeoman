@@ -54,6 +54,7 @@ def continuity_signal(
     now_ms: int | None = None,
     same_sender_gap_ms: int | None = None,
     mentioned_bot: bool = False,
+    quotes_elsewhere: bool = False,
 ) -> ContinuitySignal:
     """Positive only when the directly preceding chat message belongs to the candidate.
 
@@ -61,8 +62,12 @@ def continuity_signal(
     split over several messages arrives in quick succession, while a new question minutes
     later is a new request. After the bot's message the whole follow-up window applies.
     A message that addresses the bot afresh by mention is a new request unless the bot
-    spoke last in the thread.
+    spoke last in the thread. A quote-reply to a message outside the candidate thread is
+    never attached by adjacency: the quote says what it answers.
     """
+    if quotes_elsewhere:
+        # An explicit quote of a message outside the candidate outranks adjacency.
+        return ContinuitySignal(detail="quote_outside_thread")
     if previous is None:
         return ContinuitySignal(detail="no_previous_message")
     if candidate_thread_id not in previous.thread_ids:
