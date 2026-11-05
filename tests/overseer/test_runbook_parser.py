@@ -76,13 +76,14 @@ def test_parse_runbook_dir(tmp_path: Path) -> None:
 def test_parse_runbook_dir_empty(tmp_path: Path) -> None:
     assert parse_runbook_dir(tmp_path) == []
 
-def test_health_bridge_alerts_when_whatsapp_protocol_is_disconnected() -> None:
+def test_health_bridge_restarts_only_an_unreachable_bridge() -> None:
     rb = parse_runbook(STARTER_RUNBOOKS / "health-bridge.md")
 
-    assert rb.meta.version == 3
+    assert rb.meta.version == 4
     assert rb.meta.safety.manual_reset_after_failures is True
     assert rb.meta.trigger.condition is not None
-    assert rb.meta.trigger.condition.check == "whatsapp_bridge_connected"
+    # WhatsApp disconnects belong to the bridge's own budget; restarting cannot fix a logout.
+    assert rb.meta.trigger.condition.check == "whatsapp_bridge_reachable"
     assert rb.meta.trigger.condition.target == "default"
     assert rb.meta.trigger.condition.operator == "=="
     assert rb.meta.trigger.condition.value is False
@@ -91,7 +92,7 @@ def test_health_bridge_alerts_when_whatsapp_protocol_is_disconnected() -> None:
 
     assert [action.action for action in actions] == ["alert", "restart_service"]
     assert actions[0].target == "owner"
-    assert "WhatsApp bridge is disconnected" in actions[0].kwargs["message"]
+    assert "not answering" in actions[0].kwargs["message"]
     assert actions[1].target == "yeoman-bridge.service"
 
 def test_bridge_systemd_unit_starts_index_with_runtime_env() -> None:

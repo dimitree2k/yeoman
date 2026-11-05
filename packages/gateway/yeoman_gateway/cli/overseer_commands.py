@@ -169,7 +169,7 @@ def status() -> None:
             pid = int(pid_path.read_text().strip())
             os.kill(pid, 0)
             typer.echo(f"Overseer: running (PID {pid})")
-        except (ProcessLookupError, ValueError):
+        except ProcessLookupError, ValueError:
             typer.echo("Overseer: not running (stale PID file)")
     else:
         typer.echo("Overseer: not running")
@@ -181,6 +181,153 @@ def status() -> None:
         typer.echo(
             f"Budget: actions/hr={budget.get('actions_hour', 0)}, llm/day={budget.get('llm_daily', 0)}"
         )
+
+
+_MANAGED_UNITS = ("yeoman-gateway", "yeoman-bridge", "yeoman-overseer")
+
+
+def _unit_state(unit: str) -> str:
+    import subprocess
+
+    try:
+        proc = subprocess.run(
+            ["systemctl", "--user", "is-active", f"{unit}.service"],
+            capture_output=True,
+            text=True,
+            timeout=5,
+            check=False,
+        )
+    except (OSError, subprocess.TimeoutExpired) as exc:
+        return f"unknown ({exc.__class__.__name__})"
+    return proc.stdout.strip() or "unknown"
+
+
+def _describe_hold(record: object) -> str:
+    from datetime import datetime
+
+    until = getattr(record, "until", None)
+    when = "no expiry" if until is None else f"until {datetime.fromtimestamp(until):%Y-%m-%d %H:%M}"
+    reason = getattr(record, "reason", "") or "no reason"
+    return f"{when}; {reason}; set by {getattr(record, 'set_by', '') or '?'}"
+
+
+def _systemctl(verb: str, unit: str) -> None:
+    import subprocess
+
+    proc = subprocess.run(
+        ["systemctl", "--user", verb, unit], capture_output=True, text=True, timeout=60, check=False
+    )
+    if proc.returncode != 0:
+        typer.echo(f"systemctl {verb} {unit} failed: {proc.stderr.strip()}", err=True)
+        raise typer.Exit(1)
+
+
+def _hold(service: str, desired: str, *, for_: str | None, reason: str) -> None:
+    import time
+
+    from yeoman_shared.desired_state import (
+        DesiredStateStore,
+        canonical_service,
+        parse_duration,
+        systemd_unit,
+    )
+
+    key = canonical_service(service)
+    until = None
+    if for_:
+        try:
+            until = time.time() + parse_duration(for_)
+        except ValueError as exc:
+            typer.echo(str(exc), err=True)
+            raise typer.Exit(2) from None
+    record = DesiredStateStore().set(key, desired, until=until, reason=reason, set_by="cli")  # type: ignore[arg-type]
+    unit = systemd_unit(key)
+    if unit is not None:
+        _systemctl("stop", unit)
+    typer.echo(f"{key}: desired={desired} ({_describe_hold(record)})")
+
+
+@overseer_app.command()
+def pause(
+    service: str = typer.Argument(..., help="bridge, gateway, telegram or a unit name"),
+    for_: str | None = typer.Option(
+        None, "--for", help="Duration such as 30m, 12h, 2d; default no expiry"
+    ),
+    reason: str = typer.Option("paused by owner", "--reason"),
+) -> None:
+    """Pause a service: stop it and keep the Overseer from restarting it."""
+    _hold(service, "paused", for_=for_, reason=reason)
+
+
+@overseer_app.command("stop-service")
+def stop_service(
+    service: str = typer.Argument(..., help="bridge, gateway, telegram or a unit name"),
+    reason: str = typer.Option("stopped by owner", "--reason"),
+) -> None:
+    """Stop a service with no expiry; the Overseer never starts it."""
+    _hold(service, "stopped", for_=None, reason=reason)
+
+
+@overseer_app.command()
+def resume(
+    service: str = typer.Argument(..., help="bridge, gateway, telegram or a unit name"),
+) -> None:
+    """Hand a paused or stopped service back to the Overseer and start it."""
+    from yeoman_shared.desired_state import DesiredStateStore, canonical_service, systemd_unit
+
+    key = canonical_service(service)
+    DesiredStateStore().set(key, "running", set_by="cli")
+    unit = systemd_unit(key)
+    if key == "yeoman-bridge":
+        # Resume is the owner's go-ahead: clear the bridge's spent reconnect budget or
+        # logout hold, then restart so the bridge reads it fresh.
+        _reset_bridge_connect_budget()
+        _systemctl("restart", unit or "yeoman-bridge.service")
+    elif unit is not None:
+        _systemctl("start", unit)
+    typer.echo(f"{key}: desired=running")
+
+
+def _reset_bridge_connect_budget() -> None:
+    path = get_yeoman_home() / "data" / "ops" / "whatsapp-connect-budget.json"
+    if path.exists():
+        path.write_text(json.dumps({"attempts": []}), encoding="utf-8")
+
+
+@overseer_app.command()
+def services() -> None:
+    """Show each managed unit's state and the WhatsApp link's last disconnect (read-only)."""
+    from yeoman_shared.desired_state import DesiredStateStore
+    from yeoman_shared.disconnect_class import classify_disconnect
+
+    from yeoman_gateway.cli.bridge_client import bridge_command
+
+    store = DesiredStateStore()
+    for unit in (*_MANAGED_UNITS, "yeoman-gateway/telegram"):
+        record = store.get(unit)
+        actual = _unit_state(unit) if "/" not in unit else "-"
+        line = f"{unit:24s} desired={record.desired:8s} actual={actual}"
+        if record.desired != "running":
+            line += f" ({_describe_hold(record)})"
+            if actual == "active":
+                line += " DRIFT: running although held"
+        typer.echo(line)
+
+    try:
+        health = bridge_command("health", timeout_s=3.0)
+    except Exception as exc:
+        typer.echo(f"whatsapp                 bridge unreachable ({exc})")
+        return
+    wa = health.get("whatsapp") if isinstance(health.get("whatsapp"), dict) else {}
+    line = (
+        f"whatsapp                 connected={bool(wa.get('connected'))} "
+        f"reconnectAttempts={wa.get('reconnectAttempts', 0)}"
+    )
+    code = wa.get("lastDisconnectStatus")
+    if isinstance(code, int):
+        reason, cls = classify_disconnect("whatsapp", code)
+        line += f" lastDisconnect={code} ({reason}, {cls})"
+    typer.echo(line)
 
 
 @overseer_app.command()

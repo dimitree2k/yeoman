@@ -104,7 +104,7 @@ async def _request_owner_poll(socket_path: Path, args: dict) -> dict:
             writer.close()
             try:
                 await writer.wait_closed()
-            except (ConnectionError, OSError):
+            except ConnectionError, OSError:
                 pass
     reply = json.loads(line)
     if not isinstance(reply, dict):
@@ -140,7 +140,7 @@ def whatsapp_poll(
     socket_path = load_config().ipc.resolved_gateway_socket_path
     try:
         reply = asyncio.run(_request_owner_poll(socket_path, args))
-    except (OSError, ValueError, TimeoutError):
+    except OSError, ValueError, TimeoutError:
         console.print(
             "[red]Gateway unavailable.[/red] If interrupted, the poll may have been sent; "
             "check the chat before retrying."
@@ -322,8 +322,69 @@ def _rotate_whatsapp_bridge_token(config=None) -> tuple[str, str]:
 
 
 @channels_app.command("login")
-def channels_login() -> None:
-    """Link device via QR code."""
+def channels_login(
+    fresh: bool = typer.Option(
+        False, "--fresh", help="Start from an empty auth folder even if WhatsApp did not log us out"
+    ),
+    timeout: int = typer.Option(180, "--timeout", help="Seconds to wait for the QR scan"),
+) -> None:
+    """Relink WhatsApp: QR code in the terminal, then confirm the gateway reconnects."""
+    import time
+
+    from yeoman_gateway.cli.bridge_client import bridge_command
+
+    try:
+        health = bridge_command("health", timeout_s=5.0).get("whatsapp") or {}
+    except Exception:
+        # First install (no bridge service yet): run a foreground bridge that prints the QR.
+        _login_foreground()
+        return
+    if health.get("connected") and not fresh:
+        console.print(
+            "[green]✓[/green] WhatsApp is already connected; nothing to do (--fresh relinks anyway)"
+        )
+        return
+
+    hold = health.get("hold") or {}
+    if fresh or hold.get("kind") == "needs_human":
+        _move_auth_aside_and_restart_bridge()
+
+    qr_file = _qr_file()
+    last_qr = ""
+    deadline = time.monotonic() + timeout
+    console.print("On your phone: WhatsApp → Settings → Linked devices → Link a device.\n")
+    while time.monotonic() < deadline:
+        try:
+            login = (
+                bridge_command("login_start", {"timeoutMs": 30_000}, timeout_s=40.0).get("login")
+                or {}
+            )
+        except Exception as exc:
+            console.print(f"[yellow]Waiting for a QR code ({exc})[/yellow]")
+            time.sleep(3)
+            continue
+        if login.get("connected") or login.get("status") == "already_connected":
+            break
+        qr = str(login.get("qr") or "")
+        if qr and qr != last_qr:
+            last_qr = qr
+            qr_file.write_text(qr, encoding="utf-8")
+            qr_file.chmod(0o600)
+            _print_qr(qr)
+            console.print(f"(QR text also in {qr_file}; codes rotate every ~20 s)\n")
+        wait = bridge_command("login_wait", {"timeoutMs": 15_000}, timeout_s=25.0)
+        if wait.get("connected"):
+            break
+    else:
+        console.print("[red]No scan within the timeout.[/red] Run `yeoman channels login` again.")
+        raise typer.Exit(1)
+
+    qr_file.unlink(missing_ok=True)
+    console.print("[green]✓[/green] WhatsApp linked")
+    _confirm_gateway_attached()
+
+
+def _login_foreground() -> None:
     import os
     import subprocess
 
@@ -352,6 +413,64 @@ def channels_login() -> None:
         console.print(f"[red]Bridge failed: {e}[/red]")
     except FileNotFoundError:
         console.print("[red]node not found. Please install Node.js >= 20.[/red]")
+
+
+def _qr_file() -> Path:
+    from yeoman_shared.utils.helpers import get_run_path
+
+    return get_run_path() / "whatsapp-qr.txt"
+
+
+def _print_qr(qr: str) -> None:
+    import subprocess
+
+    script = "require('qrcode-terminal').generate(process.argv[1], { small: true })"
+    try:
+        subprocess.run(["node", "-e", script, qr], cwd=_get_bridge_dir(), check=True, timeout=10)
+    except OSError, subprocess.SubprocessError:
+        console.print(f"QR link: {qr}")
+
+
+def _move_auth_aside_and_restart_bridge() -> None:
+    """Keep the logged-out credentials as a dated backup; a relink needs an empty folder."""
+    import subprocess
+
+    from yeoman_shared.config.loader import load_config
+
+    auth_dir = load_config().channels.whatsapp.resolved_auth_dir
+    subprocess.run(
+        ["systemctl", "--user", "stop", "yeoman-bridge.service"], check=False, timeout=60
+    )
+    if auth_dir.exists() and any(auth_dir.iterdir()):
+        aside = auth_dir.with_name(f"{auth_dir.name}.loggedout-{datetime.now():%Y%m%d-%H%M%S}")
+        auth_dir.rename(aside)
+        console.print(f"Old login data kept as {aside}")
+    auth_dir.mkdir(mode=0o700, parents=True, exist_ok=True)
+    subprocess.run(
+        ["systemctl", "--user", "start", "yeoman-bridge.service"], check=True, timeout=60
+    )
+    import time
+
+    time.sleep(3)
+
+
+def _confirm_gateway_attached() -> None:
+    import time
+
+    from yeoman_gateway.cli.bridge_client import bridge_command
+
+    for _ in range(18):
+        try:
+            # This health request is itself a client; the gateway makes it two.
+            if (bridge_command("health", timeout_s=5.0).get("queue") or {}).get("clients", 0) >= 2:
+                console.print("[green]✓[/green] Gateway is attached to the bridge")
+                return
+        except Exception:
+            pass
+        time.sleep(5)
+    console.print(
+        "[yellow]The gateway has not reattached within 90 s.[/yellow] Run `yeoman gateway restart`."
+    )
 
 
 bridge_app = typer.Typer(help="Manage WhatsApp bridge process")

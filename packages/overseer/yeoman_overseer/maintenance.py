@@ -19,7 +19,7 @@ class MaintenanceManager:
 
     def enter(self, service: str, *, timeout_s: float, reason: str) -> None:
         self._entries[service] = MaintenanceEntry(
-            started_at=time.monotonic(), timeout_s=timeout_s, reason=reason
+            started_at=time.time(), timeout_s=timeout_s, reason=reason
         )
 
     def exit(self, service: str) -> None:
@@ -29,7 +29,7 @@ class MaintenanceManager:
         entry = self._entries.get(service)
         if entry is None:
             return False
-        elapsed = time.monotonic() - entry.started_at
+        elapsed = time.time() - entry.started_at
         if elapsed >= entry.timeout_s:
             del self._entries[service]
             return False

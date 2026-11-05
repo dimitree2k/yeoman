@@ -19,6 +19,8 @@ from typing import TYPE_CHECKING, Any
 
 from loguru import logger
 from yeoman_shared.config.schema import WhatsAppConfig
+from yeoman_shared.desired_state import DesiredStateStore
+from yeoman_shared.disconnect_class import classify_disconnect
 from yeoman_shared.raw_archive.writer import (
     RawArchive,
     RawArchiveCapacityError,
@@ -93,6 +95,15 @@ if TYPE_CHECKING:
     from yeoman_gateway.providers.factory import ProviderFactory
 
 
+
+
+_BRIDGE_SLOW_RETRY_S = 60.0
+_BRIDGE_HELD_POLL_S = 30.0
+
+# Bridge status events that carry the WhatsApp close code (statusCode or lastDisconnectStatus).
+_DISCONNECT_STATUSES = frozenset(
+    {"disconnected", "reconnecting", "needs_human", "budget_exhausted", "hourly_limit"}
+)
 
 
 def _markdown_to_whatsapp(text: str) -> str:
@@ -423,6 +434,8 @@ class WhatsAppChannel(BaseChannel):
         self._ack_queue_maxsize = BRIDGE_ACK_QUEUE_MAXSIZE
         self._typing_tasks: dict[str, asyncio.Task[None]] = {}
         self._reconnect_attempts = 0
+        self.last_disconnect: dict[str, Any] | None = None
+        self._bridge_held_logged = False
         self._repair_attempted = False
         self._next_dedupe_cleanup_at = 0.0
         self._max_dedupe_entries = max(1, int(self.config.max_dedupe_entries))
@@ -531,17 +544,25 @@ class WhatsAppChannel(BaseChannel):
                     break
 
                 self._reconnect_attempts += 1
-                if self.config.reconnect_max_attempts > 0 and (
-                    self._reconnect_attempts >= self.config.reconnect_max_attempts
-                ):
-                    logger.error(
-                        "WhatsApp reconnect attempts exhausted "
-                        f"({self._reconnect_attempts}/{self.config.reconnect_max_attempts})"
-                    )
-                    self._running = False
-                    break
-
-                delay = self._compute_backoff_ms(self._reconnect_attempts) / 1000.0
+                # The local bridge link never reaches WhatsApp, so it may keep retrying
+                # slowly, but only while the owner wants the bridge running.
+                if DesiredStateStore().is_held("yeoman-bridge"):
+                    if not self._bridge_held_logged:
+                        logger.info("WhatsApp bridge is paused by the owner; not reconnecting")
+                        self._bridge_held_logged = True
+                    await asyncio.sleep(_BRIDGE_HELD_POLL_S)
+                    continue
+                self._bridge_held_logged = False
+                max_attempts = self.config.reconnect_max_attempts
+                if max_attempts > 0 and self._reconnect_attempts >= max_attempts:
+                    if self._reconnect_attempts == max_attempts:
+                        logger.warning(
+                            f"WhatsApp bridge unreachable after {max_attempts} attempts; "
+                            f"retrying every {_BRIDGE_SLOW_RETRY_S:.0f}s"
+                        )
+                    delay = _BRIDGE_SLOW_RETRY_S
+                else:
+                    delay = self._compute_backoff_ms(self._reconnect_attempts) / 1000.0
                 logger.info(f"Reconnecting in {delay:.2f}s...")
                 await asyncio.sleep(delay)
             finally:
@@ -1092,7 +1113,13 @@ class WhatsAppChannel(BaseChannel):
 
         if msg_type == "status":
             status = payload.get("status")
-            logger.info(f"WhatsApp status: {status}")
+            code = payload.get("statusCode", payload.get("lastDisconnectStatus"))
+            if status in _DISCONNECT_STATUSES and isinstance(code, int):
+                reason, cls = classify_disconnect("whatsapp", code)
+                self.last_disconnect = {"code": code, "reason": reason, "class": cls}
+                logger.info(f"WhatsApp status: {status} code={code} reason={reason} class={cls}")
+            else:
+                logger.info(f"WhatsApp status: {status}")
             return
 
         if msg_type == "qr":

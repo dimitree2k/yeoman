@@ -9,6 +9,7 @@ from datetime import datetime, timezone
 from pathlib import Path
 
 import yaml
+from yeoman_shared.desired_state import DesiredStateStore
 from yeoman_shared.raw_archive.paths import (
     ProtectedPathError,
     assert_deletable,
@@ -47,6 +48,12 @@ class DeterministicExecutor:
         return await handler(self, target=target, **kwargs)
 
     async def _restart_service(self, *, target: str, **_: str) -> ActionResult:
+        held = DesiredStateStore().get(target)
+        if held.desired != "running":
+            return ActionResult(
+                success=True,
+                detail=f"Skipped restart of {target}: desired={held.desired} ({held.reason or 'no reason'})",
+            )
         try:
             proc = await asyncio.create_subprocess_exec(
                 "systemctl", "--user", "restart", target,
