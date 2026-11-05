@@ -176,6 +176,45 @@ def check_whatsapp_bridge_connected(*, target: str) -> CheckResult:
     return CheckResult(value=connected, detail=", ".join(parts))
 
 
+def check_whatsapp_bridge_reachable(*, target: str) -> CheckResult:
+    """Whether the bridge process answers at all.
+
+    WhatsApp reconnects belong to the bridge and its persisted budget; the Overseer
+    restarts the bridge only when the process is dead or hung, never because it is
+    disconnected from WhatsApp.
+    """
+    try:
+        _whatsapp_bridge_health(target=target, timeout_s=5.0)
+    except Exception as exc:
+        return CheckResult(value=False, detail=f"Bridge health check failed: {exc}")
+    return CheckResult(value=True, detail="bridge answers")
+
+
+def check_whatsapp_link_held(*, target: str) -> CheckResult:
+    """True while the bridge holds off reconnecting (needs a human, or budget spent)."""
+    try:
+        health = _whatsapp_bridge_health(target=target, timeout_s=3.0)
+    except Exception as exc:
+        return CheckResult(value=False, detail=f"Bridge health check failed: {exc}")
+    whatsapp = health.get("whatsapp")
+    hold = whatsapp.get("hold") if isinstance(whatsapp, dict) else None
+    if not isinstance(hold, dict) or whatsapp.get("connected"):
+        return CheckResult(value=False, detail="no hold")
+    kind = hold.get("kind")
+    code = hold.get("code")
+    if kind == "needs_human":
+        detail = (
+            f"WhatsApp needs you: the link closed with {code} ({hold.get('reason') or 'unknown'}). "
+            "No more login attempts will be made. Relink with `yeoman channels login`."
+        )
+    else:
+        detail = (
+            "WhatsApp reconnects used up today's budget. Only one try every 8 h from now; "
+            "`yeoman overseer resume bridge` tries now."
+        )
+    return CheckResult(value=True, detail=detail)
+
+
 def check_file_age_exceeds(*, target: str, threshold: str) -> CheckResult:
     """Check if a file is older than threshold. Missing file = True (infinitely old)."""
     path = Path(target)
@@ -221,6 +260,8 @@ _CHECK_REGISTRY: dict[str, Any] = {
     "process_alive": check_process_alive,
     "systemd_active": check_systemd_active,
     "whatsapp_bridge_connected": check_whatsapp_bridge_connected,
+    "whatsapp_bridge_reachable": check_whatsapp_bridge_reachable,
+    "whatsapp_link_held": check_whatsapp_link_held,
     "file_age_exceeds": check_file_age_exceeds,
     "disk_usage_above": check_disk_usage_above,
     "row_count_exceeds": check_row_count_exceeds,

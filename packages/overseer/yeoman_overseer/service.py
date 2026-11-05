@@ -350,10 +350,14 @@ class OverseerService:
                 failed_results: list[str] = []
                 for action in actions:
                     action_start = time.monotonic()
+                    kwargs = {
+                        key: value.replace("{detail}", check_result.detail or "")
+                        for key, value in action.kwargs.items()
+                    }
                     result = await executor.execute(
                         action.action,
                         target=action.target,
-                        **action.kwargs,
+                        **kwargs,
                     )
                     if not result.success:
                         result_str = result.detail

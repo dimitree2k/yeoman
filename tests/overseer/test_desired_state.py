@@ -166,5 +166,5 @@ def test_cli_pause_and_resume(monkeypatch: pytest.MonkeyPatch) -> None:
     result = runner.invoke(app, ["overseer", "resume", "bridge"])
     assert result.exit_code == 0, result.output
     assert DesiredStateStore().get("bridge").desired == "running"
-    assert calls[-1] == ("start", "yeoman-bridge.service")
+    assert calls[-1] == ("restart", "yeoman-bridge.service")
     runner.invoke(app, ["overseer", "resume", "telegram"])

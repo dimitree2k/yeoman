@@ -278,17 +278,29 @@ def resume(
     key = canonical_service(service)
     DesiredStateStore().set(key, "running", set_by="cli")
     unit = systemd_unit(key)
-    if unit is not None:
+    if key == "yeoman-bridge":
+        # Resume is the owner's go-ahead: clear the bridge's spent reconnect budget or
+        # logout hold, then restart so the bridge reads it fresh.
+        _reset_bridge_connect_budget()
+        _systemctl("restart", unit or "yeoman-bridge.service")
+    elif unit is not None:
         _systemctl("start", unit)
     typer.echo(f"{key}: desired=running")
+
+
+def _reset_bridge_connect_budget() -> None:
+    path = get_yeoman_home() / "data" / "ops" / "whatsapp-connect-budget.json"
+    if path.exists():
+        path.write_text(json.dumps({"attempts": []}), encoding="utf-8")
 
 
 @overseer_app.command()
 def services() -> None:
     """Show each managed unit's state and the WhatsApp link's last disconnect (read-only)."""
-    from yeoman_overseer.trigger.checks import _whatsapp_bridge_health
     from yeoman_shared.desired_state import DesiredStateStore
     from yeoman_shared.disconnect_class import classify_disconnect
+
+    from yeoman_gateway.cli.bridge_client import bridge_command
 
     store = DesiredStateStore()
     for unit in (*_MANAGED_UNITS, "yeoman-gateway/telegram"):
@@ -302,7 +314,7 @@ def services() -> None:
         typer.echo(line)
 
     try:
-        health = _whatsapp_bridge_health(target="default", timeout_s=3.0)
+        health = bridge_command("health", timeout_s=3.0)
     except Exception as exc:
         typer.echo(f"whatsapp                 bridge unreachable ({exc})")
         return

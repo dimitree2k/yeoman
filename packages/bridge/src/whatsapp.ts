@@ -1,6 +1,6 @@
 /* eslint-disable @typescript-eslint/no-explicit-any */
 import { createHash, randomUUID } from 'crypto';
-import { promises as fs } from 'fs';
+import { promises as fs, statSync } from 'fs';
 import { basename, extname, isAbsolute, join, relative, resolve } from 'path';
 
 import makeWASocket, {
@@ -22,6 +22,7 @@ import {
   MessageReferenceStore,
 } from './message_reference_store.js';
 import { defaultPollReferenceFile, PollReferenceStore, type PollResults } from './poll_reference_store.js';
+import { ConnectBudget, classifyWhatsAppDisconnect, defaultConnectBudgetFile, type BudgetHold } from './connect_budget.js';
 
 const VERSION = '0.2.0';
 const INBOUND_DEDUPE_TTL_MS = 20 * 60_000;
@@ -35,7 +36,6 @@ const OUTBOUND_SELF_FILTER_MAX = 5_000;
 const OUTBOUND_SELF_FILTER_CLEANUP_INTERVAL_MS = 30_000;
 const INBOUND_IMAGE_RETRY_DELAYS_MS = [250, 500, 1000];
 const QUOTED_IMAGE_MAX_BYTES = 20 * 1024 * 1024;
-const MAX_RECONNECT_ATTEMPTS = 30;
 const MENTION_TOKEN_PATTERN = /@([0-9]{5,})/g;
 export const FALLBACK_WHATSAPP_WEB_VERSION: [number, number, number] = [2, 3000, 1033893291];
 const WHATSAPP_BROWSER: [string, string, string] = ['Yeoman', 'Chrome', '145.0.0'];
@@ -97,6 +97,9 @@ export interface WhatsAppHealth {
   lastMessageAt?: number;
   droppedInboundDuplicates: number;
   dedupeCacheSize: number;
+  hold?: BudgetHold;
+  attemptsLastHour?: number;
+  attemptsLastDay?: number;
 }
 
 export interface SendMediaInput {
@@ -165,6 +168,8 @@ export interface PresenceUpdateInput {
 
 export interface WhatsAppClientOptions {
   authDir: string;
+  /** Persisted connect budget; defaults under YEOMAN_HOME/data/ops. */
+  connectBudgetFile?: string;
   messageReferenceDir?: string;
   messageReferenceRetentionMs?: number;
   messageReferenceMaxEntries?: number;
@@ -610,6 +615,12 @@ export class WhatsAppClient {
   private connected = false;
   private reconnectAttempts = 0;
   private lastDisconnectStatus: number | undefined;
+  /** Close code of the current connectOnce() cycle only; undefined if it ended without a close. */
+  private cycleCloseCode: number | undefined;
+  private budget!: ConnectBudget;
+  private wakeLoopFn: (() => void) | null = null;
+  private healthyTimer: ReturnType<typeof setTimeout> | null = null;
+  private emittedHoldKey = '';
   private lastError: string | undefined;
   private lastMessageAt: number | undefined;
   private droppedInboundDuplicates = 0;
@@ -903,6 +914,8 @@ export class WhatsAppClient {
     await this.referenceStore.open();
     await this.pollStore.open();
     await this.ensureMediaDirs();
+    this.budget ??= new ConnectBudget(this.options.connectBudgetFile || defaultConnectBudgetFile());
+    this.clearHoldIfRelinked();
     this.acceptingProviderEvents = true;
     this.running = true;
     this.loopTask = this.runLoop();
@@ -967,6 +980,8 @@ export class WhatsAppClient {
   stopIntake(): void {
     this.acceptingProviderEvents = false;
     this.running = false;
+    this.clearHealthyTimer();
+    this.wakeLoop();
     this.connected = false;
     this.resolveConnected(false);
     if (this.sock) {
@@ -979,9 +994,38 @@ export class WhatsAppClient {
   }
 
   private async runLoop(): Promise<void> {
-    const maxDelayMs = 30_000;
-    const initialDelayMs = 1_000;
+    const maxDelayMs = 15 * 60_000;
+    const initialDelayMs = 2_000;
+    let immediate = false;
     while (this.running) {
+      let probe = false;
+      if (!immediate) {
+        const decision = this.budget.decide();
+        if (decision.action === 'hold') {
+          this.emitHoldOnce(decision.hold.kind, {
+            statusCode: decision.hold.code,
+            reason: decision.hold.reason,
+            since: decision.hold.since,
+          });
+          // Zero attempts until the owner relinks (loginStart) or resumes (resetBudget).
+          await this.sleepInterruptible(6 * 3_600_000);
+          continue;
+        }
+        if (decision.action === 'wait') {
+          this.emitHoldOnce(decision.why, {
+            waitMs: decision.ms,
+            nextAttemptAt: Date.now() + decision.ms,
+            lastDisconnectStatus: this.lastDisconnectStatus,
+          });
+          await this.sleepInterruptible(decision.ms);
+          continue;
+        }
+        probe = decision.probe;
+        this.budget.recordAttempt(probe);
+      }
+      const wasImmediate = immediate;
+      immediate = false;
+      this.cycleCloseCode = undefined;
       try {
         await this.connectOnce();
       } catch (err) {
@@ -991,27 +1035,87 @@ export class WhatsAppClient {
 
       if (!this.running) break;
 
-      this.reconnectAttempts += 1;
-      if (this.reconnectAttempts > MAX_RECONNECT_ATTEMPTS) {
-        this.running = false;
-        this.options.onStatus('reconnect_exhausted', {
-          reconnectAttempts: this.reconnectAttempts,
-          maxReconnectAttempts: MAX_RECONNECT_ATTEMPTS,
-          lastDisconnectStatus: this.lastDisconnectStatus,
-        });
-        this.lastError = `Reconnect attempts exhausted (${MAX_RECONNECT_ATTEMPTS})`;
-        this.options.onError(this.lastError);
-        break;
+      const { reason, cls } = classifyWhatsAppDisconnect(this.cycleCloseCode);
+      if (cls === 'needs_human') {
+        this.budget.holdNeedsHuman(this.cycleCloseCode, reason);
+        continue;
       }
+      if (cls === 'needs_restart' && !wasImmediate) {
+        immediate = true;
+        continue;
+      }
+
+      this.reconnectAttempts += 1;
       this.options.onStatus('reconnecting', {
         reconnectAttempts: this.reconnectAttempts,
         lastDisconnectStatus: this.lastDisconnectStatus,
+        probe,
       });
 
       const backoff = Math.min(maxDelayMs, initialDelayMs * 2 ** Math.max(0, this.reconnectAttempts - 1));
-      const delayMs = randomJitter(backoff, 0.25);
-      await sleep(delayMs);
+      await this.sleepInterruptible(randomJitter(backoff, 0.25));
     }
+  }
+
+  private emitHoldOnce(status: string, detail: Record<string, unknown>): void {
+    const key = `${status}:${String(detail.since ?? detail.nextAttemptAt ?? '')}`;
+    if (key === this.emittedHoldKey) return;
+    this.emittedHoldKey = key;
+    this.options.onStatus(status, detail);
+  }
+
+  private sleepInterruptible(ms: number): Promise<void> {
+    return new Promise((resolve) => {
+      const timer = setTimeout(done, ms);
+      const self = this;
+      function done(): void {
+        clearTimeout(timer);
+        if (self.wakeLoopFn === done) self.wakeLoopFn = null;
+        resolve();
+      }
+      this.wakeLoopFn = done;
+    });
+  }
+
+  private wakeLoop(): void {
+    this.wakeLoopFn?.();
+  }
+
+  /** Owner action (relink or resume): forget the hold and spent attempts, try now. */
+  resetBudget(): void {
+    this.budget?.reset();
+    this.emittedHoldKey = '';
+    this.reconnectAttempts = 0;
+    this.wakeLoop();
+  }
+
+  /** A needs_human hold ends by itself once the auth folder holds new or no credentials. */
+  private clearHoldIfRelinked(): void {
+    const hold = this.budget.hold;
+    if (hold?.kind !== 'needs_human') return;
+    try {
+      const credsMtime = statSync(join(this.options.authDir, 'creds.json')).mtimeMs;
+      if (credsMtime > hold.since) this.budget.reset();
+    } catch {
+      this.budget.reset(); // no creds.json: a fresh relink, QR codes are not login attempts
+    }
+  }
+
+  private clearHealthyTimer(): void {
+    if (this.healthyTimer) clearTimeout(this.healthyTimer);
+    this.healthyTimer = null;
+  }
+
+  private scheduleHealthyReset(): void {
+    this.clearHealthyTimer();
+    this.healthyTimer = setTimeout(() => {
+      this.healthyTimer = null;
+      if (this.connected) {
+        this.budget.reset();
+        this.emittedHoldKey = '';
+      }
+    }, this.budget.healthyAfterMs);
+    this.healthyTimer.unref?.();
   }
 
   /**
@@ -2196,6 +2300,7 @@ export class WhatsAppClient {
       if (connection === 'open') {
         this.connected = true;
         this.reconnectAttempts = 0;
+        this.scheduleHealthyReset();
         this.lastError = undefined;
         // Keep this companion marked online to reduce phone push notifications.
         void this.sock.sendPresenceUpdate('available').catch((err: unknown) => {
@@ -2211,6 +2316,8 @@ export class WhatsAppClient {
         const statusCode = (lastDisconnect?.error as Boom)?.output?.statusCode;
         this.connected = false;
         this.lastDisconnectStatus = typeof statusCode === 'number' ? statusCode : undefined;
+        this.cycleCloseCode = this.lastDisconnectStatus;
+        this.clearHealthyTimer();
         this.options.onStatus('disconnected', {
           statusCode: this.lastDisconnectStatus,
         });
@@ -2737,6 +2844,8 @@ export class WhatsAppClient {
     if (!this.running) {
       await this.start();
     }
+    // The owner asked to link: that is the explicit go-ahead a needs_human hold waits for.
+    this.resetBudget();
 
     const maxQrAgeMs = 120_000;
     if (this.latestQr && nowMs() - this.latestQrAt <= maxQrAgeMs) {
@@ -2834,6 +2943,9 @@ export class WhatsAppClient {
       lastMessageAt: this.lastMessageAt,
       droppedInboundDuplicates: this.droppedInboundDuplicates,
       dedupeCacheSize: this.recentInbound.size,
+      hold: this.budget?.hold,
+      attemptsLastHour: this.budget?.attemptsWithin(3_600_000),
+      attemptsLastDay: this.budget?.attemptsWithin(24 * 3_600_000),
     };
   }
 

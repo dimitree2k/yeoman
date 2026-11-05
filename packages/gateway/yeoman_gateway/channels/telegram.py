@@ -10,7 +10,15 @@ from typing import TYPE_CHECKING, Any
 from loguru import logger
 from telegram import BotCommand, Update
 from telegram.constants import MessageEntityType
-from telegram.error import Conflict, NetworkError, RetryAfter, TelegramError, TimedOut
+from telegram.error import (
+    Conflict,
+    Forbidden,
+    InvalidToken,
+    NetworkError,
+    RetryAfter,
+    TelegramError,
+    TimedOut,
+)
 from telegram.ext import (
     Application,
     CommandHandler,
@@ -20,6 +28,7 @@ from telegram.ext import (
     filters,
 )
 from yeoman_shared.config.schema import TelegramConfig
+from yeoman_shared.desired_state import DesiredStateStore
 from yeoman_shared.raw_archive.writer import (
     RawArchive,
     RawArchiveCapacityError,
@@ -35,6 +44,10 @@ from yeoman_gateway.channels.base import BaseChannel
 
 if TYPE_CHECKING:
     from yeoman_gateway.session.manager import SessionManager
+
+# Owner intent key for this channel (``yeoman overseer pause telegram``).
+TELEGRAM_SERVICE = "yeoman-gateway/telegram"
+_HOLD_POLL_S = 30.0
 
 
 def _markdown_to_telegram_html(text: str) -> str:
@@ -166,6 +179,7 @@ class TelegramChannel(BaseChannel):
         self._bot_id: int | None = None
         self._bot_username: str = ""
         self._stopping_due_to_conflict = False
+        self._token_rejected = False
         self._raw_archive: RawArchive | None = None
         self._stopping_due_to_raw_archive_capacity = False
         self._capacity_stop_task: asyncio.Task[None] | None = None
@@ -215,7 +229,27 @@ class TelegramChannel(BaseChannel):
             self._stopping_due_to_raw_archive_capacity = False
 
         self._running = True
+        held_logged = False
+        while self._running:
+            self._token_rejected = False
+            if DesiredStateStore().is_held(TELEGRAM_SERVICE):
+                if not held_logged:
+                    record = DesiredStateStore().get(TELEGRAM_SERVICE)
+                    logger.info(
+                        f"Telegram channel paused ({record.reason or record.desired}); not polling"
+                    )
+                    held_logged = True
+                await asyncio.sleep(_HOLD_POLL_S)
+                continue
+            held_logged = False
+            try:
+                await self._poll_until_held()
+            except (InvalidToken, Forbidden) as exc:
+                await self._shutdown_app()
+                self._hold_needs_human(exc)
 
+    async def _poll_until_held(self) -> None:
+        """Run one polling session; returns when stopped or when the owner pauses Telegram."""
         # Build the application
         builder = Application.builder().token(self.config.token)
         if self.config.proxy:
@@ -271,9 +305,17 @@ class TelegramChannel(BaseChannel):
             error_callback=self._on_polling_error,
         )
 
-        # Keep running until stopped
+        # Keep running until stopped or paused
+        ticks = 0
         while self._running:
             await asyncio.sleep(1)
+            ticks += 1
+            if self._token_rejected or (
+                ticks % int(_HOLD_POLL_S) == 0 and DesiredStateStore().is_held(TELEGRAM_SERVICE)
+            ):
+                logger.info("Telegram channel paused by owner; stopping polling")
+                await self._shutdown_app()
+                return
 
     async def stop(self) -> None:
         """Stop the Telegram bot."""
@@ -283,12 +325,15 @@ class TelegramChannel(BaseChannel):
         for chat_id in list(self._typing_tasks):
             self._stop_typing(chat_id)
 
+        await self._shutdown_app()
+
+    async def _shutdown_app(self) -> None:
         if self._app:
             logger.info("Stopping Telegram bot...")
-            await self._app.updater.stop()
-            await self._app.stop()
-            await self._app.shutdown()
-            self._app = None
+            app, self._app = self._app, None
+            await app.updater.stop()
+            await app.stop()
+            await app.shutdown()
 
     async def send(self, msg: OutboundMessage) -> None:
         """Send a message through Telegram."""
@@ -696,6 +741,9 @@ class TelegramChannel(BaseChannel):
         if isinstance(error, Conflict):
             self._schedule_conflict_shutdown(error)
             return
+        if isinstance(error, (InvalidToken, Forbidden)):
+            self._hold_needs_human(error)
+            return
         if isinstance(error, RetryAfter):
             logger.warning(f"Telegram rate limited; retrying after {error.retry_after}s")
             return
@@ -707,6 +755,19 @@ class TelegramChannel(BaseChannel):
             )
             return
         logger.error("Telegram polling error {}: {}", error.__class__.__name__, error)
+
+    def _hold_needs_human(self, error: TelegramError) -> None:
+        """A revoked or invalid token cannot be fixed by retrying: pause until the owner acts."""
+        self._token_rejected = True  # stops the polling session on its next one-second tick
+        if DesiredStateStore().is_held(TELEGRAM_SERVICE):
+            return
+        reason = f"needs_human: telegram {error.__class__.__name__}"
+        DesiredStateStore().set(TELEGRAM_SERVICE, "paused", reason=reason, set_by="gateway")
+        logger.error(
+            "Telegram rejected the bot token ({}); polling paused. Fix the token, then run "
+            "`yeoman overseer resume telegram`.",
+            error,
+        )
 
     def _schedule_conflict_shutdown(self, error: TelegramError) -> None:
         """Stop polling once when Telegram reports a duplicate getUpdates consumer."""
