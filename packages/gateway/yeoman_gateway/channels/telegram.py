@@ -622,7 +622,9 @@ class TelegramChannel(BaseChannel):
                     else:
                         content_parts.append(f"[{media_type}: {file_path}]")
                 elif media_type == "video" and self._video_understanding is not None:
-                    content_parts.extend(await self._understand_video(file_path))
+                    content_parts.extend(
+                        await self._understand_video(file_path, caption=message.caption)
+                    )
                 else:
                     content_parts.append(f"[{media_type}: {file_path}]")
 
@@ -734,11 +736,11 @@ class TelegramChannel(BaseChannel):
         except Exception as e:
             logger.debug(f"Typing indicator stopped for {chat_id}: {e}")
 
-    async def _understand_video(self, file_path: "Path") -> list[str]:
+    async def _understand_video(self, file_path: "Path", caption: str | None = None) -> list[str]:
         """Description + transcript lines for a received clip, via the shared service."""
         try:
             insight = await self._video_understanding.understand_file(
-                file_path, channel=self.name
+                file_path, channel=self.name, caption=caption or None
             )
         except Exception as e:  # noqa: BLE001 - an unseen video must not drop the message
             logger.warning("Telegram video understanding failed {}", type(e).__name__)

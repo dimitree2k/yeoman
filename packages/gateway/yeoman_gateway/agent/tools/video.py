@@ -24,7 +24,10 @@ class VideoUnderstandTool(Tool):
         "post's caption. Use this for Instagram reels/posts, TikTok, YouTube Shorts, X/Twitter, "
         "Facebook, Reddit and other video links whenever you need to know what a shared video "
         "is about; web_fetch and browse cannot see video content. For long YouTube videos "
-        "use youtube_transcript instead. Clips up to a few minutes; takes 10-60 s."
+        "use youtube_transcript instead. Clips up to a few minutes; takes 20-60 s. "
+        "The description starts with the clip's point or punchline: when someone shares a "
+        "funny clip, react to the joke the way a friend in the chat would instead of "
+        "retelling what the video shows."
     )
     parameters = {
         "type": "object",

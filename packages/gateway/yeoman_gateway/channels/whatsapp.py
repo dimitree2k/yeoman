@@ -1270,7 +1270,11 @@ class WhatsAppChannel(BaseChannel):
         """Describe the clip and transcribe its audio through the shared video service."""
         base = replace(event, media_path=str(path), media_bytes=size_bytes)
         try:
-            insight = await self._video_understanding.understand_file(path, channel=self.name)
+            # The bridge writes "[Video]" when a clip has no caption of its own.
+            caption = event.text if event.text.strip() and event.text.strip() != "[Video]" else None
+            insight = await self._video_understanding.understand_file(
+                path, channel=self.name, caption=caption
+            )
         except Exception as e:  # noqa: BLE001 - an unseen video must not drop the message
             logger.warning("WhatsApp video understanding failed {}", e.__class__.__name__)
             return base

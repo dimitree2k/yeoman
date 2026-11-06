@@ -1587,8 +1587,10 @@ def test_video_with_shared_service_archives_description_and_transcript(
     calls: list[tuple[Path, str]] = []
 
     class Service:
-        async def understand_file(self, file_path: Path, *, channel: str) -> VideoInsight:
-            calls.append((file_path, channel))
+        async def understand_file(
+            self, file_path: Path, *, channel: str, caption: str | None = None
+        ) -> VideoInsight:
+            calls.append((file_path, channel, caption))
             return VideoInsight(
                 description="A dog jumps into a lake.", description_model="video-model",
                 transcript="look at him go", transcript_model="whisper",
@@ -1606,7 +1608,7 @@ def test_video_with_shared_service_archives_description_and_transcript(
 
     result = asyncio.run(channel._enrich_primary_media_event(event))
 
-    assert calls == [(path, "whatsapp")]
+    assert calls == [(path, "whatsapp", None)]  # "[Video]" is the bridge placeholder
     assert result.text == (
         "[Video]\n[video_description] A dog jumps into a lake.\n[video_transcript] look at him go"
     )

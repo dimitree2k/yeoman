@@ -1,10 +1,11 @@
 """Channel-agnostic video understanding: a local file or a video link in, text out.
 
-One service serves every caller (WhatsApp, Telegram, the ``video_understand`` tool):
-the whole clip goes to the routed video model (``vision.describe_video``) while its
-audio track goes to the routed speech-to-text model (``asr.transcribe_audio``), both at
-once. Links are fetched with yt-dlp at low resolution first; the post's own caption and
-title come from the same metadata call.
+One service serves every caller (WhatsApp, Telegram, the ``video_understand`` tool).
+The audio track goes to the routed speech-to-text model (``asr.transcribe_audio``) first;
+then the whole clip, timestamped stills and the caption + transcript go to the routed
+video model (``vision.describe_video``), which explains the point (or punchline) before
+the details. Links are fetched with yt-dlp at low resolution first; the post's own
+caption and title come from the same metadata call.
 """
 
 from __future__ import annotations
@@ -35,7 +36,12 @@ DEFAULT_MAX_DESCRIBE_BYTES = 20 * 1024 * 1024
 _MAX_CAPTION_CHARS = 1500
 _MAX_TRANSCRIPT_CHARS = 12000
 #: Descriptions land in every reader's context; reasoning models ignore length requests.
-_MAX_DESCRIPTION_CHARS = 1200
+_MAX_DESCRIPTION_CHARS = 1800
+#: Stills sent next to the video: providers sample clips sparsely and miss sub-second
+#: moments (a person crossing the hood at 4 s was invisible to every model without them).
+_MAX_FRAMES = 24
+_FRAMES_PER_SECOND = 2.0
+_FRAME_WIDTH = 432
 _FFMPEG_TIMEOUT_SECONDS = 120
 _ASR_MIN_TIMEOUT_MS = 120_000
 _CACHE_SIZE = 64
@@ -119,14 +125,18 @@ def _clip(text: str | None, limit: int) -> str | None:
 
 
 def _clip_sentences(text: str | None, limit: int) -> str | None:
-    """Whitespace-normalized text, shortened at the last sentence end within ``limit``."""
+    """Whitespace-normalized text (line breaks kept), cut at a sentence end within ``limit``."""
     if not text:
         return None
-    text = " ".join(str(text).split())
+    lines = (" ".join(line.split()) for line in str(text).splitlines())
+    text = "\n".join(line for line in lines if line)
     if len(text) <= limit:
         return text or None
     head = text[:limit]
-    cut = max(head.rfind(". "), head.rfind("! "), head.rfind("? "), head.rfind('." '))
+    cut = max(
+        head.rfind(". "), head.rfind("! "), head.rfind("? "), head.rfind('." '),
+        head.rfind(".\n"), head.rfind("!\n"), head.rfind("?\n"),
+    )
     if cut >= limit // 2:
         return head[: cut + 1]
     return head.rsplit(" ", 1)[0] + " …"
@@ -194,6 +204,68 @@ async def extract_audio(source: Path, target: Path) -> bool:
     return True
 
 
+async def extract_frames(source: Path, target_dir: Path, duration: float | None) -> list[Path]:
+    """Up to ``_MAX_FRAMES`` evenly spaced, timestamped stills (empty without ffmpeg)."""
+    ffmpeg = shutil.which("ffmpeg")
+    if not ffmpeg:
+        return []
+    fps = _FRAMES_PER_SECOND
+    if duration and duration * fps > _MAX_FRAMES:
+        fps = _MAX_FRAMES / duration
+    scale = f"fps={fps:.4f},scale={_FRAME_WIDTH}:-2"
+    stamp = (
+        ",drawtext=text='%{pts\\:hms}':x=6:y=6:fontsize=20:fontcolor=yellow"
+        ":box=1:boxcolor=black@0.6"
+    )
+    pattern = str(target_dir / "frame_%02d.jpg")
+    # drawtext needs a font; without one the frames still help, just without a clock.
+    for filters in (scale + stamp, scale):
+        try:
+            code, _, _ = await _run(
+                [ffmpeg, "-nostdin", "-v", "error", "-y", "-i", str(source), "-vf", filters,
+                 "-frames:v", str(_MAX_FRAMES), "-q:v", "4", pattern],
+                _FFMPEG_TIMEOUT_SECONDS,
+            )
+        except (OSError, TimeoutError):
+            return []
+        frames = sorted(target_dir.glob("frame_*.jpg"))
+        if code == 0 and frames:
+            return frames
+        for frame in frames:
+            frame.unlink(missing_ok=True)
+    return []
+
+
+async def shrink_video(source: Path, target: Path) -> bool:
+    """Re-encode to <=480p at a low bitrate so a long or sharp clip fits inline."""
+    ffmpeg = shutil.which("ffmpeg")
+    if not ffmpeg:
+        return False
+    try:
+        code, _, err = await _run(
+            [ffmpeg, "-nostdin", "-v", "error", "-y", "-i", str(source),
+             "-vf", "scale=-2:'min(480,ih)'", "-c:v", "libx264", "-preset", "veryfast",
+             "-crf", "32", "-c:a", "aac", "-b:a", "48k", "-movflags", "+faststart",
+             str(target)],
+            _FFMPEG_TIMEOUT_SECONDS,
+        )
+    except (OSError, TimeoutError):
+        return False
+    if code != 0 or not target.is_file():
+        logger.warning("video understanding: shrink failed: {}", err.decode(errors="replace")[-300:])
+        return False
+    return True
+
+
+def _context_text(caption: str | None, transcript: str | None) -> str | None:
+    parts = []
+    if caption:
+        parts.append(f"Caption: {caption}")
+    if transcript:
+        parts.append(f"Speech in the video (automatic transcript, may contain errors): {transcript}")
+    return "\n".join(parts) or None
+
+
 def _download_reason(exc: Exception) -> str:
     text = str(exc).removeprefix("ERROR: ").strip()
     first = text.split(". ")[0].split(";")[0]
@@ -232,20 +304,30 @@ class VideoUnderstanding:
 
     # -- local files -------------------------------------------------------------------
 
-    async def understand_file(self, path: Path, *, channel: str | None = None) -> VideoInsight:
-        """Describe the whole clip and transcribe its audio, concurrently."""
+    async def understand_file(
+        self, path: Path, *, channel: str | None = None, caption: str | None = None
+    ) -> VideoInsight:
+        """Transcribe the audio, then describe the clip with caption and speech as context.
+
+        The punchline of a clip often sits in its caption or in one spoken line, so the
+        video model sees both. Speech-to-text takes a few seconds; frames are cut meanwhile.
+        """
         try:
             data_hash = await asyncio.to_thread(_sha256, path)
         except OSError:
             return VideoInsight()
-        cached = self._file_cache.get(data_hash)
+        cache_key = f"{data_hash}:{caption or ''}"
+        cached = self._file_cache.get(cache_key)
         if cached is not None:
             return cached
         duration, has_audio = await probe_video(path)
-        description, transcript = await asyncio.gather(
-            self._describe(path, channel),
-            self._transcribe(path, channel) if has_audio else _none(),
-        )
+        with tempfile.TemporaryDirectory(prefix="yeoman-frames-") as tmp:
+            transcript, frames = await asyncio.gather(
+                self._transcribe(path, channel) if has_audio else _none(),
+                extract_frames(path, Path(tmp), duration),
+            )
+            context = _context_text(caption, transcript[0] if transcript else None)
+            description = await self._describe(path, channel, frames=frames, context=context)
         insight = VideoInsight(
             description=description[0] if description else None,
             description_model=description[1] if description else None,
@@ -254,32 +336,50 @@ class VideoUnderstanding:
             duration_s=round(duration, 1) if duration else None,
         )
         if insight.description or insight.transcript:
-            self._file_cache.put(data_hash, insight)
+            self._file_cache.put(cache_key, insight)
         return insight
 
-    async def _describe(self, path: Path, channel: str | None) -> tuple[str, str | None] | None:
+    async def _describe(
+        self,
+        path: Path,
+        channel: str | None,
+        *,
+        frames: list[Path] | None = None,
+        context: str | None = None,
+    ) -> tuple[str, str | None] | None:
         if self._describer is None or self._router is None:
             return None
         try:
             size = path.stat().st_size
         except OSError:
             return None
-        if size > self._max_describe_bytes:
-            logger.info(
-                "video understanding: description skipped, file too large bytes={} limit={}",
-                size, self._max_describe_bytes,
-            )
-            return None
         try:
             profile = self._router.resolve("vision.describe_video", channel=channel)
         except KeyError as exc:
             logger.warning("video understanding: no video route ({})", exc)
             return None
-        try:
-            text = await self._describer.describe_video(path, profile)
-        except Exception as exc:  # noqa: BLE001 - a failed description must not drop the turn
-            logger.warning("video understanding: description failed {}", type(exc).__name__)
-            return None
+        with tempfile.TemporaryDirectory(prefix="yeoman-shrink-") as tmp:
+            if size > self._max_describe_bytes:
+                # The clip goes inline as base64; re-encode instead of going blind.
+                small = Path(tmp) / "small.mp4"
+                if not await shrink_video(path, small) or (
+                    small.stat().st_size > self._max_describe_bytes
+                ):
+                    logger.info(
+                        "video understanding: description skipped, file too large bytes={}",
+                        size,
+                    )
+                    return None
+                path = small
+            try:
+                text = await self._describer.describe_video(
+                    path, profile, frames=frames or (), context=context
+                )
+            except Exception as exc:  # noqa: BLE001 - a failed description must not drop the turn
+                logger.warning(
+                    "video understanding: description failed {}", type(exc).__name__
+                )
+                return None
         text = _clip_sentences(text, _MAX_DESCRIPTION_CHARS)
         return (text, profile.model) if text else None
 
@@ -343,7 +443,7 @@ class VideoUnderstanding:
             }
             if path is None:
                 return VideoInsight(duration_s=info.get("duration"), **meta)
-            local = await self.understand_file(path, channel=channel)
+            local = await self.understand_file(path, channel=channel, caption=meta["caption"])
         logger.info(
             "video understanding url site={} duration={} description={} transcript={}",
             meta["site"], local.duration_s, bool(local.description), bool(local.transcript),
