@@ -3515,8 +3515,13 @@ class WhatsAppChannel(BaseChannel):
     def _compute_backoff_ms(self, attempt: int) -> int:
         initial = max(100, self.config.reconnect_initial_ms)
         factor = max(1.1, self.config.reconnect_factor)
-        raw = initial * (factor ** max(0, attempt - 1))
-        capped = min(float(self.config.reconnect_max_ms), raw)
+        max_ms = float(self.config.reconnect_max_ms)
+        try:
+            raw = initial * (factor ** max(0, attempt - 1))
+        except OverflowError:
+            # Unlimited retries reach attempt ~1025 at factor 2; the power is far past the cap.
+            raw = max_ms
+        capped = min(max_ms, raw)
         jitter_ratio = max(0.0, min(1.0, self.config.reconnect_jitter))
         jitter = capped * jitter_ratio
         low = max(100.0, capped - jitter)
