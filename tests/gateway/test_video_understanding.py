@@ -34,8 +34,12 @@ class _Describer:
         self.delay = delay
         self.calls = 0
 
-    async def describe_video(self, path: Path, profile: Any) -> str | None:
+    async def describe_video(
+        self, path: Path, profile: Any, *, frames: Any = (), context: str | None = None
+    ) -> str | None:
         self.calls += 1
+        self.frames = list(frames)
+        self.context = context
         await asyncio.sleep(self.delay)
         return self.text
 
@@ -67,8 +71,15 @@ def _patch_media_tools(monkeypatch: pytest.MonkeyPatch, *, has_audio: bool = Tru
         target.write_bytes(b"mp3")
         return True
 
+    async def frames(source: Path, target: Path, duration: float | None) -> list[Path]:
+        stills = [target / f"frame_{i:02d}.jpg" for i in (1, 2)]
+        for still in stills:
+            still.write_bytes(b"jpg")
+        return stills
+
     monkeypatch.setattr(vu, "probe_video", probe)
     monkeypatch.setattr(vu, "extract_audio", extract)
+    monkeypatch.setattr(vu, "extract_frames", frames)
 
 
 def _service(describer: Any = None, transcriber: Any = None, **kwargs: Any) -> VideoUnderstanding:
@@ -80,27 +91,29 @@ def _service(describer: Any = None, transcriber: Any = None, **kwargs: Any) -> V
     )
 
 
-def test_file_is_described_and_transcribed_concurrently(
+def test_video_model_sees_frames_caption_and_speech(
     monkeypatch: pytest.MonkeyPatch, clip: Path
 ) -> None:
     _patch_media_tools(monkeypatch)
-    describer, transcriber = _Describer(delay=0.3), _Transcriber(delay=0.3)
+    describer, transcriber = _Describer(), _Transcriber()
     service = _service(describer, transcriber)
 
-    async def run() -> tuple[VideoInsight, float]:
-        loop = asyncio.get_running_loop()
-        start = loop.time()
-        insight = await service.understand_file(clip, channel="telegram")
-        return insight, loop.time() - start
-
-    insight, elapsed = asyncio.run(run())
+    insight = asyncio.run(
+        service.understand_file(clip, channel="telegram", caption="Was war das auf meiner Haube?")
+    )
 
     assert insight.description == "A cat opens a door."
     assert insight.transcript == "hello there"
     assert insight.description_model == "vision.describe_video-model"
     assert insight.transcript_model == "whisper-large-v3"
     assert insight.duration_s == 12.0
-    assert elapsed < 0.55  # both calls overlapped instead of 0.6 s in sequence
+    # The punchline often lives in the caption or one spoken line: the video model gets both,
+    # plus stills so sub-second moments are not lost to sparse frame sampling.
+    assert [f.name for f in describer.frames] == ["frame_01.jpg", "frame_02.jpg"]
+    assert describer.context == (
+        "Caption: Was war das auf meiner Haube?\n"
+        "Speech in the video (automatic transcript, may contain errors): hello there"
+    )
     # Speech-to-text gets room for a whole clip, whatever the voice-note budget is.
     assert transcriber.profiles[0].timeout_ms >= 120_000
     assert insight.enrichment_lines() == [
@@ -119,14 +132,38 @@ def test_silent_clip_is_not_sent_to_speech_to_text(
     assert transcriber.profiles == []
 
 
-def test_oversized_clip_keeps_transcript_without_inline_upload(
+def test_oversized_clip_is_shrunk_before_upload(
     monkeypatch: pytest.MonkeyPatch, clip: Path
 ) -> None:
     _patch_media_tools(monkeypatch)
+    seen: list[Path] = []
+
+    async def shrink(source: Path, target: Path) -> bool:
+        target.write_bytes(b"ok")
+        return True
+
+    class Describer(_Describer):
+        async def describe_video(self, path: Path, profile: Any, **kwargs: Any) -> str | None:
+            seen.append(path)
+            return await super().describe_video(path, profile, **kwargs)
+
+    monkeypatch.setattr(vu, "shrink_video", shrink)
+    insight = asyncio.run(_service(Describer(), max_describe_bytes=4).understand_file(clip))
+    assert [p.name for p in seen] == ["small.mp4"]
+    assert insight.description == "A cat opens a door."
+
+
+def test_clip_that_cannot_be_shrunk_keeps_transcript(
+    monkeypatch: pytest.MonkeyPatch, clip: Path
+) -> None:
+    _patch_media_tools(monkeypatch)
+
+    async def shrink(source: Path, target: Path) -> bool:
+        return False
+
+    monkeypatch.setattr(vu, "shrink_video", shrink)
     describer = _Describer()
-    insight = asyncio.run(
-        _service(describer, max_describe_bytes=4).understand_file(clip)
-    )
+    insight = asyncio.run(_service(describer, max_describe_bytes=4).understand_file(clip))
     assert describer.calls == 0
     assert insight.description is None and insight.transcript == "hello there"
 
@@ -303,12 +340,14 @@ def test_telegram_video_gets_description_and_transcript(tmp_path: Path) -> None:
     assert channel._get_extension("video", None) == ".mp4"
 
     class Service:
-        async def understand_file(self, path: Path, *, channel: str) -> VideoInsight:
-            assert channel == "telegram"
+        async def understand_file(
+            self, path: Path, *, channel: str, caption: str | None = None
+        ) -> VideoInsight:
+            assert channel == "telegram" and caption == "lol"
             return VideoInsight(description="Fireworks over a bay.", transcript="wow")
 
     channel.set_video_understanding(Service())
-    lines = asyncio.run(channel._understand_video(tmp_path / "v.mp4"))
+    lines = asyncio.run(channel._understand_video(tmp_path / "v.mp4", caption="lol"))
     assert lines == ["[video_description] Fireworks over a bay.", "[video_transcript] wow"]
 
     channel.set_video_understanding(SimpleNamespace(understand_file=_raise))
@@ -366,4 +405,26 @@ def test_long_description_is_cut_at_a_sentence_end(
     assert insight.description is not None
     assert len(insight.description) <= vu._MAX_DESCRIPTION_CHARS
     assert insight.description.endswith("scene.")
+    assert vu._clip_sentences("Point: a twist.\n\nFormat:  meme", 100) == (
+        "Point: a twist.\nFormat: meme"
+    )
     assert vu._clip_sentences("short  text", 50) == "short text"
+
+
+def test_frames_are_timestamped_and_capped(tmp_path: Path) -> None:
+    import shutil
+    import subprocess
+
+    if not shutil.which("ffmpeg"):
+        pytest.skip("ffmpeg not installed")
+    clip = tmp_path / "long.mp4"
+    subprocess.run(
+        ["ffmpeg", "-v", "error", "-f", "lavfi", "-i", "testsrc2=size=320x240:rate=10",
+         "-t", "30", "-pix_fmt", "yuv420p", str(clip)],
+        check=True, timeout=60,
+    )
+    out = tmp_path / "frames"
+    out.mkdir()
+    frames = asyncio.run(vu.extract_frames(clip, out, 30.0))
+    assert 20 <= len(frames) <= vu._MAX_FRAMES
+    assert all(f.stat().st_size > 0 for f in frames)

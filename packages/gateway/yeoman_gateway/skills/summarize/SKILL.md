@@ -28,6 +28,11 @@ about, call `video_understand(url="<url>")`. It returns the post's caption, a de
 what the video shows and a transcript of what is said. If it returns an error (e.g. the
 post needs a login), say so honestly — do not guess from the URL.
 
+The description starts with **Point:** — the punchline or what the clip wants to show.
+People share reels to get a reaction, not a summary: if it is a joke, show you got it
+(name the twist, play along, keep it short) instead of narrating the layout and the
+on-screen text. Forwarded videos carry the same `[video_description]` with a Point.
+
 ## Articles, podcasts, PDFs
 
 Use `web_fetch(url=...)` for non-YouTube URLs.

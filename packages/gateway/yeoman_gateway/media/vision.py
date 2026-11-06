@@ -5,7 +5,7 @@ from __future__ import annotations
 import asyncio
 import base64
 import mimetypes
-from collections.abc import Callable
+from collections.abc import Callable, Sequence
 from pathlib import Path
 
 from loguru import logger
@@ -22,18 +22,30 @@ PROMPT = (
 )
 
 VIDEO_PROMPT = (
-    "Describe the complete video factually in 2-4 sentences: what is shown and what "
-    "happens, the setting, and any clearly readable on-screen text (quote it exactly). "
-    "Mention music or notable sounds briefly; spoken words are transcribed separately, "
-    "so summarize speech in a few words at most. Do not identify people, invent details "
-    "or infer anything that is not clearly visible or audible."
+    "Watch this short video to the very end so that someone in a group chat who cannot "
+    "see it gets it - including the joke, if there is one. Still frames taken at regular "
+    "intervals (timestamp in the corner) may follow the video so brief moments are not "
+    "missed; use them together with the video.\n\n"
+    "Answer in these labelled parts, each 1-3 sentences, in this order:\n"
+    "Point: if the clip is meant to be funny or ironic, explain the punchline - the twist "
+    "or contrast between the text, the images, the sound and how the people behave. If it "
+    "is not a joke, say what the clip wants to show.\n"
+    "Format: the kind of clip (meme/sketch, prank, news clip, tutorial, vlog, ad...) and "
+    "its layout (split screen, text overlay, reaction cam).\n"
+    "What happens: the events in order, with times. Watch closely for brief, unexpected "
+    "moments (a collision, something falling, a sudden cut, a reveal) - they are often "
+    "the point - and say exactly what happens in them.\n"
+    "On-screen text: quote it exactly.\n"
+    "Sound: tone of voice (calm, panicked, deadpan) and notable music or effects; spoken "
+    "words are transcribed separately, so do not transcribe them.\n\n"
+    "Describe only what is visible or audible, and do not identify people by name."
 )
 
 #: A whole clip is uploaded inline; slow providers need more than the image budget.
 VIDEO_MIN_TIMEOUT_S = 90.0
 #: GLM-class video models must reason before answering (it cannot be switched off), and
 #: a 15 s clip already takes 100-400 reasoning tokens - a small cap returns no text at all.
-VIDEO_MIN_MAX_TOKENS = 1500
+VIDEO_MIN_MAX_TOKENS = 3000
 
 OCR_PROMPT = (
     "Transcribe the visible text in this image as accurately as possible. "
@@ -191,8 +203,16 @@ class VisionDescriber:
         self,
         video_path: Path,
         profile: ResolvedProfile,
+        *,
+        frames: Sequence[Path] = (),
+        context: str | None = None,
     ) -> str | None:
-        """Send the complete local video to a video-capable routed model."""
+        """Send the complete local video to a video-capable routed model.
+
+        ``frames`` are timestamped stills that make brief moments visible to models that
+        sample the video sparsely; ``context`` is the post caption and speech transcript,
+        which often carry the punchline.
+        """
         if profile.kind != "vision" or not profile.model:
             return None
         if not video_path.exists() or not video_path.is_file():
@@ -207,16 +227,30 @@ class VisionDescriber:
             logger.debug("Video description skipped for unsupported MIME type {}", mime)
             return None
         b64 = base64.b64encode(video_path.read_bytes()).decode("ascii")
+        content: list[dict[str, object]] = [
+            {"type": "video_url", "video_url": {"url": f"data:{mime};base64,{b64}"}}
+        ]
+        for frame in frames:
+            block = self._image_block(frame)
+            if block is not None:
+                content.append(block)
+        prompt = VIDEO_PROMPT
+        if context:
+            prompt += (
+                "\n\nContext shared with the video (use it to understand the joke; it may be "
+                f"in another language):\n{context}"
+            )
+        content.append({"type": "text", "text": prompt})
         text = await self._run(
             "video description",
             profile,
-            [
-                {"type": "video_url", "video_url": {"url": f"data:{mime};base64,{b64}"}},
-                {"type": "text", "text": VIDEO_PROMPT},
-            ],
+            content,
             timeout_s=max((profile.timeout_ms or 0) / 1000.0, VIDEO_MIN_TIMEOUT_S),
             default_max_tokens=400,
             min_max_tokens=VIDEO_MIN_MAX_TOKENS,
             default_temperature=0.1,
         )
-        return " ".join(text.split()) if text else None
+        if not text:
+            return None
+        lines = (" ".join(line.split()) for line in text.splitlines())
+        return "\n".join(line for line in lines if line) or None
