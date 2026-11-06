@@ -1,6 +1,6 @@
 ---
 name: summarize
-description: "ALWAYS use for YouTube links. Call youtube_transcript(url=...) immediately — never web_fetch or web_search a YouTube URL. For articles/files use web_fetch."
+description: "ALWAYS use for YouTube, Instagram, TikTok and other video links. YouTube → youtube_transcript(url=...); Instagram reels/posts, TikTok, Shorts and other short clips → video_understand(url=...). Never web_fetch or web_search a video URL. For articles/files use web_fetch."
 metadata: {"yeoman":{"emoji":"🧾","always":true}}
 ---
 
@@ -19,6 +19,14 @@ youtube_transcript(url="https://youtu.be/dQw4w9WgXcQ")
 ```
 
 If `youtube_transcript` returns an error (no captions available), say so honestly — do not guess or search.
+
+## Instagram, TikTok and other short videos
+
+When a message contains an Instagram reel/post (`instagram.com/reel/…`, `/p/…`, `/tv/…`),
+a TikTok link, a YouTube Short or another short video link and you need to know what it is
+about, call `video_understand(url="<url>")`. It returns the post's caption, a description of
+what the video shows and a transcript of what is said. If it returns an error (e.g. the
+post needs a login), say so honestly — do not guess from the URL.
 
 ## Articles, podcasts, PDFs
 

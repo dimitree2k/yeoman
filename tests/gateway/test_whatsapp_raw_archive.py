@@ -1569,3 +1569,50 @@ def test_transcript_retained_before_audio_unlink(tmp_path, monkeypatch, quoted, 
         }
     finally:
         store.close()
+
+
+def test_video_with_shared_service_archives_description_and_transcript(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    from yeoman_gateway.media.video_understanding import VideoInsight
+
+    channel, archive, _ = _setup(tmp_path)
+    path = tmp_path / "incoming" / "clip.mp4"
+    path.parent.mkdir(parents=True, exist_ok=True)
+    path.write_bytes(b"video")
+    channel.config.media.enabled = True
+    channel.config.media.describe_videos = True
+    channel._model_router = object()
+    channel._vision_describer = object()
+    calls: list[tuple[Path, str]] = []
+
+    class Service:
+        async def understand_file(self, file_path: Path, *, channel: str) -> VideoInsight:
+            calls.append((file_path, channel))
+            return VideoInsight(
+                description="A dog jumps into a lake.", description_model="video-model",
+                transcript="look at him go", transcript_model="whisper",
+            )
+
+    channel.set_video_understanding(Service())
+    monkeypatch.setattr(whatsapp_module, "datetime", _FixedDateTime)
+    event = InboundEvent(
+        message_id="native-video", chat_jid=CHAT, participant_jid="sender@lid", sender_id="sender",
+        sender_phone_jid=None, is_group=True, text="[Video]", timestamp=NOW, mentioned_jids=[],
+        mentioned_bot=False, reply_to_bot=False, reply_to_message_id=None, reply_to_participant=None,
+        reply_to_text=None, media_kind="video", media_type="video/mp4", media_file_name="clip.mp4",
+        media_path=str(path), media_bytes=5, media_description=None, voice_transcript=None,
+    )
+
+    result = asyncio.run(channel._enrich_primary_media_event(event))
+
+    assert calls == [(path, "whatsapp")]
+    assert result.text == (
+        "[Video]\n[video_description] A dog jumps into a lake.\n[video_transcript] look at him go"
+    )
+    assert result.media_description == "A dog jumps into a lake."
+    [description] = [r for _, r, _ in iter_records(archive.root / "derived" / "media-descriptions.jsonl")]
+    assert description["generator"] == "video-model" and description["mode"] == "description"
+    [transcript] = [r for _, r, _ in iter_records(archive.root / "derived" / "media-transcripts.jsonl")]
+    assert transcript["kind"] == "media_transcript" and transcript["text"] == "look at him go"
+    assert transcript["native_message_id"] == "native-video"

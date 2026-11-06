@@ -34,6 +34,7 @@ RESEARCH_TOOL_NAMES: frozenset[str] = frozenset(
         "fact_check",
         "browse",
         "youtube_transcript",
+        "video_understand",
         "market_quote",
         "market_intelligence",
     }

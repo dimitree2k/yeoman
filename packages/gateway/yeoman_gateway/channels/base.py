@@ -28,6 +28,12 @@ class BaseChannel(ABC):
         self.config = config
         self.bus = bus
         self._running = False
+        # Shared video describer + transcriber (media/video_understanding.py), if any.
+        self._video_understanding: Any | None = None
+
+    def set_video_understanding(self, service: Any | None) -> None:
+        """Attach the channel-agnostic video understanding service."""
+        self._video_understanding = service
 
     @abstractmethod
     async def start(self) -> None:

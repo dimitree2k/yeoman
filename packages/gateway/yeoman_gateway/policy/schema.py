@@ -620,6 +620,7 @@ DEFAULT_OWNER_TOOLS: tuple[str, ...] = (
     "web_crawl",
     "deep_research",
     "youtube_transcript",
+    "video_understand",
     "browse",
 )
 

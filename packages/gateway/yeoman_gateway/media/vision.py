@@ -22,10 +22,18 @@ PROMPT = (
 )
 
 VIDEO_PROMPT = (
-    "Describe the complete video in 1-2 concise factual sentences. "
-    "Use visible motion and audible speech or sounds when relevant. "
-    "Do not invent details or infer anything that is not clearly visible or audible."
+    "Describe the complete video factually in 2-4 sentences: what is shown and what "
+    "happens, the setting, and any clearly readable on-screen text (quote it exactly). "
+    "Mention music or notable sounds briefly; spoken words are transcribed separately, "
+    "so summarize speech in a few words at most. Do not identify people, invent details "
+    "or infer anything that is not clearly visible or audible."
 )
+
+#: A whole clip is uploaded inline; slow providers need more than the image budget.
+VIDEO_MIN_TIMEOUT_S = 90.0
+#: GLM-class video models must reason before answering (it cannot be switched off), and
+#: a 15 s clip already takes 100-400 reasoning tokens - a small cap returns no text at all.
+VIDEO_MIN_MAX_TOKENS = 1500
 
 OCR_PROMPT = (
     "Transcribe the visible text in this image as accurately as possible. "
@@ -76,6 +84,7 @@ class VisionDescriber:
         default_max_tokens: int,
         default_temperature: float,
         empty_is_failure: bool = True,
+        min_max_tokens: int = 0,
     ) -> str | None:
         """Try the profile, then its fallbacks; return the first non-empty answer."""
         reasons: list[str] = []
@@ -92,7 +101,8 @@ class VisionDescriber:
                     provider.chat(
                         messages=[{"role": "user", "content": content}],
                         model=candidate.model,
-                        max_tokens=candidate.max_tokens or default_max_tokens,
+                        max_tokens=max(candidate.max_tokens or default_max_tokens, min_max_tokens),
+                        reasoning=candidate.reasoning,
                         temperature=(
                             candidate.temperature
                             if candidate.temperature is not None
@@ -111,7 +121,11 @@ class VisionDescriber:
                 text = (response.content or "").strip()
                 if text:
                     return text
-                if getattr(response, "finish_reason", None) != "error":
+                finish = getattr(response, "finish_reason", None)
+                if finish == "length":
+                    # Reasoning models can spend the whole budget before answering.
+                    reason = "output budget used up before an answer"
+                elif finish != "error":
                     if not empty_is_failure:
                         # e.g. OCR of an image without text: a valid answer, not a failure.
                         return None
@@ -200,8 +214,9 @@ class VisionDescriber:
                 {"type": "video_url", "video_url": {"url": f"data:{mime};base64,{b64}"}},
                 {"type": "text", "text": VIDEO_PROMPT},
             ],
-            timeout_s=max((profile.timeout_ms or 0) / 1000.0, 60.0),
-            default_max_tokens=320,
+            timeout_s=max((profile.timeout_ms or 0) / 1000.0, VIDEO_MIN_TIMEOUT_S),
+            default_max_tokens=400,
+            min_max_tokens=VIDEO_MIN_MAX_TOKENS,
             default_temperature=0.1,
         )
         return " ".join(text.split()) if text else None
