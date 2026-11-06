@@ -482,7 +482,8 @@ class WebFetchTool(Tool):
     name = "web_fetch"
     description = (
         "Fetch URL and extract readable content (HTML → markdown/text). "
-        "Not suitable for JS-heavy apps (Google Maps, Twitter/X, Instagram, SPAs) — use browse instead."
+        "Not suitable for JS-heavy apps (Google Maps, Twitter/X, Instagram, SPAs) — use browse instead. "
+        "For video links (Instagram reels, TikTok, Shorts) use video_understand."
     )
     parameters = {
         "type": "object",
@@ -598,6 +599,15 @@ class WebFetchTool(Tool):
                 {
                     "error": "YouTube URLs cannot be fetched this way — web_fetch only gets page HTML, not video transcripts.",
                     "action": f'Use the youtube_transcript tool instead: youtube_transcript(url="{url}")',
+                }
+            )
+
+        # Video posts are page shells without the video — the dedicated tool watches them.
+        if _VIDEO_POST_URL.search(url):
+            return json.dumps(
+                {
+                    "error": "This is a video post; web_fetch only gets the page shell, not the video.",
+                    "action": f'Use the video_understand tool instead: video_understand(url="{url}")',
                 }
             )
 
@@ -1273,6 +1283,13 @@ class DeepResearchTool(Tool):
             lines.append("")
 
         return "\n".join(lines)
+
+
+#: Links whose page is only a player shell; routed to video_understand (site choice only).
+_VIDEO_POST_URL = re.compile(
+    r"^https?://(?:www\.|m\.)?(?:instagram\.com/(?:reels?|p|tv)/|tiktok\.com/|vm\.tiktok\.com/)",
+    re.IGNORECASE,
+)
 
 
 def _extract_youtube_id(url: str) -> str | None:

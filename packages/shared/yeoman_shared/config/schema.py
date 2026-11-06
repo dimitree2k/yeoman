@@ -566,6 +566,17 @@ class MemeToolConfig(BaseModel):
     background_daily_cap: int = Field(default=10, ge=0)
 
 
+class VideoToolConfig(BaseModel):
+    """Video understanding for links (video_understand) and forwarded clips."""
+
+    enabled: bool = True
+    #: Linked clips longer than this return only their caption and title.
+    max_url_duration_seconds: int = Field(default=180, gt=0)
+    max_download_mb: int = Field(default=40, gt=0)
+    #: Optional Netscape cookies.txt for sites that require a login (e.g. Instagram).
+    cookies_file: str = ""
+
+
 class ToolsConfig(BaseModel):
     """Tools configuration."""
 
@@ -573,6 +584,7 @@ class ToolsConfig(BaseModel):
     exec: ExecToolConfig = Field(default_factory=ExecToolConfig)
     a2a: A2AConfig = Field(default_factory=A2AConfig)
     memes: MemeToolConfig = Field(default_factory=MemeToolConfig)
+    video: VideoToolConfig = Field(default_factory=VideoToolConfig)
     restrict_to_workspace: bool = False  # If true, restrict all tool access to workspace directory
 
 

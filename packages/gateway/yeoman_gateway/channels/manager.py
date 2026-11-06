@@ -69,6 +69,7 @@ class ChannelManager:
         processing_signals: Any | None = None,
         reaction_action: Any | None = None,
         ambient_judge: Any | None = None,
+        video_understanding: Any | None = None,
     ):
         self.config = config
         self.bus = bus
@@ -81,6 +82,7 @@ class ChannelManager:
         self.processing_signals = processing_signals
         self.reaction_action = reaction_action
         self.ambient_judge = ambient_judge
+        self.video_understanding = video_understanding
         self.channels: dict[str, BaseChannel] = {}
         self._dispatch_task: asyncio.Task | None = None
         self._reaction_dispatch_task: asyncio.Task | None = None
@@ -174,6 +176,7 @@ class ChannelManager:
                     session_manager=self.session_manager,
                 )
                 self.channels["telegram"].set_raw_archive(self.raw_archive)
+                self.channels["telegram"].set_video_understanding(self.video_understanding)
                 logger.info("Telegram channel enabled")
             except ImportError as e:
                 logger.warning(f"Telegram channel not available: {e}")
@@ -197,6 +200,7 @@ class ChannelManager:
                     openai_extra_headers=openai_compat.extra_headers if openai_compat else None,
                 )
                 self.channels["whatsapp"].set_raw_archive(self.raw_archive)
+                self.channels["whatsapp"].set_video_understanding(self.video_understanding)
                 if self.processing_gate is not None:
                     setter = getattr(self.channels["whatsapp"], "set_processing_gate", None)
                     if setter is not None:

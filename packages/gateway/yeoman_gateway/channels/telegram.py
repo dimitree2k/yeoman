@@ -43,6 +43,8 @@ from yeoman_gateway.bus.queue import MessageBus
 from yeoman_gateway.channels.base import BaseChannel
 
 if TYPE_CHECKING:
+    from pathlib import Path
+
     from yeoman_gateway.session.manager import SessionManager
 
 # Owner intent key for this channel (``yeoman overseer pause telegram``).
@@ -554,6 +556,15 @@ class TelegramChannel(BaseChannel):
         elif message.audio:
             media_file = message.audio
             media_type = "audio"
+        elif message.video:
+            media_file = message.video
+            media_type = "video"
+        elif message.video_note:
+            media_file = message.video_note
+            media_type = "video"
+        elif message.animation:
+            media_file = message.animation
+            media_type = "video"
         elif message.document:
             media_file = message.document
             media_type = "file"
@@ -589,7 +600,9 @@ class TelegramChannel(BaseChannel):
                             correlation_id=str(getattr(message, "message_id", "") or ""),
                         ),
                         file_path,
-                        kind={"image": "image", "voice": "audio", "audio": "audio"}.get(
+                        kind={
+                            "image": "image", "voice": "audio", "audio": "audio", "video": "video"
+                        }.get(
                             str(media_type), "document"
                         ),
                     )
@@ -608,6 +621,8 @@ class TelegramChannel(BaseChannel):
                         content_parts.append(f"[transcription: {transcription}]")
                     else:
                         content_parts.append(f"[{media_type}: {file_path}]")
+                elif media_type == "video" and self._video_understanding is not None:
+                    content_parts.extend(await self._understand_video(file_path))
                 else:
                     content_parts.append(f"[{media_type}: {file_path}]")
 
@@ -719,6 +734,18 @@ class TelegramChannel(BaseChannel):
         except Exception as e:
             logger.debug(f"Typing indicator stopped for {chat_id}: {e}")
 
+    async def _understand_video(self, file_path: "Path") -> list[str]:
+        """Description + transcript lines for a received clip, via the shared service."""
+        try:
+            insight = await self._video_understanding.understand_file(
+                file_path, channel=self.name
+            )
+        except Exception as e:  # noqa: BLE001 - an unseen video must not drop the message
+            logger.warning("Telegram video understanding failed {}", type(e).__name__)
+            insight = None
+        lines = insight.enrichment_lines() if insight is not None else []
+        return lines or [f"[video: {file_path}]"]
+
     def _get_extension(self, media_type: str, mime_type: str | None) -> str:
         """Get file extension based on media type."""
         if mime_type:
@@ -729,11 +756,14 @@ class TelegramChannel(BaseChannel):
                 "audio/ogg": ".ogg",
                 "audio/mpeg": ".mp3",
                 "audio/mp4": ".m4a",
+                "video/mp4": ".mp4",
+                "video/quicktime": ".mov",
+                "video/webm": ".webm",
             }
             if mime_type in ext_map:
                 return ext_map[mime_type]
 
-        type_map = {"image": ".jpg", "voice": ".ogg", "audio": ".mp3", "file": ""}
+        type_map = {"image": ".jpg", "voice": ".ogg", "audio": ".mp3", "video": ".mp4", "file": ""}
         return type_map.get(media_type, "")
 
     def _on_polling_error(self, error: TelegramError) -> None:

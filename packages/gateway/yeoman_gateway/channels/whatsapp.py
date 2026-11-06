@@ -15,6 +15,8 @@ import uuid
 from contextvars import ContextVar
 from dataclasses import dataclass, replace
 from datetime import UTC, datetime
+from pathlib import Path
+from types import SimpleNamespace
 from typing import TYPE_CHECKING, Any
 
 from loguru import logger
@@ -1261,6 +1263,53 @@ class WhatsAppChannel(BaseChannel):
         if archive is not self._raw_archive:
             self._raw_archive_legacy_warned = False
         self._raw_archive = archive
+
+    async def _enrich_video_with_service(
+        self, event: InboundEvent, path: Path, size_bytes: int
+    ) -> InboundEvent:
+        """Describe the clip and transcribe its audio through the shared video service."""
+        base = replace(event, media_path=str(path), media_bytes=size_bytes)
+        try:
+            insight = await self._video_understanding.understand_file(path, channel=self.name)
+        except Exception as e:  # noqa: BLE001 - an unseen video must not drop the message
+            logger.warning("WhatsApp video understanding failed {}", e.__class__.__name__)
+            return base
+        if insight.description:
+            await self._archive_media_description(
+                chat_id=event.chat_jid,
+                message_id=event.message_id,
+                profile=SimpleNamespace(model=insight.description_model),
+                mode="description",
+                text=insight.description,
+            )
+        if insight.transcript:
+            await append_media_transcript_async(
+                self._raw_archive,
+                {
+                    "raw_archive_version": 1,
+                    "kind": "media_transcript",
+                    "provenance": "derived_only",
+                    "channel": self.name,
+                    "chat_id": event.chat_jid,
+                    "native_message_id": event.message_id,
+                    "generated_ms": int(datetime.now(UTC).timestamp() * 1000),
+                    "generator": insight.transcript_model,
+                    "text": insight.transcript,
+                },
+            )
+        if self.config.media.delete_video_after_description and (
+            insight.description or insight.transcript
+        ):
+            with contextlib.suppress(OSError):
+                path.unlink()
+        lines = [line for line in insight.enrichment_lines() if line not in event.text]
+        if not lines:
+            return base
+        return replace(
+            base,
+            text="\n".join([event.text, *lines]),
+            media_description=insight.description or event.media_description,
+        )
 
     async def _archive_media_description(
         self, *, chat_id: str, message_id: str, profile: Any, mode: str, text: str
@@ -2927,6 +2976,9 @@ class WhatsAppChannel(BaseChannel):
                     max_bytes,
                 )
                 return replace(event, media_path=str(validated_path), media_bytes=size_bytes)
+
+            if self._video_understanding is not None:
+                return await self._enrich_video_with_service(event, validated_path, size_bytes)
 
             try:
                 profile = self._model_router.resolve("vision.describe_video", channel=self.name)

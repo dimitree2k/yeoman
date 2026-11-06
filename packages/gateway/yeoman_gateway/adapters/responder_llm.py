@@ -97,6 +97,7 @@ if TYPE_CHECKING:
     from yeoman_gateway.media.memes.service import MemeService
     from yeoman_gateway.media.router import ModelRouter
     from yeoman_gateway.media.tts import TTSSynthesizer
+    from yeoman_gateway.media.video_understanding import VideoUnderstanding
     from yeoman_gateway.people.resolver import PeopleResolver, ReaderContext
     from yeoman_gateway.storage.private_handoff import PrivateHandoffStore
 
@@ -152,6 +153,7 @@ _TEXTUAL_TOOL_COERCION_SAFE_TOOLS = frozenset(
         "web_fetch",
         "web_search",
         "youtube_transcript",
+        "video_understand",
     }
 )
 _DEFERRED_WORK_PROMISE_RE = re.compile(
@@ -787,6 +789,7 @@ class LLMResponder(ResponderPort):
         meme_service: "MemeService | None" = None,
         group_decisions: "GroupDecisionStore | None" = None,
         youtube_audio_transcriber: "AudioTranscriber | None" = None,
+        video_understanding: "VideoUnderstanding | None" = None,
         whatsapp_session_history_limit: int = 15,
         whatsapp_session_history_limit_group: int = 20,
     ) -> None:
@@ -799,6 +802,7 @@ class LLMResponder(ResponderPort):
         self.max_iterations = max(1, int(max_iterations))
         self.tavily_api_key = tavily_api_key
         self._youtube_audio_transcriber = youtube_audio_transcriber
+        self._video_understanding = video_understanding
         self.web_config = web_config
         self.exec_config = exec_config or ExecToolConfig()
         self.cron_service = cron_service
@@ -965,6 +969,10 @@ class LLMResponder(ResponderPort):
         self.tools.register(MarketQuoteTool())
         self.tools.register(MarketIntelligenceTool())
         self.tools.register(YoutubeTranscriptTool(audio_transcriber=self._youtube_audio_transcriber))
+        if self._video_understanding is not None:
+            from yeoman_gateway.agent.tools.video import VideoUnderstandTool
+
+            self.tools.register(VideoUnderstandTool(self._video_understanding))
 
         from yeoman_gateway.agent.tools.browse import BrowseTool
 

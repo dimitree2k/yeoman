@@ -87,6 +87,7 @@ if TYPE_CHECKING:
     from yeoman_gateway.history.live import HistoryProjector
     from yeoman_gateway.ipc.gateway_socket import GatewaySocket
     from yeoman_gateway.media.memes.service import MemeService
+    from yeoman_gateway.media.video_understanding import VideoUnderstanding
     from yeoman_gateway.policy.engine import PolicyEngine
     from yeoman_gateway.processing.dispatch import IntentEffectRouter
     from yeoman_gateway.processing.store import ProcessingStore
@@ -3106,10 +3107,33 @@ def _validate_history_readiness(config: "Config") -> None:
             connection.close()
 
 
+def _build_video_understanding(
+    config: "Config",
+    provider_factory: Any,
+    model_router: Any,
+    transcriber: Any,
+) -> "VideoUnderstanding | None":
+    """One video service for every channel and the video_understand tool."""
+    video_cfg = config.tools.video
+    if not video_cfg.enabled:
+        return None
+    from yeoman_gateway.media.video_understanding import VideoUnderstanding
+
+    return VideoUnderstanding(
+        describer=VisionDescriber(provider_factory, model_router),
+        router=model_router,
+        transcriber=transcriber,
+        cookies_file=video_cfg.cookies_file or None,
+        max_url_duration_s=video_cfg.max_url_duration_seconds,
+        max_download_bytes=video_cfg.max_download_mb * 1024 * 1024,
+        max_describe_bytes=config.channels.whatsapp.media.max_video_bytes_mb * 1024 * 1024,
+    )
+
+
 CLI_AGENT_TOOLS = frozenset({
     "read_file", "write_file", "edit_file", "list_dir", "exec", "ops",
     "web_search", "web_fetch", "web_map", "web_crawl", "deep_research",
-    "market_quote", "market_intelligence", "youtube_transcript", "browse",
+    "market_quote", "market_intelligence", "youtube_transcript", "video_understand", "browse",
     "spawn_subagent_sync", "fact_check", "recall_conversation",
 })
 
@@ -3454,6 +3478,10 @@ def build_gateway_runtime(
         result = await youtube_asr.transcribe(audio_path, profile)
         return result.text if result else None
 
+    video_understanding = _build_video_understanding(
+        config, provider_factory, model_router, youtube_asr
+    )
+
     responder = LLMResponder(
         provider=provider,
         workspace=workspace,
@@ -3492,6 +3520,7 @@ def build_gateway_runtime(
         lazy_media_resolver=lazy_media_resolver,
         meme_service=meme_service,
         youtube_audio_transcriber=_youtube_audio_transcriber,
+        video_understanding=video_understanding,
         whatsapp_session_history_limit=config.channels.whatsapp.session_history_limit,
         whatsapp_session_history_limit_group=config.channels.whatsapp.session_history_limit_group,
     )
@@ -3591,11 +3620,16 @@ def build_gateway_runtime(
         ),
         reaction_action=_build_reaction_action(config, effect_router, processing_store),
         ambient_judge=_build_ambient_judge(config),
+        video_understanding=video_understanding,
     )
     document_processor.raw_archive = channels.raw_archive
     vision_alert = _build_vision_failure_alert(policy_adapter.owner_recipients, _admin_notify)
     whatsapp_channel = channels.get_channel("whatsapp")
-    for describer in (lazy_vision, getattr(whatsapp_channel, "_vision_describer", None)):
+    for describer in (
+        lazy_vision,
+        getattr(whatsapp_channel, "_vision_describer", None),
+        video_understanding.describer if video_understanding is not None else None,
+    ):
         if describer is not None:
             describer.failure_listener = vision_alert
 
