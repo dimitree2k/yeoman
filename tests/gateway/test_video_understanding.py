@@ -355,3 +355,15 @@ def test_video_call_leaves_room_for_mandatory_reasoning(tmp_path: Path) -> None:
     assert calls[0]["max_tokens"] == VIDEO_MIN_MAX_TOKENS
     assert calls[0]["reasoning"] == {"effort": "low"}
     assert asyncio.run(describer.describe_video(clip, profile)) == "A dog runs."
+
+
+def test_long_description_is_cut_at_a_sentence_end(
+    monkeypatch: pytest.MonkeyPatch, clip: Path
+) -> None:
+    _patch_media_tools(monkeypatch)
+    long_text = " ".join(f"Sentence number {i} describes the scene." for i in range(200))
+    insight = asyncio.run(_service(_Describer(text=long_text)).understand_file(clip))
+    assert insight.description is not None
+    assert len(insight.description) <= vu._MAX_DESCRIPTION_CHARS
+    assert insight.description.endswith("scene.")
+    assert vu._clip_sentences("short  text", 50) == "short text"

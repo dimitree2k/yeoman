@@ -34,6 +34,8 @@ DEFAULT_MAX_DOWNLOAD_BYTES = 40 * 1024 * 1024
 DEFAULT_MAX_DESCRIBE_BYTES = 20 * 1024 * 1024
 _MAX_CAPTION_CHARS = 1500
 _MAX_TRANSCRIPT_CHARS = 12000
+#: Descriptions land in every reader's context; reasoning models ignore length requests.
+_MAX_DESCRIPTION_CHARS = 1200
 _FFMPEG_TIMEOUT_SECONDS = 120
 _ASR_MIN_TIMEOUT_MS = 120_000
 _CACHE_SIZE = 64
@@ -114,6 +116,20 @@ def _clip(text: str | None, limit: int) -> str | None:
     if not text:
         return None
     return text if len(text) <= limit else text[:limit] + " [truncated]"
+
+
+def _clip_sentences(text: str | None, limit: int) -> str | None:
+    """Whitespace-normalized text, shortened at the last sentence end within ``limit``."""
+    if not text:
+        return None
+    text = " ".join(str(text).split())
+    if len(text) <= limit:
+        return text or None
+    head = text[:limit]
+    cut = max(head.rfind(". "), head.rfind("! "), head.rfind("? "), head.rfind('." '))
+    if cut >= limit // 2:
+        return head[: cut + 1]
+    return head.rsplit(" ", 1)[0] + " …"
 
 
 async def _run(argv: list[str], timeout_s: float) -> tuple[int, bytes, bytes]:
@@ -264,6 +280,7 @@ class VideoUnderstanding:
         except Exception as exc:  # noqa: BLE001 - a failed description must not drop the turn
             logger.warning("video understanding: description failed {}", type(exc).__name__)
             return None
+        text = _clip_sentences(text, _MAX_DESCRIPTION_CHARS)
         return (text, profile.model) if text else None
 
     async def _transcribe(self, path: Path, channel: str | None) -> tuple[str, str | None] | None:
