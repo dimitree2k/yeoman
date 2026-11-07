@@ -49,3 +49,16 @@ def test_network_error_does_not_pause() -> None:
     channel = TelegramChannel(TelegramConfig(token="123:abc"), MessageBus())
     channel._on_polling_error(NetworkError("down"))
     assert DesiredStateStore().get(TELEGRAM_SERVICE).desired == "running"
+
+
+def test_network_errors_spend_the_budget_then_stop_polling() -> None:
+    from yeoman_shared.utils.helpers import get_operational_store_path
+
+    get_operational_store_path("telegram_connect_budget").unlink(missing_ok=True)
+    channel = TelegramChannel(TelegramConfig(token="123:abc"), MessageBus())
+    for _ in range(4):
+        channel._on_polling_error(NetworkError("down"))
+        assert channel._budget_stop is False
+    channel._on_polling_error(NetworkError("down"))
+    assert channel._budget_stop is True
+    channel._connect_budget().reset()

@@ -59,6 +59,9 @@ def overseer_env(tmp_path: Path) -> Path:
     runbooks.mkdir(parents=True)
     (runbooks / "health.md").write_text(HEALTH_RUNBOOK)
     (runbooks / "cron.md").write_text(CRON_RUNBOOK)
+    # Keep tests hermetic: mark every starter as already offered so none is auto-installed.
+    starters = Path(__import__("yeoman_overseer.service").service.__file__).parent / "starter_runbooks"
+    (runbooks / ".starter-offered").write_text("\n".join(p.name for p in starters.glob("*.md")))
     return d
 
 @pytest.mark.asyncio

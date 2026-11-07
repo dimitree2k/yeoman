@@ -202,7 +202,13 @@ def check_whatsapp_link_held(*, target: str) -> CheckResult:
         return CheckResult(value=False, detail="no hold")
     kind = hold.get("kind")
     code = hold.get("code")
-    if kind == "needs_human":
+    if kind == "needs_human" and code == 440:
+        detail = (
+            "WhatsApp keeps handing the session to another client (440 twice in 10 min). "
+            "No more attempts will be made. Close the other WhatsApp Web/desktop session, "
+            "then run `yeoman overseer resume bridge`."
+        )
+    elif kind == "needs_human":
         detail = (
             f"WhatsApp needs you: the link closed with {code} ({hold.get('reason') or 'unknown'}). "
             "No more login attempts will be made. Relink with `yeoman channels login`."
@@ -213,6 +219,89 @@ def check_whatsapp_link_held(*, target: str) -> CheckResult:
             "`yeoman overseer resume bridge` tries now."
         )
     return CheckResult(value=True, detail=detail)
+
+
+# First time each condition was seen, so a check can require it to last (process-local).
+_FIRST_SEEN: dict[str, float] = {}
+
+
+def _sustained(key: str, active: bool, *, for_s: float) -> float:
+    """Seconds the condition has held continuously, or 0.0 when it is not active."""
+    if not active:
+        _FIRST_SEEN.pop(key, None)
+        return 0.0
+    first = _FIRST_SEEN.setdefault(key, time.time())
+    return time.time() - first
+
+
+def _unit_active(unit: str) -> bool:
+    import subprocess
+
+    try:
+        proc = subprocess.run(
+            ["systemctl", "--user", "is-active", "--quiet", unit],
+            capture_output=True,
+            timeout=5,
+            check=False,
+        )
+    except (OSError, subprocess.TimeoutExpired):
+        return False
+    return proc.returncode == 0
+
+
+def check_whatsapp_gateway_detached(*, target: str, threshold: float = 600.0) -> CheckResult:
+    """True once the bridge has had no gateway client for ``threshold`` seconds.
+
+    Only counts while both the gateway and the bridge are desired running; the health
+    request itself is one client, so a gateway makes two.
+    """
+    from yeoman_shared.desired_state import DesiredStateStore
+
+    store = DesiredStateStore()
+    if store.is_held("yeoman-bridge") or store.is_held("yeoman-gateway"):
+        _sustained("gateway_detached", False, for_s=threshold)
+        return CheckResult(value=False, detail="bridge or gateway paused by owner")
+    try:
+        health = _whatsapp_bridge_health(target=target, timeout_s=3.0)
+    except Exception as exc:
+        _sustained("gateway_detached", False, for_s=threshold)
+        return CheckResult(value=False, detail=f"bridge unreachable ({exc}); health-bridge covers it")
+    queue = health.get("queue") if isinstance(health.get("queue"), dict) else {}
+    detached = int(queue.get("clients", 0) or 0) < 2
+    held_s = _sustained("gateway_detached", detached, for_s=threshold)
+    if held_s >= threshold:
+        return CheckResult(
+            value=True,
+            detail=(
+                f"The gateway has not been connected to the WhatsApp bridge for {held_s / 60:.0f} min. "
+                "Messages are not flowing. Run `yeoman gateway restart`."
+            ),
+        )
+    return CheckResult(value=False, detail="gateway attached" if not detached else f"detached {held_s:.0f}s")
+
+
+MANAGED_UNITS = ("yeoman-gateway", "yeoman-bridge")
+
+
+def check_desired_state_drift(*, target: str, threshold: float = 60.0) -> CheckResult:
+    """True when a unit the owner paused or stopped has been running for ``threshold`` s."""
+    from yeoman_shared.desired_state import DesiredStateStore
+
+    store = DesiredStateStore()
+    drifted = [u for u in MANAGED_UNITS if store.is_held(u) and _unit_active(f"{u}.service")]
+    held_s = _sustained("desired_drift:" + ",".join(drifted), bool(drifted), for_s=threshold)
+    if drifted and held_s >= threshold:
+        names = ", ".join(drifted)
+        short = drifted[0].removeprefix("yeoman-")
+        return CheckResult(
+            value=True,
+            detail=(
+                f"{names} is running although it is marked paused. I am leaving it alone. "
+                f"Run `yeoman overseer resume {short}` to hand it back to me, or "
+                f"`yeoman overseer pause {short}` to stop it again."
+            ),
+        )
+    return CheckResult(value=False, detail="no drift" if not drifted else f"drift {held_s:.0f}s")
 
 
 def check_file_age_exceeds(*, target: str, threshold: str) -> CheckResult:
@@ -262,6 +351,8 @@ _CHECK_REGISTRY: dict[str, Any] = {
     "whatsapp_bridge_connected": check_whatsapp_bridge_connected,
     "whatsapp_bridge_reachable": check_whatsapp_bridge_reachable,
     "whatsapp_link_held": check_whatsapp_link_held,
+    "whatsapp_gateway_detached": check_whatsapp_gateway_detached,
+    "desired_state_drift": check_desired_state_drift,
     "file_age_exceeds": check_file_age_exceeds,
     "disk_usage_above": check_disk_usage_above,
     "row_count_exceeds": check_row_count_exceeds,

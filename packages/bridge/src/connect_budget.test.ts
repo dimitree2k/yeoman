@@ -67,3 +67,13 @@ test('a restart does not refill the budget', () => {
   for (let i = 0; i < 5; i += 1) b.recordAttempt(false);
   assert.equal(new ConnectBudget(file, { now: () => clock.t }).decide().action, 'wait');
 });
+
+test('a second 440 within 10 min asks for a human; one alone does not', () => {
+  const clock = { t: 200 * HOUR };
+  const { b, file } = budget(clock);
+  assert.equal(b.recordReplaced(), false);
+  clock.t += 11 * 60_000;
+  assert.equal(b.recordReplaced(), false); // first one aged out
+  clock.t += 60_000;
+  assert.equal(new ConnectBudget(file, { now: () => clock.t }).recordReplaced(), true); // survives restart
+});

@@ -58,6 +58,9 @@ def overseer_dir(tmp_path: Path) -> Path:
     runbooks = d / "runbooks"
     runbooks.mkdir(parents=True)
     (runbooks / "test-noop.md").write_text(RUNBOOK)
+    # Keep tests hermetic: mark every starter as already offered so none is auto-installed.
+    starters = Path(__import__("yeoman_overseer.service").service.__file__).parent / "starter_runbooks"
+    (runbooks / ".starter-offered").write_text("\n".join(p.name for p in starters.glob("*.md")))
     return d
 
 def test_config_defaults() -> None:
@@ -206,3 +209,22 @@ async def test_service_raises_after_deterministic_action_failure(
             service.runbooks[0],
             check_result=CheckResult(value=True),
         )
+
+
+def test_sync_installs_new_auto_install_starter_once(tmp_path: Path) -> None:
+    starter_dir = tmp_path / "starter"
+    runbook_dir = tmp_path / "runtime"
+    starter_dir.mkdir()
+    runbook_dir.mkdir()
+    (runbook_dir / "existing.md").write_text(RUNBOOK)
+    (starter_dir / "old-deleted.md").write_text(RUNBOOK.replace("name: test-health", "name: old-deleted"))
+    auto = RUNBOOK.replace("version: 1", "version: 1\nauto_install: true")
+    (starter_dir / "brand-new.md").write_text(auto)
+
+    assert _sync_starter_runbooks(starter_dir, runbook_dir) == 1
+    assert (runbook_dir / "brand-new.md").exists()
+    assert not (runbook_dir / "old-deleted.md").exists()  # owner's deletion sticks
+
+    (runbook_dir / "brand-new.md").unlink()  # owner deletes the new one too
+    assert _sync_starter_runbooks(starter_dir, runbook_dir) == 0
+    assert not (runbook_dir / "brand-new.md").exists()

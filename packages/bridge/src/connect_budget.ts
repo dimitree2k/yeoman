@@ -42,8 +42,13 @@ export interface BudgetHold {
 
 interface BudgetFile {
   attempts: number[];
+  /** When WhatsApp closed us with 440 (another client took the session). */
+  replaced?: number[];
   hold?: BudgetHold;
 }
+
+/** Two "connection replaced" closes this close together mean two clients are fighting. */
+export const REPLACED_WINDOW_MS = 10 * 60_000;
 
 export interface ConnectBudgetOptions {
   perHour?: number;
@@ -89,6 +94,7 @@ export class ConnectBudget {
       const raw = JSON.parse(readFileSync(this.file, 'utf8')) as Partial<BudgetFile>;
       this.state = {
         attempts: Array.isArray(raw.attempts) ? raw.attempts.filter((t) => typeof t === 'number') : [],
+        replaced: Array.isArray(raw.replaced) ? raw.replaced.filter((t) => typeof t === 'number') : [],
         hold: raw.hold && typeof raw.hold === 'object' ? raw.hold : undefined,
       };
     } catch {
@@ -140,6 +146,19 @@ export class ConnectBudget {
       this.state.hold = { ...this.state.hold, nextProbeAt: now + this.probeIntervalMs };
     }
     this.save();
+  }
+
+  /**
+   * Record a 440 close; true when it is the second within REPLACED_WINDOW_MS, which
+   * means another client keeps taking the session and retrying would only fight it.
+   */
+  recordReplaced(): boolean {
+    const now = this.now();
+    const recent = (this.state.replaced ?? []).filter((t) => t > now - REPLACED_WINDOW_MS);
+    recent.push(now);
+    this.state.replaced = recent;
+    this.save();
+    return recent.length >= 2;
   }
 
   holdNeedsHuman(code: number | undefined, reason: string): BudgetHold {

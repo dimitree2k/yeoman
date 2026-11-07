@@ -64,3 +64,4 @@ def test_logged_out_moves_auth_aside_and_links(monkeypatch: pytest.MonkeyPatch, 
     assert systemctl[1][-2:] == ["start", "yeoman-bridge.service"]
     assert calls[:3] == ["health", "login_start", "login_wait"]
     assert not channel_commands._qr_file().exists()
+    assert not channel_commands._qr_png_file().exists()
