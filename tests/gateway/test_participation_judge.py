@@ -1049,7 +1049,7 @@ async def test_writer_required_target_and_knowledge_budget_is_finalized_before_j
 @pytest.mark.asyncio
 async def test_judge_removes_whole_optional_entries_until_actual_request_fits() -> None:
     client = _Client(_payload())
-    judge = ParticipationJudge(client=client, allowed_emojis=(EMOJI,), max_input_tokens=1024)
+    judge = ParticipationJudge(client=client, allowed_emojis=(EMOJI,), max_input_tokens=1280)
     context = _context(
         messages=[
             {"event_id": "m1", "sender": "Anna", "text": "required"},
@@ -1063,7 +1063,7 @@ async def test_judge_removes_whole_optional_entries_until_actual_request_fits() 
     request = "\n".join(message["content"] for message in client.calls[0])
     assert "required" in request
     assert "optional" not in request
-    assert judge._estimate_tokens(client.calls[0]) <= 1024
+    assert judge._estimate_tokens(client.calls[0]) <= 1280
     assert context["judge_dropped_entry_ids"] == ["optional"]
 
 
