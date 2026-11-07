@@ -26,7 +26,7 @@ from yeoman_gateway.reception.store import SentimentStore
 from yeoman_gateway.reception.store import now_ms as _now_ms
 
 LABEL_ROUTE = "reception.label"
-PROMPT_VERSION = "reception-label-v2"
+PROMPT_VERSION = "reception-label-v3"
 MAX_OUTPUT_TOKENS = 3_000
 TIMEOUT_SECONDS = 30.0
 MAX_ATTEMPTS = 2
@@ -43,6 +43,8 @@ STANCES = ("positive", "playful", "neutral", "annoyed", "hostile")
 SIGNALS = (
     "face_saving_last_word",
     "asks_to_remove_or_mute",
+    "tells_him_to_back_off",
+    "tells_others_to_ignore_him",
     "uses_his_answer",
     "mocks_bot_behaviour",
     "task_request",
@@ -104,10 +106,20 @@ LABEL_SYSTEM_PROMPT = (
     "- stance: positive, playful, neutral, annoyed or hostile. A topic change is "
     "neutral, never annoyed.\n"
     "- signals: only what the text shows; task_request when the candidate asks Arvid "
-    "for something, asks_to_remove_or_mute when it asks to remove, mute or stop him, "
-    "mocks_bot_behaviour when it mocks him as a bot, uses_his_answer when it reuses his "
-    "content, face_saving_last_word when it merely gets the last word.\n"
-    "- confidence: 0 to 1.\n"
+    "for something, mocks_bot_behaviour when it mocks him as a bot, uses_his_answer "
+    "when it reuses his content, face_saving_last_word when it merely gets the last "
+    "word. Three signals about wanting less of him are distinct; pick the one the text "
+    "actually does:\n"
+    "  - asks_to_remove_or_mute: someone asks that Arvid be taken out of the group, "
+    "switched off or muted for the group (\"can we finally kick this AI?\", \"please "
+    "turn the bot off\"). Only a request to change his presence counts.\n"
+    "  - tells_him_to_back_off: the candidate tells Arvid himself to answer or comment "
+    "less (\"you don't have to reply\", \"stop commenting on everything\"). He stays.\n"
+    "  - tells_others_to_ignore_him: the candidate tells other members to stop "
+    "engaging with him (\"stop talking to the bot\", \"just ignore it\").\n"
+    "  A member saying they mute something themselves, a joke about a mode, or a "
+    "message that does not respond to Arvid carries none of the three.\n"
+    "- confidence: 0 to 1, how sure you are of the stance and every signal you gave.\n"
     "Return only JSON: {\"labels\": [...]}."
 )
 

@@ -247,3 +247,17 @@ async def test_route_unavailable_is_a_clean_failure(tmp_path: Path) -> None:
     finally:
         history.close()
         runner._store.close()
+
+
+def test_wanting_less_of_arvid_has_three_distinct_signals() -> None:
+    enum = LABEL_RESPONSE_FORMAT["json_schema"]["schema"]["properties"]["labels"]["items"][
+        "properties"]["signals"]["items"]["enum"]
+    for signal in ("asks_to_remove_or_mute", "tells_him_to_back_off",
+                   "tells_others_to_ignore_him"):
+        assert signal in enum and signal in LABEL_SYSTEM_PROMPT
+    raw = json.dumps({"labels": [
+        {"arvid_message_id": "a1", "message_id": "m1", "responds_to_arvid": "yes",
+         "stance": "annoyed", "signals": ["tells_others_to_ignore_him"], "confidence": 0.8},
+    ]})
+    parsed = parse_labels(raw, arvid_ids={"a1": "actual-a"}, message_ids={"m1": "actual-m"})
+    assert parsed is not None and parsed[0].signals == ("tells_others_to_ignore_him",)
