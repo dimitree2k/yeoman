@@ -9,6 +9,7 @@ from datetime import datetime, tzinfo
 from typing import Any
 
 from yeoman_gateway.history.group_signals import previous_week, week_of
+from yeoman_gateway.reception.alerts import asks_to_remove
 from yeoman_gateway.reception.store import LabelRow, SentimentStore, WeeklyRow
 
 TREND_UP = "↑"
@@ -65,7 +66,7 @@ def _stance_distribution(labels: Sequence[LabelRow]) -> str:
 
 
 def _asks(labels: Sequence[LabelRow]) -> int:
-    return sum(1 for item in labels if "asks_to_remove_or_mute" in item.signals)
+    return len({item.message_id for item in labels if asks_to_remove(item)})
 
 
 def _row_line(

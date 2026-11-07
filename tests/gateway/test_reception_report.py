@@ -168,7 +168,7 @@ async def test_owner_digest_is_sent_once_per_week_across_restarts(tmp_path: Path
 
 def test_alert_reason_uses_signals_and_a_bounded_annoyance_cluster() -> None:
     base = 1_000_000
-    remove = LabelRow(CHAT, "2026-W41", "a", "m1", "yes", "neutral",
+    remove = LabelRow(CHAT, "2026-W41", "a", "m1", "yes", "hostile",
                       ("asks_to_remove_or_mute",), 0.9, "f", "v1", base)
     annoyed = [
         LabelRow(CHAT, "2026-W41", "a", f"m{i}", "yes", "annoyed", (), 0.9, "f", "v1", base)
@@ -183,3 +183,38 @@ def test_alert_reason_uses_signals_and_a_bounded_annoyance_cluster() -> None:
     stale = LabelRow(CHAT, "2026-W41", "a", "m9", "yes", "hostile", (), 0.9,
                      "f", "v1", base - 2 * 24 * 60 * 60 * 1000)
     assert alert_reason([*annoyed, stale], now_ms=base + 1, threshold=3) is None
+
+
+def _row(message_id: str, *, arvid: str = "a", responds: str = "yes",
+         stance: str = "annoyed", signals: tuple[str, ...] = (),
+         confidence: float = 0.9, at: int = 1_000_000) -> LabelRow:
+    return LabelRow(CHAT, "2026-W45", arvid, message_id, responds, stance, signals,
+                    confidence, "f", "v3", at)
+
+
+def test_remove_signal_alerts_only_with_confident_annoyed_reply() -> None:
+    now = 1_000_001
+    remove = ("asks_to_remove_or_mute",)
+    # Shapes the old gate alerted on (2026-10/11 Ente and Finanz): each is not enough.
+    assert alert_reason([_row("m1", stance="neutral", signals=remove)], now_ms=now) is None
+    assert alert_reason([_row("m1", responds="no", signals=remove)], now_ms=now) is None
+    assert alert_reason([_row("m1", signals=remove, confidence=0.6)], now_ms=now) is None
+    assert alert_reason(
+        [_row("m1", signals=("tells_others_to_ignore_him",)),
+         _row("m2", signals=("tells_him_to_back_off",))],
+        now_ms=now,
+    ) is None
+    assert alert_reason([_row("m1", signals=remove)], now_ms=now) == "asks_to_remove_or_mute"
+    assert alert_reason(
+        [_row("m1", stance="hostile", signals=remove, confidence=0.75)], now_ms=now
+    ) == "asks_to_remove_or_mute"
+
+
+def test_annoyance_cluster_counts_each_human_message_once() -> None:
+    now = 1_000_001
+    same_message = [_row("m1", arvid=f"a{i}") for i in range(3)]
+    assert alert_reason(same_message, now_ms=now, threshold=3) is None
+    weak = [_row(f"m{i}", confidence=0.5) for i in range(3)]
+    assert alert_reason(weak, now_ms=now, threshold=3) is None
+    three = [_row(f"m{i}") for i in range(3)]
+    assert alert_reason(three, now_ms=now, threshold=3) == "annoyed_cluster_3"
