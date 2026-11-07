@@ -1036,6 +1036,10 @@ export class WhatsAppClient {
       if (!this.running) break;
 
       const { reason, cls } = classifyWhatsAppDisconnect(this.cycleCloseCode);
+      if (this.cycleCloseCode === 440 && this.budget.recordReplaced()) {
+        this.budget.holdNeedsHuman(440, 'connection_replaced_twice');
+        continue;
+      }
       if (cls === 'needs_human') {
         this.budget.holdNeedsHuman(this.cycleCloseCode, reason);
         continue;

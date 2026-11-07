@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import asyncio
 import re
+import time
 import uuid
 from typing import TYPE_CHECKING, Any
 
@@ -28,6 +29,7 @@ from telegram.ext import (
     filters,
 )
 from yeoman_shared.config.schema import TelegramConfig
+from yeoman_shared.connect_budget import ConnectBudget
 from yeoman_shared.desired_state import DesiredStateStore
 from yeoman_shared.raw_archive.writer import (
     RawArchive,
@@ -36,7 +38,7 @@ from yeoman_shared.raw_archive.writer import (
     append_async,
     append_with_media_async,
 )
-from yeoman_shared.utils.helpers import get_data_path
+from yeoman_shared.utils.helpers import get_data_path, get_operational_store_path
 
 from yeoman_gateway.bus.events import OutboundMessage
 from yeoman_gateway.bus.queue import MessageBus
@@ -182,6 +184,9 @@ class TelegramChannel(BaseChannel):
         self._bot_username: str = ""
         self._stopping_due_to_conflict = False
         self._token_rejected = False
+        self._budget_stop = False
+        self._budget: ConnectBudget | None = None
+        self._last_poll_error_at = 0.0
         self._raw_archive: RawArchive | None = None
         self._stopping_due_to_raw_archive_capacity = False
         self._capacity_stop_task: asyncio.Task[None] | None = None
@@ -244,6 +249,22 @@ class TelegramChannel(BaseChannel):
                 await asyncio.sleep(_HOLD_POLL_S)
                 continue
             held_logged = False
+            budget = self._connect_budget()
+            decision = budget.decide()
+            if decision.action == "wait":
+                if not self._budget_stop:
+                    logger.warning(
+                        "Telegram reconnect budget {} ({} today); next try in {:.0f} min",
+                        decision.why,
+                        budget.attempts_within(86_400),
+                        decision.wait_s / 60,
+                    )
+                    self._budget_stop = True
+                await asyncio.sleep(min(decision.wait_s, _HOLD_POLL_S))
+                continue
+            if decision.probe or self._budget_stop:
+                budget.record_attempt(probe=decision.probe)
+            self._budget_stop = False
             try:
                 await self._poll_until_held()
             except (InvalidToken, Forbidden) as exc:
@@ -307,11 +328,24 @@ class TelegramChannel(BaseChannel):
             error_callback=self._on_polling_error,
         )
 
-        # Keep running until stopped or paused
+        # Keep running until stopped, paused, or out of reconnect budget
         ticks = 0
+        self._last_poll_error_at = time.time()
         while self._running:
             await asyncio.sleep(1)
             ticks += 1
+            if self._budget_stop:
+                logger.warning(
+                    "Telegram network errors used the reconnect budget; stopping polling"
+                )
+                await self._shutdown_app()
+                return
+            budget = self._connect_budget()
+            quiet_s = time.time() - self._last_poll_error_at
+            if quiet_s >= budget.healthy_after_s and (
+                budget.exhausted or budget.attempts_within(86_400)
+            ):
+                budget.reset()  # quiet for healthy_after_s: the network is fine again
             if self._token_rejected or (
                 ticks % int(_HOLD_POLL_S) == 0 and DesiredStateStore().is_held(TELEGRAM_SERVICE)
             ):
@@ -601,10 +635,11 @@ class TelegramChannel(BaseChannel):
                         ),
                         file_path,
                         kind={
-                            "image": "image", "voice": "audio", "audio": "audio", "video": "video"
-                        }.get(
-                            str(media_type), "document"
-                        ),
+                            "image": "image",
+                            "voice": "audio",
+                            "audio": "audio",
+                            "video": "video",
+                        }.get(str(media_type), "document"),
                     )
                 except RawArchiveCapacityError:
                     self._stop_for_raw_archive_capacity()
@@ -780,6 +815,7 @@ class TelegramChannel(BaseChannel):
             logger.warning(f"Telegram rate limited; retrying after {error.retry_after}s")
             return
         if isinstance(error, (TimedOut, NetworkError)):
+            self._count_network_error()
             logger.warning(
                 "Telegram polling transient network error {}: {}",
                 error.__class__.__name__,
@@ -787,6 +823,19 @@ class TelegramChannel(BaseChannel):
             )
             return
         logger.error("Telegram polling error {}: {}", error.__class__.__name__, error)
+
+    def _connect_budget(self) -> ConnectBudget:
+        if self._budget is None:
+            self._budget = ConnectBudget(get_operational_store_path("telegram_connect_budget"))
+        return self._budget
+
+    def _count_network_error(self) -> None:
+        """Each failed getUpdates retry spends budget; out of budget stops polling."""
+        self._last_poll_error_at = time.time()
+        budget = self._connect_budget()
+        budget.record_attempt()
+        if budget.decide().action == "wait":
+            self._budget_stop = True
 
     def _hold_needs_human(self, error: TelegramError) -> None:
         """A revoked or invalid token cannot be fixed by retrying: pause until the owner acts."""

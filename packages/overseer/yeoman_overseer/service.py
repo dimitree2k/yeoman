@@ -46,12 +46,25 @@ def _sync_starter_runbooks(
         return 0
 
     synced = 0
+    offered_path = runbook_dir / ".starter-offered"
+    try:
+        offered = set(offered_path.read_text(encoding="utf-8").split())
+    except OSError:
+        offered = set()
+    newly_offered: list[str] = []
     for src in starter_dir.glob("*.md"):
         dest = runbook_dir / src.name
         if not dest.exists():
-            if copy_missing:
+            auto = False
+            if not copy_missing and src.name not in offered:
+                try:
+                    auto = parse_runbook(src).meta.auto_install
+                except ValueError:
+                    auto = False
+            if copy_missing or auto:
                 shutil.copy2(src, dest)
                 synced += 1
+                newly_offered.append(src.name)
             continue
 
         try:
@@ -63,6 +76,9 @@ def _sync_starter_runbooks(
         if source_runbook.meta.version > existing_runbook.meta.version:
             shutil.copy2(src, dest)
             synced += 1
+    if newly_offered:
+        offered.update(newly_offered)
+        offered_path.write_text("\n".join(sorted(offered)) + "\n", encoding="utf-8")
     return synced
 
 

@@ -69,6 +69,9 @@ class RunbookFrontmatter(BaseModel):
     enabled: bool = True
     version: int = 1
     origin: Literal["manual", "auto"] = "manual"
+    # A starter runbook added after first install: copied once into an existing runbook
+    # folder. Starters without it are never re-added, so an owner's deletion sticks.
+    auto_install: bool = False
 
     trigger: TriggerConfig
 

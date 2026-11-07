@@ -51,3 +51,41 @@ def test_starter_runbooks_use_the_new_checks() -> None:
     assert bridge.meta.trigger.condition.check == "whatsapp_bridge_reachable"
     assert link.meta.trigger.condition.check == "whatsapp_link_held"
     assert "restart_service" not in link.body
+
+
+def test_gateway_detached_alerts_only_after_ten_minutes(monkeypatch: pytest.MonkeyPatch) -> None:
+    clock = {"t": 1_000.0}
+    monkeypatch.setattr(checks.time, "time", lambda: clock["t"])
+    monkeypatch.setattr(checks, "_whatsapp_bridge_health", lambda **_: {"queue": {"clients": 1}})
+    checks._FIRST_SEEN.clear()
+    assert checks.check_whatsapp_gateway_detached(target="default").value is False
+    clock["t"] += 601
+    result = checks.check_whatsapp_gateway_detached(target="default")
+    assert result.value is True and "yeoman gateway restart" in result.detail
+    monkeypatch.setattr(checks, "_whatsapp_bridge_health", lambda **_: {"queue": {"clients": 2}})
+    assert checks.check_whatsapp_gateway_detached(target="default").value is False
+    assert "gateway_detached" not in checks._FIRST_SEEN
+
+
+def test_drift_reports_a_paused_unit_that_runs(monkeypatch: pytest.MonkeyPatch) -> None:
+    from yeoman_shared.desired_state import DesiredStateStore
+
+    clock = {"t": 5_000.0}
+    monkeypatch.setattr(checks.time, "time", lambda: clock["t"])
+    monkeypatch.setattr(checks, "_unit_active", lambda unit: unit == "yeoman-bridge.service")
+    checks._FIRST_SEEN.clear()
+    DesiredStateStore().set("bridge", "paused", reason="owner")
+    try:
+        assert checks.check_desired_state_drift(target="default").value is False
+        clock["t"] += 61
+        result = checks.check_desired_state_drift(target="default")
+        assert result.value is True and "yeoman overseer resume bridge" in result.detail
+    finally:
+        DesiredStateStore().set("bridge", "running")
+    assert checks.check_desired_state_drift(target="default").value is False
+
+
+def test_repeated_440_hold_names_the_other_client(monkeypatch: pytest.MonkeyPatch) -> None:
+    _health(monkeypatch, {"connected": False, "hold": {"kind": "needs_human", "code": 440}})
+    detail = checks.check_whatsapp_link_held(target="default").detail
+    assert "another client" in detail and "resume bridge" in detail

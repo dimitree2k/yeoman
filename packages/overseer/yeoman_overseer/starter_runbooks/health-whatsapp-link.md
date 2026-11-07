@@ -2,7 +2,8 @@
 name: health-whatsapp-link
 domain: health
 enabled: true
-version: 1
+version: 2
+auto_install: true
 trigger:
   kind: poll
   interval_s: 60

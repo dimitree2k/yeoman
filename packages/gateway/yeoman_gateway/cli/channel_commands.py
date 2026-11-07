@@ -370,8 +370,11 @@ def channels_login(
             last_qr = qr
             qr_file.write_text(qr, encoding="utf-8")
             qr_file.chmod(0o600)
+            _write_qr_png(qr)
             _print_qr(qr)
-            console.print(f"(QR text also in {qr_file}; codes rotate every ~20 s)\n")
+            console.print(
+                f"(Also saved as {_qr_png_file()} and {qr_file}; codes rotate every ~20 s)\n"
+            )
         wait = bridge_command("login_wait", {"timeoutMs": 15_000}, timeout_s=25.0)
         if wait.get("connected"):
             break
@@ -380,6 +383,7 @@ def channels_login(
         raise typer.Exit(1)
 
     qr_file.unlink(missing_ok=True)
+    _qr_png_file().unlink(missing_ok=True)
     console.print("[green]✓[/green] WhatsApp linked")
     _confirm_gateway_attached()
 
@@ -419,6 +423,23 @@ def _qr_file() -> Path:
     from yeoman_shared.utils.helpers import get_run_path
 
     return get_run_path() / "whatsapp-qr.txt"
+
+
+def _qr_png_file() -> Path:
+    from yeoman_shared.utils.helpers import get_run_path
+
+    return get_run_path() / "whatsapp-qr.png"
+
+
+def _write_qr_png(qr: str) -> None:
+    """Same QR as an image, for relinking from a remote session (send it to a second screen)."""
+    import segno
+
+    path = _qr_png_file()
+    tmp = path.with_suffix(".png.tmp")
+    segno.make(qr, error="m").save(str(tmp), kind="png", scale=10, border=4)
+    tmp.chmod(0o600)
+    tmp.replace(path)
 
 
 def _print_qr(qr: str) -> None:
