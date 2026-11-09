@@ -35,6 +35,8 @@ from yeoman_gateway.reception.store import (
 LESSONS_ROUTE = "reception.lessons"
 LESSONS_HEADER = "## Lessons from reception (generated; never overrides the rules above)"
 MAX_LESSONS = 5
+_WEEK_PAGE_ROWS = 500  # HistoryQueries.recent limit
+_MAX_WEEK_ROWS = 4_000
 MAX_LESSONS_CHARS = 1_500
 MAX_ITEM_FIELD_CHARS = 200
 MAX_DIFF_CHARS = 4_000
@@ -587,12 +589,21 @@ class LessonProposer:
         )
         async with history_turn(self._history) as snapshot:
             queries = HistoryQueries(snapshot)
-            rows = queries.recent(
-                chat_id=str(chat_id),
-                limit=4_000,
-                after_ms=int(week.start_ms) - 1,
-                until_ms=int(week.end_ms) - 1,
-            )
+            # ``recent`` serves at most 500 rows per call; page back through the week.
+            rows: list[Any] = []
+            before_id: str | None = None
+            while len(rows) < _MAX_WEEK_ROWS:
+                page = queries.recent(
+                    chat_id=str(chat_id),
+                    limit=_WEEK_PAGE_ROWS,
+                    before_id=before_id,
+                    after_ms=int(week.start_ms) - 1,
+                    until_ms=int(week.end_ms) - 1,
+                )
+                rows = [*page, *rows]
+                if len(page) < _WEEK_PAGE_ROWS:
+                    break
+                before_id = str(page[0]["message_id"])
             names: set[str] = set()
             for row in rows:
                 if str(row.get("direction") or "") == "out":
