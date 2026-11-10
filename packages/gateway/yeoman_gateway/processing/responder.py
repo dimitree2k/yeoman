@@ -16,7 +16,7 @@ from typing import Any
 
 from loguru import logger
 
-from yeoman_gateway.history.context import current_history_snapshot
+from yeoman_gateway.history.context import current_history_snapshot, history_refreshed_turn
 from yeoman_gateway.history.live import HistoryPaused
 from yeoman_gateway.history.reader import HistorySnapshot
 from yeoman_gateway.processing.actor import (
@@ -186,7 +186,7 @@ class ThreadActorResponder:
             session_key=session_key,
             history_snapshot=current_history_snapshot(),
         )
-        for _attempt in range(MAX_ADDITIONAL_GENERATIONS + 1):
+        for attempt in range(MAX_ADDITIONAL_GENERATIONS + 1):
             snapshot = actor.freeze_snapshot()
             if snapshot is None:
                 return await self._inner.generate_reply(
@@ -210,6 +210,16 @@ class ThreadActorResponder:
                 # Review F04: a restart must actually put the follow-up into the request.
                 # Re-sending the original event made the actor consume the pending input
                 # without the provider ever seeing it.
+                projector = getattr(self._inner, "_history_projector", None)
+                if attempt and projector is not None and current_history_snapshot() is not None:
+                    # A restart answers a follow-up that arrived during the first call; the
+                    # turn's lease predates it, so read the sources from a fresh one
+                    # (live 2026-11-10: the follow-up was "unavailable" and nothing was sent).
+                    async with history_refreshed_turn(projector):
+                        return await _generate(_snapshot)
+                return await _generate(_snapshot)
+
+            async def _generate(_snapshot: Any) -> str | None:
                 request_event = self._request_event(event, _snapshot)
                 token = CURRENT_TURN.set(binding)
                 try:
