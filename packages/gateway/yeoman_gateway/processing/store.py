@@ -76,7 +76,7 @@ from yeoman_gateway.processing.models import (
     now_ms as _now_ms,
 )
 
-SCHEMA_VERSION = 9
+SCHEMA_VERSION = 10
 
 _VOLATILE_EVENT_PAYLOAD_KEYS = frozenset(
     {
@@ -309,8 +309,7 @@ _SCHEMA = (
       state TEXT NOT NULL DEFAULT 'active',
       created_ms INTEGER NOT NULL,
       finished_ms INTEGER,
-      UNIQUE (channel, chat_id, event_id),
-      UNIQUE (turn_id)
+      UNIQUE (channel, chat_id, event_id)
     )
     """,
     "CREATE INDEX IF NOT EXISTS idx_direct_admissions_chat "
@@ -357,6 +356,34 @@ _THREAD_SCHEMA = """
 #: Ordered additive migrations. ``_MIGRATIONS[1]`` upgrades schema 1 to schema 2; existing
 #: tables (events, effects, decisions, attempts, evidence) are never altered.
 _MIGRATIONS: dict[int, tuple[str, ...]] = {
+    # A follow-up that joins an answered, still-open turn is its own direct message and
+    # needs its own fence row. Schema 9 allowed one row per turn, so the second insert
+    # failed and the follow-up was dropped. SQLite cannot drop a table constraint, so the
+    # table is rebuilt; the event identity stays the idempotency key.
+    9: (
+        """
+        CREATE TABLE direct_admissions_v10 (
+          binding_id TEXT PRIMARY KEY,
+          channel TEXT NOT NULL,
+          chat_id TEXT NOT NULL,
+          event_id TEXT NOT NULL,
+          turn_id TEXT NOT NULL,
+          arbitration_revision INTEGER NOT NULL,
+          state TEXT NOT NULL DEFAULT 'active',
+          created_ms INTEGER NOT NULL,
+          finished_ms INTEGER,
+          UNIQUE (channel, chat_id, event_id)
+        )
+        """,
+        "INSERT INTO direct_admissions_v10 SELECT binding_id, channel, chat_id, event_id, "
+        "turn_id, arbitration_revision, state, created_ms, finished_ms FROM direct_admissions",
+        "DROP TABLE direct_admissions",
+        "ALTER TABLE direct_admissions_v10 RENAME TO direct_admissions",
+        "CREATE INDEX IF NOT EXISTS idx_direct_admissions_chat "
+        "ON direct_admissions(channel, chat_id, state, created_ms)",
+        "CREATE INDEX IF NOT EXISTS idx_direct_admissions_turn "
+        "ON direct_admissions(turn_id, state)",
+    ),
     5: (
         """
         CREATE TABLE IF NOT EXISTS voice_send_quota (

@@ -5,6 +5,8 @@ from __future__ import annotations
 import asyncio
 import os
 import re
+import shutil
+import subprocess
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from typing import Any
@@ -21,6 +23,7 @@ _BRIDGE_LOG = _LOGS_DIR / "whatsapp-bridge.log"
 _RUN_DIR = get_run_path()
 _GATEWAY_PID = _RUN_DIR / "gateway.pid"
 _BRIDGE_PID = _RUN_DIR / "whatsapp-bridge.pid"
+_GATEWAY_UNIT = "yeoman-gateway.service"
 
 _LOGURU_TS_RE = re.compile(r"^(\d{4}-\d{2}-\d{2} \d{2}:\d{2}:\d{2})\.\d+")
 _LOGURU_LEVEL_RE = re.compile(r"\|\s*(DEBUG|INFO|WARNING|ERROR|CRITICAL)\s*\|")
@@ -67,8 +70,18 @@ def _parse_time_spec(spec: str, *, now: datetime | None = None) -> datetime:
         return now - delta
     parsed = datetime.fromisoformat(spec.strip())
     if parsed.tzinfo is None:
-        parsed = parsed.replace(tzinfo=timezone.utc)
+        # Read a bare timestamp the way the log writes it: in host local time.
+        parsed = parsed.astimezone()
     return parsed
+
+
+def _parse_log_timestamp(text: str) -> datetime:
+    """Loguru writes host local time without an offset; make it timezone-aware.
+
+    Reading it as UTC put every line of the last UTC-offset hours in the future, so
+    log_scan silently dropped the most recent activity (live 2026-11-10, CET).
+    """
+    return datetime.strptime(text, "%Y-%m-%d %H:%M:%S").astimezone()
 
 
 def _parse_loguru_line(line: str) -> tuple[datetime | None, str | None, str]:
@@ -77,8 +90,7 @@ def _parse_loguru_line(line: str) -> tuple[datetime | None, str | None, str]:
     if not ts_match:
         return None, None, line
     try:
-        ts = datetime.strptime(ts_match.group(1), "%Y-%m-%d %H:%M:%S")
-        ts = ts.replace(tzinfo=timezone.utc)
+        ts = _parse_log_timestamp(ts_match.group(1))
     except ValueError:
         return None, None, line
     level_match = _LOGURU_LEVEL_RE.search(line)
@@ -86,6 +98,34 @@ def _parse_loguru_line(line: str) -> tuple[datetime | None, str | None, str]:
     dash_idx = line.find(" - ", ts_match.end())
     msg = line[dash_idx + 3 :] if dash_idx != -1 else line
     return ts, level, msg
+
+
+def _systemd_main_pid(unit: str) -> int | None:
+    """Main PID of an active systemd user unit, or None when it is not running."""
+    if shutil.which("systemctl") is None:
+        return None
+    try:
+        proc = subprocess.run(
+            ["systemctl", "--user", "show", unit, "--property=ActiveState,MainPID"],
+            check=False,
+            capture_output=True,
+            text=True,
+            timeout=5,
+        )
+    except (OSError, subprocess.SubprocessError):
+        return None
+    if proc.returncode != 0:
+        return None
+    props = dict(
+        line.split("=", 1) for line in proc.stdout.splitlines() if "=" in line
+    )
+    try:
+        main_pid = int(props.get("MainPID", "0"))
+    except ValueError:
+        return None
+    if props.get("ActiveState") != "active" or main_pid <= 0 or not pid_alive(main_pid):
+        return None
+    return main_pid
 
 
 class OpsTool(Tool):
@@ -478,10 +518,7 @@ class OpsTool(Tool):
                         ts_match = _LOGURU_TS_RE.match(line)
                         if ts_match:
                             try:
-                                ts = datetime.strptime(
-                                    ts_match.group(1), "%Y-%m-%d %H:%M:%S"
-                                )
-                                ts = ts.replace(tzinfo=timezone.utc)
+                                ts = _parse_log_timestamp(ts_match.group(1))
                                 if ts < since or ts > until:
                                     continue
                             except ValueError:
@@ -524,6 +561,12 @@ class OpsTool(Tool):
         if pid is not None and pid_alive(pid):
             lines.append(f"  status: running (pid={pid})")
             uptime = self._process_uptime(pid)
+            if uptime:
+                lines.append(f"  uptime: {uptime}")
+        elif (unit_pid := _systemd_main_pid(_GATEWAY_UNIT)) is not None:
+            # The systemd service writes no PID file; its main PID is the answer.
+            lines.append(f"  status: running (systemd {_GATEWAY_UNIT}, pid={unit_pid})")
+            uptime = self._process_uptime(unit_pid)
             if uptime:
                 lines.append(f"  uptime: {uptime}")
         elif pid is not None:
