@@ -1108,3 +1108,84 @@ class _EnabledConfig:
 
     def is_chat_shadowed(self, channel: str, chat_id: str) -> bool:
         return False
+
+
+def test_follow_up_on_answered_turn_gets_its_own_direct_fence(tmp_path: Path) -> None:
+    """A DM follow-up that joins an answered, still-open turn must not be dropped.
+
+    Live 2026-11-10: the follow-up joined the open turn, the fence insert hit the
+    one-row-per-turn constraint, and the message never got an answer.
+    """
+    store = _store(tmp_path)
+    registry = ThreadRegistry(store=store, config=_Config())
+    decision = _turn(store, registry)
+    turn_id = str(decision.turn_id)
+    try:
+        first = store.note_direct_admission("whatsapp", CHAT, "m1", turn_id, now_ms=T0)
+        store.finish_direct_admission(turn_id, now_ms=T0 + 1)
+        assert store.direct_work_active("whatsapp", CHAT) is False
+
+        second = store.note_direct_admission("whatsapp", CHAT, "m2", turn_id, now_ms=T0 + 2)
+
+        assert second == first + 1
+        assert store.direct_admission_for_event("m2", channel="whatsapp", chat_id=CHAT) == (
+            "whatsapp",
+            CHAT,
+            turn_id,
+            second,
+            "active",
+        )
+        assert store.direct_work_active("whatsapp", CHAT) is True
+        # Redelivery of the same follow-up stays idempotent.
+        assert store.note_direct_admission("whatsapp", CHAT, "m2", turn_id, now_ms=T0 + 3) == (
+            second
+        )
+        store.finish_direct_admission(turn_id, now_ms=T0 + 4)
+        assert store.direct_work_active("whatsapp", CHAT) is False
+    finally:
+        store.close()
+
+
+def test_schema_9_direct_fence_table_is_migrated(tmp_path: Path) -> None:
+    """An existing store keeps its fence rows and loses only the per-turn constraint."""
+    import sqlite3
+
+    path = tmp_path / "processing.db"
+    ProcessingStore(str(path)).close()
+    conn = sqlite3.connect(path)
+    conn.executescript(
+        """
+        DROP TABLE direct_admissions;
+        CREATE TABLE direct_admissions (
+          binding_id TEXT PRIMARY KEY,
+          channel TEXT NOT NULL,
+          chat_id TEXT NOT NULL,
+          event_id TEXT NOT NULL,
+          turn_id TEXT NOT NULL,
+          arbitration_revision INTEGER NOT NULL,
+          state TEXT NOT NULL DEFAULT 'active',
+          created_ms INTEGER NOT NULL,
+          finished_ms INTEGER,
+          UNIQUE (channel, chat_id, event_id),
+          UNIQUE (turn_id)
+        );
+        INSERT INTO direct_admissions VALUES
+          ('direct-old', 'whatsapp', 'chat@g.us', 'm1', 'tu_1', 7, 'finished', 1, 2);
+        UPDATE meta SET value = '9' WHERE key = 'schema_version';
+        """
+    )
+    conn.commit()
+    conn.close()
+
+    store = ProcessingStore(str(path))
+    try:
+        assert store.direct_admission_for_event("m1") == (
+            "whatsapp",
+            CHAT,
+            "tu_1",
+            7,
+            "finished",
+        )
+        assert store.note_direct_admission("whatsapp", CHAT, "m2", "tu_1", now_ms=T0) == 8
+    finally:
+        store.close()

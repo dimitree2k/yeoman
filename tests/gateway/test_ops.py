@@ -294,6 +294,25 @@ async def test_log_scan_filters_by_time_range(tmp_path):
     assert "very recent error" not in result
 
 
+@pytest.mark.asyncio
+async def test_log_scan_finds_lines_written_in_the_last_minutes(tmp_path):
+    """Loguru writes local time; a line from a minute ago is not in the future."""
+    from datetime import timedelta
+
+    recent = (datetime.now() - timedelta(minutes=1)).strftime("%Y-%m-%d %H:%M:%S")
+    log_file = tmp_path / "gateway.log"
+    log_file.write_text(
+        f"{recent}.000 | DEBUG    | yeoman_gateway.channels.telegram:_on_message:1 - "
+        "Telegram message from 1|someone: hi\n"
+    )
+    tool = OpsTool()
+    with patch("yeoman_gateway.agent.tools.ops._GATEWAY_LOG", log_file):
+        result = await tool.execute(
+            action="log_scan", service="gateway", keyword="telegram", since="1h"
+        )
+    assert "Telegram message from" in result
+
+
 # ── service_status tests ─────────────────────────────────────
 
 
@@ -310,9 +329,21 @@ async def test_service_status_all_reports_both(tmp_path):
 @pytest.mark.asyncio
 async def test_service_status_stopped_no_pid_file(tmp_path):
     tool = OpsTool()
-    with patch("yeoman_gateway.agent.tools.ops._GATEWAY_PID", tmp_path / "nonexistent.pid"):
+    with patch("yeoman_gateway.agent.tools.ops._GATEWAY_PID", tmp_path / "nonexistent.pid"), \
+         patch("yeoman_gateway.agent.tools.ops._systemd_main_pid", return_value=None):
         result = await tool.execute(action="service_status", service="gateway")
     assert "stopped" in result.lower()
+
+
+@pytest.mark.asyncio
+async def test_service_status_running_under_systemd_without_pid_file(tmp_path):
+    """The systemd unit writes no PID file; the tool must not call it stopped."""
+    tool = OpsTool()
+    with patch("yeoman_gateway.agent.tools.ops._GATEWAY_PID", tmp_path / "nonexistent.pid"), \
+         patch("yeoman_gateway.agent.tools.ops._systemd_main_pid", return_value=4242):
+        result = await tool.execute(action="service_status", service="gateway")
+    assert "running (systemd yeoman-gateway.service, pid=4242)" in result
+    assert "stopped" not in result.lower()
 
 
 @pytest.mark.asyncio
