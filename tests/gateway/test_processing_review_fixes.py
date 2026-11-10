@@ -483,3 +483,84 @@ async def test_restart_reads_a_follow_up_projected_after_the_turn_began(tmp_path
     finally:
         request_finalizer()
         store.close()
+
+
+@pytest.mark.asyncio
+async def test_merged_burst_keeps_every_question_for_the_provider(tmp_path: Path) -> None:
+    """Live 2026-11-10: two DMs within the debounce window were merged by the channel.
+
+    The turn source is the burst's last message under its canonical id, while the event
+    carries the native id. The id comparison missed, the request was rebuilt from the
+    last message alone, and the first question never reached the provider.
+    """
+    import asyncio
+    from datetime import UTC, datetime
+
+    from yeoman_gateway.core.models import InboundEvent
+    from yeoman_gateway.processing.actor import ThreadActorRegistry
+    from yeoman_gateway.processing.responder import ThreadActorResponder
+
+    from tests.gateway.history_test_helpers import ProjectedHistory
+
+    store = _store(tmp_path)
+    history = ProjectedHistory(tmp_path / "burst-history")
+    thread_id = store.open_thread(
+        channel="whatsapp", chat_id=CHAT_A, root_principal="orderer",
+        kind="dm", trigger_event_id="wa_n2", now_ms=T0,
+    )
+    turn_id = store.open_turn(
+        thread_id=thread_id, principal="orderer", trigger_event_id="wa_n2", now_ms=T0
+    )
+    store.append_event(
+        event_key="k2", event_id="wa_n2", trace_id="tr-n2",
+        payload={"channel": "whatsapp", "chat_id": CHAT_A, "source_message_id": "n2"},
+        now_ms=T0,
+    )
+    history.add_message(chat_id=CHAT_A, message_id="n1", text="Wie ist das Wetter morgen?",
+                        timestamp=T0 - 1, sender_id="orderer")
+    history.add_message(chat_id=CHAT_A, message_id="n2", text="Wie spät ist es in Madrid?",
+                        timestamp=T0, sender_id="orderer")
+    store.add_turn_source(
+        turn_id=turn_id, event_id="wa_n2", source_message_id="n2", role="trigger",
+        revision_at_join=1, now_ms=T0,
+    )
+    store.attach_event_assignment(
+        event_id="wa_n2", thread_id=thread_id, turn_id=turn_id, now_ms=T0
+    )
+
+    class _Config:
+        threads = type(
+            "T", (), {"max_additional_generations": 2, "postbox_max_waiting": 8}
+        )()
+
+    actors = ThreadActorRegistry(store=store, config=_Config(), clock=lambda: T0)
+    seen: list[str] = []
+
+    class _Inner:
+        _history_knowledge = None
+
+        def __init__(self) -> None:
+            self._history_projector = history
+
+        async def generate_reply(self, event, decision, *, session_key=None) -> str | None:
+            seen.append(str(getattr(event, "content", "")))
+            return "ok"
+
+    event = InboundEvent(
+        channel="whatsapp", chat_id=CHAT_A, sender_id="orderer",
+        content="Wie ist das Wetter morgen?\nWie spät ist es in Madrid?",
+        message_id="n2", is_group=False, mentioned_bot=True,
+        timestamp=datetime(2023, 11, 14, tzinfo=UTC),
+    )
+    wrapper = ThreadActorResponder(
+        inner=_Inner(), actors=actors, store=store, clock=lambda: T0
+    )
+    try:
+        await asyncio.wait_for(wrapper.generate_reply(event, None), timeout=5)
+        assert seen and seen[-1].splitlines() == [
+            "Wie ist das Wetter morgen?",
+            "Wie spät ist es in Madrid?",
+        ], f"a merged question never reached the provider: {seen}"
+    finally:
+        history.close()
+        store.close()
