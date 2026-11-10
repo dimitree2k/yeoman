@@ -39,6 +39,7 @@ from yeoman_shared.raw_archive.writer import (
     append_with_media_async,
 )
 from yeoman_shared.utils.helpers import get_data_path, get_operational_store_path
+from yeoman_shared.utils.topic_chat import split_topic_chat_id, topic_chat_id
 
 from yeoman_gateway.bus.events import OutboundMessage
 from yeoman_gateway.bus.queue import MessageBus
@@ -190,9 +191,6 @@ class TelegramChannel(BaseChannel):
         self._raw_archive: RawArchive | None = None
         self._stopping_due_to_raw_archive_capacity = False
         self._capacity_stop_task: asyncio.Task[None] | None = None
-        # Chats with topics (forum groups, or private chats in the bot's threaded mode):
-        # the topic of the latest inbound message, so the answer lands next to it.
-        self._topic_by_chat: dict[str, int] = {}
 
     def set_raw_archive(self, archive: RawArchive | None) -> None:
         """Attach the append-only raw archive (V1 spec §4.0)."""
@@ -220,7 +218,6 @@ class TelegramChannel(BaseChannel):
             # In threaded mode Telegram can deliver a new topic as this service message
             # alone, without the text that started it (live 2026-11-10). Nothing can be
             # answered, but it must not vanish silently.
-            self._remember_topic(message)
             logger.info(
                 "telegram_topic_created chat={} thread={} has_text={}",
                 message.chat_id,
@@ -228,19 +225,18 @@ class TelegramChannel(BaseChannel):
                 bool(getattr(message, "text", None) or getattr(message, "caption", None)),
             )
 
-    def _remember_topic(self, message: Any) -> None:
-        chat = str(getattr(message, "chat_id", "") or "")
-        if not chat:
-            return
+    @staticmethod
+    def _conversation_chat_id(message: Any) -> str:
+        """Each topic is its own conversation: ``<chat>:<topic>`` (plain chat otherwise)."""
         thread = getattr(message, "message_thread_id", None)
-        if getattr(message, "is_topic_message", False) and isinstance(thread, int):
-            self._topic_by_chat[chat] = thread
-        else:
-            self._topic_by_chat.pop(chat, None)
+        topic = thread if getattr(message, "is_topic_message", False) else None
+        return topic_chat_id(getattr(message, "chat_id", ""), topic)
 
-    def _topic_kwargs(self, chat_id: str) -> dict[str, int]:
-        thread = self._topic_by_chat.get(str(chat_id))
-        return {"message_thread_id": thread} if thread is not None else {}
+    @staticmethod
+    def _address(chat_id: str) -> tuple[int, dict[str, int]]:
+        """Telegram chat and topic kwargs for a (possibly topic-scoped) chat id."""
+        base, topic = split_topic_chat_id(str(chat_id))
+        return int(base), ({"message_thread_id": topic} if topic is not None else {})
 
     def _stop_for_raw_archive_capacity(self) -> None:
         if self._stopping_due_to_raw_archive_capacity:
@@ -430,14 +426,11 @@ class TelegramChannel(BaseChannel):
 
         try:
             # chat_id should be the Telegram chat ID (integer)
-            chat_id = int(msg.chat_id)
+            chat_id, topic = self._address(msg.chat_id)
             # Convert markdown to Telegram HTML
             html_content = _markdown_to_telegram_html(msg.content)
             sent = await self._app.bot.send_message(
-                chat_id=chat_id,
-                text=html_content,
-                parse_mode="HTML",
-                **self._topic_kwargs(msg.chat_id),
+                chat_id=chat_id, text=html_content, parse_mode="HTML", **topic
             )
         except ValueError:
             logger.error(f"Invalid chat_id: {msg.chat_id}")
@@ -446,8 +439,9 @@ class TelegramChannel(BaseChannel):
             # Fallback to plain text if HTML parsing fails
             logger.warning(f"HTML parse failed, falling back to plain text: {e}")
             try:
+                chat_id, topic = self._address(msg.chat_id)
                 sent = await self._app.bot.send_message(
-                    chat_id=int(msg.chat_id), text=msg.content, **self._topic_kwargs(msg.chat_id)
+                    chat_id=chat_id, text=msg.content, **topic
                 )
             except Exception as e2:
                 logger.error(f"Error sending Telegram message: {e2}")
@@ -495,7 +489,7 @@ class TelegramChannel(BaseChannel):
         if not await self._archive_native_update(update, context):
             return
 
-        chat_id = str(update.message.chat_id)
+        chat_id = self._conversation_chat_id(update.message)
         session_key = f"{self.name}:{chat_id}"
 
         if self.session_manager is None:
@@ -592,7 +586,6 @@ class TelegramChannel(BaseChannel):
         message = update.message
         user = update.effective_user
         chat_id = message.chat_id
-        self._remember_topic(message)
 
         # Use stable numeric ID, but keep username for allowlist compatibility
         sender_id = str(user.id)
@@ -707,7 +700,7 @@ class TelegramChannel(BaseChannel):
 
         logger.debug(f"Telegram message from {sender_id}: {content[:50]}...")
 
-        str_chat_id = str(chat_id)
+        str_chat_id = self._conversation_chat_id(message)
         mention_meta = self._mention_metadata(message)
 
         # Stop processing if another handler reached the raw archive capacity limit.
@@ -799,9 +792,8 @@ class TelegramChannel(BaseChannel):
         """Repeatedly send 'typing' action until cancelled."""
         try:
             while self._app:
-                await self._app.bot.send_chat_action(
-                    chat_id=int(chat_id), action="typing", **self._topic_kwargs(chat_id)
-                )
+                target, topic = self._address(chat_id)
+                await self._app.bot.send_chat_action(chat_id=target, action="typing", **topic)
                 await asyncio.sleep(4)
         except asyncio.CancelledError:
             pass

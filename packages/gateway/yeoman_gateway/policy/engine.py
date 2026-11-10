@@ -7,6 +7,8 @@ from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any
 
+from yeoman_shared.utils.topic_chat import split_topic_chat_id
+
 from yeoman_gateway.policy.identity import normalize_identity_token, normalize_sender_list
 from yeoman_gateway.policy.persona import load_persona_text, resolve_persona_path
 from yeoman_gateway.policy.schema import (
@@ -450,6 +452,11 @@ class PolicyEngine:
 
         compiled = self._chat_rules.get(key)
         if compiled is None:
+            # A topic of a chat follows the chat's own override unless it has one itself.
+            base, topic = split_topic_chat_id(chat_id)
+            if topic is not None:
+                compiled = self._chat_rules.get((channel, base))
+        if compiled is None:
             compiled = self._channel_defaults[channel]
 
         self._resolved_cache[key] = compiled
@@ -689,6 +696,10 @@ class PolicyEngine:
                 else (f"channels.{channel}.default.participation", ParticipationPolicyOverride())
             )
             chat_override = channel_policy.chats.get(chat_id)
+            if chat_override is None:
+                base, topic = split_topic_chat_id(chat_id)
+                if topic is not None:
+                    chat_override = channel_policy.chats.get(base)
             if chat_override is not None and chat_override.participation is not None:
                 layers.append(
                     (
