@@ -297,9 +297,20 @@ class ThreadActorResponder:
             return event
         content = "\n".join(texts)
         original = str(getattr(event, "content", "") or "")
+        # The channel may have merged a quick burst into this one event; its single turn
+        # source is the burst's last message, so the merged text ends with it. WhatsApp
+        # events carry the native id while the turn source holds the canonical one, so
+        # match either (live 2026-11-10: the first question of a burst never reached the
+        # provider because only the canonical id was compared).
+        own_id = self._event_id(event)
         if (
             len(refs) == 1
-            and str(getattr(refs[0], "event_id", "") or "") == self._event_id(event)
+            and own_id
+            and own_id
+            in {
+                str(getattr(refs[0], "event_id", "") or ""),
+                str(getattr(refs[0], "source_message_id", "") or ""),
+            }
             and original
             and content
             and original.endswith(content)
