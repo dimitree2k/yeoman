@@ -190,6 +190,9 @@ class TelegramChannel(BaseChannel):
         self._raw_archive: RawArchive | None = None
         self._stopping_due_to_raw_archive_capacity = False
         self._capacity_stop_task: asyncio.Task[None] | None = None
+        # Chats with topics (forum groups, or private chats in the bot's threaded mode):
+        # the topic of the latest inbound message, so the answer lands next to it.
+        self._topic_by_chat: dict[str, int] = {}
 
     def set_raw_archive(self, archive: RawArchive | None) -> None:
         """Attach the append-only raw archive (V1 spec §4.0)."""
@@ -212,6 +215,32 @@ class TelegramChannel(BaseChannel):
     async def _on_update(self, update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
         """Archive every polled update before filters or command handlers run."""
         await self._archive_native_update(update, context)
+        message = getattr(update, "message", None)
+        if message is not None and getattr(message, "forum_topic_created", None) is not None:
+            # In threaded mode Telegram can deliver a new topic as this service message
+            # alone, without the text that started it (live 2026-11-10). Nothing can be
+            # answered, but it must not vanish silently.
+            self._remember_topic(message)
+            logger.info(
+                "telegram_topic_created chat={} thread={} has_text={}",
+                message.chat_id,
+                getattr(message, "message_thread_id", None),
+                bool(getattr(message, "text", None) or getattr(message, "caption", None)),
+            )
+
+    def _remember_topic(self, message: Any) -> None:
+        chat = str(getattr(message, "chat_id", "") or "")
+        if not chat:
+            return
+        thread = getattr(message, "message_thread_id", None)
+        if getattr(message, "is_topic_message", False) and isinstance(thread, int):
+            self._topic_by_chat[chat] = thread
+        else:
+            self._topic_by_chat.pop(chat, None)
+
+    def _topic_kwargs(self, chat_id: str) -> dict[str, int]:
+        thread = self._topic_by_chat.get(str(chat_id))
+        return {"message_thread_id": thread} if thread is not None else {}
 
     def _stop_for_raw_archive_capacity(self) -> None:
         if self._stopping_due_to_raw_archive_capacity:
@@ -405,7 +434,10 @@ class TelegramChannel(BaseChannel):
             # Convert markdown to Telegram HTML
             html_content = _markdown_to_telegram_html(msg.content)
             sent = await self._app.bot.send_message(
-                chat_id=chat_id, text=html_content, parse_mode="HTML"
+                chat_id=chat_id,
+                text=html_content,
+                parse_mode="HTML",
+                **self._topic_kwargs(msg.chat_id),
             )
         except ValueError:
             logger.error(f"Invalid chat_id: {msg.chat_id}")
@@ -414,7 +446,9 @@ class TelegramChannel(BaseChannel):
             # Fallback to plain text if HTML parsing fails
             logger.warning(f"HTML parse failed, falling back to plain text: {e}")
             try:
-                sent = await self._app.bot.send_message(chat_id=int(msg.chat_id), text=msg.content)
+                sent = await self._app.bot.send_message(
+                    chat_id=int(msg.chat_id), text=msg.content, **self._topic_kwargs(msg.chat_id)
+                )
             except Exception as e2:
                 logger.error(f"Error sending Telegram message: {e2}")
                 return
@@ -558,6 +592,7 @@ class TelegramChannel(BaseChannel):
         message = update.message
         user = update.effective_user
         chat_id = message.chat_id
+        self._remember_topic(message)
 
         # Use stable numeric ID, but keep username for allowlist compatibility
         sender_id = str(user.id)
@@ -764,7 +799,9 @@ class TelegramChannel(BaseChannel):
         """Repeatedly send 'typing' action until cancelled."""
         try:
             while self._app:
-                await self._app.bot.send_chat_action(chat_id=int(chat_id), action="typing")
+                await self._app.bot.send_chat_action(
+                    chat_id=int(chat_id), action="typing", **self._topic_kwargs(chat_id)
+                )
                 await asyncio.sleep(4)
         except asyncio.CancelledError:
             pass

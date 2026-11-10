@@ -1,5 +1,6 @@
 #!/usr/bin/env node
 
+import './console_guard_install.js';
 import { webcrypto } from 'crypto';
 import { readFileSync } from 'fs';
 import { join } from 'path';
