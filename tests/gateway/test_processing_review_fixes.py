@@ -393,3 +393,93 @@ async def test_f04_a_restart_puts_the_follow_up_into_the_request(tmp_path: Path)
         f"the follow-up never reached the provider: {seen}"
     )
     store.close()
+
+
+@pytest.mark.asyncio
+async def test_restart_reads_a_follow_up_projected_after_the_turn_began(tmp_path: Path) -> None:
+    """Live 2026-11-10: a DM follow-up arrived while the first answer was being written.
+
+    The restart read the follow-up from the turn's History lease, opened before the
+    follow-up was projected, found no text and raised ``thread_source_unavailable``:
+    the generation errored and nothing was sent. The restart must use a fresh lease.
+    """
+    import asyncio
+    from datetime import UTC, datetime
+
+    from yeoman_gateway.core.models import InboundEvent
+    from yeoman_gateway.processing.actor import ThreadActorRegistry
+    from yeoman_gateway.processing.responder import ThreadActorResponder
+
+    from tests.gateway.history_test_helpers import ProjectedHistory
+
+    store = _store(tmp_path)
+    history = ProjectedHistory(tmp_path / "live-history")
+    request_finalizer = history.close
+    thread_id = store.open_thread(
+        channel="whatsapp", chat_id=CHAT_A, root_principal="orderer",
+        kind="dm", trigger_event_id="m1", now_ms=T0,
+    )
+    turn_id = store.open_turn(
+        thread_id=thread_id, principal="orderer", trigger_event_id="m1", now_ms=T0
+    )
+    store.append_event(
+        event_key="k1", event_id="m1", trace_id="tr-m1", payload={"channel": "whatsapp", "chat_id": CHAT_A, "source_message_id": "m1"}, now_ms=T0,
+    )
+    history.add_message(chat_id=CHAT_A, message_id="m1", text="Book Tuesday",
+                        timestamp=T0, sender_id="orderer")
+    store.add_turn_source(
+        turn_id=turn_id, event_id="m1", source_message_id="m1", role="trigger",
+        revision_at_join=1, now_ms=T0,
+    )
+    store.attach_event_assignment(
+        event_id="m1", thread_id=thread_id, turn_id=turn_id, now_ms=T0
+    )
+
+    class _Config:
+        threads = type(
+            "T", (), {"max_additional_generations": 2, "postbox_max_waiting": 8}
+        )()
+
+    actors = ThreadActorRegistry(store=store, config=_Config(), clock=lambda: T0)
+    actor = actors.actor_for(thread_id)
+    seen: list[str] = []
+
+    class _Inner:
+        _history_knowledge = None
+
+        def __init__(self) -> None:
+            self._history_projector = history
+
+        async def generate_reply(self, event, decision, *, session_key=None) -> str | None:
+            seen.append(str(getattr(event, "content", "")))
+            if len(seen) == 1:
+                # The follow-up arrives now: journaled without text, projected into
+                # History, and accepted by the running actor.
+                store.append_event(
+                    event_key="k2", event_id="m2", trace_id="tr-m2", payload={"channel": "whatsapp", "chat_id": CHAT_A, "source_message_id": "m2"}, now_ms=T0 + 1,
+                )
+                history.add_message(chat_id=CHAT_A, message_id="m2",
+                                    text="At 15:00 please", timestamp=T0 + 1,
+                                    sender_id="orderer")
+                actor.accept(
+                    event_id="m2", principal="orderer", kind="message",
+                    explicit_correction=False, authorized=True,
+                )
+            return f"answer {len(seen)}"
+
+    event = InboundEvent(
+        channel="whatsapp", chat_id=CHAT_A, sender_id="orderer", content="Book Tuesday",
+        message_id="m1", is_group=False, mentioned_bot=True,
+        timestamp=datetime(2023, 11, 14, tzinfo=UTC),
+    )
+    wrapper = ThreadActorResponder(
+        inner=_Inner(), actors=actors, store=store, clock=lambda: T0
+    )
+    try:
+        reply = await asyncio.wait_for(wrapper.generate_reply(event, None), timeout=5)
+        assert len(seen) == 2, f"the restart never reached the provider: {seen}"
+        assert "At 15:00 please" in seen[-1].splitlines()
+        assert reply == "answer 2"
+    finally:
+        request_finalizer()
+        store.close()

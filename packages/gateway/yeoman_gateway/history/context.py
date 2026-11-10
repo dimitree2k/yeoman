@@ -43,6 +43,28 @@ async def history_turn(projector: HistoryProjector) -> AsyncIterator[HistorySnap
         snapshot.close()
 
 
+@asynccontextmanager
+async def history_refreshed_turn(projector: HistoryProjector) -> AsyncIterator[HistorySnapshot]:
+    """A fresh lease for work that must see messages projected after the turn began.
+
+    A generation restarted for a follow-up reads that follow-up from History; the turn's
+    original lease was opened before it arrived and cannot contain it. The fresh lease is
+    current only inside this scope; the outer lease is restored (not closed) afterwards.
+    """
+    current = current_history_snapshot()
+    if current is not None and _PROJECTOR.get() is not projector:
+        raise HistoryPaused('history_scope_mismatch')
+    snapshot = await projector.read_turn()
+    token = _HISTORY.set(snapshot)
+    owner = _PROJECTOR.set(projector)
+    try:
+        yield snapshot
+    finally:
+        _PROJECTOR.reset(owner)
+        _HISTORY.reset(token)
+        snapshot.close()
+
+
 def validate_history_effect_generation(projector: HistoryProjector, generation: int) -> None:
     health = projector.health()
     if health['status'] != 'ready' or health['generation'] != generation:
