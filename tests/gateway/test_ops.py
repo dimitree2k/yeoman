@@ -71,6 +71,21 @@ def test_ops_tool_schema_has_action_enum():
     assert "system_stats" in action_schema["enum"]
 
 
+def test_ops_validate_params_accepts_lowercase_level():
+    # Models send "debug"/"warning"; _log_scan upper-cases the level, so the
+    # schema check must not refuse the call before it gets there.
+    tool = OpsTool()
+    params = {"action": "log_scan", "level": "debug", "service": "all", "since": "24h"}
+    assert tool.validate_params(params) == []
+    assert params["level"] == "debug"
+
+
+def test_ops_validate_params_still_rejects_unknown_level():
+    tool = OpsTool()
+    errors = tool.validate_params({"action": "log_scan", "level": "verbose"})
+    assert errors and "level" in errors[0]
+
+
 # ── _parse_time_spec tests ────────────────────────────────────
 
 
