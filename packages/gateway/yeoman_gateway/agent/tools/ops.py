@@ -189,6 +189,13 @@ class OpsTool(Tool):
             "required": ["action"],
         }
 
+    def validate_params(self, params: dict[str, Any]) -> list[str]:
+        # _log_scan upper-cases the level, so accept any case here too.
+        level = params.get("level")
+        if isinstance(level, str):
+            params = {**params, "level": level.upper()}
+        return super().validate_params(params)
+
     async def execute(self, **kwargs: Any) -> str:
         if refusal := owner_dm_only_refusal(self.name):
             return refusal
