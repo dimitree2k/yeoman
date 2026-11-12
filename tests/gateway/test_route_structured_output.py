@@ -94,3 +94,23 @@ async def test_fallback_target_gets_its_own_format():
     client._resolve_fallback = lambda name: fallback
     await client.chat_with_usage(MESSAGES, max_tokens=50, response_format=SCHEMA)
     assert seen == [{"type": "json_object"}, SCHEMA]
+
+
+@pytest.mark.parametrize(
+    ("provider", "model", "override", "expected"),
+    [
+        ("deepseek", "deepseek-v4-flash", None, "json_object"),
+        ("openrouter", "z-ai/glm-5.3-flash", None, "json_schema_strict"),
+        ("openrouter", "z-ai/glm-5.3-flash", "json_object", "json_object"),
+        ("deepseek", "deepseek-v4-flash", "json_schema_strict", "json_object"),
+    ],
+)
+def test_provider_registry_is_the_default_and_profile_only_overrides(
+    provider, model, override, expected
+):
+    from yeoman_gateway.processing.model_route import _effective_structured_output
+
+    profile = SimpleNamespace(provider=provider, structured_output=override)
+    assert _effective_structured_output(
+        route_key="r", profile_name="p", profile=profile, model=model
+    ) == expected

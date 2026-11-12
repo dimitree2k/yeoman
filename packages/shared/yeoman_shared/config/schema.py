@@ -51,9 +51,9 @@ class ModelProfile(BaseModel):
     reasoning: dict[str, Any] | None = None
     # Embedding profiles: vector size to request (models with adjustable output size)
     dimensions: int | None = Field(default=None, gt=0)
-    structured_output: Literal["json_schema_strict", "json_object", "prompt_only"] = (
-        "json_schema_strict"
-    )
+    # Optional override, only to ask for less than the provider supports. Unset, the
+    # route uses the strictest mode the provider accepts (gateway provider registry).
+    structured_output: Literal["json_schema_strict", "json_object", "prompt_only"] | None = None
 
 
 class ModelRoutingConfig(BaseModel):

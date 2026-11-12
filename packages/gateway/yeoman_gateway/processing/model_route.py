@@ -60,13 +60,19 @@ class _RouteTarget:
 def _effective_structured_output(
     *, route_key: str, profile_name: str, profile: Any, model: str
 ) -> str:
-    """The profile's mode, lowered to what its provider accepts (logged when lowered)."""
+    """The provider's strictest mode, or the profile's override lowered to what it accepts.
+
+    The provider registry is the source of truth; a profile only sets
+    ``structuredOutput`` to ask for less. An override above what the provider
+    accepts is lowered and logged, so a wrong config never reaches the provider.
+    """
     from yeoman_gateway.providers.registry import supported_structured_output
 
-    requested = str(getattr(profile, "structured_output", "") or "json_schema_strict")
+    override = str(getattr(profile, "structured_output", "") or "")
     provider_name = getattr(profile, "provider", None)
+    requested = override or "json_schema_strict"
     effective = supported_structured_output(provider_name, model, requested)
-    if effective != requested:
+    if override and effective != override:
         logger.warning(
             "route_structured_output_lowered route={} profile={} requested={} effective={}",
             route_key, profile_name, requested, effective,

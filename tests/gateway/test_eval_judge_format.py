@@ -57,7 +57,7 @@ def test_profile_override_is_applied_to_a_copy(monkeypatch: pytest.MonkeyPatch) 
     )
     assert client.route_key == "eval.judge" and client.structured_output == "prompt_only"
     assert "eval.judge" not in config.models.routes
-    assert config.models.profiles["security_classifier"].structured_output == "json_schema_strict"
+    assert config.models.profiles["security_classifier"].structured_output is None
 
 
 def test_unknown_profile_fails_before_provider_construction(
