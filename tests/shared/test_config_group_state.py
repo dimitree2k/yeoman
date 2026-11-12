@@ -172,4 +172,5 @@ def test_summaries_config_defaults_off_and_round_trips() -> None:
     assert route == route.lower() and "_" not in route
     assert camel_to_snake(snake_to_camel(route)) == route
     assert DEFAULT_MODEL_ROUTES[route] == "history_summaries"
-    assert DEFAULT_MODEL_PROFILES[DEFAULT_MODEL_ROUTES[route]]["structured_output"] == "json_object"
+    profile = DEFAULT_MODEL_PROFILES[DEFAULT_MODEL_ROUTES[route]]
+    assert profile["provider"] == "deepseek" and "structured_output" not in profile
