@@ -50,6 +50,9 @@ class ProviderSpec:
     # per-model param overrides, e.g. (("kimi-k2.5", {"temperature": 1.0}),)
     model_overrides: tuple[tuple[str, dict[str, Any]], ...] = ()
 
+    # structured-output modes the API accepts, strictest first (see STRUCTURED_OUTPUT_MODES)
+    structured_outputs: tuple[str, ...] = ("json_schema_strict", "json_object", "prompt_only")
+
     @property
     def label(self) -> str:
         return self.display_name or self.name.title()
@@ -149,6 +152,8 @@ PROVIDERS: tuple[ProviderSpec, ...] = (
         default_api_base="",
         strip_model_prefix=False,
         model_overrides=(),
+        # The DeepSeek API rejects response_format json_schema ("unavailable").
+        structured_outputs=("json_object", "prompt_only"),
     ),
     # Gemini: needs "gemini/" prefix for LiteLLM.
     ProviderSpec(
@@ -343,3 +348,22 @@ def find_by_name(name: str) -> ProviderSpec | None:
         if spec.name == name:
             return spec
     return None
+
+
+#: Structured-output modes from strictest to loosest. A route asks for the strictest
+#: one its caller wants and gets the strictest one its provider accepts.
+STRUCTURED_OUTPUT_MODES: tuple[str, ...] = ("json_schema_strict", "json_object", "prompt_only")
+
+
+def supported_structured_output(provider_name: str | None, model: str, requested: str) -> str:
+    """The strictest mode at or below ``requested`` that the provider accepts."""
+    spec = find_by_name(provider_name) if provider_name else None
+    if spec is None:
+        spec = find_by_model(model)
+    accepted = spec.structured_outputs if spec is not None else STRUCTURED_OUTPUT_MODES
+    if requested not in STRUCTURED_OUTPUT_MODES:
+        requested = STRUCTURED_OUTPUT_MODES[0]
+    for mode in STRUCTURED_OUTPUT_MODES[STRUCTURED_OUTPUT_MODES.index(requested):]:
+        if mode in accepted:
+            return mode
+    return "prompt_only"
