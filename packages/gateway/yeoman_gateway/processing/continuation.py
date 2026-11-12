@@ -29,6 +29,34 @@ Recency alone is not continuity. Do not answer the user or execute anything.
 """
 
 
+#: How many later messages the quote check reads after an anchor.
+_QUOTE_CHECK_LIMIT = 200
+
+
+def _quoted_someone_else_since(
+    queries: Any, *, chat_id: str, sender: str | None, after_ms: Any, before_ms: int,
+) -> bool:
+    """Whether the sender's latest quote-reply after Arvid's anchor went to another person.
+
+    A quote is the sender's own statement of whom they are talking to. Once they
+    quote someone else, their unquoted lines belong to that exchange, not to Arvid's.
+    """
+    if not sender or not isinstance(after_ms, int):
+        return False
+    rows = queries.window(
+        chat_id=chat_id, after_ms=after_ms, before_ms=before_ms, limit=_QUOTE_CHECK_LIMIT,
+    )
+    quotes = [row for row in rows
+              if row['sender_contact_id'] == sender and row['reply_to_native_id']]
+    if not quotes:
+        return False
+    quoted = queries.native_message(chat_id=chat_id, native_id=quotes[-1]['reply_to_native_id'])
+    if quoted is None or not quoted['sender_contact_id']:
+        return False
+    author = quoted['sender_contact_id']
+    return author != sender and author not in queries.assistant_contact_ids()
+
+
 @dataclass(frozen=True)
 class ContinuationAnchor:
     message_id: str
@@ -114,6 +142,11 @@ class ContinuationResolver:
                 human = queries.native_message(chat_id=event.chat_id, native_id=source.source_message_id or target or '')
                 bot = queries.native_message(chat_id=event.chat_id, native_id=receipt.provider_message_id)
                 if human is None or bot is None:
+                    continue
+                if _quoted_someone_else_since(
+                    queries, chat_id=event.chat_id, sender=human['sender_contact_id'],
+                    after_ms=bot['sent_ms'], before_ms=now_ms + 1,
+                ):
                     continue
                 source = replace(source, payload={'text': human['current_text'] or ''},
                     principal=human['sender_identifier'] or source.principal)

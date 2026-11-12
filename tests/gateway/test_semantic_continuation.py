@@ -3,7 +3,7 @@ from types import SimpleNamespace
 from unittest.mock import AsyncMock
 
 import pytest
-from yeoman_gateway.processing.continuation import ContinuationJudge
+from yeoman_gateway.processing.continuation import ContinuationJudge, _quoted_someone_else_since
 
 
 @pytest.mark.parametrize(("output", "finish", "expected"), [
@@ -31,3 +31,50 @@ async def test_judge_timeout_is_not_continuity_but_cancellation_propagates():
     client.chat_with_usage.side_effect = asyncio.CancelledError()
     with pytest.raises(asyncio.CancelledError):
         await judge.choose(text="295k", anchors=[{"id": "bot-1"}], context=[])
+
+
+class _Queries:
+    """Minimal history: rows by native id, ``window`` in time order."""
+
+    def __init__(self, rows):
+        self.rows = rows
+
+    def window(self, *, chat_id, after_ms, before_ms, limit):
+        return [row for row in self.rows if after_ms < row["sent_ms"] < before_ms][:limit]
+
+    def native_message(self, *, chat_id, native_id):
+        return next((row for row in self.rows if row["native_message_id"] == native_id), None)
+
+    def assistant_contact_ids(self):
+        return frozenset({"arvid"})
+
+
+def _row(native, sender, sent_ms, reply_to=None):
+    return {"native_message_id": native, "sender_contact_id": sender, "sent_ms": sent_ms,
+            "reply_to_native_id": reply_to}
+
+
+@pytest.mark.parametrize(
+    ("later", "expected"),
+    [
+        ([], False),
+        ([_row("f2", "frank", 30, "d1")], True),                      # quoted Dimi
+        ([_row("f2", "frank", 30, "d1"), _row("f3", "frank", 40, "a1")], False),  # back to Arvid
+        ([_row("f2", "frank", 30, "f1")], False),                     # quoted himself
+        ([_row("d2", "dimi", 30, "f1")], False),                      # someone else quoted
+        ([_row("f2", "frank", 30, "gone")], False),                   # unknown target
+    ],
+)
+def test_sender_who_quoted_another_person_left_arvids_exchange(later, expected):
+    rows = [_row("d1", "dimi", 5), _row("f1", "frank", 10), _row("a1", "arvid", 20, "f1"), *later]
+    queries = _Queries(rows)
+    assert _quoted_someone_else_since(
+        queries, chat_id="g", sender="frank", after_ms=20, before_ms=100,
+    ) is expected
+
+
+def test_quote_check_needs_a_known_sender():
+    queries = _Queries([_row("f2", "frank", 30, "d1"), _row("d1", "dimi", 5)])
+    assert _quoted_someone_else_since(
+        queries, chat_id="g", sender=None, after_ms=20, before_ms=100,
+    ) is False

@@ -1447,7 +1447,8 @@ async def test_participation_approval_rechecks_pause_and_submits_once(
             return (
                 '{"action":"comment","intent":"initiate","reason":"useful",'
                 f'"evidence_ids":["{source_id}"],"target_message_id":"{source_id}",'
-                '"contribution_type":"observation","purpose":"brief answer"}'
+                '"contribution_type":"observation","purpose":"brief answer",'
+                '"added_value":"the answer"}'
             )
 
     class Provider:
