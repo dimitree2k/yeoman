@@ -80,7 +80,6 @@ DEFAULT_MODEL_PROFILES: dict[str, dict[str, Any]] = {
         "max_tokens": 2000,
         "temperature": 0.0,
         "timeout_ms": 30000,
-        "structured_output": "json_object",
         "reasoning": {"enabled": False},
     },
     "reception_label": {
@@ -92,7 +91,6 @@ DEFAULT_MODEL_PROFILES: dict[str, dict[str, Any]] = {
         "timeout_ms": 30000,
         # DeepSeek refuses json_schema, and with reasoning on it spends the whole
         # output budget thinking.
-        "structured_output": "json_object",
         "reasoning": {"enabled": False},
     },
     "reception_lessons": {
@@ -102,7 +100,6 @@ DEFAULT_MODEL_PROFILES: dict[str, dict[str, Any]] = {
         "max_tokens": 1500,
         "temperature": 0.0,
         "timeout_ms": 30000,
-        "structured_output": "json_object",
         "reasoning": {"enabled": False},
     },
     "history_summaries": {
@@ -112,7 +109,6 @@ DEFAULT_MODEL_PROFILES: dict[str, dict[str, Any]] = {
         "max_tokens": 900,
         "temperature": 0.0,
         "timeout_ms": 30000,
-        "structured_output": "json_object",
         "reasoning": {"enabled": False},
     },
 }

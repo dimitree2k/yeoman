@@ -66,7 +66,7 @@ def test_knowledge_notes_route_defaults_to_a_profile() -> None:
     profile = config.models.profiles["person_notes"]
     assert profile.kind == "chat"
     assert profile.temperature == 0.0
-    assert profile.structured_output == "json_object"
+    assert profile.provider == "deepseek" and profile.structured_output is None  # registry decides
     assert profile.reasoning == {"enabled": False}
     # A dotted lowercase route survives both config-key transformations unchanged.
     route = config.processing.person_notes.route
