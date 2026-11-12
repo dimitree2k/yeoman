@@ -352,7 +352,10 @@ CONTRIBUTION_TYPE_DEFINITIONS: dict[str, str] = {
     "share_opinion": "a view of Arvid's own that differs from or sharpens what was said.",
     "light_humor": "a joke with its own punchline that nobody in the chat made; never the "
     "speaker's point or the headline retold with irony. When the message itself is "
-    "already the joke, there is nothing to add.",
+    "already the joke, there is nothing to add. Friendly teasing of a member who just "
+    "admitted their own mistake, mishap or embarrassing moment counts as its own "
+    "punchline: name their specific mishap in a few words, never anything serious "
+    "such as health, money trouble or grief.",
     "cold_joke": "a deliberately dry or deadpan joke with its own punchline, under the "
     "same rule as light_humor.",
     "observation": "a concrete fact, number or connection the chat has not mentioned.",

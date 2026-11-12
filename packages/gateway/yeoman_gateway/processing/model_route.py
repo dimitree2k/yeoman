@@ -307,3 +307,18 @@ __all__ = [
     "RouteUnavailableError",
     "resolve_route_key",
 ]
+
+
+def schema_format_for(client: Any, schema: dict[str, Any]) -> dict[str, Any] | None:
+    """The strict ``schema`` when the client's profile supports it, else what it does.
+
+    A provider without JSON-schema support (DeepSeek direct) rejects the request
+    outright, so a caller with its own schema asks for plain JSON there; the caller
+    still validates every value it reads.
+    """
+    mode = str(getattr(client, "structured_output", "json_schema_strict") or "")
+    if mode == "json_object":
+        return {"type": "json_object"}
+    if mode == "prompt_only":
+        return None
+    return schema
