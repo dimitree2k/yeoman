@@ -1618,3 +1618,79 @@ def test_video_with_shared_service_archives_description_and_transcript(
     [transcript] = [r for _, r, _ in iter_records(archive.root / "derived" / "media-transcripts.jsonl")]
     assert transcript["kind"] == "media_transcript" and transcript["text"] == "look at him go"
     assert transcript["native_message_id"] == "native-video"
+
+
+def _link_event(text: str) -> InboundEvent:
+    return InboundEvent(
+        message_id="native-link", chat_jid=CHAT, participant_jid="sender@lid", sender_id="sender",
+        sender_phone_jid=None, is_group=True, text=text, timestamp=NOW, mentioned_jids=[],
+        mentioned_bot=False, reply_to_bot=False, reply_to_message_id=None, reply_to_participant=None,
+        reply_to_text=None, media_kind=None, media_type=None, media_file_name=None,
+        media_path=None, media_bytes=None, media_description=None, voice_transcript=None,
+    )
+
+
+def test_shared_video_post_link_is_watched_and_archived(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    from yeoman_gateway.media.video_understanding import VideoInsight
+
+    channel, archive, _ = _setup(tmp_path)
+    channel.config.media.enabled = True
+    urls: list[str] = []
+
+    class Service:
+        async def understand_url(self, url: str, *, channel: str) -> VideoInsight:
+            urls.append(url)
+            return VideoInsight(
+                site="Instagram", uploader="tagesschau", caption="Huang (63) tritt zurueck.",
+                description="An anchor reads the news.", description_model="video-model",
+                transcript="guten abend", transcript_model="whisper",
+            )
+
+    channel.set_video_understanding(Service())
+    monkeypatch.setattr(whatsapp_module, "datetime", _FixedDateTime)
+
+    result = asyncio.run(
+        channel._enrich_media_event(_link_event("https://www.instagram.com/p/DfpX7WdCp6G/?obrf=x"))
+    )
+
+    assert urls == ["https://www.instagram.com/p/DfpX7WdCp6G/?obrf=x"]
+    summary = (
+        "Instagram post by tagesschau, caption: Huang (63) tritt zurueck.\n"
+        "The video shows: An anchor reads the news."
+    )
+    assert result.text == (
+        "https://www.instagram.com/p/DfpX7WdCp6G/?obrf=x\n"
+        f"[shared_post] {summary}\n[video_transcript] guten abend"
+    )
+    [description] = [r for _, r, _ in iter_records(archive.root / "derived" / "media-descriptions.jsonl")]
+    assert description["native_message_id"] == "native-link" and description["text"] == summary
+    assert description["generator"] == "video-model"
+    [transcript] = [r for _, r, _ in iter_records(archive.root / "derived" / "media-transcripts.jsonl")]
+    assert transcript["native_message_id"] == "native-link" and transcript["text"] == "guten abend"
+
+
+@pytest.mark.parametrize("case", ["other_link", "disabled", "fails"])
+def test_video_post_link_enrichment_leaves_message_alone(
+    tmp_path: Path, case: str
+) -> None:
+    from yeoman_gateway.media.video_understanding import VideoUnderstandingError
+
+    channel, archive, _ = _setup(tmp_path)
+    channel.config.media.enabled = True
+    channel.config.media.describe_video_links = case != "disabled"
+    calls: list[str] = []
+
+    class Service:
+        async def understand_url(self, url: str, *, channel: str):
+            calls.append(url)
+            raise VideoUnderstandingError("login required")
+
+    channel.set_video_understanding(Service())
+    text = "https://example.com/news" if case == "other_link" else "https://vm.tiktok.com/ZM1/"
+    event = _link_event(text)
+
+    assert asyncio.run(channel._enrich_media_event(event)) == event
+    assert calls == (["https://vm.tiktok.com/ZM1/"] if case == "fails" else [])
+    assert not (archive.root / "derived" / "media-descriptions.jsonl").exists()

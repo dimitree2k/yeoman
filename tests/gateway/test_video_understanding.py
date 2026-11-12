@@ -238,7 +238,7 @@ def test_download_error_becomes_user_facing_reason(
         def __exit__(self, *args: object) -> None:
             return None
 
-        def extract_info(self, url: str, download: bool) -> dict:
+        def extract_info(self, url: str, download: bool, process: bool = True) -> dict:
             raise DownloadError(
                 "ERROR: [Instagram] X: Requested content is not available, rate-limit reached "
                 "or login required. Use --cookies"
@@ -428,3 +428,68 @@ def test_frames_are_timestamped_and_capped(tmp_path: Path) -> None:
     frames = asyncio.run(vu.extract_frames(clip, out, 30.0))
     assert 20 <= len(frames) <= vu._MAX_FRAMES
     assert all(f.stat().st_size > 0 for f in frames)
+
+
+def test_video_post_link_is_found_in_message_text() -> None:
+    from yeoman_gateway.media.video_understanding import find_video_post_url
+
+    text = "schau mal (https://www.instagram.com/p/DfpX7WdCp6G/?obrf=x), krass"
+    assert find_video_post_url(text) == "https://www.instagram.com/p/DfpX7WdCp6G/?obrf=x"
+    assert find_video_post_url("https://example.com/a https://vm.tiktok.com/ZM1/") == (
+        "https://vm.tiktok.com/ZM1/"
+    )
+    assert find_video_post_url("https://www.instagram.com/someprofile/") is None
+    assert find_video_post_url("") is None
+
+
+def test_image_post_returns_its_caption_instead_of_failing(tmp_path: Path) -> None:
+    """An Instagram image post has no video format; its caption is still the content."""
+    from yt_dlp.utils import DownloadError
+
+    calls: list[bool] = []
+
+    class FakeYDL:
+        def __init__(self, options: dict) -> None:
+            self.options = options
+
+        def __enter__(self) -> "FakeYDL":
+            return self
+
+        def __exit__(self, *args: object) -> None:
+            return None
+
+        def extract_info(self, url: str, download: bool, process: bool = True) -> dict:
+            calls.append(process)
+            if process:
+                raise DownloadError("ERROR: [Instagram] X: No video formats found!")
+            return {
+                "_type": "playlist", "extractor_key": "Instagram", "title": "Post by tagesschau",
+                "uploader": "tagesschau",
+                "description": "Jensen Huang tritt zurueck. Der 63-Jaehrige ...",
+                "entries": iter([{"id": "a", "title": "Video by tagesschau"}]),
+            }
+
+    import yt_dlp
+
+    original = yt_dlp.YoutubeDL
+    yt_dlp.YoutubeDL = FakeYDL  # type: ignore[misc]
+    try:
+        info, path = _service()._download("https://www.instagram.com/p/X/", tmp_path)
+    finally:
+        yt_dlp.YoutubeDL = original  # type: ignore[misc]
+
+    assert calls == [True, False] and path is None
+    assert info["description"].startswith("Jensen Huang") and "entries" not in info
+
+
+def test_link_summary_leads_with_the_caption() -> None:
+    insight = VideoInsight(
+        site="Instagram", uploader="tagesschau", caption="Huang (63) tritt zurueck.",
+        description="A news anchor reads the headline.",
+    )
+    assert insight.link_summary() == (
+        "Instagram post by tagesschau, caption: Huang (63) tritt zurueck.\n"
+        "The video shows: A news anchor reads the headline."
+    )
+    assert VideoInsight(title="Only a title").link_summary() == "post, title: Only a title"
+    assert VideoInsight().link_summary() is None

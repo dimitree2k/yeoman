@@ -104,6 +104,9 @@ class WhatsAppMediaConfig(BaseModel):
         default=int(DEFAULT_WHATSAPP_MEDIA["max_tts_concurrency"]), ge=1
     )
     describe_videos: bool = bool(DEFAULT_WHATSAPP_MEDIA["describe_videos"])
+    #: Watch Instagram/TikTok post links when they arrive, so everyone reading the chat
+    #: later (judge, writer, summaries) knows what the shared post is about.
+    describe_video_links: bool = bool(DEFAULT_WHATSAPP_MEDIA["describe_video_links"])
     max_video_bytes_mb: int = int(DEFAULT_WHATSAPP_MEDIA["max_video_bytes_mb"])
     delete_video_after_description: bool = bool(
         DEFAULT_WHATSAPP_MEDIA["delete_video_after_description"]

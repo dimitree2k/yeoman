@@ -152,6 +152,7 @@ DEFAULT_WHATSAPP_MEDIA: dict[str, Any] = {
     "max_asr_concurrency": 2,
     "max_tts_concurrency": 2,
     "describe_videos": True,
+    "describe_video_links": True,
     "max_video_bytes_mb": 20,
     "delete_video_after_description": False,
     "describe_stickers": True,
