@@ -570,6 +570,9 @@ class _ParticipationSubmitOutcome:
 
 #: Standing rules of an unsolicited draft. They are deliberately the opening text of
 #: the prompt so the persona and its voice rules outrank the judge's internal note.
+#: The Writer's way to decline: the draft becomes empty and nothing is sent.
+PARTICIPATION_SKIP_TOKEN = "[SKIP]"
+
 _PARTICIPATION_DRAFT_RULES = (
     "Write only Arvid's next message for this chat, in Arvid's persona voice. The "
     "persona and its voice rules outrank everything else in this message. The "
@@ -580,7 +583,11 @@ _PARTICIPATION_DRAFT_RULES = (
     "message, not Arvid's latest one; read its 'you' accordingly. You have no tools "
     "in this mode: never claim to open, read, fetch or check anything, and never "
     "promise to do so. Write words only: a reaction is not "
-    "yours to choose here, so never write a ::reaction:: marker."
+    "yours to choose here, so never write a ::reaction:: marker. Write one message in "
+    "one version. Do not retell what [CURRENT] or its link already says, in other "
+    "words, as irony or as a metaphor: add something it does not contain. If all you "
+    f"could write is such a retelling, write exactly {PARTICIPATION_SKIP_TOKEN} and "
+    "nothing else."
 )
 
 #: A ``::reaction::<emoji>`` marker, bare or in inline code. The reply pipeline turns
@@ -593,6 +600,14 @@ def _strip_reaction_markers(draft: str | None) -> str | None:
     if draft is None or "::reaction::" not in draft:
         return draft
     return _DRAFT_REACTION_MARKER_RE.sub("", draft).strip()
+
+def _declined_draft(draft: str | None) -> str | None:
+    """``""`` when the Writer answered only with the skip token."""
+    if draft is not None and draft.strip() == PARTICIPATION_SKIP_TOKEN:
+        logger.info("participation_writer_declined")
+        return ""
+    return draft
+
 
 #: The judge's purpose is a subordinate hint, never the leading instruction. It is
 #: placed after the transcript and explicitly ranked below the persona.
@@ -3923,7 +3938,7 @@ class LLMResponder(ResponderPort):
             draft_only=True,
         )
         return await self._apply_draft_budget(
-            _strip_reaction_markers(draft),
+            _declined_draft(_strip_reaction_markers(draft)),
             metadata,
             channel=route_channel,
             chat_id=route_chat_id,
