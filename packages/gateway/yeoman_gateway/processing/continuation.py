@@ -14,6 +14,7 @@ from typing import Any
 
 from loguru import logger
 
+from yeoman_gateway.processing.model_route import schema_format_for
 from yeoman_gateway.processing.models import CanonicalEvent
 
 PROMPT = """Decide whether the current message continues one of Arvid's exchanges.
@@ -88,7 +89,7 @@ class ContinuationJudge:
                  {"role": "user", "content": json.dumps(
                      {"anchors": anchors, "context": context, "current_message": text},
                      ensure_ascii=False)}],
-                max_tokens=1024, response_format=schema, max_retries=0,
+                max_tokens=1024, response_format=schema_format_for(self._client, schema), max_retries=0,
             ), timeout=self._timeout)
             if reply.finish_reason != "stop":
                 return None
