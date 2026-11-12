@@ -19,6 +19,7 @@ from yeoman_gateway.agent.tools.base import Tool
 from yeoman_gateway.agent.tools.url_provenance import (
     provenance_transition_error,
 )
+from yeoman_gateway.media.video_understanding import VIDEO_POST_URL as _VIDEO_POST_URL
 
 if TYPE_CHECKING:
     from yeoman_shared.config.schema import WebToolsConfig
@@ -1285,11 +1286,6 @@ class DeepResearchTool(Tool):
         return "\n".join(lines)
 
 
-#: Links whose page is only a player shell; routed to video_understand (site choice only).
-_VIDEO_POST_URL = re.compile(
-    r"^https?://(?:www\.|m\.)?(?:instagram\.com/(?:reels?|p|tv)/|tiktok\.com/|vm\.tiktok\.com/)",
-    re.IGNORECASE,
-)
 
 
 def _extract_youtube_id(url: str) -> str | None:

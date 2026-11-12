@@ -54,6 +54,7 @@ from yeoman_gateway.implicit_addressing import (
 )
 from yeoman_gateway.media.asr import ASRTranscriber
 from yeoman_gateway.media.storage import MediaStorage, is_sticker_file
+from yeoman_gateway.media.video_understanding import find_video_post_url
 from yeoman_gateway.media.vision import VisionDescriber
 from yeoman_gateway.processing.models import JournalConflictError
 
@@ -246,6 +247,9 @@ def _quoted_image_text(reply_to_text: str | None, description: str) -> str:
 
 
 DEDUPE_TTL_SECONDS = 20 * 60
+#: A shared reel is downloaded, transcribed and watched before its message moves on;
+#: past this the message goes ahead as a bare link.
+VIDEO_LINK_TIMEOUT_SECONDS = 240.0
 DEDUPE_CLEANUP_INTERVAL_SECONDS = 30
 TYPING_LOOP_INTERVAL_SECONDS = 4.0
 TYPING_MAX_DURATION_SECONDS = 45.0
@@ -1314,6 +1318,61 @@ class WhatsAppChannel(BaseChannel):
             text="\n".join([event.text, *lines]),
             media_description=insight.description or event.media_description,
         )
+
+    async def _enrich_video_link_event(self, event: InboundEvent) -> InboundEvent:
+        """Watch a shared Instagram/TikTok post so the chat's readers know what it says.
+
+        Without this a post reaches every reader as a bare URL, and a reply to it later
+        reads like a standalone claim. The result is archived as the message's derived
+        description, exactly like a described image or clip.
+        """
+        if (
+            event.media_kind is not None
+            or not self.config.media.enabled
+            or not self.config.media.describe_video_links
+            or self._video_understanding is None
+        ):
+            return event
+        url = find_video_post_url(event.text)
+        if url is None:
+            return event
+        try:
+            insight = await asyncio.wait_for(
+                self._video_understanding.understand_url(url, channel=self.name),
+                timeout=VIDEO_LINK_TIMEOUT_SECONDS,
+            )
+        except Exception as e:  # noqa: BLE001 - an unread link must not drop the message
+            logger.info("WhatsApp video link not understood {}: {}", e.__class__.__name__, e)
+            return event
+        summary = insight.link_summary()
+        if not summary:
+            return event
+        await self._archive_media_description(
+            chat_id=event.chat_jid,
+            message_id=event.message_id,
+            profile=SimpleNamespace(model=insight.description_model or "link_metadata"),
+            mode="description",
+            text=summary,
+        )
+        if insight.transcript:
+            await append_media_transcript_async(
+                self._raw_archive,
+                {
+                    "raw_archive_version": 1,
+                    "kind": "media_transcript",
+                    "provenance": "derived_only",
+                    "channel": self.name,
+                    "chat_id": event.chat_jid,
+                    "native_message_id": event.message_id,
+                    "generated_ms": int(datetime.now(UTC).timestamp() * 1000),
+                    "generator": insight.transcript_model,
+                    "text": insight.transcript,
+                },
+            )
+        lines = [f"[shared_post] {summary}"]
+        if insight.transcript:
+            lines.append(f"[video_transcript] {insight.transcript}")
+        return replace(event, text="\n".join([event.text, *lines]))
 
     async def _archive_media_description(
         self, *, chat_id: str, message_id: str, profile: Any, mode: str, text: str
@@ -2692,6 +2751,7 @@ class WhatsAppChannel(BaseChannel):
 
     async def _enrich_media_event(self, event: InboundEvent) -> InboundEvent:
         event = await self._enrich_primary_media_event(event)
+        event = await self._enrich_video_link_event(event)
         event = await self._enrich_quoted_image_event(event)
         event = await self._enrich_quoted_audio_event(event)
         return event

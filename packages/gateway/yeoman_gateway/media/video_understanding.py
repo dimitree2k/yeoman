@@ -13,6 +13,7 @@ from __future__ import annotations
 import asyncio
 import hashlib
 import json
+import re
 import shutil
 import tempfile
 import time
@@ -54,6 +55,24 @@ _YTDLP_FORMAT = (
 )
 
 
+#: Links whose page is only a player shell: short-video and social posts. A site choice
+#: (which fetcher can read the page), not a guess about what the sender meant.
+VIDEO_POST_URL = re.compile(
+    r"^https?://(?:www\.|m\.)?(?:instagram\.com/(?:reels?|p|tv)/|tiktok\.com/|vm\.tiktok\.com/)",
+    re.IGNORECASE,
+)
+_URL_IN_TEXT = re.compile(r"https?://\S+", re.IGNORECASE)
+
+
+def find_video_post_url(text: str | None) -> str | None:
+    """The first video-post link in a message, or ``None``."""
+    for match in _URL_IN_TEXT.finditer(text or ""):
+        url = match.group(0).rstrip(").,;!?>\"'")
+        if VIDEO_POST_URL.search(url):
+            return url
+    return None
+
+
 class VideoUnderstandingError(Exception):
     """User-facing reason a video link could not be understood."""
 
@@ -86,6 +105,24 @@ class VideoInsight:
         if self.transcript:
             lines.append(f"[video_transcript] {self.transcript}")
         return lines
+
+    def link_summary(self) -> str | None:
+        """What a shared post is about, for readers who never opened it.
+
+        Caption first (an image post or a news card has nothing else), then what the
+        clip shows. The transcript stays in its own derived record.
+        """
+        parts: list[str] = []
+        source = " ".join(p for p in (self.site, "post") if p)
+        if self.uploader:
+            source += f" by {self.uploader}"
+        if self.caption:
+            parts.append(f"{source}, caption: {self.caption}")
+        elif self.title:
+            parts.append(f"{source}, title: {self.title}")
+        if self.description:
+            parts.append(f"The video shows: {self.description}")
+        return "\n".join(parts) or None
 
     def as_dict(self) -> dict[str, Any]:
         return {key: value for key, value in asdict(self).items() if value not in (None, "")}
@@ -479,7 +516,15 @@ class VideoUnderstanding:
 
         try:
             with YoutubeDL(self._ydl_options(target_dir)) as ydl:
-                info = ydl.extract_info(url, download=False) or {}
+                try:
+                    info = ydl.extract_info(url, download=False) or {}
+                except DownloadError:
+                    # Image posts and carousels have no video format, but their caption
+                    # is still the post's content.
+                    post = self._post_metadata(ydl, url)
+                    if post is None:
+                        raise
+                    return post, None
                 if info.get("_type") == "playlist":
                     entries = [e for e in info.get("entries") or [] if e]
                     if not entries:
@@ -496,6 +541,23 @@ class VideoUnderstanding:
             raise VideoUnderstandingError(f"Could not fetch the video: {_download_reason(exc)}") from exc
         files = sorted(p for p in target_dir.glob("video.*") if not p.name.endswith(".part"))
         return info, (files[0] if files else None)
+
+    @staticmethod
+    def _post_metadata(ydl: Any, url: str) -> dict[str, Any] | None:
+        """Caption and title of a post without choosing a video format, or ``None``."""
+        from yt_dlp.utils import DownloadError
+
+        try:
+            info = ydl.extract_info(url, download=False, process=False) or {}
+        except DownloadError:
+            return None
+        if info.get("_type") == "playlist" and not info.get("description"):
+            first = next((e for e in info.get("entries") or [] if isinstance(e, dict)), None)
+            if first:
+                info = {**first, **{k: v for k, v in info.items() if v and k != "entries"}}
+        if not (info.get("description") or info.get("title")):
+            return None
+        return {k: v for k, v in info.items() if k != "entries"}
 
 
 async def _none() -> None:
