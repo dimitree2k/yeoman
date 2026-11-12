@@ -8,6 +8,7 @@ here so neither caller has to grow its own copy of it.
 from __future__ import annotations
 
 import asyncio
+import json
 import time
 from collections.abc import Mapping
 from dataclasses import dataclass, field
@@ -52,6 +53,60 @@ class _RouteTarget:
     timeout_ms: int
     reasoning: dict[str, Any] | None
     provider: Any
+    #: The strictest structured-output mode this target's provider accepts.
+    structured_output: str = "json_schema_strict"
+
+
+def _effective_structured_output(
+    *, route_key: str, profile_name: str, profile: Any, model: str
+) -> str:
+    """The profile's mode, lowered to what its provider accepts (logged when lowered)."""
+    from yeoman_gateway.providers.registry import supported_structured_output
+
+    requested = str(getattr(profile, "structured_output", "") or "json_schema_strict")
+    provider_name = getattr(profile, "provider", None)
+    effective = supported_structured_output(provider_name, model, requested)
+    if effective != requested:
+        logger.warning(
+            "route_structured_output_lowered route={} profile={} requested={} effective={}",
+            route_key, profile_name, requested, effective,
+        )
+    return effective
+
+
+def adapt_messages_and_format(
+    messages: list[dict[str, str]],
+    response_format: dict[str, Any] | None,
+    mode: str,
+) -> tuple[list[dict[str, str]], dict[str, Any] | None]:
+    """Fit one request's ``response_format`` to a target's structured-output mode.
+
+    Callers ask for the strictest format they want. A target that cannot honour a
+    JSON schema gets plain JSON plus the schema as a written instruction; a target
+    without any JSON mode gets the instruction alone. Callers validate every answer
+    either way, so a lowered format never widens what is accepted.
+    """
+    if response_format is None:
+        return messages, None
+    kind = str(response_format.get("type") or "")
+    if kind == "json_schema" and mode == "json_schema_strict":
+        return messages, response_format
+    if kind == "json_object" and mode in {"json_schema_strict", "json_object"}:
+        return messages, response_format
+    if kind == "json_schema":
+        schema = (response_format.get("json_schema") or {}).get("schema")
+        note = (
+            "Answer with exactly one JSON object that matches this JSON schema, "
+            "and nothing else:\n" + json.dumps(schema, ensure_ascii=False)
+        )
+    else:
+        note = "Answer with exactly one JSON object and nothing else."
+    adapted = [dict(message) for message in messages]
+    if adapted and adapted[0].get("role") == "system":
+        adapted[0]["content"] = f"{adapted[0].get('content') or ''}\n\n{note}"
+    else:
+        adapted.insert(0, {"role": "system", "content": note})
+    return adapted, ({"type": "json_object"} if mode == "json_object" else None)
 
 
 def _make_provider(model: str, provider_cfg: Any) -> Any:
@@ -91,8 +146,8 @@ class RouteClient:
             )
         self.model = model
         self.timeout_ms = int(getattr(profile, "timeout_ms", 0) or 0)
-        self.structured_output = str(
-            getattr(profile, "structured_output", "json_schema_strict") or "json_schema_strict"
+        self.structured_output = _effective_structured_output(
+            route_key=self.route_key, profile_name=str(route_name), profile=profile, model=model,
         )
         reasoning = getattr(profile, "reasoning", None)
         self.reasoning: dict[str, Any] | None = dict(reasoning) if reasoning else None
@@ -103,6 +158,7 @@ class RouteClient:
             timeout_ms=self.timeout_ms,
             reasoning=self.reasoning,
             provider=self._provider,
+            structured_output=self.structured_output,
         )
         self._fallback_names = tuple(
             str(name).strip()
@@ -138,6 +194,10 @@ class RouteClient:
                 timeout_ms=int(getattr(profile, "timeout_ms", 0) or 0),
                 reasoning=dict(reasoning) if reasoning else None,
                 provider=provider,
+                structured_output=_effective_structured_output(
+                    route_key=self.route_key, profile_name=profile_name,
+                    profile=profile, model=model,
+                ),
             )
         except Exception as exc:  # noqa: BLE001 - a bad fallback never breaks the route
             logger.warning(
@@ -162,6 +222,7 @@ class RouteClient:
                 timeout_ms=self.timeout_ms,
                 reasoning=self.reasoning,
                 provider=self._provider,
+                structured_output=getattr(self, "structured_output", "json_schema_strict"),
             )
         targets = [primary]
         for name in getattr(self, "_fallback_names", ()):
@@ -181,6 +242,9 @@ class RouteClient:
         timeout_ms: int | None = None,
         temperature: float | None = None,
     ) -> Any:
+        messages, response_format = adapt_messages_and_format(
+            messages, response_format, target.structured_output
+        )
         call = target.provider.chat(
             messages=messages,
             tools=None,
@@ -307,18 +371,3 @@ __all__ = [
     "RouteUnavailableError",
     "resolve_route_key",
 ]
-
-
-def schema_format_for(client: Any, schema: dict[str, Any]) -> dict[str, Any] | None:
-    """The strict ``schema`` when the client's profile supports it, else what it does.
-
-    A provider without JSON-schema support (DeepSeek direct) rejects the request
-    outright, so a caller with its own schema asks for plain JSON there; the caller
-    still validates every value it reads.
-    """
-    mode = str(getattr(client, "structured_output", "json_schema_strict") or "")
-    if mode == "json_object":
-        return {"type": "json_object"}
-    if mode == "prompt_only":
-        return None
-    return schema

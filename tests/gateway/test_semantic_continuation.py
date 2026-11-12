@@ -78,26 +78,3 @@ def test_quote_check_needs_a_known_sender():
     assert _quoted_someone_else_since(
         queries, chat_id="g", sender=None, after_ms=20, before_ms=100,
     ) is False
-
-
-@pytest.mark.parametrize(
-    ("mode", "expected"),
-    [("json_schema_strict", "schema"), ("json_object", {"type": "json_object"}),
-     ("prompt_only", None)],
-)
-def test_schema_format_follows_the_route_profile(mode, expected):
-    from yeoman_gateway.processing.model_route import schema_format_for
-
-    schema = {"type": "json_schema", "json_schema": {"name": "x"}}
-    result = schema_format_for(SimpleNamespace(structured_output=mode), schema)
-    assert result == (schema if expected == "schema" else expected)
-
-
-@pytest.mark.asyncio
-async def test_json_object_route_gets_plain_json_and_ids_are_still_checked():
-    reply = SimpleNamespace(content='{"anchor_message_id": "invented"}', finish_reason="stop")
-    client = SimpleNamespace(structured_output="json_object",
-                             chat_with_usage=AsyncMock(return_value=reply))
-    judge = ContinuationJudge(client=client)
-    assert await judge.choose(text="x", anchors=[{"id": "a1"}], context=[]) is None
-    assert client.chat_with_usage.call_args.kwargs["response_format"] == {"type": "json_object"}
