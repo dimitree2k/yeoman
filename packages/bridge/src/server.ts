@@ -30,6 +30,7 @@ import {
 } from './protocol.js';
 import {
   BridgeOutbox,
+  ConflictingOutboxEventError,
   defaultBridgeOutboxDir,
   isReplayableEventType,
   type ReplayableBridgeEvent,
@@ -664,7 +665,7 @@ export class BridgeServer {
     try {
       persisted = await this.outbox.append(event);
     } catch (error) {
-      this.recordPersistenceFailure();
+      if (!(error instanceof ConflictingOutboxEventError)) this.recordPersistenceFailure();
       throw error;
     }
 
@@ -714,7 +715,16 @@ export class BridgeServer {
     let tracked: Promise<void>;
     tracked = operation
       .catch((error: unknown) => {
-        if (!this.stopping) this.recordPersistenceFailure();
+        if (error instanceof ConflictingOutboxEventError) {
+          // A re-delivery that disagrees with the stored copy is not a storage failure:
+          // refuse only that copy and keep intake running.
+          console.warn(
+            `Bridge kept the stored copy of ${error.eventId}; a re-delivery differed in: ` +
+              (error.differingFields.join(', ') || 'unknown fields'),
+          );
+        } else if (!this.stopping) {
+          this.recordPersistenceFailure();
+        }
         throw error;
       })
       .finally(() => this.inFlight.delete(tracked));

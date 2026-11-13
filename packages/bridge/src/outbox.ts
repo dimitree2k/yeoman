@@ -153,6 +153,28 @@ function sameReplayableEvent(a: ReplayableBridgeEvent, b: ReplayableBridgeEvent)
   });
 }
 
+/**
+ * A provider re-delivered an event id with different content. Only that copy is refused:
+ * the first stored copy stays authoritative, and intake continues.
+ */
+export class ConflictingOutboxEventError extends Error {
+  constructor(readonly eventId: string, readonly differingFields: string[]) {
+    super('Conflicting bridge outbox event');
+    this.name = 'ConflictingOutboxEventError';
+  }
+}
+
+function differingPayloadFields(a: ReplayableBridgeEvent, b: ReplayableBridgeEvent): string[] {
+  const left = canonicalProviderValue(metadataComparisonPayload(a)) as Record<string, unknown>;
+  const right = canonicalProviderValue(metadataComparisonPayload(b)) as Record<string, unknown>;
+  const fields = [...new Set([...Object.keys(left), ...Object.keys(right)])]
+    .filter((key) => JSON.stringify(left[key]) !== JSON.stringify(right[key]));
+  for (const key of ['version', 'type', 'accountId', 'eventKey'] as const) {
+    if (a[key] !== b[key]) fields.push(key);
+  }
+  return fields.sort();
+}
+
 function fileNameFor(sequence: number, event: ReplayableBridgeEvent): string {
   return `${String(sequence).padStart(20, '0')}-${encodeURIComponent(event.eventId)}-${encodeURIComponent(event.eventKey)}.json`;
 }
@@ -513,7 +535,10 @@ export class BridgeOutbox {
     const existing = this.entries.get(expected.eventId);
     if (existing) {
       if (!sameReplayableEvent(existing.event, expected)) {
-        throw new Error('Conflicting bridge outbox event');
+        throw new ConflictingOutboxEventError(
+          expected.eventId,
+          differingPayloadFields(existing.event, expected),
+        );
       }
       return;
     }
@@ -537,7 +562,10 @@ export class BridgeOutbox {
       const existing = this.entries.get(replayable.eventId);
       if (existing) {
         if (!sameReplayableEvent(existing.event, replayable)) {
-          throw new Error('Conflicting bridge outbox event');
+          throw new ConflictingOutboxEventError(
+            replayable.eventId,
+            differingPayloadFields(existing.event, replayable),
+          );
         }
         return existing.event;
       }
