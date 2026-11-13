@@ -1212,3 +1212,50 @@ def test_group_state_dropped_before_any_message_on_budget() -> None:
     assert context["group_state_status"] == "budget_dropped"
     assert len(context["messages"]) == messages_before
     assert context["judge_dropped_entry_count"] == 0
+
+
+@pytest.mark.parametrize(
+    ("contribution", "unacknowledged", "expected"),
+    [
+        ("light_humor", True, "silence"),
+        ("light_humor", False, "comment"),
+        ("observation", True, "comment"),
+    ],
+)
+@pytest.mark.asyncio
+async def test_next_unasked_joke_waits_until_the_last_one_was_taken_up(
+    contribution: str, unacknowledged: bool, expected: str
+) -> None:
+    """One unasked joke at a time; facts and observations are not paced."""
+    judge = ParticipationJudge(client=_Client(_payload(
+        action="comment",
+        intent="initiate",
+        purpose="deadpan punchline",
+        contribution_type=contribution,
+        target_message_id="m1",
+        added_value="a punchline nobody made yet",
+    )), allowed_emojis=(EMOJI,))
+    decision = await judge.decide(
+        _opportunity(), _context(arvid_unacknowledged=unacknowledged)
+    )
+    assert decision.action == expected
+    if expected == "silence":
+        assert decision.reason == "previous_unacknowledged"
+
+
+def test_arvid_unacknowledged_reads_quote_replies_and_reactions() -> None:
+    from yeoman_gateway.processing.participation_context import _arvid_unacknowledged
+
+    def row(mid: str, ms: int, direction: str = "in", **extra: object) -> dict[str, object]:
+        return {"message_id": mid, "event_id": f"h-{mid}", "sent_ms": ms,
+                "direction": direction, **extra}
+
+    arvid = row("a1", 2_000, "out", sender_contact_id="arvid", reactions="[]")
+    talk_on = [row("m1", 1_000), arvid, row("m2", 3_000), row("m3", 4_000)]
+    assert _arvid_unacknowledged(talk_on, since_ms=0) is True
+    assert _arvid_unacknowledged(talk_on, since_ms=2_500) is False  # before the conversation
+    quoted = [*talk_on, row("m4", 5_000, reply_to_message_id="a1")]
+    assert _arvid_unacknowledged(quoted, since_ms=0) is False
+    liked = [row("m1", 1_000), {**arvid, "reactions": json.dumps([{"actor": "c-ben", "emoji": "😂"}])}]
+    assert _arvid_unacknowledged(liked, since_ms=0) is False
+    assert _arvid_unacknowledged([row("m1", 1_000)], since_ms=0) is False
