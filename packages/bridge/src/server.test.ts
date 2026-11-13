@@ -334,6 +334,54 @@ test('BridgeServer derives provider identity independently of content and quaran
   }
 });
 
+test('BridgeServer keeps intake running when a provider re-delivers a conflicting event', async () => {
+  const root = await mkdtemp(join(tmpdir(), 'yeoman-bridge-conflict-intake-'));
+  try {
+    const message = {
+      messageId: 'redelivered-1',
+      chatJid: 'chat@g.us',
+      participantJid: '4915@s.whatsapp.net',
+      senderId: '4915',
+      isGroup: true,
+      text: 'provider text',
+      timestamp: 1_700_000_000,
+      mentionedJids: [],
+      mentionedBot: false,
+      replyToBot: false,
+    };
+    const server = makeServer(root);
+    const warnings: string[] = [];
+    const warn = console.warn;
+    console.warn = (line: string) => warnings.push(line);
+    try {
+      await (server as any).trackProviderEvent((server as any).broadcastMessage(message));
+      await assert.rejects(
+        (server as any).trackProviderEvent(
+          (server as any).broadcastMessage({ ...message, timestamp: 1_700_000_700 }),
+        ),
+        /Conflicting bridge outbox event/,
+      );
+    } finally {
+      console.warn = warn;
+    }
+
+    assert.equal((server as any).intakeStopped, false);
+    assert.equal((server as any).persistenceFailure, false);
+    assert.equal(warnings.length, 1);
+    assert.match(warnings[0], /differed in: timestamp$/);
+    const pending = await (server as any).outbox.pending();
+    assert.equal(pending.length, 1);
+    assert.equal(pending[0].payload.timestamp, 1_700_000_000);
+
+    await (server as any).trackProviderEvent(
+      (server as any).broadcastMessage({ ...message, messageId: 'next-1' }),
+    );
+    assert.equal((await (server as any).outbox.pending()).length, 2);
+  } finally {
+    await rm(root, { recursive: true, force: true });
+  }
+});
+
 test('BridgeServer accepts an event exactly at the UTF-8 serialized byte ceiling', async () => {
   const root = await mkdtemp(join(tmpdir(), 'yeoman-bridge-event-limit-'));
   try {
