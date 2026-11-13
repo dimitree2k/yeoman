@@ -17,6 +17,7 @@ Knowledge comes only through the injected selector and its verified readers.
 
 from __future__ import annotations
 
+import json
 import time
 from collections.abc import Callable, Iterable, Mapping
 from dataclasses import dataclass
@@ -412,6 +413,15 @@ class ParticipationContextBuilder:
             # Shown messages from before the conversation start (only when the floor
             # added earlier context); the Judge view draws one separator after them.
             "earlier_message_ids": earlier_ids,
+            # Arvid's latest message here drew no quote-reply and no reaction yet.
+            "arvid_unacknowledged": _arvid_unacknowledged(
+                range_rows,
+                since_ms=(
+                    conversation.start_ms
+                    if conversation is not None
+                    else moment - UNACKNOWLEDGED_FALLBACK_MS
+                ),
+            ),
             "direct_addressed": bool(_snapshot_value(inputs.snapshot, "direct_addressed", False)),
             "allows_continuation": "continue" in inputs.allowed_intents,
             # Fixed text of each offered trend card; a card is posted verbatim.
@@ -859,6 +869,45 @@ def _history_shape(row: Mapping[str, Any]) -> dict[str, Any]:
         "sent_ms": sent_ms if isinstance(sent_ms, int) else _row_timestamp_ms(row),
         "reply_to_native_id": row.get("reply_to_native_id") or row.get("reply_to_message_id"),
     }
+
+
+#: Without a segmented conversation, Arvid's messages this recent still count.
+UNACKNOWLEDGED_FALLBACK_MS = 30 * 60_000
+
+
+def _arvid_unacknowledged(rows: Iterable[Mapping[str, Any]], *, since_ms: int) -> bool:
+    """Whether Arvid's latest message since ``since_ms`` drew no response aimed at it.
+
+    Structural only: a member's quote-reply to that message or a member's reaction on
+    it counts as taking him up. Other members simply talking on does not.
+    """
+    shaped = sorted(
+        (_history_shape(row) for row in rows if isinstance(row, Mapping)),
+        key=lambda row: (row["sent_ms"] or 0, str(row["message_id"])),
+    )
+    own = [
+        row for row in shaped
+        if row.get("direction") == "out" and (row["sent_ms"] or 0) >= since_ms
+    ]
+    if not own:
+        return False
+    last = own[-1]
+    native = str(last["native_message_id"] or "")
+    if any(
+        row.get("direction") != "out" and str(row.get("reply_to_native_id") or "") == native
+        for row in shaped
+    ):
+        return False
+    raw = last.get("reactions")
+    try:
+        reactions = json.loads(raw) if isinstance(raw, str) else (raw or [])
+    except ValueError:
+        reactions = []
+    arvid = last.get("sender_contact_id")
+    return not any(
+        isinstance(item, Mapping) and item.get("emoji") and item.get("actor") != arvid
+        for item in reactions
+    )
 
 
 def _cap_conversation(

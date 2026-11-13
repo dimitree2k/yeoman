@@ -100,6 +100,9 @@ _INTENT_ALIASES: dict[str, str] = {
     "initiation": "initiate",
 }
 
+#: Contribution types whose point is a laugh; paced by ``arvid_unacknowledged``.
+HUMOR_CONTRIBUTION_TYPES = frozenset({"light_humor", "cold_joke"})
+
 JUDGE_SYSTEM_PROMPT = (
     "You are the participation judge for an assistant called Arvid in one chat.\n"
     "You decide whether Arvid should stay silent, react with one emoji, or write a "
@@ -133,7 +136,9 @@ JUDGE_SYSTEM_PROMPT = (
     "its subject clear.\n"
     "- Then write added_value: the one concrete thing Arvid's comment would add that is "
     "not already in the chat or in the shared link or article: a fact, an answer, a "
-    "correction, a different view, or a joke with its own punchline. Leave it empty when "
+    "correction, a different view, or a joke with its own punchline. A joke counts only "
+    "when it is sharp and specific to this exact moment, one the members would really "
+    "laugh at; a generic quip about the topic is not added value. Leave it empty when "
     "there is nothing. Set restates_chat=true when the comment would mainly retell what "
     "someone said or what the link says, in other words, as irony or as a metaphor. A "
     "comment needs a non-empty added_value and restates_chat=false; otherwise choose "
@@ -999,6 +1004,31 @@ class ParticipationJudge:
                 restates_chat=restates_chat,
             )
 
+        if (
+            intent != "direct"
+            and view.arvid_unacknowledged
+            and (
+                action in IMAGE_ACTIONS
+                or (action == "comment" and contribution in HUMOR_CONTRIBUTION_TYPES)
+            )
+            and not is_trend_source(target)
+        ):
+            # One unasked joke at a time: the next waits until a member took the last
+            # one up (a quote-reply or a reaction on it), or the conversation moved on.
+            logger.info(
+                "participation_judge_joke_unacknowledged opportunity={} action={} "
+                "contribution_type={}",
+                opportunity.opportunity_id, action, contribution,
+            )
+            return ParticipationDecision(
+                action="silence",
+                intent="initiate",
+                reason="previous_unacknowledged",
+                reading=reading,
+                added_value=added_value,
+                restates_chat=restates_chat,
+            )
+
         emoji: str | None = None
         if action == "react":  # a silent verdict never carries a face
             emoji = allowed_reaction(payload.get("emoji") or "", self._allowed_emojis)
@@ -1075,6 +1105,8 @@ class _JudgeContext:
     allows_continuation: bool
     selected_knowledge_text: str
     rendered: str
+    #: Arvid's latest message in this conversation drew no quote-reply or reaction.
+    arvid_unacknowledged: bool = False
     group_notes_text: str = ""
     group_notes_week: str = ""
     reception_stance_text: str = ""
@@ -1232,6 +1264,7 @@ class _JudgeContext:
             guidance=str(context.get("guidance") or ""),
             direct_addressed=bool(context.get("direct_addressed")),
             allows_continuation=bool(context.get("allows_continuation", False)),
+            arvid_unacknowledged=bool(context.get("arvid_unacknowledged", False)),
             selected_knowledge_text=str(context.get("selected_knowledge_text") or ""),
             rendered="\n".join(lines) if lines else "(no retained context)",
             group_notes_text=str(context.get("group_notes_text") or ""),
