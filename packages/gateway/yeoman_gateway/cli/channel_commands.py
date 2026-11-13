@@ -593,6 +593,31 @@ def bridge_status(
     console.print(f"Log: {status.log_path}")
 
 
+INTAKE_EXIT_STOPPED = 3
+INTAKE_EXIT_UNREACHABLE = 2
+
+
+@bridge_app.command("intake")
+def bridge_intake() -> None:
+    """Report whether the bridge still takes in WhatsApp messages (for watchdogs).
+
+    Exit 0 when intake runs, 3 when the bridge stopped intake, 2 when the bridge
+    cannot be asked. The bridge stays "running" in systemd while intake is stopped.
+    """
+    from yeoman_gateway.cli.bridge_client import bridge_command
+
+    try:
+        health = bridge_command("health", timeout_s=5.0)
+    except Exception as exc:
+        console.print(f"unreachable: {type(exc).__name__}")
+        raise typer.Exit(INTAKE_EXIT_UNREACHABLE) from None
+    if health.get("intakeStopped"):
+        reason = "persistence failure" if health.get("persistenceFailure") else "stopped"
+        console.print(f"stopped: {reason}")
+        raise typer.Exit(INTAKE_EXIT_STOPPED)
+    console.print("accepting")
+
+
 @bridge_app.command("rotate")
 @bridge_app.command("rotate-token")
 def bridge_rotate_token(
