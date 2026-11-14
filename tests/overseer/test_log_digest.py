@@ -117,6 +117,20 @@ def test_checkpoint_skips_seen_lines_and_marks_recurring(env: dict[str, Path]) -
     assert vision[0]["new"] is False and vision[0]["days_seen"] == 2
 
 
+def test_reads_lines_with_utc_offset(env: dict[str, Path]) -> None:
+    # Loguru 0.8's default format writes the UTC offset after the timestamp.
+    (env["logs"] / "gateway.log").write_text(
+        "2026-10-28 05:00:00.123 +01:00 | WARNING  | m:f:1 - vision OCR failed provider=p\n"
+        "2026-10-28 05:00:01.123 -05:30 | ERROR    | m:g:2 - LLM provider request failed\n"
+    )
+    digest = _digest(env)
+    assert digest["lines_read"] == 2
+    assert {i["signature"] for i in digest["incidents"] if i["kind"] == "log_signature"} == {
+        "WARNING m:f vision OCR failed provider=p",
+        "ERROR m:g LLM provider request failed",
+    }
+
+
 def test_reads_rotated_gz_after_rotation(env: dict[str, Path]) -> None:
     (env["out"]).mkdir()
     (env["out"] / "state.json").write_text(json.dumps({"last_ts": "2026-10-28 04:00:00.000000"}))
