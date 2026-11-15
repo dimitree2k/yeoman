@@ -967,6 +967,10 @@ class IntentEffectRouter:
         result = await self._run(
             channel=event.channel,
             chat_id=event.chat_id,
+            # The answered message names the turn its generation was frozen with; without
+            # it every reply fell back to the chat's first open turn (live 2026-11-15:
+            # three answers from three threads were all recorded under one turn).
+            source_message_id=str(metadata.get("message_id") or "") or None,
             principal=principal,
             payload=payload,
             # Stable per logical action: source identity plus a deterministic content

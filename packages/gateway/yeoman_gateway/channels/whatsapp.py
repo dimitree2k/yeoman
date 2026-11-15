@@ -2698,6 +2698,20 @@ class WhatsAppChannel(BaseChannel):
                     if source_id
                 )
             ),
+            # The gate's decisions for the members survive the merge: the burst answers
+            # the turn its newest addressed member opened, instead of the last message
+            # being filed as a thread of its own while that turn stays unanswered
+            # (live 2026-11-15: an ask merged with its follow-up was answered twice).
+            thread_assignment=next(
+                (
+                    event.thread_assignment
+                    for event in reversed(events)
+                    if event.thread_assignment and event.thread_assignment.get("turn_id")
+                ),
+                last.thread_assignment,
+            ),
+            processing_reacted=any(event.processing_reacted for event in events),
+            processing_answer_granted=any(event.processing_answer_granted for event in events),
         )
 
         await self._publish_event(merged)
