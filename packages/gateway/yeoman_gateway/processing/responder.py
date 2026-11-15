@@ -11,6 +11,7 @@ passed through unchanged, so the legacy path stays byte-identical.
 
 from __future__ import annotations
 
+from collections import deque
 from collections.abc import Callable
 from typing import Any
 
@@ -34,6 +35,16 @@ from yeoman_gateway.session.manager import (
     LEGACY_CONTEXT_TURNS,
     SessionManager,
 )
+
+#: Metadata key: Arvid's replies in this chat that were generated after the current
+#: message was sent. The prompt shows them, and the model may then decline with [SKIP].
+REPLIES_SINCE_MESSAGE_KEY = "replies_since_message"
+#: How many such replies a chat remembers, and for how long.
+_RECENT_REPLIES_PER_CHAT = 4
+_RECENT_REPLY_TTL_MS = 15 * 60 * 1000
+#: How many of them one prompt shows, and how much of each.
+_REPLIES_SHOWN = 3
+_REPLY_EXCERPT_CHARS = 600
 
 
 class ThreadActorResponder:
@@ -61,6 +72,8 @@ class ThreadActorResponder:
         self._finish_direct_admission = finish_direct_admission
         self._direct_work_active = direct_work_active
         self._release_chat = release_chat
+        #: Replies this process generated per chat, newest last: ``(finished_ms, text)``.
+        self._recent_replies: dict[tuple[str, str], deque[tuple[int, str]]] = {}
 
     async def generate_participation_draft(
         self,
@@ -220,7 +233,9 @@ class ThreadActorResponder:
                 return await _generate(_snapshot)
 
             async def _generate(_snapshot: Any) -> str | None:
-                request_event = self._request_event(event, _snapshot)
+                request_event = self._with_replies_since(
+                    self._request_event(event, _snapshot)
+                )
                 token = CURRENT_TURN.set(binding)
                 try:
                     return await self._inner.generate_reply(
@@ -243,8 +258,77 @@ class ThreadActorResponder:
                     snapshot.turn_id,
                 )
                 return None
+            # Recorded before this coroutine yields again: the next generation in the
+            # chat (waiting for the shared generation slot) must already see it.
+            self._remember_reply(event, outcome.text)
             return outcome.text
         return None
+
+    # -- replies generated while a message waited ----------------------------------------
+
+    @staticmethod
+    def _chat_key(event: Any) -> tuple[str, str]:
+        return (
+            str(getattr(event, "channel", "") or ""),
+            str(getattr(event, "chat_id", "") or ""),
+        )
+
+    def _remember_reply(self, event: Any, text: str | None) -> None:
+        reply = str(text or "").strip()
+        key = self._chat_key(event)
+        if not reply or not all(key):
+            return
+        replies = self._recent_replies.setdefault(
+            key, deque(maxlen=_RECENT_REPLIES_PER_CHAT)
+        )
+        replies.append((self._clock(), reply))
+
+    def _replies_since(self, event: Any) -> list[str]:
+        """Replies this chat got after ``event`` was sent, oldest first.
+
+        Generations of one chat wait for each other (one shared slot), but each froze its
+        context when its message arrived. A message that waited behind another answer
+        therefore cannot see that answer (live 2026-11-15: one fact-check request in a
+        backlog of five messages was answered three times). Only replies generated after
+        the message itself count; earlier ones are already ordinary chat history.
+        """
+        replies = self._recent_replies.get(self._chat_key(event))
+        if not replies:
+            return []
+        timestamp = getattr(event, "timestamp", None)
+        try:
+            sent_ms = int(timestamp.timestamp() * 1000)  # type: ignore[union-attr]
+        except (AttributeError, TypeError, ValueError, OverflowError):
+            return []
+        horizon = self._clock() - _RECENT_REPLY_TTL_MS
+        return [
+            text
+            for finished_ms, text in replies
+            if finished_ms > sent_ms and finished_ms > horizon
+        ][-_REPLIES_SHOWN:]
+
+    def _with_replies_since(self, event: Any) -> Any:
+        replies = self._replies_since(event)
+        if not replies:
+            return event
+        metadata = dict(getattr(event, "raw_metadata", None) or {})
+        metadata[REPLIES_SINCE_MESSAGE_KEY] = [
+            text if len(text) <= _REPLY_EXCERPT_CHARS else text[:_REPLY_EXCERPT_CHARS] + "..."
+            for text in replies
+        ]
+        try:
+            from dataclasses import replace as dataclass_replace
+
+            updated = dataclass_replace(event, raw_metadata=metadata)
+        except Exception:  # pragma: no cover - event shapes without dataclass semantics
+            return event
+        logger.info(
+            "reply_context_replies_since chat={} message_id={} replies={}",
+            getattr(event, "chat_id", "-"),
+            getattr(event, "message_id", "-"),
+            len(replies),
+        )
+        return updated
 
     def _other_threads_for(self, event: Any, thread_id: str) -> Any:
         channel = str(getattr(event, "channel", "") or "")
