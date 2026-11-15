@@ -128,6 +128,11 @@ class ThreadActor:
         '''True while a provider call is running for this thread.'''
         return self._generation_in_flight
 
+    @property
+    def last_snapshot(self) -> GenerationSnapshot | None:
+        '''The snapshot of the newest generation, with the sources it answers.'''
+        return self._state.last_snapshot
+
     # -- postbox -----------------------------------------------------------------------
 
     def accept(
@@ -474,6 +479,18 @@ class ThreadActorRegistry:
             )
             self._actors[thread_id] = actor
         return actor
+
+    def busy_actor_for_chat(
+        self, channel: str, chat_id: str, *, exclude_thread_id: str = ""
+    ) -> ThreadActor | None:
+        """Another thread of this chat whose answer is being generated or waits for a slot."""
+        for thread_id, actor in list(self._actors.items()):
+            if thread_id == exclude_thread_id or not actor.generation_in_flight:
+                continue
+            thread = self._store.get_thread(thread_id)
+            if thread is not None and thread.channel == channel and thread.chat_id == chat_id:
+                return actor
+        return None
 
     def active_turn(self, channel: str, chat_id: str) -> TurnRef | None:
         """Turn provider for the dispatch line."""

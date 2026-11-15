@@ -235,6 +235,20 @@ def _timestamp_to_datetime(value: int) -> datetime:
     return datetime.fromtimestamp(seconds, tz=UTC)
 
 
+def _sent_in_one_burst(previous: "InboundEvent", current: "InboundEvent", window_ms: float) -> bool:
+    """Whether two messages of one sender were *sent* within the debounce window.
+
+    Bridge timestamps have one-second resolution, so a second of slack is allowed. A
+    message without a timestamp keeps the old arrival-based behaviour.
+    """
+    if not previous.timestamp or not current.timestamp:
+        return True
+    gap_ms = abs(
+        _timestamp_to_datetime(current.timestamp) - _timestamp_to_datetime(previous.timestamp)
+    ).total_seconds() * 1000.0
+    return gap_ms <= float(window_ms) + 1000.0
+
+
 def _quoted_image_text(reply_to_text: str | None, description: str) -> str:
     base = (reply_to_text or "").strip()
     if not base or base == "[Image]":
@@ -2485,6 +2499,15 @@ class WhatsAppChannel(BaseChannel):
                 direct_publish = self._schedule_debounce_publish_locked(key, [event])
             else:
                 bucket = self._debounce_buffers.get(key)
+                if bucket and not _sent_in_one_burst(bucket[-1], event, effective_debounce):
+                    # Arrival order is not a burst: a backlog (a slow media read, a
+                    # reconnect) delivers minutes of messages at once. Only messages *sent*
+                    # within the window are one thought (live 2026-11-15: an ask and a
+                    # remark to someone else 42 s later were merged into one request).
+                    self._schedule_debounce_publish_locked(
+                        key, self._detach_debounce_batch_locked(key)
+                    )
+                    bucket = None
                 bucket_bytes = self._debounce_buffer_bytes.get(key, 0)
                 if bucket and (
                     len(bucket) >= self._debounce_max_items

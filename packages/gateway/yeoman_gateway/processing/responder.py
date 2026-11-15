@@ -174,6 +174,10 @@ class ThreadActorResponder:
                 # The running generation answers with the wider snapshot: no second answer path.
                 return None
 
+            holding = await self._busy_reply(event, decision, thread_id)
+            if holding is not None:
+                return holding
+
             try:
                 return await self._run_loop(actor, event, decision)
             except HistoryPaused:
@@ -263,6 +267,86 @@ class ThreadActorResponder:
             self._remember_reply(event, outcome.text)
             return outcome.text
         return None
+
+    # -- addressed while another answer of the chat is still being written ---------------
+
+    async def _busy_reply(self, event: Any, decision: Any, thread_id: str) -> str | None:
+        """A short holding line when someone pushes while Arvid is still working.
+
+        Live 2026-11-15: reading a TikTok took a minute, the group nudged ("schläft wohl",
+        "@Arvid hey") and every nudge became a full second answer. While another thread of
+        the chat is generating, the model reads the new message next to the request in
+        progress: a nudge gets one short line in Arvid's voice, anything else ([NEW])
+        takes the normal path. No wording or pattern is fixed here.
+        """
+        finder = getattr(self._actors, "busy_actor_for_chat", None)
+        generator = getattr(self._inner, "generate_busy_reply", None)
+        if not callable(finder) or not callable(generator):
+            return None
+        channel, chat_id = self._chat_key(event)
+        busy = finder(channel, chat_id, exclude_thread_id=thread_id)
+        if busy is None:
+            return None
+        snapshot = getattr(busy, "last_snapshot", None)
+        working_on = "\n".join(
+            self._source_texts(tuple(getattr(snapshot, "source_refs", ()) or ()))
+        )
+        if not working_on:
+            return None
+        try:
+            text = await generator(event, decision, working_on=working_on)
+        except HistoryPaused:
+            raise
+        except Exception as exc:  # noqa: BLE001 - a holding line is optional
+            logger.warning("busy_reply_failed chat={} error_type={}", chat_id, type(exc).__name__)
+            return None
+        reply = str(text or "").strip()
+        if not reply:
+            logger.info(
+                "busy_reply_passed chat={} message_id={} busy_thread={}",
+                chat_id,
+                getattr(event, "message_id", "-"),
+                busy.thread_id,
+            )
+            return None
+        turn = self._store.active_turn(thread_id)
+        if turn is not None and getattr(self, "_router", None) is not None:
+            self._router.remember_turn_for_source(
+                self._event_id(event),
+                TurnBinding(turn=turn, trace_id=turn.turn_id, generation_id=None),
+            )
+        self._remember_reply(event, reply)
+        logger.info(
+            "busy_reply_sent chat={} message_id={} busy_thread={} chars={}",
+            chat_id,
+            getattr(event, "message_id", "-"),
+            busy.thread_id,
+            len(reply),
+        )
+        return reply
+
+    def _source_texts(self, refs: tuple[Any, ...]) -> list[str]:
+        """The journal or History text of each turn source, in order; unreadable ones skipped."""
+        from yeoman_gateway.adapters.reply_archive_history import history_text
+        from yeoman_gateway.history.queries import HistoryQueries
+
+        texts: list[str] = []
+        history = current_history_snapshot()
+        for ref in refs:
+            event_id = str(getattr(ref, "event_id", "") or "")
+            source = self._store.get_event(event_id) if event_id else None
+            if source is None:
+                continue
+            payload = getattr(source, "payload", None)
+            if history is not None and getattr(source, "channel", "") == "whatsapp":
+                row = HistoryQueries(history).native_message(
+                    chat_id=source.chat_id, native_id=source.source_message_id or ""
+                )
+                payload = {"text": history_text(row)} if row else payload
+            text = str(payload.get("text") or "").strip() if isinstance(payload, dict) else ""
+            if text:
+                texts.append(text)
+        return texts
 
     # -- replies generated while a message waited ----------------------------------------
 

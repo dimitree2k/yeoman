@@ -182,3 +182,95 @@ async def test_skip_is_not_a_decline_without_already_sent_replies(tmp_path: Path
     result, _shown = await _reply(tmp_path, {})
 
     assert result == "[SKIP]"
+
+
+@pytest.mark.asyncio
+async def test_a_nudge_while_another_answer_is_written_gets_a_holding_line(
+    tmp_path: Path,
+) -> None:
+    from yeoman_gateway.processing.actor import ThreadActorRegistry
+    from yeoman_gateway.processing.responder import ThreadActorResponder
+
+    store = ProcessingStore(tmp_path / "processing.db")
+    _thread_with_turn(store, "ask", "zusammenfassen und faktchecken")
+    _thread_with_turn(store, "hey", "@Arvid hey")
+    _thread_with_turn(store, "other", "was kostet ein Bitcoin?")
+
+    class _Config:
+        threads = type("T", (), {"pending_inputs_per_thread": 8})()
+
+    registry = ThreadActorRegistry(store=store, config=_Config(), clock=lambda: T0)
+    busy = registry.actor_for(store.event_assignment("ask")[0])
+    assert busy.freeze_snapshot() is not None
+    busy._generation_in_flight = True  # the fact-check is still being written
+
+    class _Inner:
+        def __init__(self) -> None:
+            self.working_on: list[str] = []
+            self.full_answers: list[str] = []
+
+        async def generate_busy_reply(self, event, decision, *, working_on):
+            self.working_on.append(working_on)
+            return "" if "Bitcoin" in event.content else "Geduld, bin dran."
+
+        async def generate_reply(self, event, decision, *, session_key=None):
+            self.full_answers.append(str(event.message_id))
+            return "full answer"
+
+    inner = _Inner()
+    wrapper = ThreadActorResponder(inner=inner, actors=registry, store=store, clock=lambda: T0)
+
+    nudge = await wrapper.generate_reply(_event("hey", "@Arvid hey", sent_ms=T0), None)
+    other = await wrapper.generate_reply(
+        _event("other", "was kostet ein Bitcoin?", sent_ms=T0), None
+    )
+
+    assert nudge == "Geduld, bin dran."
+    assert inner.working_on[0] == "zusammenfassen und faktchecken"
+    assert other == "full answer", "a separate request still gets its own answer"
+    assert inner.full_answers == ["other"]
+    store.close()
+
+
+@pytest.mark.asyncio
+@pytest.mark.usefixtures("_responder_history")
+async def test_the_busy_writer_hands_a_new_request_back(tmp_path: Path) -> None:
+    from yeoman_gateway.adapters.responder_llm import LLMResponder
+    from yeoman_gateway.bus.queue import MessageBus
+    from yeoman_gateway.providers.base import LLMProvider, LLMResponse
+
+    shown: list[str] = []
+    answers = ["Moment, bin dran.", "[NEW]"]
+
+    class _Provider(LLMProvider):
+        async def chat(self, messages, tools=None, model=None, max_tokens=4096,
+                       temperature=0.7, reasoning=None) -> LLMResponse:
+            shown.append(str(messages[-1].get("content")))
+            return LLMResponse(content=answers[len(shown) - 1], finish_reason="stop")
+
+        def get_default_model(self) -> str:
+            return "test/provider"
+
+    from types import SimpleNamespace
+
+    provider = _Provider()
+    responder = LLMResponder(
+        bus=MessageBus(), provider=provider, workspace=tmp_path, max_iterations=2,
+    )
+    responder._profile_for_name = lambda name: SimpleNamespace(model="test/provider")
+    responder._provider_for_profile = lambda profile: provider
+    decision = PolicyDecision(
+        accept_message=True, should_respond=True, allowed_tools=frozenset(), reason="test",
+        model_profile="assistantDefault",
+    )
+    # A channel without the WhatsApp History lease: the writer itself is under test here.
+    event = InboundEvent(channel="telegram", chat_id="-1001", sender_id="42", content="hey")
+    try:
+        holding = await responder.generate_busy_reply(event, decision, working_on="faktcheck")
+        passed = await responder.generate_busy_reply(event, decision, working_on="faktcheck")
+    finally:
+        await responder.aclose()
+
+    assert holding == "Moment, bin dran."
+    assert passed == ""
+    assert "[WORKING ON]" in shown[0] and "faktcheck" in shown[0]
