@@ -837,6 +837,7 @@ class IngestGate:
             # A source observed by the live participation lane is context only. Do not let a
             # later reconciliation call reopen it as a legacy ambient answer.
             return None
+        self._join_burst_turn(request, event)
         assignment = self._assign(request, now=self._clock(), allow_turn=True)
         if assignment is not None and assignment.thread_id and assignment.turn_id:
             logger.info(
@@ -853,6 +854,68 @@ class IngestGate:
             message_id,
         )
         return None
+
+    def _join_burst_turn(self, request: IngestRequest, event: InboundEvent) -> None:
+        """Attach the last message of a merged burst to the turn a member already holds.
+
+        The channel merges a quick burst into one event that carries the newest member's
+        id and the gate's assignment of the member that opened a turn. Without this, that
+        last message - often an unaddressed follow-up - was assigned on its own and opened
+        a fresh thread, while the member's turn was never answered.
+        """
+        metadata = event.raw_metadata or {}
+        thread_id = str(metadata.get("thread_id") or "").strip()
+        turn_id = str(metadata.get("turn_id") or "").strip()
+        if not thread_id or not turn_id or self._store is None:
+            return
+        try:
+            canonical = self._canonical_event(
+                request, identity=self._bridge_canonical_identity(request)
+            )
+            if self._store.get_event(canonical.event_id) is None:
+                return
+            stored = self._store.event_assignment(canonical.event_id)
+            if stored is not None and stored[1]:
+                return  # already part of a turn: the gate decided for this message itself
+            turn = self._store.get_turn(turn_id)
+            thread = self._store.get_thread(thread_id)
+            if (
+                turn is None
+                or thread is None
+                or turn.thread_id != thread_id
+                or turn.closed_ms is not None
+                or turn.state in {"closed", "superseded"}
+                or thread.chat_id != event.chat_id
+                or thread.channel != event.channel
+            ):
+                return
+            now = self._clock()
+            self._store.add_turn_source(
+                turn_id=turn_id,
+                event_id=canonical.event_id,
+                source_message_id=str(event.message_id or "") or None,
+                role="context",
+                revision_at_join=int(getattr(turn, "revision", 1) or 1),
+                now_ms=now,
+            )
+            self._store.attach_event_assignment(
+                event_id=canonical.event_id, thread_id=thread_id, turn_id=turn_id, now_ms=now
+            )
+        except Exception as exc:  # noqa: BLE001 - joining is an improvement, never a gate
+            logger.warning(
+                "burst_turn_join_failed chat={} event_id={} error_type={}",
+                event.chat_id,
+                event.message_id,
+                type(exc).__name__,
+            )
+            return
+        logger.info(
+            "burst_turn_joined chat={} event_id={} thread_id={} turn_id={}",
+            event.chat_id,
+            event.message_id,
+            thread_id,
+            turn_id,
+        )
 
     def admit_reply(self, event: InboundEvent) -> bool:
         """Ensure managed replies have a turn before generation or typing.

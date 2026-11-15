@@ -257,6 +257,10 @@ class OutboundMiddleware:
         )
 
         outbound_metadata: dict[str, object] = {}
+        if event.message_id:
+            # The message this reply answers: the effect router binds the reply to the turn
+            # that generation was frozen with, not to whichever turn of the chat is open.
+            outbound_metadata["message_id"] = event.message_id
         if outbound_channel == "whatsapp":
             mention_candidates = _collect_whatsapp_mention_candidates(event)
             # Resolve @Name mentions only through proven knowledge bindings.
