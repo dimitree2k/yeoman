@@ -839,6 +839,7 @@ When a user asks you to send, create, or reply with a voice message / Sprachnach
     ) -> str | list[dict[str, Any]]:
         """Build user message content with optional base64-encoded images."""
         text_with_context = self._with_reply_context(text, metadata)
+        text_with_context = self._with_replies_since_message(text_with_context, metadata)
         text_with_context = self._with_conversation_state(text_with_context, metadata)
         text_with_context = self._with_group_state(text_with_context, metadata)
         text_with_context = self._with_private_handoff_context(text_with_context, metadata)
@@ -1108,6 +1109,35 @@ When a user asks you to send, create, or reply with a voice message / Sprachnach
             f"room_mode: {room_mode}",
             f"guidance: {guidance}",
         ]
+        return f"{text}\n\n" + "\n".join(lines)
+
+    @staticmethod
+    def _with_replies_since_message(text: str, metadata: dict[str, Any] | None) -> str:
+        """Show what Arvid already sent to this chat after the current message was sent.
+
+        A message that waited behind another answer was otherwise answered blind: the
+        recent-messages window ends *before* the current message, so the answer that
+        came in between was invisible and the same question got answered again.
+        """
+        if not metadata:
+            return text
+        raw = metadata.get("replies_since_message")
+        if not isinstance(raw, list):
+            return text
+        replies = [" ".join(str(item).split()) for item in raw if str(item or "").strip()]
+        if not replies:
+            return text
+        lines = [
+            "[Already Sent]",
+            "usage: After the current message was sent, you already wrote these messages to "
+            "this chat (oldest first). Everyone in the chat has read them.",
+            "usage: Do not repeat or restate them. Answer only what the current message "
+            "still needs beyond them.",
+            "usage: If they already answer the current message and you have nothing new to "
+            "add, reply with exactly [SKIP] and nothing else.",
+            "already_sent:",
+        ]
+        lines.extend(f"{index}. {reply}" for index, reply in enumerate(replies, 1))
         return f"{text}\n\n" + "\n".join(lines)
 
     @staticmethod

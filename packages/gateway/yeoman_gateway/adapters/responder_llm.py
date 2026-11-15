@@ -3458,6 +3458,20 @@ class LLMResponder(ResponderPort):
             finally:
                 self._current_session = None
 
+        if (
+            final_content is not None
+            and metadata.get("replies_since_message")
+            and final_content.strip() == PARTICIPATION_SKIP_TOKEN
+        ):
+            # Arvid already answered while this message waited (the prompt showed those
+            # replies) and the model has nothing to add: no second answer.
+            logger.info(
+                "reply_withheld_already_answered chat={} message_id={}",
+                chat_id,
+                metadata.get("message_id"),
+            )
+            final_content = None
+
         if final_content is None:
             if not _user_message_already_added:
                 session.add_message("user", content, **self._session_user_metadata(sender_id, metadata))
