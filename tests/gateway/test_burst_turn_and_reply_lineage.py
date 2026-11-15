@@ -144,3 +144,39 @@ async def test_a_reply_intent_is_recorded_under_its_frozen_turn(runtime, monkeyp
 
     effects = [effect for effect in runtime.store.list_effects() if effect.turn_id]
     assert [effect.turn_id for effect in effects] == [turn_a.turn_id]
+
+
+def _wa_event(channel: WhatsAppChannel, message_id: str, text: str, sent_s: int):
+    event = channel._parse_inbound_event(
+        {"chatJid": "g@g.us", "messageId": message_id, "senderId": "4915", "text": text}
+    )
+    assert event is not None
+    return replace(event, timestamp=sent_s)
+
+
+@pytest.mark.parametrize(
+    ("gap_s", "expected"),
+    [(1, [("ask", "follow")]), (42, [("ask",), ("follow",)])],
+)
+def test_only_messages_sent_close_together_are_merged(gap_s, expected) -> None:
+    """A backlog arrives at once; only messages *sent* within the window are one burst."""
+    channel = WhatsAppChannel(WhatsAppConfig(debounce_ms=200), MessageBus())
+    published = []
+
+    async def publish(event):
+        published.append(tuple(event.source_ids))
+
+    channel._publish_event = publish  # type: ignore[method-assign]
+
+    async def exercise() -> None:
+        await channel._enrich_and_publish_inbound(
+            _wa_event(channel, "ask", "faktchecken", 1_763_211_838), False
+        )
+        await channel._enrich_and_publish_inbound(
+            _wa_event(channel, "follow", "natürlich nicht", 1_763_211_838 + gap_s), False
+        )
+        await channel.stop()
+
+    asyncio.run(exercise())
+
+    assert published == expected
