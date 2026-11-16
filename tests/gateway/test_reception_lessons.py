@@ -427,6 +427,81 @@ async def test_trial_week_proposes_rollback(tmp_path: Path) -> None:
         store.close()
 
 
+class _PagedHistory:
+    """Week of history rows behind the real ``recent`` limit check (1..500)."""
+
+    def __init__(self, rows: list[dict[str, Any]]) -> None:
+        self.rows = rows  # oldest first, like HistoryQueries.recent
+        self.limits: list[int] = []
+
+    def recent(self, *, chat_id: str, limit: int, before_id: str | None = None,
+               after_ms: int | None = None, until_ms: int | None = None) -> list[Any]:
+        from yeoman_gateway.history.queries import _limit
+
+        _limit(limit)
+        self.limits.append(limit)
+        rows = [
+            row for row in self.rows
+            if (after_ms is None or row["sent_ms"] > after_ms)
+            and (until_ms is None or row["sent_ms"] <= until_ms)
+        ]
+        if before_id is not None:
+            index = next(i for i, row in enumerate(rows) if row["message_id"] == before_id)
+            rows = rows[:index]
+        return rows[-limit:]
+
+    def terminal(self, person: str) -> str:
+        return person
+
+    def contact(self, person: str) -> dict[str, str]:
+        return {"display_name": "Early Member" if person == "p-0" else "Later Member"}
+
+
+@pytest.mark.asyncio
+async def test_proposal_read_pages_a_busy_week(tmp_path: Path, monkeypatch) -> None:
+    from contextlib import asynccontextmanager
+
+    import yeoman_gateway.history.context as history_context
+    import yeoman_gateway.history.queries as history_queries
+    from yeoman_gateway.history.group_signals import previous_week
+
+    now_ms = (BASE + 7 * 86_400) * 1000
+    week = previous_week(now_ms, tz=None)
+    rows = [
+        {
+            "message_id": f"m-{index:04d}",
+            "sent_ms": int(week.start_ms) + index * 1000,
+            "direction": "in",
+            "sender_contact_id": f"p-{index}",
+        }
+        for index in range(1_200)
+    ]
+    history = _PagedHistory(rows)
+
+    @asynccontextmanager
+    async def fake_turn(_history: Any):
+        yield None
+
+    monkeypatch.setattr(history_context, "history_turn", fake_turn)
+    monkeypatch.setattr(history_queries, "HistoryQueries", lambda _snapshot: history)
+    store = SentimentStore(tmp_path / "ops" / "sentiment.db")
+    try:
+        proposer = LessonProposer(
+            store=store,
+            history=object(),
+            workspace=tmp_path / "workspace",
+            runtime_home=tmp_path,
+            client_factory=lambda: object(),
+            send_owner=lambda _text: None,
+        )
+        built = await proposer._read(CHAT, week)
+    finally:
+        store.close()
+    assert history.limits and max(history.limits) <= 500
+    # The oldest message of the week is outside the newest 500 and still read.
+    assert "Early Member" in built.member_names
+
+
 @pytest.mark.asyncio
 async def test_ipc_lessons_validation_and_owner_handlers(tmp_path: Path) -> None:
     seen: list[tuple[str, dict[str, Any]]] = []
