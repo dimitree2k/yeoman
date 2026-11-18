@@ -20,12 +20,14 @@ class RecordedProvider:
         return SimpleNamespace(content=self.content, finish_reason=self.finish_reason)
 
 
-def _config() -> Config:
+def _config(**profile: object) -> Config:
     return Config.model_validate(
         {
             "models": {
                 "routes": {"memory.capture.extract": "recorded"},
-                "profiles": {"recorded": {"kind": "chat", "model": "recorded/offline"}},
+                "profiles": {
+                    "recorded": {"kind": "chat", "model": "recorded/offline", **profile}
+                },
             }
         }
     )
@@ -68,6 +70,22 @@ def test_prompt_states_the_per_batch_limit() -> None:
 
     system = provider.calls[0]["messages"][0]["content"]  # type: ignore[index]
     assert f"at most {MAX_CANDIDATES_PER_JOB} statements" in system
+
+
+def test_route_reasoning_setting_reaches_the_model() -> None:
+    """Left at a reasoning model's default effort, thinking uses up the output budget."""
+    provider = RecordedProvider(json.dumps({"statements": []}))
+    config = _config(reasoning={"effort": "low"})
+    StatementExtractor(config=config, provider=provider)(_items(1))
+
+    assert provider.calls[0]["reasoning"] == {"effort": "low"}
+
+
+def test_route_without_reasoning_setting_keeps_the_provider_default() -> None:
+    provider = RecordedProvider(json.dumps({"statements": []}))
+    StatementExtractor(config=_config(), provider=provider)(_items(1))
+
+    assert provider.calls[0]["reasoning"] is None
 
 
 def test_garbage_still_yields_nothing() -> None:

@@ -143,6 +143,7 @@ class StatementExtractor:
         self._model = str(profile.model or "").strip()
         self._max_tokens = int(profile.max_tokens or 700)
         self._temperature = float(profile.temperature if profile.temperature is not None else 0.0)
+        self._reasoning = dict(profile.reasoning) if profile.reasoning else None
         if provider is not None:
             self._provider = provider
         else:
@@ -216,6 +217,7 @@ class StatementExtractor:
                 model=self._model,
                 max_tokens=self._max_tokens,
                 temperature=self._temperature,
+                reasoning=self._reasoning,
             )
         )
         content = str(getattr(response, "content", "") or "").strip()
