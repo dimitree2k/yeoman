@@ -26,7 +26,7 @@ class _UsageProvider(LLMProvider):
             ),
             LLMResponse(
                 content="done",
-                usage={"prompt_tokens": 100, "completion_tokens": 20},
+                usage={"prompt_tokens": 100, "completion_tokens": 20, "cached_tokens": 80},
             ),
         ]
 
@@ -104,6 +104,8 @@ async def test_reply_loop_logs_per_call_and_turn_usage(tmp_path: Path) -> None:
     assert "finish_reason=stop" in call_lines[0]
     assert "tool_calls=1" in call_lines[0]
     assert "tool_calls=0" in call_lines[1]
+    assert "cached_tokens=0" in call_lines[0]
+    assert "cached_tokens=80" in call_lines[1]
     usage_line = turn_lines[0]
     assert "iterations=2" in usage_line
     assert "prompt_tokens_total=200" in usage_line

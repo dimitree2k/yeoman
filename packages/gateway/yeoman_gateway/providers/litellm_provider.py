@@ -246,6 +246,13 @@ class LiteLLMProvider(LLMProvider):
                 "completion_tokens": response.usage.completion_tokens,
                 "total_tokens": response.usage.total_tokens,
             }
+            # Prompt tokens the provider served from its prefix cache (OpenAI-style
+            # usage.prompt_tokens_details.cached_tokens); absent when not reported.
+            cached = getattr(
+                getattr(response.usage, "prompt_tokens_details", None), "cached_tokens", None
+            )
+            if isinstance(cached, int) and not isinstance(cached, bool):
+                usage["cached_tokens"] = cached
 
         native_finish_reason = choice.finish_reason or "stop"
         finish_reason = native_finish_reason

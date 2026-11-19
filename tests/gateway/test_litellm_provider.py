@@ -141,3 +141,29 @@ def test_litellm_tool_calls_can_load_their_mcp_handler() -> None:
     import importlib
 
     importlib.import_module("litellm.responses.mcp.chat_completions_handler")
+
+
+@pytest.mark.parametrize(
+    ("details", "expected"),
+    [(SimpleNamespace(cached_tokens=2816), 2816), (None, None)],
+)
+def test_parse_response_reports_cached_prompt_tokens(details, expected):
+    provider = litellm_provider.LiteLLMProvider(default_model="openai/gpt-6-luna")
+    response = SimpleNamespace(
+        choices=[
+            SimpleNamespace(
+                message=SimpleNamespace(content="hi", tool_calls=None),
+                finish_reason="stop",
+            )
+        ],
+        usage=SimpleNamespace(
+            prompt_tokens=2963,
+            completion_tokens=84,
+            total_tokens=3047,
+            prompt_tokens_details=details,
+        ),
+    )
+
+    result = provider._parse_response(response)
+
+    assert result.usage.get("cached_tokens") == expected
