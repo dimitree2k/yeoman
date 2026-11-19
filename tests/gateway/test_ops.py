@@ -485,3 +485,49 @@ def test_ops_manage_tool_registers_with_correct_schema():
     schema = tool.to_schema()
     assert schema["function"]["name"] == "ops_manage"
     assert "action" in schema["function"]["parameters"]["properties"]
+
+
+@pytest.mark.asyncio
+async def test_service_status_overseer_reports_systemd_state_and_runbooks(tmp_path):
+    audit = tmp_path / "audit"
+    audit.mkdir()
+    (audit / "2026-11.jsonl").write_text(
+        '{"runbook": "ops-agent-cli-update", "duration_ms": 55745, "result": "claude: updated", '
+        '"ts": "2026-11-19T04:30:56+00:00"}\n'
+        "not json\n"
+        '{"runbook": "ops-log-digest", "duration_ms": 80, "result": "0 incidents", '
+        '"ts": "2026-11-19T06:15:00+00:00"}\n'
+    )
+    props = {
+        "ActiveState": "active",
+        "SubState": "running",
+        "Result": "success",
+        "MainPID": "2698963",
+        "NRestarts": "1",
+        "ActiveEnterTimestamp": "Thu 2026-11-19 05:31:11 CET",
+        "InactiveEnterTimestamp": "Thu 2026-11-19 05:31:00 CET",
+    }
+    tool = OpsTool()
+    with patch("yeoman_gateway.agent.tools.ops._OVERSEER_AUDIT_DIR", audit), \
+         patch("yeoman_gateway.agent.tools.ops._OVERSEER_DOWN_MARKER", tmp_path / "none"), \
+         patch("yeoman_gateway.agent.tools.ops._systemd_unit_properties", return_value=props):
+        result = await tool.execute(action="service_status", service="overseer")
+    assert "active/running (pid=2698963)" in result
+    assert "automatic restarts since unit load: 1" in result
+    assert "last stopped: Thu 2026-11-19 05:31:00 CET" in result
+    assert result.index("ops-log-digest") < result.index("ops-agent-cli-update")
+    assert "gateway" not in result.lower().split("overseer", 1)[0]
+
+
+@pytest.mark.asyncio
+async def test_service_status_overseer_without_systemctl_or_audit(tmp_path):
+    marker = tmp_path / "overseer-down-alerted"
+    marker.touch()
+    tool = OpsTool()
+    with patch("yeoman_gateway.agent.tools.ops._OVERSEER_AUDIT_DIR", tmp_path / "missing"), \
+         patch("yeoman_gateway.agent.tools.ops._OVERSEER_DOWN_MARKER", marker), \
+         patch("yeoman_gateway.agent.tools.ops._systemd_unit_properties", return_value=None):
+        result = await tool.execute(action="service_status", service="overseer")
+    assert "unknown (systemctl unavailable)" in result
+    assert "down alert sent" in result
+    assert "none found" in result

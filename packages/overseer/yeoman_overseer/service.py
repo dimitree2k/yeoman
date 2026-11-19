@@ -34,6 +34,10 @@ from yeoman_overseer.trigger.lock import LockManager
 
 logger = logging.getLogger(__name__)
 
+# Written by yeoman-overseer-alert.service after it sent the "OVERSEER DOWN" alert;
+# the next successful start sends the matching recovery notice and removes it.
+DOWN_ALERT_MARKER = "overseer-down-alerted"
+
 
 def _sync_starter_runbooks(
     starter_dir: Path,
@@ -90,6 +94,11 @@ class OverseerConfig:
     llm_tokens_per_day: int = 2_000_000
     failure_threshold: int = 3
     max_quarantines: int = 3
+    # A runbook action runs inside a tick, so ticks can take minutes (the CLI update
+    # alone took 56 s). The systemd watchdog is pinged from its own task instead,
+    # and only while the last completed tick is younger than this.
+    max_tick_stall_s: float = 1800.0
+    watchdog_ping_interval_s: float = 15.0
 
 
 @dataclass
@@ -109,6 +118,8 @@ class OverseerService:
     _running: bool = False
     _stop_event: asyncio.Event = field(default_factory=asyncio.Event)
     _sd_notifier: sdnotify.SystemdNotifier = field(default_factory=sdnotify.SystemdNotifier)
+    _last_tick_done: float = 0.0
+    run_dir: Path | None = None
 
     async def init(self) -> None:
         self.data_dir.mkdir(parents=True, exist_ok=True)
@@ -206,6 +217,9 @@ class OverseerService:
 
         logger.info("Overseer service started")
         self._sd_notifier.notify("READY=1")
+        self._last_tick_done = time.monotonic()
+        watchdog_task = asyncio.create_task(self._watchdog_loop())
+        await self._announce_recovery()
         last_hourly_reset = time.monotonic()
         last_daily_reset = time.monotonic()
         try:
@@ -232,7 +246,7 @@ class OverseerService:
 
                 self._state.heartbeat_ts = datetime.now(timezone.utc).isoformat()
                 self._state.save(self.data_dir / "state.json")
-                self._sd_notifier.notify("WATCHDOG=1")
+                self._last_tick_done = time.monotonic()
 
                 try:
                     await asyncio.wait_for(
@@ -243,7 +257,55 @@ class OverseerService:
                 except asyncio.TimeoutError:
                     pass
         finally:
+            watchdog_task.cancel()
+            await asyncio.gather(watchdog_task, return_exceptions=True)
             await self.stop()
+
+    def _watchdog_alive(self) -> bool:
+        return time.monotonic() - self._last_tick_done < self.config.max_tick_stall_s
+
+    async def _watchdog_loop(self) -> None:
+        """Ping the systemd watchdog while the event loop runs and ticks still complete.
+
+        A long but healthy runbook action no longer starves the watchdog; a tick stuck
+        for longer than ``max_tick_stall_s`` (or a blocked event loop) still gets the
+        service killed and restarted.
+        """
+        stalled_logged = False
+        while True:
+            if self._watchdog_alive():
+                self._sd_notifier.notify("WATCHDOG=1")
+                stalled_logged = False
+            elif not stalled_logged:
+                logger.error(
+                    "Tick stalled for over %.0f s; no longer pinging the systemd watchdog",
+                    self.config.max_tick_stall_s,
+                )
+                stalled_logged = True
+            await asyncio.sleep(self.config.watchdog_ping_interval_s)
+
+    async def _announce_recovery(self) -> None:
+        """Send the recovery notice that pairs with a sent "OVERSEER DOWN" alert."""
+        if self.run_dir is None:
+            from yeoman_shared.utils.helpers import get_run_path
+
+            self.run_dir = get_run_path()
+        marker = self.run_dir / DOWN_ALERT_MARKER
+        if not marker.exists():
+            return
+        if self._comms is None:
+            return
+        undelivered_before = len(self._comms.local_messages)
+        try:
+            await self._comms.send(
+                "✅ OVERSEER BACK UP: yeoman-overseer.service restarted and is running again."
+            )
+        except Exception:
+            logger.exception("Could not send the Overseer recovery notice")
+            return
+        if len(self._comms.local_messages) > undelivered_before:
+            return  # only kept in the local log; retry on the next start
+        marker.unlink(missing_ok=True)
 
     def request_stop(self) -> None:
         self._running = False

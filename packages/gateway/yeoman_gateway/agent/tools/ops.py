@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import asyncio
+import json
 import os
 import re
 import shutil
@@ -11,7 +12,11 @@ from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from typing import Any
 
-from yeoman_shared.utils.helpers import get_logs_path, get_run_path
+from yeoman_shared.utils.helpers import (
+    get_logs_path,
+    get_operational_store_path,
+    get_run_path,
+)
 from yeoman_shared.utils.process import pid_alive, read_pid_file
 
 from yeoman_gateway.agent.tools.base import Tool
@@ -24,6 +29,18 @@ _RUN_DIR = get_run_path()
 _GATEWAY_PID = _RUN_DIR / "gateway.pid"
 _BRIDGE_PID = _RUN_DIR / "whatsapp-bridge.pid"
 _GATEWAY_UNIT = "yeoman-gateway.service"
+_OVERSEER_UNIT = "yeoman-overseer.service"
+_OVERSEER_AUDIT_DIR = get_operational_store_path("overseer", create=False) / "audit"
+_OVERSEER_DOWN_MARKER = _RUN_DIR / "overseer-down-alerted"
+_OVERSEER_UNIT_PROPS = (
+    "ActiveState",
+    "SubState",
+    "Result",
+    "MainPID",
+    "NRestarts",
+    "ActiveEnterTimestamp",
+    "InactiveEnterTimestamp",
+)
 
 _LOGURU_TS_RE = re.compile(r"^(\d{4}-\d{2}-\d{2} \d{2}:\d{2}:\d{2})\.\d+")
 _LOGURU_LEVEL_RE = re.compile(r"\|\s*(DEBUG|INFO|WARNING|ERROR|CRITICAL)\s*\|")
@@ -128,6 +145,52 @@ def _systemd_main_pid(unit: str) -> int | None:
     return main_pid
 
 
+def _systemd_unit_properties(unit: str, names: tuple[str, ...]) -> dict[str, str] | None:
+    """Selected properties of a systemd user unit, or None when systemctl is unusable."""
+    if shutil.which("systemctl") is None:
+        return None
+    try:
+        proc = subprocess.run(
+            ["systemctl", "--user", "show", unit, f"--property={','.join(names)}"],
+            check=False,
+            capture_output=True,
+            text=True,
+            timeout=5,
+        )
+    except (OSError, subprocess.SubprocessError):
+        return None
+    if proc.returncode != 0:
+        return None
+    return dict(line.split("=", 1) for line in proc.stdout.splitlines() if "=" in line)
+
+
+def _recent_overseer_runs(audit_dir: Path, limit: int) -> list[dict[str, Any]]:
+    """Newest Overseer audit entries (runbook results), newest first."""
+    try:
+        files = sorted(p for p in audit_dir.glob("*.jsonl") if p.is_file())
+    except OSError:
+        return []
+    entries: list[dict[str, Any]] = []
+    for path in reversed(files):
+        try:
+            lines = path.read_text(encoding="utf-8", errors="replace").splitlines()
+        except OSError:
+            continue
+        for line in reversed(lines):
+            try:
+                entry = json.loads(line)
+            except ValueError:
+                continue
+            if isinstance(entry, dict):
+                entries.append(entry)
+            if len(entries) >= limit:
+                break
+        if len(entries) >= limit:
+            break
+    entries.sort(key=lambda e: str(e.get("ts", "")), reverse=True)
+    return entries[:limit]
+
+
 class OpsTool(Tool):
     """System operations: stats, log scanning, and service status."""
 
@@ -141,7 +204,8 @@ class OpsTool(Tool):
             "System operations tool with three actions: "
             "system_stats (CPU, memory, disk, uptime, top processes), "
             "log_scan (search gateway/bridge logs by level, keyword, time range), "
-            "service_status (check gateway/bridge process health)."
+            "service_status (check gateway/bridge/overseer health; the overseer report "
+            "includes systemd state, automatic restarts and its latest runbook results)."
         )
 
     @property
@@ -156,10 +220,11 @@ class OpsTool(Tool):
                 },
                 "service": {
                     "type": "string",
-                    "enum": ["gateway", "bridge", "all"],
+                    "enum": ["gateway", "bridge", "overseer", "all"],
                     "description": (
                         "Target service (for log_scan and service_status). "
-                        "log_scan defaults to 'gateway'; 'all' scans both logs."
+                        "log_scan defaults to 'gateway'; 'all' scans the gateway and "
+                        "bridge logs. 'overseer' is for service_status only."
                     ),
                 },
                 "level": {
@@ -490,7 +555,8 @@ class OpsTool(Tool):
         if service not in ("gateway", "bridge"):
             return (
                 f"Error: unknown service {service!r} for log_scan. "
-                "Use 'gateway', 'bridge' or 'all'."
+                "Use 'gateway', 'bridge' or 'all'. For the overseer, use "
+                "service_status with service='overseer'."
             )
 
         log_path = _GATEWAY_LOG if service == "gateway" else _BRIDGE_LOG
@@ -560,7 +626,39 @@ class OpsTool(Tool):
             lines.append(self._gateway_status())
         if service in ("all", "bridge"):
             lines.append(await self._bridge_status())
+        if service in ("all", "overseer"):
+            lines.append(await asyncio.to_thread(self._overseer_status))
         return "\n\n".join(lines)
+
+    def _overseer_status(self, recent: int = 8) -> str:
+        lines = ["Overseer:"]
+        props = _systemd_unit_properties(_OVERSEER_UNIT, _OVERSEER_UNIT_PROPS)
+        if props is None:
+            lines.append("  status: unknown (systemctl unavailable)")
+        else:
+            state = f"{props.get('ActiveState', '?')}/{props.get('SubState', '?')}"
+            lines.append(f"  status: {state} (pid={props.get('MainPID', '?')})")
+            if since := props.get("ActiveEnterTimestamp"):
+                lines.append(f"  active since: {since}")
+            lines.append(f"  automatic restarts since unit load: {props.get('NRestarts', '?')}")
+            if (result := props.get("Result")) and result != "success":
+                lines.append(f"  last result: {result}")
+            if stopped := props.get("InactiveEnterTimestamp"):
+                lines.append(f"  last stopped: {stopped}")
+        if _OVERSEER_DOWN_MARKER.exists():
+            lines.append("  down alert sent; no recovery notice delivered yet")
+        runs = _recent_overseer_runs(_OVERSEER_AUDIT_DIR, recent)
+        if runs:
+            lines.append("  latest runbook results (newest first):")
+            for entry in runs:
+                result = str(entry.get("result", ""))[:200].replace("\n", " ")
+                lines.append(
+                    f"    {entry.get('ts', '?')} {entry.get('runbook', '?')} "
+                    f"({entry.get('duration_ms', '?')} ms): {result}"
+                )
+        else:
+            lines.append("  latest runbook results: none found")
+        return "\n".join(lines)
 
     def _gateway_status(self) -> str:
         lines = ["Gateway:"]
