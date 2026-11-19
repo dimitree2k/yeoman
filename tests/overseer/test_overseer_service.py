@@ -228,3 +228,100 @@ def test_sync_installs_new_auto_install_starter_once(tmp_path: Path) -> None:
     (runbook_dir / "brand-new.md").unlink()  # owner deletes the new one too
     assert _sync_starter_runbooks(starter_dir, runbook_dir) == 0
     assert not (runbook_dir / "brand-new.md").exists()
+
+
+class _RecordingNotifier:
+    def __init__(self) -> None:
+        self.messages: list[str] = []
+
+    def notify(self, message: str) -> None:
+        self.messages.append(message)
+
+
+@pytest.mark.asyncio
+async def test_watchdog_keeps_pinging_during_a_long_tick(overseer_dir: Path) -> None:
+    cfg = OverseerConfig(tick_interval_s=0.01, watchdog_ping_interval_s=0.01)
+    service = OverseerService(data_dir=overseer_dir, socket_path=overseer_dir / "test.sock", config=cfg)
+    await service.init()
+    service.run_dir = overseer_dir
+    notifier = _RecordingNotifier()
+    service._sd_notifier = notifier  # type: ignore[assignment]
+    release = asyncio.Event()
+
+    async def long_tick() -> None:
+        await release.wait()
+
+    service._evaluator.tick = long_tick  # type: ignore[method-assign,union-attr]
+    task = asyncio.create_task(service.run())
+    await asyncio.sleep(0.1)
+    pings_during_tick = notifier.messages.count("WATCHDOG=1")
+    release.set()
+    service.request_stop()
+    await task
+    assert pings_during_tick >= 3
+
+
+@pytest.mark.asyncio
+async def test_watchdog_stops_pinging_when_a_tick_stalls(overseer_dir: Path) -> None:
+    cfg = OverseerConfig(
+        tick_interval_s=0.01, watchdog_ping_interval_s=0.01, max_tick_stall_s=0.05
+    )
+    service = OverseerService(data_dir=overseer_dir, socket_path=overseer_dir / "test.sock", config=cfg)
+    await service.init()
+    service.run_dir = overseer_dir
+    notifier = _RecordingNotifier()
+    service._sd_notifier = notifier  # type: ignore[assignment]
+    release = asyncio.Event()
+
+    async def stuck_tick() -> None:
+        await release.wait()
+
+    service._evaluator.tick = stuck_tick  # type: ignore[method-assign,union-attr]
+    task = asyncio.create_task(service.run())
+    await asyncio.sleep(0.15)
+    pings_at_stall = notifier.messages.count("WATCHDOG=1")
+    await asyncio.sleep(0.1)
+    pings_later = notifier.messages.count("WATCHDOG=1")
+    release.set()
+    service.request_stop()
+    await task
+    assert pings_at_stall == pings_later
+
+
+class _Channel:
+    def __init__(self, fail: bool = False) -> None:
+        self.fail = fail
+        self.sent: list[str] = []
+
+    @property
+    def name(self) -> str:
+        return "test"
+
+    async def send(self, message: str) -> None:
+        if self.fail:
+            raise RuntimeError("offline")
+        self.sent.append(message)
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("fail", [False, True])
+async def test_recovery_notice_pairs_with_down_alert(overseer_dir: Path, fail: bool) -> None:
+    from yeoman_overseer.comms.cascading import CascadingComms
+    from yeoman_overseer.service import DOWN_ALERT_MARKER
+
+    service = OverseerService(data_dir=overseer_dir, socket_path=overseer_dir / "test.sock")
+    await service.init()
+    channel = _Channel(fail=fail)
+    service._comms = CascadingComms(channels=[channel], local_log=True)
+    service.run_dir = overseer_dir
+    marker = overseer_dir / DOWN_ALERT_MARKER
+    marker.touch()
+
+    await service._announce_recovery()
+
+    assert marker.exists() is fail
+    assert len(channel.sent) == (0 if fail else 1)
+    if not fail:
+        await service._announce_recovery()  # no marker, no second notice
+        assert len(channel.sent) == 1
+    await service.stop()

@@ -25,6 +25,9 @@ BindPaths=%h/.yeoman
 ReadOnlyPaths=%h/Documents/yeoman
 
 Environment=YEOMAN_HOME=%h/.yeoman
+# Runbooks restart units via `systemctl --user`; without a runtime dir that fails with
+# "Failed to connect to user scope bus", the runbook errors, and the service exits 1.
+Environment=XDG_RUNTIME_DIR=/run/user/1000
 
 [Install]
 WantedBy=default.target

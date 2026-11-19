@@ -3,6 +3,6 @@ Description=Yeoman Overseer Alert — last-resort notification on overseer failu
 
 [Service]
 Type=oneshot
-ExecStart=/bin/bash -c 'curl --fail --silent --show-error --max-time 15 -X POST "https://api.telegram.org/bot${TELEGRAM_BOT_TOKEN}/sendMessage" -d chat_id="${TELEGRAM_OWNER_CHAT_ID}" -d text="🔴 OVERSEER DOWN: yeoman-overseer.service failed on $(hostname). Manual intervention required."'
+ExecStart=/bin/bash -c 'curl --fail --silent --show-error --max-time 15 -X POST "https://api.telegram.org/bot${TELEGRAM_BOT_TOKEN}/sendMessage" -d chat_id="${TELEGRAM_OWNER_CHAT_ID}" -d text="🔴 OVERSEER DOWN: yeoman-overseer.service failed on $(hostname). systemd restarts it automatically; a ✅ BACK UP message follows when it is running again. No ✅ within 10 minutes means it needs a manual look." && touch "%h/.yeoman/run/overseer-down-alerted"'
 
 EnvironmentFile=%h/.yeoman/.env
