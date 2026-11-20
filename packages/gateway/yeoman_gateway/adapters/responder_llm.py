@@ -2236,11 +2236,13 @@ class LLMResponder(ResponderPort):
                 usage.latency_ms_total += call_latency_ms
                 logger.info(
                     "reply_llm_call chat={} iteration={} model={} prompt_tokens={} "
-                    "completion_tokens={} latency_ms={} finish_reason={} tool_calls={}",
+                    "cached_tokens={} completion_tokens={} latency_ms={} finish_reason={} "
+                    "tool_calls={}",
                     current_chat_id or "-",
                     iteration,
                     model or self.model,
                     prompt_tokens,
+                    _usage_count(raw_usage.get("cached_tokens")),
                     completion_tokens,
                     call_latency_ms,
                     str(getattr(response, "finish_reason", "") or ""),

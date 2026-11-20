@@ -1219,14 +1219,19 @@ def test_group_state_dropped_before_any_message_on_budget() -> None:
     [
         ("light_humor", True, "silence"),
         ("light_humor", False, "comment"),
-        ("observation", True, "comment"),
+        ("observation", True, "silence"),
+        ("share_opinion", True, "silence"),
+        ("contrarian", True, "silence"),
+        ("contrarian", False, "comment"),
+        ("correct_error", True, "comment"),
+        ("answer_open_question", True, "comment"),
     ],
 )
 @pytest.mark.asyncio
-async def test_next_unasked_joke_waits_until_the_last_one_was_taken_up(
+async def test_next_unasked_comment_waits_until_the_last_one_was_taken_up(
     contribution: str, unacknowledged: bool, expected: str
 ) -> None:
-    """One unasked joke at a time; facts and observations are not paced."""
+    """One unasked comment at a time; open questions and factual errors are not paced."""
     judge = ParticipationJudge(client=_Client(_payload(
         action="comment",
         intent="initiate",
@@ -1236,7 +1241,11 @@ async def test_next_unasked_joke_waits_until_the_last_one_was_taken_up(
         added_value="a punchline nobody made yet",
     )), allowed_emojis=(EMOJI,))
     decision = await judge.decide(
-        _opportunity(), _context(arvid_unacknowledged=unacknowledged)
+        _opportunity(),
+        _context(
+            arvid_unacknowledged=unacknowledged,
+            allowed_contribution_types=[contribution],
+        ),
     )
     assert decision.action == expected
     if expected == "silence":
