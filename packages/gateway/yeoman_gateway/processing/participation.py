@@ -100,8 +100,11 @@ _INTENT_ALIASES: dict[str, str] = {
     "initiation": "initiate",
 }
 
-#: Contribution types whose point is a laugh; paced by ``arvid_unacknowledged``.
-HUMOR_CONTRIBUTION_TYPES = frozenset({"light_humor", "cold_joke"})
+#: Unasked contributions that answer something the chat needs: a question still waiting
+#: or a factual error that matters. Every other unasked comment, joke or image is paced
+#: by ``arvid_unacknowledged``: Arvid does not open the next angle on a conversation
+#: until a member took up his last message.
+UNPACED_CONTRIBUTION_TYPES = frozenset({"answer_open_question", "correct_error"})
 
 JUDGE_SYSTEM_PROMPT = (
     "You are the participation judge for an assistant called Arvid in one chat.\n"
@@ -1009,14 +1012,15 @@ class ParticipationJudge:
             and view.arvid_unacknowledged
             and (
                 action in IMAGE_ACTIONS
-                or (action == "comment" and contribution in HUMOR_CONTRIBUTION_TYPES)
+                or (action == "comment" and contribution not in UNPACED_CONTRIBUTION_TYPES)
             )
             and not is_trend_source(target)
         ):
-            # One unasked joke at a time: the next waits until a member took the last
-            # one up (a quote-reply or a reaction on it), or the conversation moved on.
+            # One unasked contribution at a time: the next waits until a member took the
+            # last one up (a quote-reply or a reaction on it), or the conversation moved
+            # on. Open questions and factual errors are not held back.
             logger.info(
-                "participation_judge_joke_unacknowledged opportunity={} action={} "
+                "participation_judge_previous_unacknowledged opportunity={} action={} "
                 "contribution_type={}",
                 opportunity.opportunity_id, action, contribution,
             )
