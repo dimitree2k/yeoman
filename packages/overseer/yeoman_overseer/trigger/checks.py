@@ -73,11 +73,14 @@ def check_systemd_active(*, target: str) -> CheckResult:
     return CheckResult(value=False, detail=detail)
 
 
-def check_gateway_healthy(*, target: str) -> CheckResult:
-    """Require both an active user unit and a responsive gateway event loop."""
-    active = check_systemd_active(target=target)
-    if not active.value:
-        return active
+#: Missed pings in a row before an active gateway counts as unhealthy. The Overseer polls
+#: every 30 s, so a gateway busy for a minute (a long video download on the Pi) keeps running
+#: instead of being restarted in the middle of a reply.
+GATEWAY_PING_MISSES_BEFORE_UNHEALTHY = 3
+_GATEWAY_PING_MISSES: dict[str, int] = {}
+
+
+def _ping_gateway() -> CheckResult:
     from yeoman_shared.utils.helpers import get_yeoman_home
 
     home = get_yeoman_home()
@@ -92,6 +95,29 @@ def check_gateway_healthy(*, target: str) -> CheckResult:
         return CheckResult(value=healthy, detail="Gateway pong" if healthy else "Invalid gateway ping response")
     except (OSError, ValueError) as exc:
         return CheckResult(value=False, detail=f"Gateway ping failed: {exc}")
+
+
+def check_gateway_healthy(*, target: str) -> CheckResult:
+    """Require an active user unit and a gateway event loop that answers its socket.
+
+    An inactive unit is unhealthy at once. A missed ping only counts once it has
+    happened on ``GATEWAY_PING_MISSES_BEFORE_UNHEALTHY`` checks in a row.
+    """
+    active = check_systemd_active(target=target)
+    if not active.value:
+        _GATEWAY_PING_MISSES.pop(target, None)
+        return active
+    ping = _ping_gateway()
+    if ping.value:
+        _GATEWAY_PING_MISSES.pop(target, None)
+        return ping
+    misses = _GATEWAY_PING_MISSES.get(target, 0) + 1
+    limit = GATEWAY_PING_MISSES_BEFORE_UNHEALTHY
+    if misses < limit:
+        _GATEWAY_PING_MISSES[target] = misses
+        return CheckResult(value=True, detail=f"Gateway ping missed {misses}/{limit}: {ping.detail}")
+    _GATEWAY_PING_MISSES.pop(target, None)
+    return CheckResult(value=False, detail=f"{ping.detail} ({limit} checks in a row)")
 
 
 def _whatsapp_bridge_health(target: str, timeout_s: float) -> dict[str, Any]:

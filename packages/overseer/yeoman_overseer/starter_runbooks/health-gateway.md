@@ -22,7 +22,7 @@ safety:
 
 ## Context
 The gateway is the core message processing service. If it goes down, no messages are processed.
-Check the user systemd unit and require a Unix socket pong within five seconds.
+Check the user systemd unit and require a Unix socket pong within five seconds. A missed pong only counts after three checks in a row (about 90 s), so a gateway busy with a long task is not restarted in the middle of a reply.
 
 ## Actions
 - action: restart_service

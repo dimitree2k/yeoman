@@ -21,6 +21,8 @@ from yeoman_overseer.trigger import checks
 def test_gateway_health_checks_service_and_ping(tmp_path, monkeypatch, active, reply, healthy):
     monkeypatch.setenv("YEOMAN_HOME", str(tmp_path))
     monkeypatch.setattr(checks, "check_systemd_active", lambda **_: checks.CheckResult(active))
+    monkeypatch.setattr(checks, "GATEWAY_PING_MISSES_BEFORE_UNHEALTHY", 1)
+    monkeypatch.setattr(checks, "_GATEWAY_PING_MISSES", {})
     run = tmp_path / "run"
     run.mkdir()
 
@@ -41,6 +43,31 @@ def test_gateway_health_checks_service_and_ping(tmp_path, monkeypatch, active, r
             result = checks.run_check("gateway_healthy", target="yeoman-gateway.service")
             future.result(timeout=3)
     assert result.value is healthy
+
+
+def test_gateway_health_needs_three_missed_pings_in_a_row(monkeypatch):
+    monkeypatch.setattr(checks, "_GATEWAY_PING_MISSES", {})
+    monkeypatch.setattr(checks, "check_systemd_active", lambda **_: checks.CheckResult(True))
+    pings = iter([False, False, True, False, False, False, False])
+    monkeypatch.setattr(
+        checks, "_ping_gateway", lambda: checks.CheckResult(next(pings), detail="Gateway ping failed: timed out")
+    )
+
+    results = [checks.check_gateway_healthy(target="yeoman-gateway.service") for _ in range(7)]
+
+    # A pong resets the count; only the third miss in a row is unhealthy, then counting restarts.
+    assert [r.value for r in results] == [True, True, True, True, True, False, True]
+    assert results[0].detail.startswith("Gateway ping missed 1/3")
+    assert "3 checks in a row" in results[5].detail
+
+
+def test_gateway_health_inactive_unit_is_unhealthy_at_once(monkeypatch):
+    monkeypatch.setattr(checks, "_GATEWAY_PING_MISSES", {"yeoman-gateway.service": 2})
+    monkeypatch.setattr(checks, "check_systemd_active", lambda **_: checks.CheckResult(False, detail="inactive"))
+    monkeypatch.setattr(checks, "_ping_gateway", lambda: pytest.fail("no ping for an inactive unit"))
+
+    assert checks.check_gateway_healthy(target="yeoman-gateway.service").value is False
+    assert checks._GATEWAY_PING_MISSES == {}
 
 
 def test_gateway_runbook_restarts_on_unhealthy_result():
