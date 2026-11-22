@@ -451,6 +451,9 @@ class WhatsAppChannel(BaseChannel):
         self._raw_retry_max_seconds = 30.0
         self._bridge_intake_closed = False
         self._stopping = False
+        #: Set by ``pause_intake`` while a stop lets running replies finish: new frames
+        #: stay unACKed in the Bridge outbox, sends keep working.
+        self._intake_paused = False
         self._ack_queue_maxsize = BRIDGE_ACK_QUEUE_MAXSIZE
         self._typing_tasks: dict[str, asyncio.Task[None]] = {}
         self._reconnect_attempts = 0
@@ -614,6 +617,14 @@ class WhatsAppChannel(BaseChannel):
                     self._inbound_tasks.difference_update(inbound_tasks)
                 await self._stop_bridge_worker()
                 self._ws = None
+
+    def pause_intake(self) -> None:
+        """Take no new inbound frames; they stay in the Bridge outbox for replay.
+
+        Used while the gateway stops gracefully: replies that are still being written
+        can be sent over the open link, and nothing new is ACKed and then dropped.
+        """
+        self._intake_paused = True
 
     async def stop(self) -> None:
         """Stop the WhatsApp channel."""
@@ -1649,7 +1660,7 @@ class WhatsAppChannel(BaseChannel):
             self._reject_replayable_frame(kind, "missing_observed_at")
             return False
 
-        if self._bridge_intake_closed or self._stopping:
+        if self._bridge_intake_closed or self._stopping or self._intake_paused:
             # A valid frame that arrives while intake is closing stays unACKed in
             # the Bridge outbox and is replayed after reconnect; it is not malformed.
             logger.debug(

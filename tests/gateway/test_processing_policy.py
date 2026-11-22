@@ -1219,3 +1219,23 @@ def test_shadow_chat_creates_no_effects(tmp_path: Path) -> None:
     assert router.manages("whatsapp", "chat@g.us") is False
     assert store.count_effects() == 0
     store.close()
+
+
+def test_restart_names_direct_messages_whose_reply_was_lost(tmp_path: Path) -> None:
+    store = ProcessingStore(tmp_path / "processing.db")
+    try:
+        store.note_direct_admission("whatsapp", "dm@lid", "evt-lost", "turn-lost", now_ms=1)
+        store.note_direct_admission("whatsapp", "dm@lid", "evt-done", "turn-done", now_ms=2)
+        with store._lock:
+            store._conn.execute("PRAGMA foreign_keys = OFF")
+            for turn_id, state in (("turn-lost", "open"), ("turn-done", "closed")):
+                store._conn.execute(
+                    "INSERT INTO turns (turn_id, thread_id, principal, state, opened_ms, updated_ms) "
+                    "VALUES (?, 'th', 'owner', ?, 1, 1)",
+                    (turn_id, state),
+                )
+        recovered = store.recover_direct_admissions(now_ms=3)
+        assert store.unanswered_recovered_turns(recovered) == (("dm@lid", "evt-lost", "turn-lost"),)
+        assert store.unanswered_recovered_turns(()) == ()
+    finally:
+        store.close()

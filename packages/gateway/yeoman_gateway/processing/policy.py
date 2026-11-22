@@ -227,9 +227,29 @@ class IngestGate:
         recover = getattr(self._store, "recover_direct_admissions", None)
         if callable(recover):
             try:
-                recover()
+                recovered = recover()
             except Exception as exc:  # noqa: BLE001 - startup stays conservative
                 logger.error("direct_fence_recovery_failed error_type={}", type(exc).__name__)
+            else:
+                self._log_unanswered_after_restart(recovered)
+
+    def _log_unanswered_after_restart(self, binding_ids: Any) -> None:
+        """Warn about each direct message whose answer the previous process never finished."""
+        lookup = getattr(self._store, "unanswered_recovered_turns", None)
+        if not callable(lookup) or not binding_ids:
+            return
+        try:
+            lost = lookup(tuple(binding_ids))
+        except Exception as exc:  # noqa: BLE001 - a log line must not fail startup
+            logger.warning("direct_reply_lost_lookup_failed error_type={}", type(exc).__name__)
+            return
+        for chat_id, event_id, turn_id in lost:
+            logger.warning(
+                "direct_reply_lost_on_restart chat={} event_id={} turn_id={}",
+                chat_id,
+                event_id,
+                turn_id,
+            )
 
     def enabled_for(self, channel: str, chat_id: str) -> bool:
         """True when the new mode owns this chat; unmanaged chats stay on legacy."""

@@ -3,7 +3,7 @@
 from __future__ import annotations
 
 import asyncio
-from collections.abc import Coroutine
+from collections.abc import Awaitable, Callable, Coroutine
 from pathlib import Path
 from typing import Any
 
@@ -292,12 +292,19 @@ def _setup_daemon_logging(log_path: Path) -> None:
     )
 
 
-async def _run_until_stopped(main: Coroutine[Any, Any, None]) -> None:
+async def _run_until_stopped(
+    main: Coroutine[Any, Any, None],
+    prepare_stop: Callable[[], Awaitable[None]] | None = None,
+) -> None:
     """Run ``main``, turning SIGTERM and SIGINT into a cancellation so its cleanup runs.
 
     Python's default SIGTERM action ends the process at once, so a systemd stop or
     ``yeoman gateway restart`` used to skip the runtime's whole shutdown, including the
     history projector's index snapshot.
+
+    With ``prepare_stop`` the first signal awaits it before the cancellation, while the
+    channels are still connected, so running replies can still be sent. A second
+    signal skips the wait.
     """
     import signal
 
@@ -306,14 +313,30 @@ async def _run_until_stopped(main: Coroutine[Any, Any, None]) -> None:
     loop = asyncio.get_running_loop()
     task = asyncio.ensure_future(main)
     stopping = False
+    drain: asyncio.Task[None] | None = None
+
+    async def drain_then_cancel() -> None:
+        try:
+            await prepare_stop()  # type: ignore[misc]
+        except Exception as exc:  # noqa: BLE001 - the stop itself must still happen
+            logger.warning("Gateway stop drain failed error_type={}", type(exc).__name__)
+        finally:
+            task.cancel()
 
     def request_stop(sig: signal.Signals) -> None:
-        nonlocal stopping
+        nonlocal stopping, drain
         if stopping:
+            # A second signal does not wait for running replies any more.
+            if drain is not None and not drain.done():
+                logger.info("Gateway stopping now signal={}", sig.name)
+                drain.cancel()
             return
         stopping = True
         logger.info("Gateway stopping signal={}", sig.name)
-        task.cancel()
+        if prepare_stop is None:
+            task.cancel()
+            return
+        drain = asyncio.ensure_future(drain_then_cancel())
 
     installed: list[signal.Signals] = []
     for sig in (signal.SIGTERM, signal.SIGINT):
@@ -330,6 +353,8 @@ async def _run_until_stopped(main: Coroutine[Any, Any, None]) -> None:
     finally:
         for sig in installed:
             loop.remove_signal_handler(sig)
+        if drain is not None and not drain.done():
+            drain.cancel()
 
 
 def _run_gateway_foreground(port: int, verbose: bool, ensure_whatsapp: bool = True) -> None:
@@ -388,7 +413,7 @@ def _run_gateway_foreground(port: int, verbose: bool, ensure_whatsapp: bool = Tr
 
     async def run() -> None:
         try:
-            await _run_until_stopped(runtime.run())
+            await _run_until_stopped(runtime.run(), runtime.prepare_stop)
         except Exception:
             logger.exception("Gateway crashed")
             raise

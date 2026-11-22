@@ -99,6 +99,9 @@ if TYPE_CHECKING:
 #: It is an internal cost heuristic deciding which *quota* an opportunity may use - it
 #: never decides whether a reply is allowed.
 CONTINUATION_CANDIDATE_MAX_CHARS = 120
+#: How long a stop waits for running replies. The rest of the shutdown takes about
+#: 25 s on the Pi, and ``yeoman gateway stop`` kills after 60 s (systemd after 90 s).
+STOP_DRAIN_SECONDS = 30.0
 
 
 def _normalize_timestamp(ts: datetime) -> datetime:
@@ -251,6 +254,24 @@ class OrchestratorService:
         # A stop is graceful: in-flight messages finish (bounded) instead of being cut in
         # half, so run() returning means the work it accepted is done.
         await self._drain()
+
+    @property
+    def in_flight(self) -> int:
+        return len(self._tasks)
+
+    async def wait_idle(self, *, timeout: float) -> int:
+        """Wait until no accepted message is still running; return how many still are.
+
+        Nothing is cancelled here: this runs before the channels stop, so a reply that
+        is still being written can be sent. ``_drain`` is the cancelling fallback.
+        """
+        deadline = asyncio.get_running_loop().time() + max(0.0, timeout)
+        while self._tasks:
+            remaining = deadline - asyncio.get_running_loop().time()
+            if remaining <= 0:
+                break
+            await asyncio.wait(set(self._tasks), timeout=remaining)
+        return len(self._tasks)
 
     async def _drain(self, *, timeout: float = 20.0) -> None:
         while self._tasks:
@@ -510,6 +531,34 @@ class GatewayRuntime:
         resume = getattr(a2a_tool, "resume_pending_research", None)
         if callable(resume):
             resume()
+
+    async def prepare_stop(self, *, timeout: float = STOP_DRAIN_SECONDS) -> None:
+        """Let replies that are already running finish before the shutdown starts.
+
+        A restart used to close the WhatsApp link and the stores at once, so an answer
+        finishing a few seconds later was dropped (live 2026-11-22: a reply to the
+        owner was lost 6 s into an Overseer restart). New inbound messages are refused
+        first, so the Bridge keeps them for replay instead of losing them here.
+        """
+        orchestrator = self.orchestrator
+        wait_idle = getattr(orchestrator, "wait_idle", None)
+        if not callable(wait_idle):
+            return
+        started = getattr(orchestrator, "in_flight", 0)
+        pause = getattr(self.channels, "pause_intake", None)
+        if callable(pause):
+            pause()
+        if not started:
+            return
+        loop = asyncio.get_running_loop()
+        begun = loop.time()
+        left = await wait_idle(timeout=timeout)
+        logger.info(
+            "gateway_stop_drain in_flight={} unfinished={} waited_ms={}",
+            started,
+            left,
+            int((loop.time() - begun) * 1000),
+        )
 
     async def run(self) -> None:
         tracing.init()
