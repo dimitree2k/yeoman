@@ -36,3 +36,71 @@ def test_a_cancellation_not_caused_by_a_signal_still_propagates():
 
     with pytest.raises(asyncio.CancelledError):
         asyncio.run(scenario())
+
+
+def test_sigterm_waits_for_prepare_stop_before_cancelling_main():
+    events: list[str] = []
+
+    async def main() -> None:
+        try:
+            await asyncio.Event().wait()
+        finally:
+            events.append("cancelled")
+
+    async def prepare_stop() -> None:
+        events.append("drain started")
+        await asyncio.sleep(0.05)  # a reply still being written and sent
+        events.append("drain done")
+
+    async def scenario() -> None:
+        asyncio.get_running_loop().call_later(0.05, os.kill, os.getpid(), signal.SIGTERM)
+        await asyncio.wait_for(_run_until_stopped(main(), prepare_stop), timeout=30)
+
+    asyncio.run(scenario())
+    assert events == ["drain started", "drain done", "cancelled"]
+
+
+def test_second_signal_skips_the_drain():
+    events: list[str] = []
+
+    async def main() -> None:
+        try:
+            await asyncio.Event().wait()
+        finally:
+            events.append("cancelled")
+
+    async def prepare_stop() -> None:
+        try:
+            await asyncio.Event().wait()
+        except asyncio.CancelledError:
+            events.append("drain cut short")
+            raise
+
+    async def scenario() -> None:
+        loop = asyncio.get_running_loop()
+        loop.call_later(0.05, os.kill, os.getpid(), signal.SIGTERM)
+        loop.call_later(0.15, os.kill, os.getpid(), signal.SIGTERM)
+        await asyncio.wait_for(_run_until_stopped(main(), prepare_stop), timeout=30)
+
+    asyncio.run(scenario())
+    assert events == ["drain cut short", "cancelled"]
+
+
+def test_a_failing_drain_still_stops():
+    events: list[str] = []
+
+    async def main() -> None:
+        try:
+            await asyncio.Event().wait()
+        finally:
+            events.append("cancelled")
+
+    async def prepare_stop() -> None:
+        raise RuntimeError("boom")
+
+    async def scenario() -> None:
+        asyncio.get_running_loop().call_later(0.05, os.kill, os.getpid(), signal.SIGTERM)
+        await asyncio.wait_for(_run_until_stopped(main(), prepare_stop), timeout=30)
+
+    asyncio.run(scenario())
+    assert events == ["cancelled"]

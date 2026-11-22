@@ -810,6 +810,27 @@ class ProcessingStore:
                 )
         return binding_ids
 
+    def unanswered_recovered_turns(
+        self, binding_ids: tuple[str, ...]
+    ) -> tuple[tuple[str, str, str], ...]:
+        """``(chat_id, event_id, turn_id)`` of recovered bindings whose turn never closed.
+
+        These are direct messages the previous process admitted for an answer and did
+        not finish, so the restart dropped the reply.
+        """
+        if not binding_ids:
+            return ()
+        marks = ",".join("?" for _ in binding_ids)
+        with self._lock:
+            rows = self._conn.execute(
+                "SELECT d.chat_id, d.event_id, d.turn_id FROM direct_admissions d "
+                "JOIN turns t ON t.turn_id = d.turn_id "
+                f"WHERE d.binding_id IN ({marks}) AND t.state IN ('open', 'awaiting') "
+                "ORDER BY d.created_ms",
+                tuple(binding_ids),
+            ).fetchall()
+        return tuple((str(r["chat_id"]), str(r["event_id"]), str(r["turn_id"])) for r in rows)
+
     @property
     def schema_version(self) -> int:
         with self._lock:

@@ -271,6 +271,17 @@ class ChannelManager:
         # Wait for all to complete (they should run forever)
         await asyncio.gather(*tasks, return_exceptions=True)
 
+    def pause_intake(self) -> None:
+        """Ask every channel that supports it to stop taking new inbound messages."""
+        for name, channel in self.channels.items():
+            pause = getattr(channel, "pause_intake", None)
+            if not callable(pause):
+                continue
+            try:
+                pause()
+            except Exception as e:  # noqa: BLE001 - a stop must go on
+                logger.warning("channel_pause_intake_failed channel={} error_type={}", name, type(e).__name__)
+
     async def stop_all(self) -> None:
         """Stop all channels and the dispatcher."""
         logger.info("Stopping all channels...")

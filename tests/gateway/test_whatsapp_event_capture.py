@@ -549,6 +549,24 @@ def test_frame_after_intake_closed_is_deferred_without_malformed_warning(caplog)
     )
 
 
+def test_paused_intake_defers_new_frames_to_bridge_replay() -> None:
+    channel = WhatsAppChannel(WhatsAppConfig(), MessageBus())
+    channel.pause_intake()
+    frame = json.loads(
+        _frame("group_subject",
+               {"chatJid": CHAT, "value": "s", "snapshot": True, "observedAtMs": NOW},
+               event_id="event-while-paused", event_key="wa:while-paused")
+    )
+
+    accepted = asyncio.run(
+        channel._capture_and_queue_bridge_event(frame, "group_subject", frame["payload"])
+    )
+
+    # Not ACKed, so the Bridge replays it after the restart; the link itself stays open.
+    assert accepted is False
+    assert channel._bridge_intake_closed is False and channel._stopping is False
+
+
 def test_unrelated_ack_failure_still_warns_after_intake_closes(caplog) -> None:
     from loguru import logger
     from yeoman_gateway.channels.whatsapp import _BridgeEventWork
