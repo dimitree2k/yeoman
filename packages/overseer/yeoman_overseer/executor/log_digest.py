@@ -24,8 +24,10 @@ SCHEMA_VERSION = 1
 DEFAULT_LOOKBACK = timedelta(hours=24)
 _TS_FORMAT = "%Y-%m-%d %H:%M:%S.%f"
 
+# Loguru 0.8's default format adds the UTC offset (" +01:00") after the timestamp;
+# it stays outside ``ts`` so checkpoint comparisons remain plain local-time strings.
 _LINE_RE = re.compile(
-    r"^(?P<ts>\d{4}-\d\d-\d\d \d\d:\d\d:\d\d\.\d{3}) \| (?P<level>[A-Z]+)\s*\| "
+    r"^(?P<ts>\d{4}-\d\d-\d\d \d\d:\d\d:\d\d\.\d{3})(?: [+-]\d\d:?\d\d)? \| (?P<level>[A-Z]+)\s*\| "
     r"(?P<module>[\w.]+):(?P<func>[\w<>]+):\d+ - (?P<msg>.*)$"
 )
 _TOOL_CALL_RE = re.compile(r"^Tool call: (?P<tool>[\w.-]+)\(")
